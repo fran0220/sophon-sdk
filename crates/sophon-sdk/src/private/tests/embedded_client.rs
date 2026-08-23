@@ -18,12 +18,19 @@ impl crate::ToolPermissionHandler for PermissionPolicy {
         self.decision.clone()
     }
 }
+
+fn event_journal_store() -> Arc<dyn crate::SessionEventJournalStore> {
+    Arc::new(crate::LocalSessionEventJournalStore::temporary().unwrap())
+}
+
 fn permission_client(handler: Option<Arc<dyn crate::ToolPermissionHandler>>) -> Client {
     let (events, _) = mpsc::unbounded_channel();
     Client {
         events,
         sequences: Rc::new(RefCell::new(HashMap::new())),
         retained: Rc::new(RefCell::new(HashMap::new())),
+        journal_generations: Rc::new(RefCell::new(HashMap::new())),
+        event_journal_store: event_journal_store(),
         capacity: 1,
         host: None,
         tool_permission_handler: handler,
@@ -458,6 +465,8 @@ async fn mcp_notifications_never_forward_raw_catalog_secrets_to_the_host() {
         events,
         sequences: Rc::new(RefCell::new(HashMap::new())),
         retained: Rc::new(RefCell::new(HashMap::new())),
+        journal_generations: Rc::new(RefCell::new(HashMap::new())),
+        event_journal_store: event_journal_store(),
         capacity: 4,
         host: Some(host.clone()),
         tool_permission_handler: None,
@@ -597,6 +606,8 @@ async fn reverse_extension_transport_preserves_json_and_journals_notifications()
         events,
         sequences: Rc::new(RefCell::new(HashMap::new())),
         retained: Rc::new(RefCell::new(HashMap::new())),
+        journal_generations: Rc::new(RefCell::new(HashMap::new())),
+        event_journal_store: event_journal_store(),
         capacity: 4,
         host: Some(host.clone()),
         tool_permission_handler: None,
@@ -665,6 +676,8 @@ async fn reverse_hook_transport_is_typed_and_fails_closed() {
         events,
         sequences: Rc::new(RefCell::new(HashMap::new())),
         retained: Rc::new(RefCell::new(HashMap::new())),
+        journal_generations: Rc::new(RefCell::new(HashMap::new())),
+        event_journal_store: event_journal_store(),
         capacity: 1,
         host: None,
         tool_permission_handler: None,

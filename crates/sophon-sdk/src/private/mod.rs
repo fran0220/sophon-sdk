@@ -103,6 +103,7 @@ enum Command {
         SessionConfig,
         Option<HarnessDigest>,
         CapabilityLayer,
+        Option<u64>,
         Reply<()>,
     ),
     SetCapabilities(SessionId, CapabilityLayer, Reply<CapabilityResolution>),

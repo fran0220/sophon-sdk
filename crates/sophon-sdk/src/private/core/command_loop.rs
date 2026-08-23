@@ -50,8 +50,11 @@ impl Core {
                 Command::Load(i, x, harness_digest, layer, r) => {
                     let _ = r.send(self.load(i, x, harness_digest, layer).await);
                 }
-                Command::Resume(i, x, harness_digest, layer, r) => {
-                    let _ = r.send(self.resume(i, x, harness_digest, layer).await);
+                Command::Resume(i, x, harness_digest, layer, after_sequence, r) => {
+                    let _ = r.send(
+                        self.resume(i, x, harness_digest, layer, after_sequence)
+                            .await,
+                    );
                 }
                 Command::SetCapabilities(i, layer, r) => {
                     let _ = r.send(self.set_session_capabilities(i, layer).await);

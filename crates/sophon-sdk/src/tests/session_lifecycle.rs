@@ -242,7 +242,7 @@ fn rich_prompt_digest_covers_binary_content() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rich_prompt_blocks_digest_rewind_and_restart_replay_are_end_to_end() {
+async fn rich_prompt_blocks_digest_rewind_and_restart_durability_are_end_to_end() {
     let _guard = SESSION_LIFECYCLE_LOCK.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server = MockInferenceServer::start().await.expect("mock server");
@@ -340,20 +340,30 @@ async fn rich_prompt_blocks_digest_rewind_and_restart_replay_are_end_to_end() {
         .unload_session(session.clone())
         .await
         .expect("session unloads");
+    let sequence_before_restart = runtime
+        .events_after(&session, 0)
+        .await
+        .expect("journal remains")
+        .last()
+        .expect("journal event")
+        .sequence;
     runtime.shutdown().await.expect("first runtime shuts down");
 
     let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
     restarted
         .load_session(session.clone(), session_config(workspace.clone()))
         .await
-        .expect("load replays persisted history");
-    let replay = restarted
+        .expect("load restores the durable journal");
+    let retained = restarted
         .events_after(&session, 0)
         .await
-        .expect("fresh journal captures replay");
-    assert!(!replay.is_empty(), "load must rebuild a fresh journal");
-    assert!(replay.iter().all(|event| event.replay));
-    assert!(replay.iter().any(|event| {
+        .expect("durable journal survives restart");
+    assert_eq!(
+        retained.last().map(|event| event.sequence),
+        Some(sequence_before_restart)
+    );
+    assert!(retained.iter().all(|event| !event.replay));
+    assert!(retained.iter().any(|event| {
         matches!(&event.update, EventUpdate::UserText(text) if text == "rich-wire-marker")
     }));
     restarted
@@ -388,6 +398,151 @@ async fn rich_prompt_blocks_digest_rewind_and_restart_replay_are_end_to_end() {
         Some(expected_digest)
     );
     restarted.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_after_runtime_restart_continues_the_durable_event_sequence() {
+    let _guard = SESSION_LIFECYCLE_LOCK.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock server");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = runtime_config(&root, server.url());
+    let session_config = session_config(workspace);
+
+    let (runtime, _) = Runtime::start(config.clone())
+        .await
+        .expect("runtime starts");
+    let session = runtime
+        .create_session(session_config.clone())
+        .await
+        .expect("session starts");
+    runtime
+        .prompt(&session, "before-restart", "first marker")
+        .await
+        .expect("first turn succeeds");
+    runtime
+        .unload_session(session.clone())
+        .await
+        .expect("session unloads");
+    let before_restart = runtime
+        .events_after(&session, 0)
+        .await
+        .expect("journal is readable")
+        .last()
+        .expect("journal has events")
+        .sequence;
+    runtime.shutdown().await.expect("runtime shuts down");
+
+    let (restarted, _) = Runtime::start(config).await.expect("runtime restarts");
+    restarted
+        .resume_session(session.clone(), session_config)
+        .await
+        .expect("session resumes without replay");
+    assert!(
+        restarted
+            .events_after(&session, before_restart)
+            .await
+            .expect("the old cursor remains valid")
+            .is_empty(),
+        "resume duplicated a pre-restart event"
+    );
+    let receipt = restarted
+        .prompt(&session, "after-restart", "second marker")
+        .await
+        .expect("second turn succeeds");
+    let suffix = restarted
+        .events_after(&session, before_restart)
+        .await
+        .expect("new suffix is readable");
+    assert_eq!(
+        suffix.first().map(|event| event.sequence),
+        Some(before_restart + 1)
+    );
+    assert_eq!(
+        suffix.last().map(|event| event.sequence),
+        Some(receipt.final_sequence)
+    );
+    restarted.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_journal_upgrade_adopts_the_hosts_existing_cursor_without_replay() {
+    let _guard = SESSION_LIFECYCLE_LOCK.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock server");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = runtime_config(&root, server.url());
+    let session_config = session_config(workspace);
+
+    let (runtime, _) = Runtime::start(config.clone())
+        .await
+        .expect("runtime starts");
+    let session = runtime
+        .create_session(session_config.clone())
+        .await
+        .expect("session starts");
+    runtime
+        .prompt(&session, "before-upgrade", "existing marker")
+        .await
+        .expect("existing turn succeeds");
+    runtime
+        .unload_session(session.clone())
+        .await
+        .expect("session unloads");
+    let host_cursor = runtime
+        .events_after(&session, 0)
+        .await
+        .expect("old Host projects the journal")
+        .last()
+        .expect("journal has events")
+        .sequence;
+    assert!(host_cursor > 0);
+    runtime.shutdown().await.expect("old runtime shuts down");
+    drop(runtime);
+
+    let journal = config.session_storage.join("origin-event-journal.sqlite3");
+    std::fs::remove_file(&journal).expect("simulate a pre-journal installation");
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", journal.display()));
+    }
+
+    let (upgraded, _) = Runtime::start(config)
+        .await
+        .expect("upgraded runtime starts");
+    upgraded
+        .resume_session_from_cursor(session.clone(), session_config, host_cursor)
+        .await
+        .expect("upgraded runtime adopts the Host cursor");
+    assert!(
+        upgraded
+            .events_after(&session, host_cursor)
+            .await
+            .expect("adopted cursor is immediately valid")
+            .is_empty(),
+        "adoption must not replay historical events"
+    );
+    let receipt = upgraded
+        .prompt(&session, "after-upgrade", "new marker")
+        .await
+        .expect("new turn succeeds");
+    let suffix = upgraded
+        .events_after(&session, host_cursor)
+        .await
+        .expect("new suffix follows the adopted cursor");
+    assert_eq!(
+        suffix.first().map(|event| event.sequence),
+        Some(host_cursor + 1)
+    );
+    assert_eq!(
+        suffix.last().map(|event| event.sequence),
+        Some(receipt.final_sequence)
+    );
+    assert!(suffix.iter().all(|event| !event.replay));
+    upgraded.shutdown().await.expect("runtime shuts down");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

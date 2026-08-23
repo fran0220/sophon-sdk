@@ -162,30 +162,34 @@ impl Core {
             })
             .collect()
     }
-    pub(super) fn emit(&self, id: &SessionId, u: EventUpdate, t: Option<String>) {
-        let event = self.retain_event(id, u, t);
+    pub(super) fn emit(
+        &self,
+        id: &SessionId,
+        u: EventUpdate,
+        t: Option<String>,
+    ) -> Result<(), Error> {
+        let event = self.retain_event(id, u, t)?;
         self.publish_event(event);
+        Ok(())
     }
 
-    pub(super) fn retain_event(&self, id: &SessionId, u: EventUpdate, t: Option<String>) -> Event {
-        let mut s = self.sequences.borrow_mut();
-        let n = s.entry(id.0.clone()).or_default();
-        *n += 1;
-        let event = Event {
-            session_id: id.clone(),
-            sequence: *n,
-            turn_id: t,
-            timestamp_ms: now_ms(),
-            replay: false,
-            update: u,
-        };
-        let mut journal = self.retained.borrow_mut();
-        let retained = journal.entry(id.0.clone()).or_default();
-        retained.push_back(event.clone());
-        while retained.len() > self.capacity {
-            retained.pop_front();
-        }
-        event
+    pub(super) fn retain_event(
+        &self,
+        id: &SessionId,
+        u: EventUpdate,
+        t: Option<String>,
+    ) -> Result<Event, Error> {
+        retain_durable_event(
+            &self.sequences,
+            &self.retained,
+            &self.journal_generations,
+            &self.event_journal_store,
+            self.capacity,
+            id.clone(),
+            t,
+            false,
+            u,
+        )
     }
 
     pub(super) fn publish_event(&self, event: Event) {
@@ -288,6 +292,7 @@ impl Core {
                         None,
                         crate::CapabilityLayer::default(),
                         false,
+                        None,
                         lease,
                     )
                     .await?;
@@ -370,6 +375,19 @@ impl Core {
             };
         }
         let active_guard = ActiveMcpBindingGuard::new(self.mcp_bindings.clone(), id.0.clone());
+        if let Err(error) = self.initialize_event_journal(&id) {
+            return match self.detach_unregistered_session(&id).await {
+                Ok(()) => {
+                    if let Some(admission) = &mut lease_admission {
+                        admission.release();
+                    }
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(Error::Operation(format!(
+                    "{error}; native session cleanup failed: {cleanup_error}"
+                ))),
+            };
+        }
         if let Err(error) = self.save_ledger(&id, &SessionLedger::default()) {
             return match self.detach_unregistered_session(&id).await {
                 Ok(()) => {
@@ -399,6 +417,37 @@ impl Core {
             }
             return Err(Error::Operation(detail));
         }
+        if let Err(error) = self.emit(&id, EventUpdate::SessionStarted, None) {
+            let cleanup = self.detach_unregistered_session(&id).await;
+            let native_cleanup_complete = cleanup.is_ok();
+            if native_cleanup_complete {
+                xai_grok_shell::origin_runtime::unregister_session_tree(&id.0);
+            }
+            let journal_cleanup = if native_cleanup_complete {
+                self.delete_event_journal(&id)
+            } else {
+                Ok(())
+            };
+            if native_cleanup_complete && journal_cleanup.is_ok() {
+                if let Some(admission) = &mut lease_admission {
+                    admission.release();
+                }
+                return Err(error);
+            }
+            return Err(Error::Operation(format!(
+                "{error}; native session cleanup: {}; event journal cleanup: {}",
+                cleanup
+                    .err()
+                    .map_or_else(|| "complete".to_owned(), |error| error.to_string()),
+                if native_cleanup_complete {
+                    journal_cleanup
+                        .err()
+                        .map_or_else(|| "complete".to_owned(), |error| error.to_string())
+                } else {
+                    "retained because native cleanup is uncertain".to_owned()
+                }
+            )));
+        }
         self.resident.borrow_mut().insert(id.0.clone());
         self.session_bindings
             .borrow_mut()
@@ -407,7 +456,6 @@ impl Core {
         if let Some(admission) = &mut lease_admission {
             admission.commit_resident();
         }
-        self.emit(&id, EventUpdate::SessionStarted, None);
         Ok(id)
     }
     pub(super) async fn load(
@@ -417,7 +465,8 @@ impl Core {
         harness_digest: Option<HarnessDigest>,
         layer: crate::CapabilityLayer,
     ) -> Result<(), Error> {
-        self.attach(id, config, harness_digest, layer, false).await
+        self.attach(id, config, harness_digest, layer, false, None)
+            .await
     }
 
     pub(super) async fn resume(
@@ -426,8 +475,10 @@ impl Core {
         config: SessionConfig,
         harness_digest: Option<HarnessDigest>,
         layer: crate::CapabilityLayer,
+        after_sequence: Option<u64>,
     ) -> Result<(), Error> {
-        self.attach(id, config, harness_digest, layer, true).await
+        self.attach(id, config, harness_digest, layer, true, after_sequence)
+            .await
     }
 
     pub(super) async fn attach(
@@ -437,11 +488,20 @@ impl Core {
         harness_digest: Option<HarnessDigest>,
         layer: crate::CapabilityLayer,
         resume: bool,
+        after_sequence: Option<u64>,
     ) -> Result<(), Error> {
         self.check(&config)?;
         let lease = self.acquire_session_lease(&id)?;
-        self.attach_with_lease(id, config, harness_digest, layer, resume, lease)
-            .await
+        self.attach_with_lease(
+            id,
+            config,
+            harness_digest,
+            layer,
+            resume,
+            after_sequence,
+            lease,
+        )
+        .await
     }
 
     pub(super) async fn attach_with_lease(
@@ -451,6 +511,7 @@ impl Core {
         harness_digest: Option<HarnessDigest>,
         layer: crate::CapabilityLayer,
         resume: bool,
+        after_sequence: Option<u64>,
         lease: Option<Box<dyn crate::SessionStateLease>>,
     ) -> Result<(), Error> {
         self.check(&config)?;
@@ -478,7 +539,13 @@ impl Core {
                 self.0.borrow_mut().remove(&self.1);
             }
         }
-        let capture_replay = !resume && !self.sequences.borrow().contains_key(&id.0);
+        let rebuild_generation = if resume {
+            self.restore_or_adopt_event_journal(&id, after_sequence.unwrap_or(0))?;
+            None
+        } else {
+            self.restore_or_rebuild_event_journal(&id)?
+        };
+        let capture_replay = rebuild_generation.is_some();
         self.replay.borrow_mut().insert(
             id.0.clone(),
             if capture_replay {
@@ -522,6 +589,19 @@ impl Core {
                 }
                 Err(cleanup_error) => Err(Error::Operation(format!(
                     "loaded session identity collided with an existing embedded root; native session cleanup failed: {cleanup_error}"
+                ))),
+            };
+        }
+        if let Some(generation) = rebuild_generation
+            && let Err(error) = self.finish_event_journal_rebuild(&id, generation)
+        {
+            return match self.detach_unregistered_session(&id).await {
+                Ok(()) => {
+                    lease_admission.release();
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(Error::Operation(format!(
+                    "{error}; native session cleanup failed: {cleanup_error}"
                 ))),
             };
         }

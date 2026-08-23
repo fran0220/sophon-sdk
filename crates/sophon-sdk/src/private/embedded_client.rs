@@ -8,6 +8,8 @@ pub(super) struct Client {
     pub(super) events: mpsc::UnboundedSender<Event>,
     pub(super) sequences: Rc<RefCell<HashMap<String, u64>>>,
     pub(super) retained: Rc<RefCell<HashMap<String, VecDeque<Event>>>>,
+    pub(super) journal_generations: Rc<RefCell<HashMap<String, u64>>>,
+    pub(super) event_journal_store: Arc<dyn crate::SessionEventJournalStore>,
     pub(super) capacity: usize,
     pub(super) host: Option<Arc<dyn crate::HostDelegate>>,
     pub(super) tool_permission_handler: Option<Arc<dyn crate::ToolPermissionHandler>>,
@@ -254,34 +256,29 @@ impl Client {
         let root_session_id = xai_grok_shell::origin_runtime::resolve_root_session(&sid, None)
             .or_else(|| self.replay.borrow().contains_key(&sid).then(|| sid.clone()))
             .ok_or_else(EmbeddedError::invalid_params)?;
-        self.emit_root(root_session_id, update);
-        Ok(())
+        self.emit_root(root_session_id, update)
     }
 
-    fn emit_root(&self, root_session_id: String, update: EventUpdate) {
+    fn emit_root(&self, root_session_id: String, update: EventUpdate) -> EmbeddedResult<()> {
         let replay = match self.replay.borrow().get(&root_session_id).copied() {
             Some(ReplayMode::Capture) => true,
-            Some(ReplayMode::Suppress) => return,
+            Some(ReplayMode::Suppress) => return Ok(()),
             None => false,
         };
-        let mut seq = self.sequences.borrow_mut();
-        let n = seq.entry(root_session_id.clone()).or_default();
-        *n += 1;
-        let event = Event {
-            session_id: SessionId(root_session_id.clone()),
-            sequence: *n,
-            turn_id: self.turns.borrow().get(&root_session_id).cloned(),
-            timestamp_ms: now_ms(),
+        let event = crate::private::core::retain_durable_event(
+            &self.sequences,
+            &self.retained,
+            &self.journal_generations,
+            &self.event_journal_store,
+            self.capacity,
+            SessionId(root_session_id.clone()),
+            self.turns.borrow().get(&root_session_id).cloned(),
             replay,
             update,
-        };
-        let mut journal = self.retained.borrow_mut();
-        let retained = journal.entry(root_session_id).or_default();
-        retained.push_back(event.clone());
-        while retained.len() > self.capacity {
-            retained.pop_front();
-        }
+        )
+        .map_err(|_| EmbeddedError::internal_error())?;
         let _ = self.events.send(event);
+        Ok(())
     }
 
     async fn request_permission(
@@ -468,7 +465,7 @@ impl Client {
                 raw,
             },
         };
-        self.emit_root(root, update);
+        self.emit_root(root, update)?;
         if !is_mcp_notification && let Some(host) = &self.host {
             host.notification(crate::HostNotification {
                 method: method.to_owned(),

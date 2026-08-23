@@ -19,8 +19,7 @@ impl Core {
             .and_then(|meta| meta.get("x.ai/closeOutcome"))
             .and_then(serde_json::Value::as_str);
         if close_outcome_releases_lease(outcome) {
-            self.finish_close(&id, true);
-            Ok(())
+            self.finish_close(&id, true)
         } else {
             if outcome != Some("superseded") {
                 self.mark_close_uncertain(&id);
@@ -60,6 +59,7 @@ impl Core {
                 }
             });
         if result.is_ok() {
+            self.delete_event_journal(&id)?;
             self.session_leases.borrow_mut().remove(&id.0);
         }
         result
@@ -88,16 +88,15 @@ impl Core {
             ));
         }
         if response.drained {
-            self.finish_close(&id, release_lease);
-            Ok(())
+            self.finish_close(&id, release_lease)
         } else {
             Err(Error::Operation(
                 "native session detached but its actor missed the teardown deadline".into(),
             ))
         }
     }
-    pub(super) fn finish_close(&self, id: &SessionId, release_lease: bool) {
-        self.emit(id, EventUpdate::SessionClosed, None);
+    pub(super) fn finish_close(&self, id: &SessionId, release_lease: bool) -> Result<(), Error> {
+        let journal_result = self.emit(id, EventUpdate::SessionClosed, None);
         self.resident.borrow_mut().remove(&id.0);
         self.session_bindings.borrow_mut().remove(&id.0);
         if release_lease {
@@ -107,6 +106,7 @@ impl Core {
         self.turns.borrow_mut().remove(&id.0);
         self.replay.borrow_mut().remove(&id.0);
         xai_grok_shell::origin_runtime::unregister_session_tree(&id.0);
+        journal_result
     }
 
     pub(super) fn mark_close_uncertain(&self, id: &SessionId) {

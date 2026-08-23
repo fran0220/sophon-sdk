@@ -112,7 +112,9 @@ impl Runtime {
             .load_session_with_capabilities(id, config, None, capabilities)
             .await
     }
-    /// Resumes without replay under its own capability layer.
+    /// Resumes without replay under its own capability layer. When adopting a
+    /// Session whose Host cursor predates the SDK event journal, use
+    /// [`Self::resume_session_with_capabilities_from_cursor`].
     pub async fn resume_session_with_capabilities(
         &self,
         id: SessionId,
@@ -121,6 +123,26 @@ impl Runtime {
     ) -> Result<(), Error> {
         self.inner
             .resume_session_with_capabilities(id, config, None, capabilities)
+            .await
+    }
+    /// Resumes without replay and adopts `after_sequence` as the journal head
+    /// only when this Session has no durable SDK journal yet. An existing
+    /// journal remains authoritative and must be at least this far advanced.
+    pub async fn resume_session_with_capabilities_from_cursor(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        capabilities: CapabilityLayer,
+        after_sequence: u64,
+    ) -> Result<(), Error> {
+        self.inner
+            .resume_session_with_capabilities_from_cursor(
+                id,
+                config,
+                None,
+                capabilities,
+                after_sequence,
+            )
             .await
     }
     /// Replaces a resident Session's capability layer. The new layer is
@@ -189,10 +211,29 @@ impl Runtime {
             .await
     }
     /// Resumes a durable session without replaying its historical updates.
-    /// Use [`Self::load_session`] when the host needs history replay to rebuild
-    /// a fresh event journal.
+    /// Use [`Self::resume_session_from_cursor`] when adopting a Host cursor
+    /// written before the durable SDK event journal existed.
     pub async fn resume_session(&self, id: SessionId, config: SessionConfig) -> Result<(), Error> {
         self.inner.resume_session(id, config).await
+    }
+    /// Resumes without replay and adopts `after_sequence` as the initial SDK
+    /// journal head only if this Session has no journal. This is the one-time
+    /// upgrade path for Hosts that already persisted event cursors.
+    pub async fn resume_session_from_cursor(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        after_sequence: u64,
+    ) -> Result<(), Error> {
+        self.inner
+            .resume_session_with_capabilities_from_cursor(
+                id,
+                config,
+                None,
+                CapabilityLayer::default(),
+                after_sequence,
+            )
+            .await
     }
     /// Resumes without replay and binds this Session incarnation to the
     /// Host-selected immutable snapshot.
@@ -208,6 +249,24 @@ impl Runtime {
                 id,
                 materialized.apply_to_session(config),
                 snapshot.digest().clone(),
+            )
+            .await
+    }
+    /// Harness-aware form of [`Self::resume_session_from_cursor`].
+    pub async fn resume_session_with_harness_from_cursor(
+        &self,
+        id: SessionId,
+        config: SessionConfig,
+        snapshot: &HarnessSnapshot,
+        after_sequence: u64,
+    ) -> Result<(), Error> {
+        let materialized = snapshot.materialize()?;
+        self.inner
+            .resume_session_with_harness_from_cursor(
+                id,
+                materialized.apply_to_session(config),
+                snapshot.digest().clone(),
+                after_sequence,
             )
             .await
     }

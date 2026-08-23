@@ -351,7 +351,7 @@ impl Runtime {
         options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
-        Self::start_with_stores(input, options, run_store, None, None, None).await
+        Self::start_with_stores(input, options, run_store, None, None, None, None).await
     }
 
     pub async fn start_with_stores(
@@ -359,6 +359,7 @@ impl Runtime {
         mut options: RuntimeOptions,
         run_store: Option<Arc<dyn xai_agent_lifecycle::run::RunStore>>,
         evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
+        event_journal_store: Option<Arc<dyn crate::SessionEventJournalStore>>,
         session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
         compaction_observer: Option<Arc<dyn crate::CompactionObserver>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), Error> {
@@ -414,6 +415,14 @@ impl Runtime {
                 Arc::new(crate::LocalSessionEvidenceStore::new(&input.session_storage).map_err(op)?)
             }
         };
+        let event_journal_store: Arc<dyn crate::SessionEventJournalStore> =
+            match event_journal_store {
+                Some(store) => store,
+                None => Arc::new(
+                    crate::LocalSessionEventJournalStore::new(&input.session_storage)
+                        .map_err(op)?,
+                ),
+            };
         let probe_session_state_store = session_state_store.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -440,6 +449,7 @@ impl Runtime {
                                         options,
                                         events,
                                         evidence_store,
+                                        event_journal_store,
                                         session_state_store,
                                         compaction_observer,
                                     )
@@ -920,7 +930,18 @@ impl Runtime {
         digest: Option<HarnessDigest>,
         layer: CapabilityLayer,
     ) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, digest, layer, r))
+        self.call(|r| Command::Resume(id, c, digest, layer, None, r))
+            .await
+    }
+    pub async fn resume_session_with_capabilities_from_cursor(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: Option<HarnessDigest>,
+        layer: CapabilityLayer,
+        after_sequence: u64,
+    ) -> Result<(), Error> {
+        self.call(|r| Command::Resume(id, c, digest, layer, Some(after_sequence), r))
             .await
     }
     pub async fn set_session_capabilities(
@@ -967,7 +988,7 @@ impl Runtime {
             .await
     }
     pub async fn resume_session(&self, id: SessionId, c: SessionConfig) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, None, CapabilityLayer::default(), r))
+        self.call(|r| Command::Resume(id, c, None, CapabilityLayer::default(), None, r))
             .await
     }
     pub async fn resume_session_with_harness(
@@ -976,8 +997,27 @@ impl Runtime {
         c: SessionConfig,
         digest: HarnessDigest,
     ) -> Result<(), Error> {
-        self.call(|r| Command::Resume(id, c, Some(digest), CapabilityLayer::default(), r))
+        self.call(|r| Command::Resume(id, c, Some(digest), CapabilityLayer::default(), None, r))
             .await
+    }
+    pub async fn resume_session_with_harness_from_cursor(
+        &self,
+        id: SessionId,
+        c: SessionConfig,
+        digest: HarnessDigest,
+        after_sequence: u64,
+    ) -> Result<(), Error> {
+        self.call(|r| {
+            Command::Resume(
+                id,
+                c,
+                Some(digest),
+                CapabilityLayer::default(),
+                Some(after_sequence),
+                r,
+            )
+        })
+        .await
     }
     pub async fn prompt(
         &self,

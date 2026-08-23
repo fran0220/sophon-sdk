@@ -218,7 +218,8 @@ impl Core {
             outcome,
             &usage,
         )?;
-        let terminal = self.retain_event(&id, EventUpdate::TurnFinished(outcome), Some(t.clone()));
+        let terminal =
+            self.retain_event(&id, EventUpdate::TurnFinished(outcome), Some(t.clone()))?;
         let receipt = PromptReceipt {
             outcome,
             final_sequence: terminal.sequence,

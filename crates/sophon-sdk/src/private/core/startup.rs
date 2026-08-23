@@ -6,6 +6,7 @@ impl Core {
         options: RuntimeOptions,
         events: mpsc::UnboundedSender<Event>,
         evidence_store: Arc<dyn SessionEvidenceStore>,
+        event_journal_store: Arc<dyn crate::SessionEventJournalStore>,
         session_state_store: Option<Arc<dyn crate::SessionStateStore>>,
         compaction_observer: Option<Arc<dyn crate::CompactionObserver>>,
     ) -> Result<(Self, RuntimeCapabilities), Error> {
@@ -179,6 +180,7 @@ impl Core {
         let mcp_bindings = Arc::new(McpBindingRegistry::default());
         let sequences = Rc::new(RefCell::new(HashMap::new()));
         let retained = Rc::new(RefCell::new(HashMap::new()));
+        let journal_generations = Rc::new(RefCell::new(HashMap::new()));
         let turns = Rc::new(RefCell::new(HashMap::new()));
         let turn_usages = Rc::new(RefCell::new(HashMap::new()));
         let replay = Rc::new(RefCell::new(HashMap::new()));
@@ -186,6 +188,8 @@ impl Core {
             events: events.clone(),
             sequences: sequences.clone(),
             retained: retained.clone(),
+            journal_generations: journal_generations.clone(),
+            event_journal_store: event_journal_store.clone(),
             capacity: options.event_journal_capacity,
             host: options.host.clone(),
             tool_permission_handler: if options.profile == crate::RuntimeProfile::Desktop {
@@ -287,6 +291,8 @@ impl Core {
                     .collect(),
                 sequences,
                 retained,
+                journal_generations,
+                event_journal_store,
                 capacity: options.event_journal_capacity,
                 options,
                 general_capabilities,

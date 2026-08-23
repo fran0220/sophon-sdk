@@ -10,6 +10,7 @@ impl Runtime {
             options: RuntimeOptions::default(),
             run_store: None,
             evidence_store: None,
+            event_journal_store: None,
             session_state_store: None,
             compaction_observer: None,
         }
@@ -20,6 +21,7 @@ pub struct RuntimeBuilder {
     options: RuntimeOptions,
     run_store: Option<Arc<dyn run::RunStore>>,
     evidence_store: Option<Arc<dyn SessionEvidenceStore>>,
+    event_journal_store: Option<Arc<dyn SessionEventJournalStore>>,
     session_state_store: Option<Arc<dyn SessionStateStore>>,
     compaction_observer: Option<Arc<dyn CompactionObserver>>,
 }
@@ -165,6 +167,12 @@ impl RuntimeBuilder {
         self.evidence_store = Some(value);
         self
     }
+    /// Replaces the standalone durable Session event journal with the Host's
+    /// one append authority. Event bytes remain opaque to the Host.
+    pub fn session_event_journal_store(mut self, value: Arc<dyn SessionEventJournalStore>) -> Self {
+        self.event_journal_store = Some(value);
+        self
+    }
     /// Replaces native Session transcript, rewind, and compaction persistence
     /// with the Host's single canonical authority. The store is shared by all
     /// Sessions created or loaded by this Runtime.
@@ -187,6 +195,7 @@ impl RuntimeBuilder {
             self.options,
             self.run_store,
             self.evidence_store,
+            self.event_journal_store,
             self.session_state_store,
             self.compaction_observer,
         )

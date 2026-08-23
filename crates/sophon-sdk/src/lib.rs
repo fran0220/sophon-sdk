@@ -10,6 +10,7 @@ mod artifact;
 mod autonomous;
 mod compaction;
 mod conversation;
+mod event_journal;
 mod evidence;
 mod evolution;
 mod harness;
@@ -62,6 +63,12 @@ pub use conversation::{
     MAX_CONVERSATION_LABEL_BYTES, MAX_CONVERSATION_TITLE_BYTES, MAX_DIGEST_FOCUS_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_PEER_MESSAGE_BYTES, MAX_PROJECT_NAME_BYTES, PeerMessage,
     ProjectName, conversation_tool_descriptors,
+};
+pub use event_journal::{
+    EVENT_JOURNAL_SCHEMA_MARKER, EVENT_JOURNAL_SCHEMA_VERSION, EventJournalAppend,
+    EventJournalCommit, EventJournalSnapshot, EventJournalStatus, EventJournalStoreError,
+    LocalSessionEventJournalStore, MAX_SESSION_EVENT_BYTES, SessionEventJournalStore,
+    StoredSessionEvent,
 };
 pub use evidence::{
     LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,

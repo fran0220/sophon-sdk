@@ -11,6 +11,8 @@ mod shutdown;
 mod startup;
 mod turns;
 
+pub(super) use journal::retain_durable_event;
+
 #[derive(serde::Deserialize)]
 pub(super) struct RewindPointsWire {
     rewind_points: Vec<RewindPointWire>,
@@ -213,6 +215,8 @@ pub(super) struct Core {
     catalog: HashMap<String, crate::ModelSpec>,
     sequences: Rc<RefCell<HashMap<String, u64>>>,
     retained: Rc<RefCell<HashMap<String, VecDeque<Event>>>>,
+    journal_generations: Rc<RefCell<HashMap<String, u64>>>,
+    event_journal_store: Arc<dyn crate::SessionEventJournalStore>,
     capacity: usize,
     options: RuntimeOptions,
     general_capabilities: crate::CapabilityLayer,
