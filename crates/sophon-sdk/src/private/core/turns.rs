@@ -185,7 +185,16 @@ impl Core {
             EmbeddedStopReason::End => TurnOutcome::End,
             EmbeddedStopReason::Cancelled => TurnOutcome::Cancelled,
             EmbeddedStopReason::MaxTokens => TurnOutcome::MaxTokens,
-            EmbeddedStopReason::MaxTurnRequests => TurnOutcome::MaxTurnRequests,
+            EmbeddedStopReason::BudgetLimited(reason) => TurnOutcome::BudgetLimited {
+                reason: match reason {
+                    EmbeddedLoopHealthLimitReason::StepBudget { limit } => {
+                        crate::LoopHealthLimitReason::StepBudget { limit }
+                    }
+                    EmbeddedLoopHealthLimitReason::Repetition { repeated_steps } => {
+                        crate::LoopHealthLimitReason::Repetition { repeated_steps }
+                    }
+                },
+            },
             EmbeddedStopReason::Refusal => TurnOutcome::Refusal,
             EmbeddedStopReason::Other => {
                 self.turn_usages.borrow_mut().remove(&usage_key);

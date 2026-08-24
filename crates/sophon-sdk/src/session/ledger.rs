@@ -67,7 +67,7 @@ pub(crate) fn durable_turn_outcome(outcome: TurnOutcome) -> run::SessionTurnOutc
         TurnOutcome::End => run::SessionTurnOutcome::End,
         TurnOutcome::Cancelled => run::SessionTurnOutcome::Cancelled,
         TurnOutcome::MaxTokens => run::SessionTurnOutcome::MaxTokens,
-        TurnOutcome::MaxTurnRequests => run::SessionTurnOutcome::MaxTurnRequests,
+        TurnOutcome::BudgetLimited { .. } => run::SessionTurnOutcome::BudgetLimited,
         TurnOutcome::Refusal => run::SessionTurnOutcome::Refusal,
     }
 }

@@ -648,6 +648,45 @@ impl ToolBridge {
             .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
     }
 
+    pub async fn deliver_scheduled_task_occurrence(
+        &self,
+        task_id: &str,
+        occurrence: crate::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
+    ) -> Result<bool, xai_tool_runtime::ToolError> {
+        use crate::implementations::grok_build::scheduler::types::{
+            SchedulerCommand, SchedulerHandle,
+        };
+        let sender = {
+            let resources = self.registry.resources.lock().await;
+            resources
+                .get::<SchedulerHandle>()
+                .ok_or_else(|| {
+                    xai_tool_runtime::ToolError::custom("missing_resource", "SchedulerHandle")
+                })?
+                .0
+                .clone()
+        };
+        let (reply, response) = tokio::sync::oneshot::channel();
+        sender
+            .send(SchedulerCommand::Deliver {
+                id: task_id.to_owned(),
+                occurrence,
+                reply,
+            })
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
+    }
+
     /// Move a foreground command to background by tool_call_id.
     /// Returns `true` if a matching foreground process was found and unblocked.
     pub async fn background_foreground_command(&self, tool_call_id: &str) -> bool {

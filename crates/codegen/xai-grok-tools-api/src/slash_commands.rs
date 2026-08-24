@@ -76,7 +76,8 @@ pub fn loop_schedule_instruction(args: &str, mode: LoopFireMode) -> String {
          ## Action\n\
          Schedule from what the user already gave you \u{2014} do not explore the workspace or run\n\
          checks before scheduling; the first fire does that.\n\
-         1. Call scheduler_create with the interval, the prompt, and fire_immediately: true.\n\
+         1. Call scheduler_create with the prompt and wake_source \
+            {{kind: \"recurrence\", interval, recurring: true, fire_immediately: true}}.\n\
             If the interval is rejected, fix the string rather than guessing.\n\
          2. Confirm what's scheduled, the cadence, its stop condition, that it auto-expires\n\
             after 7 days, and the task_id to cancel with scheduler_delete.\n\

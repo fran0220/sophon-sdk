@@ -740,6 +740,13 @@ pub(super) async fn run_session(
                                 .upsert_scheduled_task(request).await.map_err(|e| e.to_string());
                             let _ = respond_to.send(result);
                         }
+                        SessionCommand::DeliverScheduledTaskOccurrence { task_id, occurrence, respond_to } => {
+                            let result = session.agent.borrow().tool_bridge()
+                                .deliver_scheduled_task_occurrence(&task_id, occurrence)
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = respond_to.send(result);
+                        }
                         SessionCommand::ListScheduledTasks { respond_to } => {
                             let result = session.agent.borrow().tool_bridge().list_scheduled_tasks().await;
                             let _ = respond_to.send(result);

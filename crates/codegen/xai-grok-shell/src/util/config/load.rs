@@ -104,11 +104,6 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
         permission,
         diagnostics: section(table, "diagnostics"),
         session: section(table, "session"),
-        ask_user_question: table
-            .get("toolset")
-            .and_then(|t| t.get("ask_user_question"))
-            .and_then(|v| v.clone().try_into().ok())
-            .unwrap_or_default(),
         privacy: section(table, "privacy"),
         consent: section(table, "consent"),
     }

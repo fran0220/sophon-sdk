@@ -1,3 +1,4 @@
+use super::super::types::SchedulerWakeSource;
 use super::*;
 use crate::persistence::ResourcesPersistence;
 use crate::types::resources::{Resources, State};
@@ -12,9 +13,11 @@ fn uuid(suffix: u64) -> uuid::Uuid {
 fn task(id: &str, recurring: bool, durable: bool) -> ScheduledTask {
     ScheduledTask {
         id: id.into(),
-        interval_secs: 300,
         prompt: format!("run {id}"),
-        recurring,
+        wake_source: SchedulerWakeSource::Recurrence {
+            interval_secs: 300,
+            recurring,
+        },
         durable,
         foreground: true,
         created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
@@ -23,6 +26,8 @@ fn task(id: &str, recurring: bool, durable: bool) -> ScheduledTask {
         last_subagent_id: None,
         iterations_since_fresh: 0,
         chain_reset_pending: false,
+        pending_occurrences: Vec::new(),
+        delivered_occurrences: Vec::new(),
     }
 }
 

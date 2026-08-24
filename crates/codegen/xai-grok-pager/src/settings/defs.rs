@@ -13,7 +13,6 @@ use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
 use xai_grok_shell::agent::config::UiConfig;
 use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
-use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
 // Int bounds for `max_thoughts_width`.
@@ -1267,35 +1266,6 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 supports_preview: false,
             },
             restart_required: false,
-            hidden_in_minimal: false,
-        },
-        // SHELL-owned `[toolset.ask_user_question].timeout_enabled`. Surfaces
-        // the user-config layer of the tiered timeout gate (requirements/env/
-        // managed/remote settings feed the effective value at agent build); the
-        // default is the resolver-shared const. `restart_required` — resolved
-        // when an agent is built, like `remember_tool_approvals`.
-        SettingMeta {
-            key: "toolset.ask_user_question.timeout_enabled",
-            category: SettingCategory::Agent,
-            owner: SettingOwner::Shell,
-            label: "Ask-Question timeout",
-            description: "When on, the ask_user_question tool will time out after a set period \
-                          of time instead of infinitely blocking.",
-            keywords: &[
-                "ask",
-                "question",
-                "questionnaire",
-                "timeout",
-                "ask_user_question",
-                "block",
-                "wait",
-                "forever",
-                "tool",
-            ],
-            kind: SettingKind::Bool {
-                default: ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED,
-            },
-            restart_required: true,
             hidden_in_minimal: false,
         },
         // PAGER-owned, ACP-mediated. Reads from

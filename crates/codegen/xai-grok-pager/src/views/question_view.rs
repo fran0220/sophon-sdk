@@ -238,8 +238,8 @@ impl QuestionViewState {
 
     /// Create a new question view state with an ACP response sender.
     ///
-    /// Called by the `ExtMethod` handler when a blocking `x.ai/ask_user_question`
-    /// request arrives from the shell coordinator.
+    /// Called by the `ExtMethod` handler when a non-blocking
+    /// `x.ai/ask_user_question` request arrives from the shell coordinator.
     pub fn with_response_tx(
         tool_call_id: String,
         questions: Vec<Question>,

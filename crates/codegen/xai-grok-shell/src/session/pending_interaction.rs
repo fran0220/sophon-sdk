@@ -1,15 +1,14 @@
 //! Per-session pending-interaction registry.
 //!
-//! Permissions, `ask_user_question`, and plan approval are **blocking ACP
-//! reverse-requests**: the agent parks a tool-loop future on an in-memory
-//! oneshot and waits for the driver to answer. While such a request is open we
-//! record it here, keyed by `tool_call_id` (stable, lives in the transcript →
-//! survives reconnect). This registry is the single source of truth for "what
-//! is pending right now" and is read by the roster to surface
+//! Permissions and plan approval park their owning operation while
+//! `ask_user_question` leaves the model loop running and waits independently
+//! for an answer. While any such interaction is open we record it here, keyed
+//! by `tool_call_id`. This registry is the single source of truth for "what is
+//! pending right now" and is read by the roster to surface
 //! [`crate::agent::roster::RosterActivity::NeedsInput`].
 //!
-//! Pending interactions are **requests, not notifications** — they are never
-//! persisted. We broadcast `pending_interaction` / `interaction_resolved`
+//! Pending interactions are ephemeral requests. We broadcast
+//! `pending_interaction` / `interaction_resolved`
 //! **fire-and-forget** via the gateway (same idiom as
 //! [`crate::session::summary`]); the routing layer fans them to every
 //! subscriber because they carry a `sessionId`.
@@ -30,7 +29,7 @@ use crate::extensions::notification::{SessionNotification, SessionUpdate as XaiS
 /// synchronously).
 pub(crate) type PendingInteractions = Arc<Mutex<HashMap<String, PendingKind>>>;
 
-/// Which kind of blocking reverse-request is pending.
+/// Which kind of interaction is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingKind {
@@ -40,6 +39,14 @@ pub enum PendingKind {
     Question,
     /// `x.ai/exit_plan_mode` plan approval.
     PlanApproval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionResolution {
+    Resolved,
+    Answered,
+    Unanswered,
 }
 
 /// Whether a blocking plan-approval reverse-request is parked in `pending`.
@@ -76,8 +83,7 @@ fn broadcast(gateway: &GatewaySender, session_id: &acp::SessionId, update: XaiSe
     }
 }
 
-/// RAII guard registering an open reverse-request for the lifetime of the
-/// parked oneshot.
+/// RAII guard registering an open interaction for its consumable lifetime.
 ///
 /// On construction it inserts `(tool_call_id, kind)` into the registry and
 /// broadcasts `pending_interaction`. On drop — which happens whether the await
@@ -90,6 +96,7 @@ pub(crate) struct PendingInteractionGuard {
     gateway: GatewaySender,
     session_id: acp::SessionId,
     tool_call_id: String,
+    resolution: InteractionResolution,
 }
 
 impl PendingInteractionGuard {
@@ -118,7 +125,12 @@ impl PendingInteractionGuard {
             gateway,
             session_id,
             tool_call_id,
+            resolution: InteractionResolution::Resolved,
         }
+    }
+
+    pub(crate) fn set_resolution(&mut self, resolution: InteractionResolution) {
+        self.resolution = resolution;
     }
 }
 
@@ -136,6 +148,7 @@ impl Drop for PendingInteractionGuard {
                 &self.session_id,
                 XaiSessionUpdate::InteractionResolved {
                     tool_call_id: self.tool_call_id.clone(),
+                    resolution: self.resolution,
                 },
             );
         }

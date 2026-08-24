@@ -1359,6 +1359,7 @@ impl acp::Agent for MvpAgent {
                                 last_turn_usage: None,
                                 prompt_usage: None,
                                 cancellation_category: None,
+                                loop_health_limit: None,
                                 cancel_trigger: None,
                                 structured_output: None,
                                 tool_overrides: applied_tool_overrides.clone(),
@@ -1904,6 +1905,8 @@ impl acp::Agent for MvpAgent {
                                     last_turn_usage: last_turn_usage.as_ref(),
                                     prompt_usage,
                                     cancellation_category,
+                                    loop_health_limit: completion_kind
+                                        .loop_health_limit_reason(),
                                     cancel_trigger,
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,

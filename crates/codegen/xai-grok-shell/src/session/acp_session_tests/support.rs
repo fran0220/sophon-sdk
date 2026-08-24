@@ -340,6 +340,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         max_retries: 3,
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
+        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: None,
         dream_check_timeout: None,

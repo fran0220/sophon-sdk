@@ -416,20 +416,15 @@ struct UpsertScheduledTaskRequest {
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
-    interval: Option<String>,
-    #[serde(default)]
     prompt: Option<String>,
-    #[serde(default = "scheduler_default_true")]
-    recurring: bool,
+    #[serde(default)]
+    wake_source: Option<
+        xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput,
+    >,
     #[serde(default)]
     durable: Option<bool>,
     #[serde(default)]
     foreground: Option<bool>,
-    #[serde(default)]
-    fire_immediately: bool,
-}
-fn scheduler_default_true() -> bool {
-    true
 }
 impl From<UpsertScheduledTaskRequest>
     for xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput
@@ -437,12 +432,10 @@ impl From<UpsertScheduledTaskRequest>
     fn from(request: UpsertScheduledTaskRequest) -> Self {
         Self {
             task_id: request.task_id,
-            interval: request.interval,
             prompt: request.prompt,
-            recurring: request.recurring,
+            wake_source: request.wake_source,
             durable: request.durable,
             foreground: request.foreground,
-            fire_immediately: request.fire_immediately,
         }
     }
 }
@@ -457,17 +450,74 @@ struct ListScheduledTasksRequest {
 #[serde(rename_all = "camelCase")]
 struct ScheduledTaskDto {
     id: String,
-    interval_seconds: u64,
     prompt: String,
-    recurring: bool,
+    wake_source: ScheduledWakeSourceDto,
     durable: bool,
     foreground: bool,
     created_at: String,
     last_fired_at: Option<String>,
     expires_at: Option<String>,
     last_subagent: Option<String>,
-    next_fire_at: String,
+    next_fire_at: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum ScheduledWakeSourceDto {
+    Recurrence {
+        interval_seconds: u64,
+        recurring: bool,
+    },
+    ExternalEvent {
+        service: String,
+        event: String,
+        recurring: bool,
+    },
+    ProcessSettlement {
+        process_id: String,
+        command: String,
+    },
+}
+
+impl From<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource>
+    for ScheduledWakeSourceDto
+{
+    fn from(
+        source: xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource,
+    ) -> Self {
+        use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource;
+        match source {
+            SchedulerWakeSource::Recurrence {
+                interval_secs,
+                recurring,
+            } => Self::Recurrence {
+                interval_seconds: interval_secs,
+                recurring,
+            },
+            SchedulerWakeSource::ExternalEvent {
+                service,
+                event,
+                recurring,
+            } => Self::ExternalEvent {
+                service,
+                event,
+                recurring,
+            },
+            SchedulerWakeSource::ProcessSettlement {
+                process_id,
+                command,
+            } => Self::ProcessSettlement {
+                process_id,
+                command,
+            },
+        }
+    }
+}
+
 impl From<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>
     for ScheduledTaskDto
 {
@@ -475,11 +525,10 @@ impl From<xai_grok_tools::implementations::grok_build::scheduler::types::Schedul
         t: xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
     ) -> Self {
         Self {
-            next_fire_at: t.next_fire_at().to_rfc3339(),
+            next_fire_at: t.next_fire_at().map(|value| value.to_rfc3339()),
             id: t.id,
-            interval_seconds: t.interval_secs,
             prompt: t.prompt,
-            recurring: t.recurring,
+            wake_source: t.wake_source.into(),
             durable: t.durable,
             foreground: t.foreground,
             created_at: t.created_at.to_rfc3339(),
@@ -498,6 +547,23 @@ struct UpsertScheduledTaskResponse {
 #[derive(Debug, Clone, Serialize)]
 struct ListScheduledTasksResponse {
     tasks: Vec<ScheduledTaskDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliverScheduledTaskRequest {
+    session_id: String,
+    task_id: String,
+    occurrence: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliverScheduledTaskResponse {
+    task_id: String,
+    occurrence: String,
+    accepted: bool,
 }
 
 /// Handle `x.ai/scheduler/*` extension methods.
@@ -535,6 +601,26 @@ pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -
                 .map(|deleted| DeleteScheduledTaskResponse {
                     task_id: req.task_id,
                     deleted,
+                });
+            respond(result)
+        }
+        "x.ai/scheduler/deliver" => {
+            let request: DeliverScheduledTaskRequest = parse(args)?;
+            let occurrence = xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence {
+                id: request.occurrence.clone(),
+                detail: request.detail,
+            };
+            let result = agent
+                .deliver_scheduled_task_occurrence(
+                    &request.session_id,
+                    request.task_id.clone(),
+                    occurrence,
+                )
+                .await
+                .map(|accepted| DeliverScheduledTaskResponse {
+                    task_id: request.task_id,
+                    occurrence: request.occurrence,
+                    accepted,
                 });
             respond(result)
         }
@@ -641,16 +727,23 @@ mod tests {
         let request: UpsertScheduledTaskRequest = serde_json::from_value(serde_json::json!({
             "sessionId": "sess-1",
             "taskId": "task-42",
-            "interval": "10m",
+            "wakeSource": {
+                "kind": "recurrence",
+                "interval": "10m",
+                "recurring": true,
+                "fireImmediately": false
+            },
             "prompt": "inspect the update"
         }))
         .expect("should parse");
         assert_eq!(request.session_id, "sess-1");
         let input: xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput = request.into();
         assert_eq!(input.task_id.as_deref(), Some("task-42"));
-        assert_eq!(input.interval.as_deref(), Some("10m"));
         assert_eq!(input.prompt.as_deref(), Some("inspect the update"));
-        assert!(input.recurring);
+        assert!(matches!(
+            input.wake_source,
+            Some(xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput::Recurrence { interval, .. }) if interval == "10m"
+        ));
     }
 
     #[test]

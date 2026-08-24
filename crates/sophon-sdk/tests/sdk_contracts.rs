@@ -14,12 +14,18 @@ mod harness_facade;
 mod harness_store;
 #[path = "host_backend_conformance.rs"]
 mod host_backend_conformance;
+#[path = "interaction_facade.rs"]
+mod interaction_facade;
+#[path = "loop_health_facade.rs"]
+mod loop_health_facade;
 #[path = "mcp_facade.rs"]
 mod mcp_facade;
 #[path = "program_runtime.rs"]
 mod program_runtime;
 #[path = "provider_config.rs"]
 mod provider_config;
+#[path = "scheduler_facade.rs"]
+mod scheduler_facade;
 #[path = "session_state_store.rs"]
 mod session_state_store;
 #[path = "source_layout.rs"]

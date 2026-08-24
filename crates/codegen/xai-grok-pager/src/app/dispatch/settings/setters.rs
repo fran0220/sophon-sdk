@@ -364,44 +364,6 @@ pub(in crate::app::dispatch) fn set_remember_tool_approvals(
     }]
 }
 
-/// Mirror the just-written TOML value in `app` so the modal reflects it (the
-/// effective timeout is re-resolved shell-side at agent build).
-pub(super) fn set_ask_user_question_timeout_enabled_inner(app: &mut AppView, new: bool) {
-    app.ask_user_question_timeout_enabled = Some(new);
-}
-
-/// SHELL-owned setter for the ask_user_question timeout gate; persists via
-/// `Effect::PersistSetting`. Applies to new sessions (restart-required).
-pub(in crate::app::dispatch) fn set_ask_user_question_timeout_enabled(
-    app: &mut AppView,
-    new: bool,
-) -> Vec<Effect> {
-    use xai_grok_tools::implementations::grok_build::ask_user_question;
-    let prev_state = app.ask_user_question_timeout_enabled;
-    let prev_effective =
-        prev_state.unwrap_or(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED);
-    if prev_effective == new && prev_state.is_some() {
-        return vec![];
-    }
-    set_ask_user_question_timeout_enabled_inner(app, new);
-    refresh_open_settings_modals(app);
-    tracing::info!(
-        target: "settings",
-        key = "toolset.ask_user_question.timeout_enabled",
-        value = new,
-        "setting changed",
-    );
-    app.show_toast(&format!(
-        "{} (restart to apply)",
-        save_success_toast("Ask-Question timeout", new),
-    ));
-    vec![Effect::PersistSetting {
-        key: "toolset.ask_user_question.timeout_enabled",
-        value: crate::settings::SettingValue::Bool(new),
-        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
-    }]
-}
-
 pub(super) fn set_show_thinking_blocks_inner(app: &mut AppView, new: bool) {
     crate::appearance::cache::set_show_thinking_blocks(new);
     // Thinking visibility reshapes verb-group runs (shown thoughts claim
@@ -2053,16 +2015,12 @@ pub(in crate::app::dispatch) fn set_max_thoughts_width(app: &mut AppView, new: i
 // ---------------------------------------------------------------------------
 
 /// Effective-default lookup for the `Option<bool>` AppView mirrors
-/// (`show_tips`, `auto_update`, ask_user_question timeout).
+/// (`show_tips`, `auto_update`).
 /// Matches the consumer's `.unwrap_or(...)` fallback.
 pub(super) fn pr13_effective_default(key: &str) -> Option<bool> {
-    use xai_grok_tools::implementations::grok_build::ask_user_question;
     match key {
         "show_tips" => Some(true),
         "auto_update" => Some(true),
-        "toolset.ask_user_question.timeout_enabled" => {
-            Some(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED)
-        }
         _ => None,
     }
 }

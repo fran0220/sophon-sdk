@@ -9,6 +9,7 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
+use tokio_util::sync::CancellationToken;
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -734,7 +735,7 @@ pub(crate) async fn spawn_session_actor(
     };
     let reminder_policy = resolve_reminder_policy(remote_settings.as_ref(), todo_gate);
     let (user_question_tx, user_question_rx) = tokio::sync::mpsc::unbounded_channel::<
-        xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest,
+        xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionCommand,
     >();
     let attribution_callback_for_spec = auth_manager.as_ref().map(|am| {
         crate::auth::attribution::ShellAttribution::new_tool_callback(
@@ -1662,6 +1663,7 @@ pub(crate) async fn spawn_session_actor(
         max_turns,
         max_retries: xai_grok_sampler::resolve_max_retries(max_retries),
         pending_interjections: InterjectionBuffer::new(),
+        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config
             .as_ref()
@@ -2001,7 +2003,7 @@ pub(crate) async fn spawn_session_actor(
     {
         use agent_client_protocol::Client as _;
         use xai_grok_tools::implementations::grok_build::ask_user_question::{
-            AskUserQuestionExtRequest, AskUserQuestionExtResponse, UserQuestionError,
+            AskUserQuestionExtRequest, AskUserQuestionExtResponse, UserQuestionCommand,
             UserQuestionResponse,
         };
         let gateway = session.notifications.gateway.clone();
@@ -2010,77 +2012,228 @@ pub(crate) async fn spawn_session_actor(
         let pending_interactions = session.pending_interactions.clone();
         let session_for_hooks = session.clone();
         let mut user_question_rx = user_question_rx;
+        let open_questions = Arc::new(std::sync::Mutex::new(HashMap::<
+            String,
+            (CancellationToken, ElicitationClaim),
+        >::new()));
         tokio::task::spawn_local(async move {
-            while let Some(mut request) = user_question_rx.recv().await {
-                use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionMode;
-                let mode = match *current_prompt_mode.lock() {
-                    PromptMode::Plan => AskUserQuestionMode::Plan,
-                    _ => AskUserQuestionMode::Default,
-                };
-                let ext_req = AskUserQuestionExtRequest {
-                    session_id: session_id.0.to_string(),
-                    tool_call_id: request.tool_call_id.clone(),
-                    questions: request.questions.clone(),
-                    mode,
-                };
-                debug_assert!(
-                    !ext_req.session_id.is_empty(),
-                    "ask_user_question reverse-request must carry a non-empty sessionId (design §5.4)"
-                );
-                let ext_request = agent_client_protocol::ExtRequest::new(
-                    "x.ai/ask_user_question",
-                    serde_json::value::to_raw_value(&ext_req)
-                        .expect("AskUserQuestionExtRequest serialization should not fail")
-                        .into(),
-                );
-                session_for_hooks
-                    .dispatch_notification_hook(
-                        "elicitation_dialog",
-                        Some("User question requested".into()),
-                        None,
-                        Some("info".into()),
-                    )
-                    .await;
-                let questions_for_response = request.questions.clone();
-                let tool_call_id = request.tool_call_id.clone();
-                let result = {
-                    let _pending_guard =
-                        crate::session::pending_interaction::PendingInteractionGuard::new(
-                            pending_interactions.clone(),
-                            gateway.clone(),
-                            session_id.clone(),
-                            tool_call_id.clone(),
-                            crate::session::pending_interaction::PendingKind::Question,
-                        );
-                    tokio::select! {
-                        biased;
-                        () = request.result_tx.closed() => {
-                            tracing::info!(
-                                %tool_call_id,
-                                "ask_user_question tool receiver closed (timeout or cancel); abandoning ACP wait"
-                            );
-                            Ok(UserQuestionResponse::Cancelled)
+            while let Some(command) = user_question_rx.recv().await {
+                let request = match command {
+                    UserQuestionCommand::Withdraw {
+                        tool_call_id,
+                        reply,
+                    } => {
+                        let token = open_questions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&tool_call_id);
+                        let withdrawn = token.as_ref().is_some_and(|(_, claim)| claim.claim());
+                        if let Some((token, _)) = token {
+                            token.cancel();
                         }
-                        acp_result = gateway.ext_method(ext_request) => {
-                            match acp_result {
-                                Ok(raw) => {
-                                    match serde_json::from_str::<AskUserQuestionExtResponse>(
-                                        raw.0.get(),
-                                    ) {
-                                        Ok(typed) => {
-                                            Ok(typed.into_response(questions_for_response))
-                                        }
-                                        Err(e) => Err(UserQuestionError::MalformedResponse(
-                                            e.to_string(),
-                                        )),
-                                    }
+                        let _ = reply.send(withdrawn);
+                        continue;
+                    }
+                    UserQuestionCommand::Open(request) => request,
+                };
+                let gateway = gateway.clone();
+                let session_id = session_id.clone();
+                let current_prompt_mode = current_prompt_mode.clone();
+                let pending_interactions = pending_interactions.clone();
+                let session_for_hooks = session_for_hooks.clone();
+                let open_questions = open_questions.clone();
+                let withdrawal = CancellationToken::new();
+                let claim = ElicitationClaim::default();
+                open_questions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        request.tool_call_id.clone(),
+                        (withdrawal.clone(), claim.clone()),
+                    );
+                tokio::task::spawn_local(async move {
+                    use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionMode;
+                    let mode = match *current_prompt_mode.lock() {
+                        PromptMode::Plan => AskUserQuestionMode::Plan,
+                        _ => AskUserQuestionMode::Default,
+                    };
+                    let ext_req = AskUserQuestionExtRequest {
+                        session_id: session_id.0.to_string(),
+                        tool_call_id: request.tool_call_id.clone(),
+                        questions: request.questions.clone(),
+                        mode,
+                    };
+                    debug_assert!(
+                        !ext_req.session_id.is_empty(),
+                        "ask_user_question reverse-request must carry a non-empty sessionId (design §5.4)"
+                    );
+                    let ext_request = agent_client_protocol::ExtRequest::new(
+                        "x.ai/ask_user_question",
+                        serde_json::value::to_raw_value(&ext_req)
+                            .expect("AskUserQuestionExtRequest serialization should not fail")
+                            .into(),
+                    );
+                    session_for_hooks
+                        .dispatch_notification_hook(
+                            "elicitation_dialog",
+                            Some("User question requested".into()),
+                            None,
+                            Some("info".into()),
+                        )
+                        .await;
+                    let tool_call_id = request.tool_call_id.clone();
+                    let owning_prompt_id = Some(request.owning_prompt_id.clone());
+                    let response = {
+                        let mut pending_guard =
+                            crate::session::pending_interaction::PendingInteractionGuard::new(
+                                pending_interactions.clone(),
+                                gateway.clone(),
+                                session_id.clone(),
+                                tool_call_id.clone(),
+                                crate::session::pending_interaction::PendingKind::Question,
+                            );
+                        let turn_settled = async {
+                            loop {
+                                let current = session_for_hooks
+                                    .current_prompt_id
+                                    .lock()
+                                    .ok()
+                                    .and_then(|prompt| prompt.clone());
+                                if owning_prompt_id.is_none() || current != owning_prompt_id {
+                                    break;
                                 }
-                                Err(e) => Err(UserQuestionError::TransportError(e.to_string())),
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                        };
+                        let response = tokio::select! {
+                            biased;
+                            () = withdrawal.cancelled() => {
+                                Ok(None)
+                            }
+                            () = turn_settled => {
+                                Ok(None)
+                            }
+                            acp_result = gateway.ext_method(ext_request) => {
+                                match acp_result {
+                                    Ok(raw) => serde_json::from_str::<AskUserQuestionExtResponse>(raw.0.get())
+                                        .map(|typed| typed.into_response(request.questions.clone()))
+                                        .map_err(|error| error.to_string())
+                                        .map(Some),
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                        };
+                        match response {
+                            Ok(Some(response)) => Some((response, pending_guard)),
+                            Ok(None) => {
+                                pending_guard.set_resolution(
+                                crate::session::pending_interaction::InteractionResolution::Unanswered,
+                            );
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(%tool_call_id, %error, "Structured elicitation closed unanswered");
+                                pending_guard.set_resolution(
+                                crate::session::pending_interaction::InteractionResolution::Unanswered,
+                            );
+                                None
                             }
                         }
-                    }
+                    };
+                    let Some((response, mut pending_guard)) = response else {
+                        open_questions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&tool_call_id);
+                        return;
+                    };
+                    let still_consumable = session_for_hooks
+                        .current_prompt_id
+                        .lock()
+                        .ok()
+                        .and_then(|prompt| prompt.clone())
+                        == owning_prompt_id;
+                    let answer = match response {
+                    UserQuestionResponse::Accepted {
+                        answers,
+                        annotations,
+                    } => Some(if request.use_id_keyed_format {
+                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_id_keyed_accepted_tool_result(
+                            &request.questions,
+                            &answers,
+                            &annotations,
+                        )
+                    } else {
+                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_accepted_tool_result(
+                            &answers,
+                            &annotations,
+                        )
+                    }),
+                    UserQuestionResponse::ChatAboutThis {
+                        questions,
+                        partial_answers,
+                    } => Some(
+                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_chat_about_this(
+                            &questions,
+                            &partial_answers,
+                        ),
+                    ),
+                    UserQuestionResponse::SkipInterview {
+                        questions,
+                        partial_answers,
+                    } => Some(
+                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_skip_interview(
+                            &questions,
+                            &partial_answers,
+                        ),
+                    ),
+                    UserQuestionResponse::Cancelled => None,
                 };
-                let _ = request.result_tx.send(result);
+                    if still_consumable && let Some(text) = answer {
+                        let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
+                        session_for_hooks.pending_elicitation_answers.push(
+                            PendingElicitationAnswer {
+                                interjection: PendingInterjection {
+                                    text,
+                                    attachments: Vec::new(),
+                                },
+                                claim,
+                                consumed: consumed_tx,
+                            },
+                        );
+                        let turn_settled = async {
+                            loop {
+                                let current = session_for_hooks
+                                    .current_prompt_id
+                                    .lock()
+                                    .ok()
+                                    .and_then(|prompt| prompt.clone());
+                                if current != owning_prompt_id {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                        };
+                        let consumed = tokio::select! {
+                            biased;
+                            consumed = consumed_rx => consumed.is_ok(),
+                            () = turn_settled => false,
+                        };
+                        pending_guard.set_resolution(if consumed {
+                            crate::session::pending_interaction::InteractionResolution::Answered
+                        } else {
+                            crate::session::pending_interaction::InteractionResolution::Unanswered
+                        });
+                    } else {
+                        pending_guard.set_resolution(
+                            crate::session::pending_interaction::InteractionResolution::Unanswered,
+                        );
+                    }
+                    open_questions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&tool_call_id);
+                });
             }
         });
     }

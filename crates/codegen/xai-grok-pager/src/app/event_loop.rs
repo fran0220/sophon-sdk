@@ -1597,7 +1597,6 @@ pub(crate) async fn run(
     let config_session_bools = load_initial_config_session_bools();
     app.show_tips = config_session_bools.show_tips;
     app.auto_update = config_session_bools.auto_update;
-    app.ask_user_question_timeout_enabled = config_session_bools.ask_user_question_timeout_enabled;
     // Prime thread-local caches so first render doesn't hit disk.
     crate::appearance::cache::prime(&app.current_ui);
     // Apply the remote soft default for text selection (flash | hold | word_select) when the
@@ -3210,7 +3209,6 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
 struct InitialConfigSessionBools {
     show_tips: Option<bool>,
     auto_update: Option<bool>,
-    ask_user_question_timeout_enabled: Option<bool>,
 }
 
 fn load_initial_config_session_bools() -> InitialConfigSessionBools {
@@ -3221,11 +3219,6 @@ fn load_initial_config_session_bools() -> InitialConfigSessionBools {
     InitialConfigSessionBools {
         show_tips: cli_bool("show_tips"),
         auto_update: cli_bool("auto_update"),
-        ask_user_question_timeout_enabled: root
-            .get("toolset")
-            .and_then(|t| t.get("ask_user_question"))
-            .and_then(|a| a.get("timeout_enabled"))
-            .and_then(|v| v.as_bool()),
     }
 }
 

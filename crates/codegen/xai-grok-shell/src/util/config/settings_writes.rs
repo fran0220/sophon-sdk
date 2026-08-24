@@ -299,13 +299,6 @@ pub async fn set_prompt_suggestions(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.prompt_suggestions = Some(value)).await
 }
 
-/// Persist `[toolset.ask_user_question].timeout_enabled` via `update_config`
-/// (the user tier of the shell's tiered resolver; the effective value is
-/// re-resolved at agent build).
-pub async fn set_ask_user_question_timeout_enabled(value: bool) -> Result<()> {
-    update_config(|cfg| cfg.ask_user_question.timeout_enabled = Some(value)).await
-}
-
 /// Persist `[ui].group_tool_verbs` via `update_config`.
 pub async fn set_group_tool_verbs(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.group_tool_verbs = Some(value)).await

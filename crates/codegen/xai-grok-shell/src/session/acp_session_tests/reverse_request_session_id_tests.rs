@@ -1,7 +1,6 @@
-//! Regression guard: every blocking reverse-request
-//! (permission / `ask_user_question` / plan-approval) must carry a
-//! non-empty `sessionId`, otherwise Tier-2 routing silently drops it
-//! (`server.rs`). The invariant holds today; these tests pin it.
+//! Regression guard: every interactive reverse-request (blocking permission /
+//! plan approval or non-blocking `ask_user_question`) must carry a non-empty
+//! `sessionId`, otherwise Tier-2 routing silently drops it (`server.rs`).
 use xai_grok_tools::implementations::grok_build::ask_user_question::{
     AskUserQuestionExtRequest, AskUserQuestionMode,
 };

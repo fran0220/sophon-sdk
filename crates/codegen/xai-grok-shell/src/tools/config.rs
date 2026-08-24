@@ -81,25 +81,6 @@ impl BashToolConfig {
     }
 }
 
-/// User configurable settings for the ask_user_question tool
-/// (`[toolset.ask_user_question]`).
-///
-/// Consumed out-of-band by
-/// `crate::util::config::resolve_ask_user_question_params_from_disk`, which
-/// reads the raw config layers so the documented precedence (requirements >
-/// env > user > managed > remote) holds — this struct exists so the keys are
-/// recognized in `config.toml` and round-trip through `AgentConfig`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AskUserQuestionToolConfig {
-    /// Whether the questionnaire timeout is armed (default: `true`).
-    /// `false` waits forever for answers.
-    pub timeout_enabled: Option<bool>,
-    /// Wait budget in seconds when the timer is armed (positive integer;
-    /// default: 1800 / 30 minutes).
-    pub timeout_secs: Option<u64>,
-}
-
 /// User configurable settings for the web_fetch tool (`[toolset.web_fetch]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -172,9 +153,6 @@ pub struct ShellToolsetConfig {
     /// Web fetch tool parameters (`[toolset.web_fetch]`).
     #[serde(default)]
     pub web_fetch: WebFetchToolConfig,
-    /// Ask-user-question tool parameters (`[toolset.ask_user_question]`).
-    #[serde(default)]
-    pub ask_user_question: AskUserQuestionToolConfig,
     /// Which file-operation toolset to use: `"standard"` (default) or `"hashline"`.
     #[serde(default)]
     pub file_toolset: FileToolset,
@@ -254,7 +232,6 @@ impl ShellToolsetConfig {
             bash: BashToolConfig::default(),
             web_search: web_search_sampling_config(default_base),
             web_fetch: WebFetchToolConfig::default(),
-            ask_user_question: AskUserQuestionToolConfig::default(),
             file_toolset: FileToolset::default(),
             hashline: HashlineSchemeConfig::default(),
         });

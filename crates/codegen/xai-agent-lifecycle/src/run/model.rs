@@ -1311,7 +1311,7 @@ pub enum SessionTurnOutcome {
     End,
     Cancelled,
     MaxTokens,
-    MaxTurnRequests,
+    BudgetLimited,
     Refusal,
     #[serde(other)]
     Unknown,
@@ -1323,7 +1323,7 @@ impl SessionTurnOutcome {
             Self::End => "End",
             Self::Cancelled => "Cancelled",
             Self::MaxTokens => "MaxTokens",
-            Self::MaxTurnRequests => "MaxTurnRequests",
+            Self::BudgetLimited => "BudgetLimited",
             Self::Refusal => "Refusal",
             Self::Unknown => "Unknown",
         }

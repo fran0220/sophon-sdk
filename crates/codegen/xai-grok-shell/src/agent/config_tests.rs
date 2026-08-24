@@ -228,17 +228,11 @@ fn parses_toolset_overrides() {
         r#"
             [toolset.bash]
             timeout_secs = 123
-
-            [toolset.ask_user_question]
-            timeout_enabled = false
-            timeout_secs = 30
             "#,
     )
     .unwrap();
     let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
     assert_eq!(cfg.toolset.bash.timeout_secs, Some(123.0));
-    assert_eq!(cfg.toolset.ask_user_question.timeout_enabled, Some(false));
-    assert_eq!(cfg.toolset.ask_user_question.timeout_secs, Some(30));
 }
 #[test]
 fn parses_toolset_bash_float_timeout() {

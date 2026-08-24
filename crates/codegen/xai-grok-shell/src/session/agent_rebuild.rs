@@ -48,7 +48,7 @@ use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
-use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
+use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionCommand;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
 use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
@@ -68,8 +68,6 @@ use xai_grok_tools::types::memory_backend::MemoryBackend;
 pub(crate) struct ResolvedToolParamsJson {
     /// `[toolset.bash]` overrides for the bash tool(s).
     pub bash: Option<serde_json::Map<String, serde_json::Value>>,
-    /// `[toolset.ask_user_question]` timeout policy for the ask tool.
-    pub ask_user_question: Option<serde_json::Map<String, serde_json::Value>>,
 }
 /// Cached recipe for building a session-scoped [`Agent`].
 ///
@@ -129,7 +127,7 @@ pub(crate) struct AgentRebuildSpec {
     pub tool_params_json: ResolvedToolParamsJson,
     pub subagent_event_tx: Option<UnboundedSender<SubagentEvent>>,
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
-    pub user_question_tx: UnboundedSender<UserQuestionRequest>,
+    pub user_question_tx: UnboundedSender<UserQuestionCommand>,
     pub subagent_depth: u32,
     pub subagents_max_depth: u32,
     pub session_id_str: String,
@@ -331,9 +329,6 @@ impl AgentRebuildSpec {
         }
         if let Some(bash_params_json) = tool_params_json.bash.clone() {
             builder = builder.with_bash_params(bash_params_json);
-        }
-        if let Some(ask_user_question_params_json) = tool_params_json.ask_user_question.clone() {
-            builder = builder.with_ask_user_question_params(ask_user_question_params_json);
         }
         if let Some(prompt_working_directory) = prompt_working_directory.clone() {
             builder = builder.with_prompt_working_directory(prompt_working_directory);

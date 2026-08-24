@@ -1138,10 +1138,6 @@ pub struct AppView {
     pub show_tips: Option<bool>,
     /// Persisted `[cli].auto_update` mirror. `None` = no override (default `true`).
     pub auto_update: Option<bool>,
-    /// Persisted `[toolset.ask_user_question].timeout_enabled` mirror, seeded
-    /// from the effective TOML merge like `show_tips`. `None` = unset in TOML
-    /// (default `true`); toggles write the user layer.
-    pub ask_user_question_timeout_enabled: Option<bool>,
     /// Whether ZDR users are allowed to use the product.
     /// Server-controlled via RemoteSettings (remote settings). Default `false` (blocked) during beta.
     pub zdr_access_enabled: bool,
@@ -1631,7 +1627,6 @@ impl AppView {
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
-            ask_user_question_timeout_enabled: None,
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,

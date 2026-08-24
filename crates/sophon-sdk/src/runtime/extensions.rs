@@ -127,7 +127,8 @@ impl Runtime {
             .filter(|value| !value.is_null())
             .ok_or_else(|| Error::Operation(format!("extension '{method}' returned no result")))
     }
-    /// Creates or updates a recurring task in an explicit session.
+    /// Creates or updates a task and its recurrence, Service-event, or
+    /// process-settlement wake source in an explicit session.
     pub async fn upsert_scheduled_task(
         &self,
         id: &SessionId,
@@ -166,6 +167,20 @@ impl Runtime {
             .await?,
         )
         .map_err(|e| Error::Operation(format!("invalid scheduler delete response: {e}")))
+    }
+    /// Delivers one Host-observed wake occurrence to an event- or process-backed task.
+    /// Repeating the same `(task_id, occurrence)` is idempotent.
+    pub async fn deliver_scheduled_task_occurrence(
+        &self,
+        id: &SessionId,
+        occurrence: &ScheduledTaskOccurrence,
+    ) -> Result<ScheduledTaskOccurrenceReceipt, Error> {
+        let mut params =
+            serde_json::to_value(occurrence).map_err(|e| Error::Operation(e.to_string()))?;
+        params["sessionId"] = serde_json::Value::String(id.as_str().to_owned());
+        serde_json::from_value(self.typed_ext("x.ai/scheduler/deliver", params).await?).map_err(
+            |error| Error::Operation(format!("invalid scheduler delivery response: {error}")),
+        )
     }
     /// Discovers built-ins, skills (including `implement`) and workflows
     /// available to this live session.

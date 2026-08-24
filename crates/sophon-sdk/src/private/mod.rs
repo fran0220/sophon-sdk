@@ -27,8 +27,8 @@ use xai_grok_shell::{
     },
     auth::AuthManager,
     embedded::{
-        EmbeddedAgent, EmbeddedError, EmbeddedMcpRegistration, EmbeddedMcpServer,
-        EmbeddedStopReason,
+        EmbeddedAgent, EmbeddedError, EmbeddedLoopHealthLimitReason, EmbeddedMcpRegistration,
+        EmbeddedMcpServer, EmbeddedStopReason,
     },
 };
 

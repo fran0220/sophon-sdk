@@ -194,38 +194,74 @@ impl SessionId {
 }
 
 /// SDK-owned scheduler request. `task_id == None` creates; otherwise only
-/// `interval` and/or `prompt` are updated and the existing phase is retained.
+/// `wake_source` and/or `prompt` are updated.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskRequest {
     pub task_id: Option<String>,
-    pub interval: Option<String>,
     pub prompt: Option<String>,
-    #[serde(default = "sdk_default_true")]
-    pub recurring: bool,
+    pub wake_source: Option<ScheduledWakeSourceRequest>,
     pub durable: Option<bool>,
     pub foreground: Option<bool>,
-    #[serde(default)]
-    pub fire_immediately: bool,
 }
-fn sdk_default_true() -> bool {
-    true
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ScheduledWakeSourceRequest {
+    Recurrence {
+        interval: String,
+        recurring: bool,
+        fire_immediately: bool,
+    },
+    ExternalEvent {
+        service: String,
+        event: String,
+        recurring: bool,
+    },
+    ProcessSettlement {
+        process_id: String,
+        command: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskSummary {
     pub id: String,
-    pub interval_seconds: u64,
     pub prompt: String,
-    pub recurring: bool,
+    pub wake_source: ScheduledWakeSourceSummary,
     pub durable: bool,
     pub foreground: bool,
     pub created_at: String,
     pub last_fired_at: Option<String>,
     pub expires_at: Option<String>,
     pub last_subagent: Option<String>,
-    pub next_fire_at: String,
+    pub next_fire_at: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ScheduledWakeSourceSummary {
+    Recurrence {
+        interval_seconds: u64,
+        recurring: bool,
+    },
+    ExternalEvent {
+        service: String,
+        event: String,
+        recurring: bool,
+    },
+    ProcessSettlement {
+        process_id: String,
+        command: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScheduledTaskReceipt {
@@ -237,4 +273,20 @@ pub struct ScheduledTaskReceipt {
 pub struct DeleteScheduledTaskReceipt {
     pub task_id: String,
     pub deleted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskOccurrence {
+    pub task_id: String,
+    pub occurrence: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskOccurrenceReceipt {
+    pub task_id: String,
+    pub occurrence: String,
+    pub accepted: bool,
 }

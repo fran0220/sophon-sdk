@@ -53,8 +53,8 @@ pub struct SessionHandle {
     /// Shared with the session actor so external cancellation paths can target
     /// subagents launched by the active turn only.
     pub current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Open blocking reverse-requests (permission / question / plan-approval),
-    /// keyed by `tool_call_id`. Mirrors `current_prompt_id`: the same `Arc` is
+    /// Open interactions (blocking permission / plan approval and non-blocking
+    /// questions), keyed by `tool_call_id`. Mirrors `current_prompt_id`: the same `Arc` is
     /// shared with the session actor, which inserts on issue and removes on
     /// resolve. The roster reads this synchronously to surface `NeedsInput`
     /// Never persisted.
@@ -278,6 +278,24 @@ impl SessionHandle {
             })
             .map_err(|_| "session not found".to_string())?;
         rx.await.unwrap_or(Err("session actor died".to_string()))
+    }
+    pub(crate) async fn deliver_scheduled_task_occurrence(
+        &self,
+        task_id: String,
+        occurrence:
+            xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
+    ) -> Result<bool, String> {
+        let (respond_to, response) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::DeliverScheduledTaskOccurrence {
+                task_id,
+                occurrence,
+                respond_to,
+            })
+            .map_err(|_| "session not found".to_string())?;
+        response
+            .await
+            .unwrap_or(Err("session actor died".to_string()))
     }
     pub(crate) async fn list_scheduled_tasks(
         &self,

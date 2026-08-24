@@ -35,7 +35,6 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     merge_section(table, "ui", &config.ui);
     merge_section(table, "harness", &config.harness);
     merge_section(table, "session", &config.session);
-    merge_ask_user_question_section(table, &config.ask_user_question);
     if config.privacy == super::mcp::PrivacyConfig::default() {
         table.remove("privacy");
     } else {
@@ -137,27 +136,6 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
         return Err(e);
     }
     Ok(())
-}
-/// Merge `[toolset.ask_user_question]` into the root table. `[toolset]` is
-/// deliberately NOT merged wholesale — it carries runtime-only structs
-/// (`web_search` sampler etc.) whose serialized defaults must never land in
-/// the user file — so only this settings-writable sub-table round-trips.
-fn merge_ask_user_question_section(
-    table: &mut TomlMap<String, TomlValue>,
-    ask: &crate::tools::config::AskUserQuestionToolConfig,
-) {
-    if ask.timeout_enabled.is_none() && ask.timeout_secs.is_none() {
-        return;
-    }
-    let toolset = table
-        .entry("toolset".to_string())
-        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
-    if !matches!(toolset, TomlValue::Table(_)) {
-        *toolset = TomlValue::Table(TomlMap::new());
-    }
-    if let TomlValue::Table(toolset_table) = toolset {
-        merge_section(toolset_table, "ask_user_question", ask);
-    }
 }
 /// Merge serialized fields of `value` into `table[key]`, preserving any
 /// existing keys not present in the serialized output. This prevents

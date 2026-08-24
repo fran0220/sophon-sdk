@@ -109,7 +109,6 @@ pub struct AgentBuilder {
     /// which reproduces the historical behavior.
     compat: xai_grok_tools::types::compat::CompatConfig,
     bash_params_json: Option<serde_json::Map<String, serde_json::Value>>,
-    ask_user_question_params_json: Option<serde_json::Map<String, serde_json::Value>>,
     plugin_registry: Option<std::sync::Arc<crate::plugins::PluginRegistry>>,
     context_window_tokens: Option<u64>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
@@ -246,7 +245,6 @@ impl AgentBuilder {
             skills_config: Default::default(),
             compat: Default::default(),
             bash_params_json: None,
-            ask_user_question_params_json: None,
             plugin_registry: None,
             context_window_tokens: None,
             api_key_provider: None,
@@ -362,9 +360,7 @@ impl AgentBuilder {
     /// Mark this session as non-interactive (headless / SDK / stdio /
     /// generic-ACP). Suppresses prompt sections that only make sense when
     /// a human is typing into the TUI prompt input (e.g. the `! <command>`
-    /// shell-prefix tip and the `<user_guide>` TUI pointer), and stamps
-    /// `non_interactive` into the ask_user_question params so an unanswered
-    /// questionnaire returns no-operator text instead of "user declined".
+    /// shell-prefix tip and the `<user_guide>` TUI pointer).
     pub fn with_is_non_interactive(mut self, value: bool) -> Self {
         self.is_non_interactive = value;
         self
@@ -604,15 +600,6 @@ impl AgentBuilder {
     /// Inject `[toolset.bash]` overrides from config.toml into bash tool params.
     pub fn with_bash_params(mut self, params: serde_json::Map<String, serde_json::Value>) -> Self {
         self.bash_params_json = Some(params);
-        self
-    }
-    /// Inject the shell-resolved `[toolset.ask_user_question]` params
-    /// (timeout policy) into the ask_user_question tool.
-    pub fn with_ask_user_question_params(
-        mut self,
-        params: serde_json::Map<String, serde_json::Value>,
-    ) -> Self {
-        self.ask_user_question_params_json = Some(params);
         self
     }
     /// Set the plugin registry for plugin-aware skill/agent discovery.
@@ -871,18 +858,6 @@ impl AgentBuilder {
                 ],
                 bash_params,
             );
-        }
-        if let Some(ref ask_params) = self.ask_user_question_params_json {
-            merge_tool_params(
-                &mut tool_config,
-                &["GrokBuild:ask_user_question"],
-                ask_params,
-            );
-        }
-        if self.is_non_interactive {
-            let mut ni = serde_json::Map::new();
-            ni.insert("non_interactive".into(), serde_json::Value::Bool(true));
-            merge_tool_params(&mut tool_config, &["GrokBuild:ask_user_question"], &ni);
         }
         if !definition.disallowed_tools.is_empty() {
             let before: std::collections::HashSet<String> =
@@ -1819,73 +1794,6 @@ mod tests {
                 )
             }
         }
-    }
-    /// The ask_user_question params merge must run after `ensure_plan_mode_tools`:
-    /// a profile that does NOT pre-declare the tool still gets the shell-resolved
-    /// timeout params on the injected instance. Fails if the merge is ever
-    /// hoisted above the injection.
-    #[tokio::test]
-    async fn plan_mode_injected_ask_user_question_receives_params() {
-        use xai_grok_tools::computer::local::LocalTerminalBackend;
-        use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams;
-        use xai_grok_tools::notification::ToolNotificationHandle;
-        use xai_grok_tools::types::resources::Params;
-        let profile = crate::config::AgentDefinition::default_grok_build();
-        assert!(
-            !profile
-                .tool_config
-                .tools
-                .iter()
-                .any(|tc| tc.id == "GrokBuild:ask_user_question"),
-            "test premise: the profile must not pre-declare ask_user_question"
-        );
-        let mut params = serde_json::Map::new();
-        params.insert("timeout_enabled".into(), serde_json::Value::Bool(false));
-        params.insert("timeout_secs".into(), serde_json::Value::from(5));
-        let agent = AgentBuilder::new(
-            std::env::temp_dir(),
-            Arc::new(LocalTerminalBackend::new()),
-            ToolNotificationHandle::noop(),
-        )
-        .from_definition(profile)
-        .with_ask_user_question_params(params)
-        .build()
-        .await
-        .expect("agent should build");
-        let applied = agent
-            .tool_bridge()
-            .read_resource::<Params<AskUserQuestionParams>>()
-            .await
-            .expect("finalize must insert Params for the injected ask_user_question");
-        assert_eq!(applied.0.timeout_enabled, Some(false));
-        assert_eq!(applied.0.timeout_secs, Some(5));
-        assert_eq!(applied.0.non_interactive, None);
-    }
-    /// A non-interactive build stamps `non_interactive: true` into the AUQ
-    /// params (session state, not user config) so cancel/timeout return the
-    /// no-operator text.
-    #[tokio::test]
-    async fn non_interactive_build_stamps_ask_user_question_params() {
-        use xai_grok_tools::computer::local::LocalTerminalBackend;
-        use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams;
-        use xai_grok_tools::notification::ToolNotificationHandle;
-        use xai_grok_tools::types::resources::Params;
-        let agent = AgentBuilder::new(
-            std::env::temp_dir(),
-            Arc::new(LocalTerminalBackend::new()),
-            ToolNotificationHandle::noop(),
-        )
-        .from_definition(crate::config::AgentDefinition::default_grok_build())
-        .with_is_non_interactive(true)
-        .build()
-        .await
-        .expect("agent should build");
-        let applied = agent
-            .tool_bridge()
-            .read_resource::<Params<AskUserQuestionParams>>()
-            .await
-            .expect("finalize must insert Params for the injected ask_user_question");
-        assert_eq!(applied.0.non_interactive, Some(true));
     }
     async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
         use xai_grok_tools::computer::local::LocalTerminalBackend;

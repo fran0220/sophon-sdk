@@ -217,6 +217,9 @@ impl SessionActor {
             current_prompt_id.is_none()
         };
         if became_idle {
+            // An answer accepted after the final safe point is no longer
+            // consumable and must not leak into a later Turn.
+            self.pending_elicitation_answers.clear();
             self.flush_pending_skill_reminders().await;
             // Idle-gated: a stale completion must not clobber the promoted turn's resources.
             self.agent
@@ -469,7 +472,8 @@ impl SessionActor {
     }
 
     /// `(turn_succeeded, suppress_goal_continuation, infra_pause_message)`.
-    /// StationarityEnded is success for the streak but skips GoalSummary re-queue.
+    /// Loop-health settlements are non-successes and never re-queue a goal
+    /// continuation in the same Turn.
     /// `infra_pause_message` is extracted before `handle_completion` consumes `result`.
     pub(super) fn post_turn_goal_degradation_plan(
         result: &PromptTurnResult,
@@ -477,7 +481,7 @@ impl SessionActor {
         let suppress_goal_continuation = result.as_ref().ok().is_some_and(|ok| {
             matches!(
                 ok.completion_kind,
-                crate::session::commands::PromptCompletionKind::StationarityEnded
+                crate::session::commands::PromptCompletionKind::StationarityEnded { .. }
             )
         });
         let turn_cancelled = result.as_ref().ok().is_some_and(|ok| {
@@ -485,6 +489,7 @@ impl SessionActor {
                 ok.completion_kind,
                 crate::session::commands::PromptCompletionKind::Cancelled { .. }
                     | crate::session::commands::PromptCompletionKind::MaxTurnsReached { .. }
+                    | crate::session::commands::PromptCompletionKind::StationarityEnded { .. }
             )
         });
         let turn_succeeded = result
@@ -549,5 +554,40 @@ impl SessionActor {
         err: &xai_grok_agent::plugins::install_registry::InstallError,
     ) -> String {
         crate::plugin::classify_install_error(err)
+    }
+}
+
+#[cfg(test)]
+mod loop_health_tests {
+    use super::*;
+
+    fn result(completion_kind: PromptCompletionKind) -> PromptTurnResult {
+        Ok(PromptTurnOk {
+            stop_reason: acp::StopReason::MaxTurnRequests,
+            total_tokens: 0,
+            turn_snapshot: None,
+            completion_kind,
+            structured_output: None,
+            usage: None,
+            tool_overrides: None,
+        })
+    }
+
+    #[test]
+    fn every_loop_health_settlement_is_a_non_successful_goal_boundary() {
+        for completion in [
+            PromptCompletionKind::MaxTurnsReached { limit: 64 },
+            PromptCompletionKind::StationarityEnded { repeated_steps: 4 },
+        ] {
+            let stationarity =
+                matches!(&completion, PromptCompletionKind::StationarityEnded { .. });
+            let (succeeded, suppress_continuation, infra) =
+                SessionActor::post_turn_goal_degradation_plan(&result(completion));
+            assert!(!succeeded);
+            assert!(infra.is_none());
+            if stationarity {
+                assert!(suppress_continuation);
+            }
+        }
     }
 }

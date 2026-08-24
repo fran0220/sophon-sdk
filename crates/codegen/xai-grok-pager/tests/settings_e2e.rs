@@ -39,7 +39,6 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "simple_mode",
     "vim_mode",
     "remember_tool_approvals",
-    "toolset.ask_user_question.timeout_enabled",
     "keep_text_selection",
     "theme",
     "auto_dark_theme",
@@ -249,15 +248,6 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
             assert_eq!(
                 b, expected,
                 "SetVoiceKeybindEnabled value differs from expected"
-            )
-        }
-        (
-            "toolset.ask_user_question.timeout_enabled",
-            Action::SetAskUserQuestionTimeoutEnabled(b),
-        ) => {
-            assert_eq!(
-                b, expected,
-                "SetAskUserQuestionTimeoutEnabled value differs from expected"
             )
         }
 
@@ -481,24 +471,6 @@ fn space_on_remember_tool_approvals_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     // Default is true, so toggling flips it off.
     assert_set_bool_action(outcome, "remember_tool_approvals", false);
-}
-
-/// The Ask-Question timeout row renders in Agent & Approval directly above
-/// Plan Mode, reads the resolved default ON, and Space dispatches the typed
-/// setter toggling it off.
-#[test]
-fn space_on_ask_user_question_timeout_dispatches_typed_setter() {
-    let mut s = make_state();
-    let row = row_idx_for(&s, "toolset.ask_user_question.timeout_enabled");
-    assert_eq!(
-        row_idx_for(&s, "plan_mode"),
-        row + 1,
-        "Ask-Question timeout must render directly above Plan Mode"
-    );
-    navigate_to(&mut s, "toolset.ask_user_question.timeout_enabled");
-    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
-    // Default is true (timer armed), so toggling flips it off.
-    assert_set_bool_action(outcome, "toolset.ask_user_question.timeout_enabled", false);
 }
 
 #[test]
@@ -780,21 +752,6 @@ fn mouse_click_on_remember_tool_approvals_indicator_toggles_in_one_click() {
         row_y,
     );
     assert_set_bool_action(outcome, "remember_tool_approvals", false);
-}
-
-/// Value-column click toggles the Ask-Question timeout in one click.
-#[test]
-fn mouse_click_on_ask_user_question_timeout_indicator_toggles_in_one_click() {
-    let mut s = make_state();
-    synth_rects(&mut s);
-    let row_y = row_idx_for(&s, "toolset.ask_user_question.timeout_enabled") as u16;
-    let outcome = handle_settings_mouse(
-        &mut s,
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        72,
-        row_y,
-    );
-    assert_set_bool_action(outcome, "toolset.ask_user_question.timeout_enabled", false);
 }
 
 /// Click on the value column toggles in one click regardless of selection.
@@ -1902,7 +1859,6 @@ fn registry_kind_membership_through_pr_14() {
             "simple_mode",
             "vim_mode",
             "remember_tool_approvals",
-            "toolset.ask_user_question.timeout_enabled",
             "auto_update",
             "show_tips",
             "voice_keybind_enabled",
@@ -2059,7 +2015,6 @@ fn defaults_round_trip_through_registry() {
             "simple_mode" => SettingValue::Bool(true),
             "vim_mode" => SettingValue::Bool(false),
             "remember_tool_approvals" => SettingValue::Bool(true),
-            "toolset.ask_user_question.timeout_enabled" => SettingValue::Bool(true),
             "keep_text_selection" => SettingValue::Enum("flash"),
             "theme" => SettingValue::Enum("groknight"),
             "auto_dark_theme" => SettingValue::Enum("groknight"),
@@ -2161,7 +2116,6 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetMultilineMode(_))
             | SettingsKeyOutcome::Action(Action::SetVimMode(_))
             | SettingsKeyOutcome::Action(Action::SetRememberToolApprovals(_))
-            | SettingsKeyOutcome::Action(Action::SetAskUserQuestionTimeoutEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetShowTips(_))
             | SettingsKeyOutcome::Action(Action::SetAutoUpdate(_))
             | SettingsKeyOutcome::Action(Action::SetRespectManualFolds(_))

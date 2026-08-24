@@ -1394,18 +1394,26 @@ done
             &session,
             &ScheduledTaskRequest {
                 task_id: None,
-                interval: Some("5m".into()),
                 prompt: Some("inspect the fixture".into()),
-                recurring: true,
+                wake_source: Some(ScheduledWakeSourceRequest::Recurrence {
+                    interval: "5m".into(),
+                    recurring: true,
+                    fire_immediately: false,
+                }),
                 durable: Some(false),
                 foreground: Some(false),
-                fire_immediately: false,
             },
         )
         .await
         .expect("create scheduled loop without a model turn");
     assert!(!scheduled.updated);
-    assert_eq!(scheduled.task.interval_seconds, 300);
+    assert_eq!(
+        scheduled.task.wake_source,
+        ScheduledWakeSourceSummary::Recurrence {
+            interval_seconds: 300,
+            recurring: true,
+        }
+    );
     let tasks = desktop
         .list_scheduled_tasks(&session)
         .await
@@ -1417,19 +1425,111 @@ done
             &session,
             &ScheduledTaskRequest {
                 task_id: Some(scheduled.task.id.clone()),
-                interval: Some("10m".into()),
                 prompt: Some("inspect the updated fixture".into()),
-                recurring: true,
+                wake_source: Some(ScheduledWakeSourceRequest::Recurrence {
+                    interval: "10m".into(),
+                    recurring: true,
+                    fire_immediately: false,
+                }),
                 durable: None,
                 foreground: None,
-                fire_immediately: false,
             },
         )
         .await
         .expect("update scheduled loop in place");
     assert!(updated.updated);
-    assert_eq!(updated.task.interval_seconds, 600);
+    assert_eq!(
+        updated.task.wake_source,
+        ScheduledWakeSourceSummary::Recurrence {
+            interval_seconds: 600,
+            recurring: true,
+        }
+    );
     assert_eq!(updated.task.id, scheduled.task.id);
+    desktop
+        .deliver_scheduled_task_occurrence(
+            &session,
+            &ScheduledTaskOccurrence {
+                task_id: scheduled.task.id.clone(),
+                occurrence: "timer-is-not-host-delivered".into(),
+                detail: String::new(),
+            },
+        )
+        .await
+        .expect_err("recurrence tasks reject Host-delivered occurrences");
+
+    let event_task = desktop
+        .upsert_scheduled_task(
+            &session,
+            &ScheduledTaskRequest {
+                task_id: None,
+                prompt: Some("inspect the changed pull request".into()),
+                wake_source: Some(ScheduledWakeSourceRequest::ExternalEvent {
+                    service: "github".into(),
+                    event: "pull_request.updated".into(),
+                    recurring: true,
+                }),
+                durable: Some(false),
+                foreground: Some(false),
+            },
+        )
+        .await
+        .expect("create a Service-event wake source");
+    assert_eq!(
+        event_task.task.wake_source,
+        ScheduledWakeSourceSummary::ExternalEvent {
+            service: "github".into(),
+            event: "pull_request.updated".into(),
+            recurring: true,
+        }
+    );
+    assert_eq!(event_task.task.next_fire_at, None);
+
+    let occurrence = ScheduledTaskOccurrence {
+        task_id: event_task.task.id.clone(),
+        occurrence: "delivery-1".into(),
+        detail: "pull request #42 changed".into(),
+    };
+    assert!(
+        desktop
+            .deliver_scheduled_task_occurrence(&session, &occurrence)
+            .await
+            .expect("first Service occurrence is accepted")
+            .accepted
+    );
+    assert!(
+        !desktop
+            .deliver_scheduled_task_occurrence(&session, &occurrence)
+            .await
+            .expect("duplicate Service occurrence is idempotent")
+            .accepted
+    );
+
+    let process_task = desktop
+        .upsert_scheduled_task(
+            &session,
+            &ScheduledTaskRequest {
+                task_id: None,
+                prompt: Some("summarize the test result".into()),
+                wake_source: Some(ScheduledWakeSourceRequest::ProcessSettlement {
+                    process_id: "process-7".into(),
+                    command: "cargo test".into(),
+                }),
+                durable: Some(false),
+                foreground: Some(false),
+            },
+        )
+        .await
+        .expect("create a detached-process wake source");
+    assert_eq!(
+        process_task.task.wake_source,
+        ScheduledWakeSourceSummary::ProcessSettlement {
+            process_id: "process-7".into(),
+            command: "cargo test".into(),
+        }
+    );
+    assert_eq!(process_task.task.next_fire_at, None);
+
     let deleted = desktop
         .delete_scheduled_task(&session, &scheduled.task.id)
         .await

@@ -18,13 +18,16 @@ use crate::notification::{
 use crate::reminders::format_loop_iteration_prompt;
 use crate::types::resources::{SharedResources, State};
 
-use super::interval::interval_to_human;
 use super::types::{
-    LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerClock,
-    SchedulerCommand, SchedulerError, SchedulerSnapshot, SchedulerState, SchedulerVersion,
+    DeliveredScheduledOccurrence, LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY,
+    ScheduledTask, SchedulerClock, SchedulerCommand, SchedulerError, SchedulerSnapshot,
+    SchedulerState, SchedulerVersion,
 };
 
 const MAX_SCHEDULED_TASKS: usize = 50;
+const MAX_PENDING_OCCURRENCES: usize = 128;
+const MAX_OCCURRENCE_ID_BYTES: usize = 512;
+const MAX_OCCURRENCE_DETAIL_BYTES: usize = 64 * 1024;
 const DURABILITY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum LoopFireOutcome {
@@ -56,8 +59,8 @@ fn task_created_payload(task: &ScheduledTask, version: SchedulerVersion) -> Sche
     ScheduledTaskCreated {
         task_id: task.id.clone(),
         prompt: task.prompt.clone(),
-        human_schedule: interval_to_human(task.interval_secs),
-        next_fire_at: Some(task.next_fire_at().to_rfc3339()),
+        human_schedule: task.human_schedule(),
+        next_fire_at: task.next_fire_at().map(|value| value.to_rfc3339()),
         generation: version.generation(),
         revision: version.revision(),
     }
@@ -264,9 +267,11 @@ impl SchedulerActor {
                 let soon = Utc::now() + chrono::Duration::seconds(2);
                 let needs_wiring = enabled
                     && res.get::<State<SchedulerState>>().is_some_and(|s| {
-                        s.tasks
-                            .iter()
-                            .any(|t| t.recurring && !t.foreground && t.next_wake_at() <= soon)
+                        s.tasks.iter().any(|task| {
+                            task.is_recurring()
+                                && !task.foreground
+                                && task.next_wake_at().is_some_and(|wake| wake <= soon)
+                        })
                     });
                 let wired = res.get::<SubagentEventSender>().is_some()
                     && res.get::<SessionIdResource>().is_some();
@@ -287,10 +292,16 @@ impl SchedulerActor {
         let scheduler_state = res.get::<State<SchedulerState>>();
         scheduler_state
             .map(|s| {
+                if s.tasks
+                    .iter()
+                    .any(|task| !task.pending_occurrences.is_empty())
+                {
+                    return Duration::from_millis(250);
+                }
                 s.tasks
                     .iter()
                     .filter(|task| !self.blocked_expiries.contains(&task.id))
-                    .map(ScheduledTask::next_wake_at)
+                    .filter_map(ScheduledTask::next_wake_at)
                     .min()
                     .map(|next| {
                         let now = Utc::now();
@@ -311,7 +322,9 @@ impl SchedulerActor {
         let mut res = self.resources.lock().await;
         let state = res.get_or_default::<State<SchedulerState>>();
         let idx = state.tasks.iter().position(|task| {
-            task.next_wake_at() <= now && !self.blocked_expiries.contains(&task.id)
+            !self.blocked_expiries.contains(&task.id)
+                && (!task.pending_occurrences.is_empty()
+                    || task.next_wake_at().is_some_and(|wake| wake <= now))
         });
 
         let Some(idx) = idx else {
@@ -320,10 +333,22 @@ impl SchedulerActor {
 
         let task = &state.tasks[idx];
         let task_id = task.id.clone();
-        let is_expired = task.recurring && task.is_expired(now);
-        let should_remove = !task.recurring;
-        let prompt = task.prompt.clone();
-        let human_schedule = interval_to_human(task.interval_secs);
+        let is_expired =
+            task.is_recurring() && task.pending_occurrences.is_empty() && task.is_expired(now);
+        let should_remove = !task.is_recurring();
+        let pending_occurrence = task.pending_occurrences.first().cloned();
+        let delivered_tombstone = pending_occurrence.as_ref().and_then(|occurrence| {
+            should_remove.then(|| DeliveredScheduledOccurrence {
+                task_id: task_id.clone(),
+                occurrence_id: occurrence.id.clone(),
+            })
+        });
+        let original_delivered_task = pending_occurrence.as_ref().map(|_| task.clone());
+        let prompt = pending_occurrence.as_ref().map_or_else(
+            || task.prompt.clone(),
+            |occurrence| format!("{}\n\nWake occurrence:\n{}", task.prompt, occurrence.detail),
+        );
+        let human_schedule = task.human_schedule();
         let is_durable = task.durable;
         let foreground = task.foreground;
         let last_subagent_id = task.last_subagent_id.clone();
@@ -458,8 +483,19 @@ impl SchedulerActor {
         // Advance the cadence before releasing actor state to avoid immediate reselection.
         let task = &mut state.tasks[idx];
         task.last_fired_at = Some(now);
-        let next_fire_at = task.recurring.then(|| task.next_fire_at().to_rfc3339());
+        if let Some(occurrence) = &pending_occurrence {
+            task.pending_occurrences.remove(0);
+            task.delivered_occurrences.push(occurrence.id.clone());
+        }
+        let next_fire_at = task
+            .is_recurring()
+            .then(|| task.next_fire_at())
+            .flatten()
+            .map(|value| value.to_rfc3339());
         if should_remove {
+            if let Some(delivered) = delivered_tombstone {
+                state.delivered_occurrences.push(delivered);
+            }
             state.tasks.remove(idx);
         }
 
@@ -474,7 +510,41 @@ impl SchedulerActor {
             events.zip(session)
         };
 
+        // Acceptance persisted the occurrence as pending. Persist its atomic
+        // pending→delivered transition before execution so a restart cannot
+        // replay one Host occurrence as a second Turn.
+        let delivered_snapshot = pending_occurrence.as_ref().map(|_| res.serialize());
+
         drop(res);
+
+        if let Some(snapshot) = delivered_snapshot
+            && let Err(error) = self.persist_snapshot(snapshot).await
+        {
+            let mut resources = self.resources.lock().await;
+            let state = resources.get_or_default::<State<SchedulerState>>();
+            let original = original_delivered_task
+                .expect("a delivered snapshot always retains its original task");
+            if should_remove {
+                state.delivered_occurrences.retain(|delivered| {
+                    delivered.task_id != task_id
+                        || pending_occurrence
+                            .as_ref()
+                            .is_none_or(|occurrence| delivered.occurrence_id != occurrence.id)
+                });
+                state.tasks.insert(idx, original);
+            } else if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+                *task = original;
+            }
+            let rollback = resources.serialize();
+            drop(resources);
+            let error = self.persist_rollback(error, rollback).await;
+            tracing::warn!(
+                %task_id,
+                %error,
+                "Host occurrence delivery transition was not durable; leaving it pending"
+            );
+            return;
+        }
 
         tracing::info!(
             task_id = %task_id,
@@ -503,6 +573,27 @@ impl SchedulerActor {
         };
 
         if matches!(&outcome, LoopFireOutcome::Skipped) {
+            if let Some(occurrence) = pending_occurrence {
+                let mut res = self.resources.lock().await;
+                if let Some(task) = res
+                    .get_or_default::<State<SchedulerState>>()
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                {
+                    task.pending_occurrences.insert(0, occurrence);
+                    task.delivered_occurrences.pop();
+                }
+                let snapshot = res.serialize();
+                drop(res);
+                if let Err(error) = self.persist_snapshot(snapshot).await {
+                    tracing::warn!(
+                        %task_id,
+                        %error,
+                        "Skipped Host occurrence could not be durably returned to pending"
+                    );
+                }
+            }
             let version = self.clock.snapshot();
             let payload = {
                 let res = self.resources.lock().await;
@@ -808,7 +899,12 @@ impl SchedulerActor {
             state
                 .tasks
                 .iter()
-                .filter(|task| task.recurring || task.next_fire_at() > now)
+                .filter(|task| {
+                    task.is_recurring()
+                        || task.accepts_delivery()
+                        || task.next_fire_at().is_some_and(|next_fire| next_fire > now)
+                        || !task.pending_occurrences.is_empty()
+                })
                 .map(|task| task_created_payload(task, version))
                 .collect()
         };
@@ -866,7 +962,7 @@ impl SchedulerActor {
             SchedulerCommand::Update {
                 id,
                 prompt,
-                interval_secs,
+                wake_source,
                 reply,
             } => {
                 if let Some(pending) = &self.pending_removal {
@@ -880,6 +976,10 @@ impl SchedulerActor {
                     let _ = reply.send(Err(SchedulerError::TaskNotFound(id)));
                     return;
                 };
+                if wake_source.is_some() && !state.tasks[index].pending_occurrences.is_empty() {
+                    let _ = reply.send(Err(SchedulerError::WakeSourceUpdatePending(id)));
+                    return;
+                }
                 let mut reservation = self.clock.prepare_transition(1);
                 let original = state.tasks[index].clone();
                 let task = &mut state.tasks[index];
@@ -894,9 +994,15 @@ impl SchedulerActor {
                     }
                     task.prompt = prompt;
                 }
-                if let Some(interval_secs) = interval_secs {
-                    task.interval_secs = interval_secs;
-                    if task.next_fire_at() <= Utc::now() {
+                if let Some(wake_source) = wake_source {
+                    task.wake_source = wake_source;
+                    task.expires_at = task.is_recurring().then(|| {
+                        Utc::now() + chrono::Duration::days(super::types::RECURRING_TASK_TTL_DAYS)
+                    });
+                    if task
+                        .next_fire_at()
+                        .is_some_and(|next_fire| next_fire <= Utc::now())
+                    {
                         task.last_fired_at = Some(Utc::now());
                     }
                 }
@@ -927,6 +1033,84 @@ impl SchedulerActor {
                 self.notification_handle
                     .send_scheduled_task_created(task_created_payload(&updated, commit.version));
                 let _ = reply.send(Ok(updated));
+            }
+            SchedulerCommand::Deliver {
+                id,
+                occurrence,
+                reply,
+            } => {
+                if occurrence.id.trim().is_empty() || occurrence.id.len() > MAX_OCCURRENCE_ID_BYTES
+                {
+                    let _ = reply.send(Err(SchedulerError::InvalidOccurrence(format!(
+                        "identity must contain 1 to {MAX_OCCURRENCE_ID_BYTES} bytes"
+                    ))));
+                    return;
+                }
+                if occurrence.detail.len() > MAX_OCCURRENCE_DETAIL_BYTES {
+                    let _ = reply.send(Err(SchedulerError::InvalidOccurrence(format!(
+                        "detail exceeds {MAX_OCCURRENCE_DETAIL_BYTES} bytes"
+                    ))));
+                    return;
+                }
+                let mut resources = self.resources.lock().await;
+                let state = resources.get_or_default::<State<SchedulerState>>();
+                if state.delivered_occurrences.iter().any(|delivered| {
+                    delivered.task_id == id && delivered.occurrence_id == occurrence.id
+                }) {
+                    let _ = reply.send(Ok(false));
+                    return;
+                }
+                let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
+                    let _ = reply.send(Err(SchedulerError::TaskNotFound(id)));
+                    return;
+                };
+                let task = &mut state.tasks[index];
+                if task.is_expired(Utc::now()) {
+                    let _ = reply.send(Err(SchedulerError::InvalidOccurrence(format!(
+                        "task {id} has expired"
+                    ))));
+                    return;
+                }
+                if !task.accepts_delivery() {
+                    let _ = reply.send(Err(SchedulerError::DeliveryUnsupported(id)));
+                    return;
+                }
+                if task.delivered_occurrences.contains(&occurrence.id)
+                    || task
+                        .pending_occurrences
+                        .iter()
+                        .any(|pending| pending.id == occurrence.id)
+                {
+                    let _ = reply.send(Ok(false));
+                    return;
+                }
+                if task.pending_occurrences.len() >= MAX_PENDING_OCCURRENCES {
+                    let _ = reply.send(Err(SchedulerError::InvalidOccurrence(format!(
+                        "task already has {MAX_PENDING_OCCURRENCES} pending occurrences"
+                    ))));
+                    return;
+                }
+                let original = task.clone();
+                task.pending_occurrences.push(occurrence);
+                let snapshot = resources.serialize();
+                drop(resources);
+                if let Err(error) = self.persist_snapshot(snapshot).await {
+                    let mut resources = self.resources.lock().await;
+                    if let Some(task) = resources
+                        .get_or_default::<State<SchedulerState>>()
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.id == id)
+                    {
+                        *task = original;
+                    }
+                    let rollback = resources.serialize();
+                    drop(resources);
+                    let error = self.persist_rollback(error, rollback).await;
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                let _ = reply.send(Ok(true));
             }
             SchedulerCommand::Delete { id, reply } => {
                 if self
@@ -981,7 +1165,8 @@ impl SchedulerActor {
 mod tests {
     use super::*;
     use crate::implementations::grok_build::scheduler::types::{
-        ScheduledTask, SchedulerHandle, scheduler_tool_error,
+        PendingScheduledOccurrence, ScheduledTask, SchedulerHandle, SchedulerWakeSource,
+        scheduler_tool_error,
     };
     use crate::notification::{AcknowledgedToolNotification, ToolNotification};
     use crate::types::resources::{Resources, WebCitationCounter};
@@ -1169,6 +1354,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_occurrence_is_durable_before_acceptance_and_deduplicates_after_fire() {
+        let mut task = ScheduledTask::from_wake_source(
+            "inspect the event".into(),
+            SchedulerWakeSource::ExternalEvent {
+                service: "github".into(),
+                event: "pull_request.updated".into(),
+                recurring: true,
+            },
+            false,
+        );
+        task.id = "event-task".into();
+        task.foreground = true;
+        let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+
+        let occurrence = PendingScheduledOccurrence {
+            id: "delivery-1".into(),
+            detail: "pull request #42 changed".into(),
+        };
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        {
+            let delivery = actor.handle_command(SchedulerCommand::Deliver {
+                id: "event-task".into(),
+                occurrence: occurrence.clone(),
+                reply,
+            });
+            tokio::pin!(delivery);
+            let (accepted_snapshot, acknowledgement) = tokio::select! {
+                _ = &mut delivery => panic!("delivery acknowledged before pending state was durable"),
+                save = saves.recv() => save.expect("pending occurrence save"),
+            };
+            assert_eq!(
+                accepted_snapshot["state"]["grok_build.Scheduler"]["tasks"][0]["pendingOccurrences"]
+                    [0]["id"],
+                "delivery-1"
+            );
+            assert!(matches!(
+                response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            acknowledgement.send(Ok(())).unwrap();
+            delivery.await;
+        }
+        assert!(response.await.unwrap().unwrap());
+
+        {
+            let fire = actor.fire_next_task();
+            tokio::pin!(fire);
+            let (delivered_snapshot, acknowledgement) = tokio::select! {
+                _ = &mut fire => panic!("occurrence fired before pending-to-delivered was durable"),
+                save = saves.recv() => save.expect("delivered occurrence save"),
+            };
+            assert!(
+                delivered_snapshot
+                    .to_string()
+                    .contains("deliveredOccurrences"),
+                "delivered identity must survive restart"
+            );
+            acknowledgement.send(Ok(())).unwrap();
+            fire.await;
+        }
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ToolNotification::ScheduledTaskFired(fired)) if fired.task_id == "event-task"
+        ));
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::Deliver {
+                id: "event-task".into(),
+                occurrence,
+                reply,
+            })
+            .await;
+        assert!(!response.await.unwrap().unwrap());
+        assert!(
+            saves.try_recv().is_err(),
+            "a duplicate must not mutate or persist scheduler state"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_host_occurrence_acceptance_rolls_back_before_reply() {
+        let mut task = ScheduledTask::from_wake_source(
+            "inspect the event".into(),
+            SchedulerWakeSource::ExternalEvent {
+                service: "github".into(),
+                event: "issue.updated".into(),
+                recurring: true,
+            },
+            false,
+        );
+        task.id = "event-task".into();
+        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        {
+            let delivery = actor.handle_command(SchedulerCommand::Deliver {
+                id: "event-task".into(),
+                occurrence: PendingScheduledOccurrence {
+                    id: "delivery-fails".into(),
+                    detail: "issue changed".into(),
+                },
+                reply,
+            });
+            tokio::pin!(delivery);
+            let (_, failed_acknowledgement) = tokio::select! {
+                _ = &mut delivery => panic!("delivery replied before persistence"),
+                save = saves.recv() => save.expect("pending occurrence save"),
+            };
+            failed_acknowledgement
+                .send(Err(std::io::Error::other("injected delivery failure")))
+                .unwrap();
+            let (rollback, rollback_acknowledgement) = tokio::select! {
+                _ = &mut delivery => panic!("delivery replied before rollback"),
+                save = saves.recv() => save.expect("delivery rollback save"),
+            };
+            assert!(!rollback.to_string().contains("delivery-fails"));
+            assert!(matches!(
+                response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            rollback_acknowledgement.send(Ok(())).unwrap();
+            delivery.await;
+        }
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(SchedulerError::Persistence(_))
+        ));
+        assert!(
+            actor
+                .resources
+                .lock()
+                .await
+                .get::<State<SchedulerState>>()
+                .unwrap()
+                .tasks[0]
+                .pending_occurrences
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_event_task_rejects_a_late_host_occurrence() {
+        let mut task = ScheduledTask::from_wake_source(
+            "inspect the event".into(),
+            SchedulerWakeSource::ExternalEvent {
+                service: "github".into(),
+                event: "issue.updated".into(),
+                recurring: true,
+            },
+            false,
+        );
+        task.id = "expired-event".into();
+        task.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::Deliver {
+                id: "expired-event".into(),
+                occurrence: PendingScheduledOccurrence {
+                    id: "late-delivery".into(),
+                    detail: "arrived after TTL".into(),
+                },
+                reply,
+            })
+            .await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(SchedulerError::InvalidOccurrence(message)) if message.contains("expired")
+        ));
+    }
+
+    #[tokio::test]
+    async fn wake_source_update_cannot_discard_an_accepted_occurrence() {
+        let mut task = ScheduledTask::from_wake_source(
+            "inspect the event".into(),
+            SchedulerWakeSource::ExternalEvent {
+                service: "github".into(),
+                event: "issue.updated".into(),
+                recurring: true,
+            },
+            false,
+        );
+        task.id = "event-task".into();
+        task.pending_occurrences.push(PendingScheduledOccurrence {
+            id: "accepted-delivery".into(),
+            detail: "issue changed".into(),
+        });
+        task.delivered_occurrences.push("earlier-delivery".into());
+        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::Update {
+                id: "event-task".into(),
+                prompt: Some("replacement prompt".into()),
+                wake_source: Some(SchedulerWakeSource::ProcessSettlement {
+                    process_id: "process-9".into(),
+                    command: "cargo test".into(),
+                }),
+                reply,
+            })
+            .await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(SchedulerError::WakeSourceUpdatePending(id)) if id == "event-task"
+        ));
+
+        let resources = actor.resources.lock().await;
+        let task = &resources.get::<State<SchedulerState>>().unwrap().tasks[0];
+        assert_eq!(task.prompt, "inspect the event");
+        assert_eq!(task.pending_occurrences[0].id, "accepted-delivery");
+        assert_eq!(task.delivered_occurrences, vec!["earlier-delivery"]);
+        assert!(matches!(
+            task.wake_source,
+            SchedulerWakeSource::ExternalEvent { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_process_task_retains_a_durable_idempotency_receipt() {
+        let mut task = ScheduledTask::from_wake_source(
+            "summarize the process".into(),
+            SchedulerWakeSource::ProcessSettlement {
+                process_id: "process-7".into(),
+                command: "cargo test".into(),
+            },
+            false,
+        );
+        task.id = "process-task".into();
+        task.foreground = true;
+        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
+        let occurrence = PendingScheduledOccurrence {
+            id: "settled-7".into(),
+            detail: "exit 0".into(),
+        };
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::Deliver {
+                id: "process-task".into(),
+                occurrence: occurrence.clone(),
+                reply,
+            })
+            .await;
+        assert!(response.await.unwrap().unwrap());
+        actor.fire_next_task().await;
+
+        {
+            let resources = actor.resources.lock().await;
+            let state = resources.get::<State<SchedulerState>>().unwrap();
+            assert!(state.tasks.is_empty(), "one-shot task row is removed");
+            assert_eq!(
+                state.delivered_occurrences,
+                vec![DeliveredScheduledOccurrence {
+                    task_id: "process-task".into(),
+                    occurrence_id: "settled-7".into(),
+                }]
+            );
+        }
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::Deliver {
+                id: "process-task".into(),
+                occurrence,
+                reply,
+            })
+            .await;
+        assert!(
+            !response.await.unwrap().unwrap(),
+            "re-delivery remains idempotent after the one-shot task row is gone"
+        );
+    }
+
+    #[tokio::test]
     async fn durable_create_and_update_reply_only_after_persistence_acknowledges() {
         let (mut actor, _notifications) = make_boundary_actor(Vec::new(), 0);
         let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
@@ -1202,7 +1668,7 @@ mod tests {
             let update = actor.handle_command(SchedulerCommand::Update {
                 id: "durable-task".into(),
                 prompt: Some("durable update".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: update_reply,
             });
             tokio::pin!(update);
@@ -1227,7 +1693,7 @@ mod tests {
         let failed_update = actor.handle_command(SchedulerCommand::Update {
             id: "durable-task".into(),
             prompt: Some("must roll back".into()),
-            interval_secs: None,
+            wake_source: None,
             reply: failed_reply,
         });
         tokio::pin!(failed_update);
@@ -1531,7 +1997,7 @@ mod tests {
             .handle_command(SchedulerCommand::Update {
                 id: task_id,
                 prompt: Some("updated".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply,
             })
             .await;
@@ -1713,8 +2179,8 @@ mod tests {
         resources.register_state::<SchedulerState>();
 
         // Simulate session restore: scheduler state already contains two
-        // recurring tasks before the actor spawns. Both intervals are far
-        // enough in the future that neither will fire during the test.
+        // recurring tasks and one process-settlement task before the actor
+        // spawns. Timed tasks are far enough in the future that neither fires.
         let state = resources.get_or_default::<State<SchedulerState>>();
         let mut task_a = ScheduledTask::new(300, "task A".into(), true, false);
         task_a.id = "restored-A".to_string();
@@ -1722,6 +2188,16 @@ mod tests {
         let mut task_b = ScheduledTask::new(600, "task B".into(), true, false);
         task_b.id = "restored-B".to_string();
         state.tasks.push(task_b);
+        let mut task_c = ScheduledTask::from_wake_source(
+            "task C".into(),
+            SchedulerWakeSource::ProcessSettlement {
+                process_id: "process-7".into(),
+                command: "cargo test".into(),
+            },
+            false,
+        );
+        task_c.id = "restored-C".to_string();
+        state.tasks.push(task_c);
 
         let shared = Arc::new(Mutex::new(resources));
         let (notif_handle, mut notif_rx) = auto_acknowledged_notifications();
@@ -1741,8 +2217,8 @@ mod tests {
 
         tokio::spawn(actor.run());
 
-        // The first two events on the channel must be ScheduledTaskCreated
-        // for the two restored tasks, in insertion order.
+        // The first three events on the channel must be ScheduledTaskCreated
+        // for every restored wake source, in insertion order.
         let n1 = tokio::time::timeout(Duration::from_secs(2), notif_rx.recv())
             .await
             .expect("first notification")
@@ -1751,12 +2227,19 @@ mod tests {
             .await
             .expect("second notification")
             .expect("channel open");
+        let n3 = tokio::time::timeout(Duration::from_secs(2), notif_rx.recv())
+            .await
+            .expect("third notification")
+            .expect("channel open");
 
         let ToolNotification::ScheduledTaskCreated(c1) = n1 else {
             panic!("expected ScheduledTaskCreated, got {n1:?}");
         };
         let ToolNotification::ScheduledTaskCreated(c2) = n2 else {
             panic!("expected ScheduledTaskCreated, got {n2:?}");
+        };
+        let ToolNotification::ScheduledTaskCreated(c3) = n3 else {
+            panic!("expected ScheduledTaskCreated, got {n3:?}");
         };
 
         assert_eq!(c1.task_id, "restored-A");
@@ -1768,8 +2251,12 @@ mod tests {
         assert_eq!(c2.prompt, "task B");
         assert_eq!(c2.human_schedule, "every 10 minutes");
         assert!(c2.next_fire_at.is_some());
+        assert_eq!(c3.task_id, "restored-C");
+        assert_eq!(c3.human_schedule, "when cargo test settles");
+        assert!(c3.next_fire_at.is_none());
         assert_eq!(c1.generation, c2.generation);
-        assert_eq!((c1.revision, c2.revision), (0, 0));
+        assert_eq!(c2.generation, c3.generation);
+        assert_eq!((c1.revision, c2.revision, c3.revision), (0, 0, 0));
 
         // No further events should arrive within a short window: tasks are
         // not yet due and no commands are in flight.
@@ -1877,13 +2364,16 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id.clone(),
                 prompt: None,
-                interval_secs: Some(600),
+                wake_source: Some(SchedulerWakeSource::Recurrence {
+                    interval_secs: 600,
+                    recurring: true,
+                }),
                 reply: up_tx,
             })
             .unwrap();
         let updated = up_rx.await.unwrap().unwrap();
         assert_eq!(updated.id, task_id, "identity preserved");
-        assert_eq!(updated.interval_secs, 600);
+        assert_eq!(updated.interval_secs(), Some(600));
         assert_eq!(updated.prompt, "check deploy");
         assert_eq!(updated.created_at, created_at, "phase anchor preserved");
         assert!(updated.last_fired_at.is_none());
@@ -1894,12 +2384,12 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id.clone(),
                 prompt: Some("check rollback".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: up_tx,
             })
             .unwrap();
         let updated = up_rx.await.unwrap().unwrap();
-        assert_eq!(updated.interval_secs, 600);
+        assert_eq!(updated.interval_secs(), Some(600));
         assert_eq!(updated.prompt, "check rollback");
 
         let (list_tx, list_rx) = tokio::sync::oneshot::channel();
@@ -1935,13 +2425,18 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id,
                 prompt: None,
-                interval_secs: Some(60),
+                wake_source: Some(SchedulerWakeSource::Recurrence {
+                    interval_secs: 60,
+                    recurring: true,
+                }),
                 reply: up_tx,
             })
             .unwrap();
         let updated = up_rx.await.unwrap().unwrap();
         assert!(
-            updated.next_fire_at() > chrono::Utc::now(),
+            updated
+                .next_fire_at()
+                .is_some_and(|next_fire| next_fire > chrono::Utc::now()),
             "an update must never leave the task immediately due"
         );
 
@@ -1969,7 +2464,10 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: "nonexistent".into(),
                 prompt: Some("new prompt".into()),
-                interval_secs: Some(300),
+                wake_source: Some(SchedulerWakeSource::Recurrence {
+                    interval_secs: 300,
+                    recurring: true,
+                }),
                 reply: up_tx,
             })
             .unwrap();
@@ -2012,7 +2510,7 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id.clone(),
                 prompt: Some("check rollback".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: up_tx,
             })
             .unwrap();
@@ -2360,7 +2858,10 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id.clone(),
                 prompt: None,
-                interval_secs: Some(3600),
+                wake_source: Some(SchedulerWakeSource::Recurrence {
+                    interval_secs: 3600,
+                    recurring: true,
+                }),
                 reply: up_tx,
             })
             .unwrap();
@@ -2374,7 +2875,7 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id,
                 prompt: Some("watch deploys instead".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: up_tx,
             })
             .unwrap();
@@ -2403,7 +2904,7 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id,
                 prompt: Some("watch deploys instead".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: up_tx,
             })
             .unwrap();
@@ -2539,7 +3040,7 @@ mod tests {
             .send(SchedulerCommand::Update {
                 id: task_id.clone(),
                 prompt: Some("watch deploys instead".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply: up_tx,
             })
             .unwrap();
@@ -2867,7 +3368,7 @@ mod tests {
             .handle_command(SchedulerCommand::Update {
                 id: "replacement".into(),
                 prompt: Some("updated".into()),
-                interval_secs: None,
+                wake_source: None,
                 reply,
             })
             .await;

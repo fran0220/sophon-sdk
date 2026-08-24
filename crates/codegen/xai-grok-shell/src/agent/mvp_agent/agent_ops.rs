@@ -8,6 +8,22 @@ use crate::auth::PreferredAuthMethod;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
 use xai_tty_utils::ProcessScope;
+
+/// Embedded Sessions always have a finite per-Turn model/tool step budget.
+/// CLI and agent-profile limits remain explicit overrides for non-embedded use.
+const DEFAULT_EMBEDDED_TURN_STEP_BUDGET: u32 = 64;
+
+fn resolve_turn_step_budget(
+    cli_limit: Option<u32>,
+    agent_limit: Option<u32>,
+    embedded: bool,
+) -> Option<usize> {
+    cli_limit
+        .or(agent_limit)
+        .or_else(|| embedded.then_some(DEFAULT_EMBEDDED_TURN_STEP_BUDGET))
+        .map(|limit| limit as usize)
+}
+
 /// `preferred` model, else catalog `current`, else first with own credentials.
 fn byok_from_models(
     models: &indexmap::IndexMap<String, ModelEntry>,
@@ -3086,6 +3102,23 @@ impl MvpAgent {
             None => Err("session not found".into()),
         }
     }
+    pub(crate) async fn deliver_scheduled_task_occurrence(
+        &self,
+        session_id: &str,
+        task_id: String,
+        occurrence:
+            xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
+    ) -> Result<bool, String> {
+        let session_id = acp::SessionId::new(session_id);
+        match self.get_session_handle(&session_id) {
+            Some(handle) => {
+                handle
+                    .deliver_scheduled_task_occurrence(task_id, occurrence)
+                    .await
+            }
+            None => Err("session not found".into()),
+        }
+    }
     pub(crate) async fn list_scheduled_tasks(
         &self,
         session_id: &str,
@@ -4598,10 +4631,11 @@ impl MvpAgent {
             );
         let max_turns = {
             let cfg = self.cfg.borrow();
-            cfg.cli_agent_overrides
-                .max_turns
-                .or(agent_definition.max_turns)
-                .map(|v| v as usize)
+            resolve_turn_step_budget(
+                cfg.cli_agent_overrides.max_turns,
+                agent_definition.max_turns,
+                self.origin_embedded,
+            )
         };
         {
             let cfg = self.cfg.borrow();
@@ -4776,19 +4810,8 @@ impl MvpAgent {
                 .bash
                 .to_bash_params_json(remote_auto_bg, remote_allow_background_operator)
         };
-        let ask_user_question_params_json = {
-            let cfg = self.cfg.borrow();
-            let params = crate::util::config::resolve_ask_user_question_params_from_disk(
-                cfg.remote_settings.as_ref(),
-            );
-            match serde_json::to_value(params) {
-                Ok(serde_json::Value::Object(map)) => Some(map),
-                _ => None,
-            }
-        };
         let tool_params_json = crate::session::agent_rebuild::ResolvedToolParamsJson {
             bash: Some(bash_params_json),
-            ask_user_question: ask_user_question_params_json,
         };
         let backend_tools_enabled = self
             .cfg
@@ -5231,5 +5254,18 @@ impl Drop for LocalWorkspaceReapGuard {
                 handle.shutdown().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_health_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_sessions_always_resolve_a_finite_step_budget() {
+        assert_eq!(resolve_turn_step_budget(None, None, true), Some(64));
+        assert_eq!(resolve_turn_step_budget(None, Some(24), true), Some(24));
+        assert_eq!(resolve_turn_step_budget(Some(12), Some(24), true), Some(12));
+        assert_eq!(resolve_turn_step_budget(None, None, false), None);
     }
 }

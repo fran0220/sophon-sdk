@@ -698,8 +698,8 @@ pub(crate) struct SessionActor {
     /// Current running prompt/turn id, shared with SessionHandle.
     pub(crate) current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) unattributed_background_usage: std::sync::atomic::AtomicBool,
-    /// Open blocking reverse-requests (permission / question / plan-approval),
-    /// keyed by `tool_call_id`. Shared with `SessionHandle` so the roster can
+    /// Open interactions (blocking permission / plan approval and non-blocking
+    /// questions), keyed by `tool_call_id`. Shared with `SessionHandle` so the roster can
     /// read it synchronously to surface `NeedsInput`. Mutated by
     /// `PendingInteractionGuard` at each reverse-request site. Never persisted.
     pub(crate) pending_interactions: crate::session::pending_interaction::PendingInteractions,
@@ -772,6 +772,10 @@ pub(crate) struct SessionActor {
     /// Pushed by `SessionCommand::Interject` handler, drained at safe
     /// points in `process_conversation_turn`. Internally synchronized.
     pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
+    /// Structured-elicitation answers accepted while the owning Turn remains
+    /// consumable. Moved into `pending_interjections` only at a model step
+    /// boundary; leftovers are discarded when that Turn settles.
+    pub(crate) pending_elicitation_answers: ElicitationAnswerBuffer,
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered

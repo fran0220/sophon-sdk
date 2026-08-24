@@ -3453,8 +3453,8 @@ async fn scheduled_task_inject_prompt_routes_to_driver_only() {
     cancel.cancel();
 }
 
-/// A blocking interaction reverse-request (permission / `ask_user_question` /
-/// plan-approval) is SHARED: broadcast to every subscriber so any client can
+/// An interaction reverse-request (blocking permission/plan approval or
+/// non-blocking `ask_user_question`) is SHARED: broadcast to every subscriber so any client can
 /// render + answer the modal. Contrast
 /// with `two_clients_one_session_broadcast_and_driver`, where an ordinary
 /// reverse-request reaches the driver only.

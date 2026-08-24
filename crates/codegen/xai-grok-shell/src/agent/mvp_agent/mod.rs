@@ -514,6 +514,11 @@ pub(crate) struct PromptResponseMeta {
     /// completions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
+    /// Typed loop-health boundary. Its presence means the Turn paused because
+    /// it exhausted its step budget or repeated the same action, not because
+    /// the user cancelled it or because the task completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
     /// `"esc"`); surfaced as `cancelTrigger`. `None` for non-cancel completions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -540,6 +545,7 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub last_turn_usage: Option<&'a xai_grok_sampling_types::TokenUsage>,
     pub prompt_usage: Option<crate::extensions::notification::PromptUsage>,
     pub cancellation_category: Option<String>,
+    pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
@@ -558,6 +564,7 @@ pub(crate) fn build_prompt_response_meta(
         last_turn_usage,
         prompt_usage,
         cancellation_category,
+        loop_health_limit,
         cancel_trigger,
         structured_output,
         tool_overrides,
@@ -579,6 +586,7 @@ pub(crate) fn build_prompt_response_meta(
         reasoning_tokens: last_turn_usage.map(|u| u.reasoning_tokens),
         usage: prompt_usage,
         cancellation_category,
+        loop_health_limit,
         cancel_trigger,
         structured_output,
         structured_output_error,

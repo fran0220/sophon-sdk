@@ -58,13 +58,14 @@ fn turn_result_cancelled() {
     );
 }
 #[test]
-fn turn_result_stationarity_ended_is_completed() {
+fn turn_result_stationarity_ended_is_limited() {
     let result: Result<TurnOutcome, acp::Error> = Ok(TurnOutcome::StationarityEnded {
         snapshot: Box::new(None),
+        repeated_steps: 16,
     });
     assert_eq!(
         turn_result_to_hook_outcome(&result),
-        TurnHookOutcome::Completed
+        TurnHookOutcome::Cancelled
     );
 }
 #[test]

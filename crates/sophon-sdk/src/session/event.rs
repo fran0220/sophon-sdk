@@ -28,6 +28,14 @@ pub enum EventUpdate {
     SessionInfo {
         title: Option<String>,
     },
+    InteractionOpened {
+        id: String,
+        kind: InteractionKind,
+    },
+    InteractionResolved {
+        id: String,
+        resolution: InteractionResolution,
+    },
     McpServerStatus(McpServerStatusEvent),
     McpTaskStatus(McpTaskStatusEvent),
     McpToolsChanged(McpToolsChangedEvent),
@@ -52,6 +60,20 @@ pub enum EventUpdate {
         raw: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionKind {
+    Permission,
+    Question,
+    PlanApproval,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionResolution {
+    Resolved,
+    Answered,
+    Unanswered,
+}
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeCommand {
     pub name: String,
@@ -74,11 +96,21 @@ pub struct ToolEvent {
     pub raw_output: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LoopHealthLimitReason {
+    StepBudget { limit: u64 },
+    Repetition { repeated_steps: u64 },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnOutcome {
     End,
     Cancelled,
     MaxTokens,
-    MaxTurnRequests,
+    BudgetLimited { reason: LoopHealthLimitReason },
     Refusal,
 }
 

@@ -1,20 +1,19 @@
 //! Settings UI: command palette, settings modal, toggles, resets, and rollback.
 
 use super::setters::{
-    pr13_effective_default, set_ask_user_question_timeout_enabled_inner, set_auto_dark_theme_inner,
-    set_auto_light_theme_inner, set_auto_update_inner, set_collapsed_edit_blocks_inner,
-    set_combine_queued_prompts_inner, set_compact_mode, set_compact_mode_inner,
-    set_confirm_before_rewind_inner, set_contextual_hint_inner, set_default_model_inner,
-    set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
-    set_follow_up_behavior_inner, set_fork_secondary_model_inner, set_group_tool_verbs_inner,
-    set_hunk_tracker_mode_inner, set_invert_scroll_inner, set_keep_text_selection_inner,
-    set_max_thoughts_width_inner, set_multiline_mode, set_page_flip_on_send_inner,
-    set_prompt_suggestions_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
-    set_respect_manual_folds_inner, set_screen_mode_inner, set_scroll_lines_inner,
-    set_scroll_mode_inner, set_scroll_speed_inner, set_show_thinking_blocks_inner,
-    set_show_tips_inner, set_simple_mode_inner, set_theme_inner, set_timeline_inner,
-    set_timestamps, set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
-    set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
+    pr13_effective_default, set_auto_dark_theme_inner, set_auto_light_theme_inner,
+    set_auto_update_inner, set_collapsed_edit_blocks_inner, set_combine_queued_prompts_inner,
+    set_compact_mode, set_compact_mode_inner, set_confirm_before_rewind_inner,
+    set_contextual_hint_inner, set_default_model_inner, set_default_selected_permission_inner,
+    set_display_refresh_auto_cadence_inner, set_follow_up_behavior_inner,
+    set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hunk_tracker_mode_inner,
+    set_invert_scroll_inner, set_keep_text_selection_inner, set_max_thoughts_width_inner,
+    set_multiline_mode, set_page_flip_on_send_inner, set_prompt_suggestions_inner,
+    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
+    set_screen_mode_inner, set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
+    set_voice_capture_mode_inner, set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -53,7 +52,6 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
-    let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     for agent in app.agents.values_mut() {
@@ -92,7 +90,6 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 scroll_speed: crate::appearance::cache::load_scroll_speed(),
                 respect_manual_folds: respect_manual_folds_from_app,
                 auto_mode_gate: auto_mode_gate_from_app,
-                ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app.clone(),
                 scheduler_background_loops: agent
                     .scheduler_background_loops
@@ -194,7 +191,6 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
-    let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
 
@@ -242,7 +238,6 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: respect_manual_folds_from_app,
         auto_mode_gate: auto_mode_gate_from_app,
-        ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
         scheduler_background_loops: agent
             .scheduler_background_loops
@@ -740,7 +735,6 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: app.appearance.scrollback.scroll.respect_manual_folds,
         auto_mode_gate: app.auto_mode_gate,
-        ask_user_question_timeout_enabled: app.ask_user_question_timeout_enabled,
         voice_stt_language: app.voice_config.language.clone(),
         scheduler_background_loops: agent_scheduler_background_loops(app),
     }
@@ -796,9 +790,6 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("vim_mode", SettingValue::Bool(b)) => Some(Action::SetVimMode(*b)),
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             Some(Action::SetRememberToolApprovals(*b))
-        }
-        ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
-            Some(Action::SetAskUserQuestionTimeoutEnabled(*b))
         }
         ("keep_text_selection", SettingValue::Enum(s)) => {
             crate::appearance::TextSelection::from_canonical(s).map(Action::SetKeepTextSelection)
@@ -1146,15 +1137,6 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("vim_mode", SettingValue::Bool(b)) => set_vim_mode_inner(app, *b),
         ("remember_tool_approvals", SettingValue::Bool(b)) => {
             set_remember_tool_approvals_inner(app, *b)
-        }
-        // ask_user_question timeout: if rollback equals the effective
-        // default, restore to None (keeps mirror in sync with disk).
-        ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
-            if Some(*b) == pr13_effective_default("toolset.ask_user_question.timeout_enabled") {
-                app.ask_user_question_timeout_enabled = None;
-            } else {
-                set_ask_user_question_timeout_enabled_inner(app, *b);
-            }
         }
         ("show_thinking_blocks", SettingValue::Bool(b)) => set_show_thinking_blocks_inner(app, *b),
         ("group_tool_verbs", SettingValue::Bool(b)) => set_group_tool_verbs_inner(app, *b),

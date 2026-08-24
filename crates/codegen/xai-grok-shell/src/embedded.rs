@@ -272,9 +272,39 @@ pub enum EmbeddedStopReason {
     End,
     Cancelled,
     MaxTokens,
-    MaxTurnRequests,
+    BudgetLimited(EmbeddedLoopHealthLimitReason),
     Refusal,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum EmbeddedLoopHealthLimitReason {
+    StepBudget { limit: u64 },
+    Repetition { repeated_steps: u64 },
+}
+
+fn embedded_stop_reason(
+    stop_reason: acp::StopReason,
+    meta: Option<&Map<String, Value>>,
+) -> EmbeddedStopReason {
+    match stop_reason {
+        acp::StopReason::EndTurn => EmbeddedStopReason::End,
+        acp::StopReason::Cancelled => EmbeddedStopReason::Cancelled,
+        acp::StopReason::MaxTokens => EmbeddedStopReason::MaxTokens,
+        acp::StopReason::MaxTurnRequests => meta
+            .and_then(|meta| meta.get("loopHealthLimit"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map(EmbeddedStopReason::BudgetLimited)
+            .unwrap_or(EmbeddedStopReason::Other),
+        acp::StopReason::Refusal => EmbeddedStopReason::Refusal,
+        _ => EmbeddedStopReason::Other,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -525,14 +555,10 @@ impl EmbeddedAgent {
             .agent
             .prompt(acp::PromptRequest::new(acp::SessionId::new(session_id), blocks).meta(meta))
             .await?;
-        Ok(match response.stop_reason {
-            acp::StopReason::EndTurn => EmbeddedStopReason::End,
-            acp::StopReason::Cancelled => EmbeddedStopReason::Cancelled,
-            acp::StopReason::MaxTokens => EmbeddedStopReason::MaxTokens,
-            acp::StopReason::MaxTurnRequests => EmbeddedStopReason::MaxTurnRequests,
-            acp::StopReason::Refusal => EmbeddedStopReason::Refusal,
-            _ => EmbeddedStopReason::Other,
-        })
+        Ok(embedded_stop_reason(
+            response.stop_reason,
+            response.meta.as_ref(),
+        ))
     }
 
     pub async fn cancel(&self, session_id: String) -> Result<(), EmbeddedError> {
@@ -653,5 +679,44 @@ impl EmbeddedAgent {
         self.agent
             .sdk_mcp_modern_subscribe(session_id, server, filter, capacity)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_turn_requests_requires_a_typed_loop_health_reason() {
+        let step_budget = serde_json::json!({
+            "loopHealthLimit": { "kind": "stepBudget", "limit": 64 }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        assert_eq!(
+            embedded_stop_reason(acp::StopReason::MaxTurnRequests, Some(&step_budget)),
+            EmbeddedStopReason::BudgetLimited(EmbeddedLoopHealthLimitReason::StepBudget {
+                limit: 64,
+            })
+        );
+
+        let repetition = serde_json::json!({
+            "loopHealthLimit": { "kind": "repetition", "repeatedSteps": 16 }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        assert_eq!(
+            embedded_stop_reason(acp::StopReason::MaxTurnRequests, Some(&repetition)),
+            EmbeddedStopReason::BudgetLimited(EmbeddedLoopHealthLimitReason::Repetition {
+                repeated_steps: 16,
+            })
+        );
+
+        assert_eq!(
+            embedded_stop_reason(acp::StopReason::MaxTurnRequests, None),
+            EmbeddedStopReason::Other
+        );
     }
 }

@@ -15,7 +15,6 @@ use serde_json::Value;
 use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_tools::computer::types::KillOutcome;
 use xai_grok_tools::computer::types::TaskKind;
-use xai_grok_tools::implementations::grok_build::scheduler::interval::interval_to_human;
 use xai_grok_tools::implementations::grok_build::scheduler::types::{
     SchedulerCommand, SchedulerHandle,
 };
@@ -349,9 +348,9 @@ async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
                 .map(|t| ScheduledTaskSnapshotWire {
                     task_id: t.id.clone(),
                     prompt: t.prompt.clone(),
-                    human_schedule: interval_to_human(t.interval_secs),
-                    next_fire_at: t.next_fire_at().to_rfc3339(),
-                    recurring: t.recurring,
+                    human_schedule: t.human_schedule(),
+                    next_fire_at: t.next_fire_at().map(|value| value.to_rfc3339()),
+                    recurring: t.is_recurring(),
                     created_at: t.created_at.to_rfc3339(),
                 })
                 .collect()

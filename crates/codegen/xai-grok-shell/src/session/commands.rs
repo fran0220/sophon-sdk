@@ -33,13 +33,28 @@ pub enum SideQuestionError {
     #[error("No response from model")]
     EmptyResponse,
 }
+/// Typed reason why the native agent stopped a Turn at a loop-health boundary.
+/// This is carried in ACP response metadata so embedded hosts can distinguish
+/// a healthy bounded pause from cancellation or normal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LoopHealthLimitReason {
+    StepBudget { limit: u64 },
+    Repetition { repeated_steps: u64 },
+}
 /// Prompt completion kind returned to the ACP layer.
 #[derive(Debug, Clone)]
 pub enum PromptCompletionKind {
     Completed,
     /// Silent EndTurn after stationarity/true-noop thrash. Distinct from
     /// Completed so goal continuation is not re-queued under an active goal.
-    StationarityEnded,
+    StationarityEnded {
+        repeated_steps: u64,
+    },
     Cancelled {
         category: Option<xai_grok_session_events::types::CancellationCategory>,
         context: Option<CancellationContext>,
@@ -83,6 +98,20 @@ pub fn meta_category_str(
     }
 }
 impl PromptCompletionKind {
+    pub fn loop_health_limit_reason(&self) -> Option<LoopHealthLimitReason> {
+        match self {
+            Self::MaxTurnsReached { limit } => Some(LoopHealthLimitReason::StepBudget {
+                limit: *limit as u64,
+            }),
+            Self::StationarityEnded { repeated_steps } => Some(LoopHealthLimitReason::Repetition {
+                repeated_steps: *repeated_steps,
+            }),
+            Self::Completed | Self::Cancelled { .. } | Self::Rewound | Self::RemovedFromQueue => {
+                None
+            }
+        }
+    }
+
     /// The completion's `_meta.cancellationCategory`, shared by every terminal
     /// rail (`PromptResponse` `_meta`, legacy `prompt_complete`, durable
     /// `TurnCompleted`) so the wires never disagree.
@@ -92,7 +121,7 @@ impl PromptCompletionKind {
                 category.map(|cat| meta_category_str(cat).to_string())
             }
             Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_string()),
-            Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
+            Self::StationarityEnded { .. } => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
             Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
         }
     }
@@ -656,6 +685,12 @@ pub enum SessionCommand {
             >,
         >,
     },
+    DeliverScheduledTaskOccurrence {
+        task_id: String,
+        occurrence:
+            xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
+        respond_to: oneshot::Sender<Result<bool, String>>,
+    },
     ListScheduledTasks {
         respond_to: oneshot::Sender<
             Vec<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>,
@@ -989,7 +1024,7 @@ mod cancellation_category_meta_tests {
                 Some("max_turns_reached"),
             ),
             (
-                PromptCompletionKind::StationarityEnded,
+                PromptCompletionKind::StationarityEnded { repeated_steps: 16 },
                 Some("action_stationarity"),
             ),
             (PromptCompletionKind::Completed, None),

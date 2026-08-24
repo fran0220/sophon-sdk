@@ -1,10 +1,10 @@
-//! Shared protocol and channel types for the AskUserQuestion blocking flow.
+//! Shared protocol and channel types for non-blocking structured elicitation.
 //!
 //! These types define the request/response contract between three crates:
 //!
-//! - **`xai-grok-tools`** — tool blocks on a oneshot, formats the result.
+//! - **`xai-grok-tools`** — tool opens an elicitation and returns immediately.
 //! - **`xai-grok-shell`** — coordinator receives requests over mpsc, calls the
-//!   client via ACP `ext_method`, sends results back over the oneshot.
+//!   client via ACP `ext_method`, and injects accepted answers at a step boundary.
 //! - **`xai-grok-pager`** — handles the `ExtMethod`, renders UI, returns a
 //!   typed response.
 //!
@@ -122,18 +122,7 @@ pub enum AskUserQuestionExtResponse {
 
 // ── In-process types (coordinator <-> tool) ──────────────────────────────
 
-/// In-process result: coordinator -> tool.
-///
-/// Uses `Result` so the tool can distinguish user actions from infrastructure
-/// failures:
-/// - `Ok(UserQuestionResponse)` for all 4 user paths (accepted, chat, skip, cancel).
-/// - `Err(UserQuestionError)` for transport failures or malformed responses.
-pub type UserQuestionResult = Result<UserQuestionResponse, UserQuestionError>;
-
 /// Successful user response (all 4 user paths).
-///
-/// Every variant here produces `Ok(UserAnswered { message })` at the tool
-/// level with `ToolCall` status `Completed`.
 #[derive(Debug, Clone)]
 pub enum UserQuestionResponse {
     /// User accepted and submitted answers (Path A).
@@ -158,30 +147,29 @@ pub enum UserQuestionResponse {
     Cancelled,
 }
 
-/// Infrastructure failure (NOT a user action).
+/// In-process request: tool -> coordinator.
 ///
-/// These produce `Err(ToolError::ExecutionError { .. })` at the tool level
-/// with `ToolCall` status `Failed`.
-#[derive(Debug, Clone)]
-pub enum UserQuestionError {
-    /// ACP `ext_method` call failed (client disconnect, timeout, etc.).
-    TransportError(String),
-    /// Client returned JSON that could not be deserialized into
-    /// `AskUserQuestionExtResponse`.
-    MalformedResponse(String),
-}
-
-/// In-process request: tool -> coordinator (carries oneshot for reply).
-///
-/// Sent over the `mpsc` channel. The coordinator receives this, performs the
-/// ACP `ext_method` round-trip, and sends the result back on `result_tx`.
+/// The tool returns as soon as this request is accepted. The coordinator keeps
+/// the form consumable only while the owning Turn is active and injects a
+/// validated answer through the interjection safe-point queue.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UserQuestionRequest {
     pub tool_call_id: String,
+    pub owning_prompt_id: String,
     pub questions: Vec<Question>,
-    #[educe(Debug(ignore))]
-    pub result_tx: oneshot::Sender<UserQuestionResult>,
+    pub use_id_keyed_format: bool,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub enum UserQuestionCommand {
+    Open(UserQuestionRequest),
+    Withdraw {
+        tool_call_id: String,
+        #[educe(Debug(ignore))]
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 // ── Resource type ────────────────────────────────────────────────────────
@@ -194,7 +182,7 @@ pub struct UserQuestionRequest {
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct UserQuestionSender(
-    #[educe(Debug(ignore))] pub mpsc::UnboundedSender<UserQuestionRequest>,
+    #[educe(Debug(ignore))] pub mpsc::UnboundedSender<UserQuestionCommand>,
 );
 
 register_resource!("grok_build", "UserQuestionSender", UserQuestionSender);
@@ -207,7 +195,7 @@ impl AskUserQuestionExtResponse {
     /// Called by the shell coordinator after deserializing the client's JSON.
     /// The `questions` parameter carries the original question list so that
     /// `ChatAboutThis` and `SkipInterview` responses can iterate all questions
-    /// (answered and unanswered) when formatting the tool result.
+    /// (answered and unanswered) when formatting the answer interjection.
     pub fn into_response(self, questions: Vec<Question>) -> UserQuestionResponse {
         match self {
             Self::Accepted {

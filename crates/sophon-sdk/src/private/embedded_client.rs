@@ -47,6 +47,31 @@ fn debug_name(value: Option<&str>) -> String {
         .collect()
 }
 
+fn interaction_update(payload: &serde_json::Value) -> Option<EventUpdate> {
+    let id = payload.get("tool_call_id")?.as_str()?.to_owned();
+    match payload.get("sessionUpdate")?.as_str()? {
+        "pending_interaction" => Some(EventUpdate::InteractionOpened {
+            id,
+            kind: match payload.get("kind")?.as_str()? {
+                "permission" => crate::InteractionKind::Permission,
+                "question" => crate::InteractionKind::Question,
+                "plan_approval" => crate::InteractionKind::PlanApproval,
+                _ => return None,
+            },
+        }),
+        "interaction_resolved" => Some(EventUpdate::InteractionResolved {
+            id,
+            resolution: match payload.get("resolution")?.as_str()? {
+                "resolved" => crate::InteractionResolution::Resolved,
+                "answered" => crate::InteractionResolution::Answered,
+                "unanswered" => crate::InteractionResolution::Unanswered,
+                _ => return None,
+            },
+        }),
+        _ => None,
+    }
+}
+
 pub(super) fn content_update(
     content: &serde_json::Value,
     text: impl FnOnce(String) -> EventUpdate,
@@ -405,6 +430,12 @@ impl Client {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
             },
+            "pending_interaction" | "interaction_resolved" => interaction_update(&payload)
+                .unwrap_or_else(|| EventUpdate::Unknown {
+                    tag: "malformed_interaction".into(),
+                    payload,
+                    raw,
+                }),
             _ => EventUpdate::Unknown {
                 tag: "unrecognized".into(),
                 payload,
@@ -654,4 +685,52 @@ pub(super) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod interaction_update_tests {
+    use super::*;
+
+    #[test]
+    fn projects_opened_answered_and_unanswered_interactions_from_the_native_wire() {
+        assert_eq!(
+            interaction_update(&serde_json::json!({
+                "sessionUpdate": "pending_interaction",
+                "tool_call_id": "ask-1",
+                "kind": "question"
+            })),
+            Some(EventUpdate::InteractionOpened {
+                id: "ask-1".into(),
+                kind: crate::InteractionKind::Question,
+            })
+        );
+        for (wire, expected) in [
+            ("answered", crate::InteractionResolution::Answered),
+            ("unanswered", crate::InteractionResolution::Unanswered),
+        ] {
+            assert_eq!(
+                interaction_update(&serde_json::json!({
+                    "sessionUpdate": "interaction_resolved",
+                    "tool_call_id": "ask-1",
+                    "resolution": wire
+                })),
+                Some(EventUpdate::InteractionResolved {
+                    id: "ask-1".into(),
+                    resolution: expected,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_interaction_does_not_create_an_empty_typed_identity() {
+        assert!(
+            interaction_update(&serde_json::json!({
+                "sessionUpdate": "pending_interaction",
+                "toolCallId": "wrong-wire-case",
+                "kind": "question"
+            }))
+            .is_none()
+        );
+    }
 }

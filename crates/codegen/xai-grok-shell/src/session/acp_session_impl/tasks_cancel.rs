@@ -868,6 +868,7 @@ impl SessionActor {
                 .expect("current_prompt_id mutex poisoned");
             *current_prompt_id = None;
         }
+        self.pending_elicitation_answers.clear();
         let turn_stopped = cancelled_prompt_id.is_some() && cancel_reason.is_some();
         // Announced for every cancel that stopped a turn, including a rewind and a
         // cancel-and-send. A no-op if the turn task announced first.

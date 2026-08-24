@@ -2050,14 +2050,22 @@ impl SessionActor {
                 vec![],
             ),
             ToolInput::SchedulerCreate(ref sc) => {
-                let title = match (&sc.task_id, &sc.interval) {
-                    (Some(id), Some(interval)) => {
-                        format!("Update scheduled task {id} (every {interval})")
+                use xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput;
+                let wake = sc.wake_source.as_ref().map(|source| match source {
+                    SchedulerWakeSourceInput::Recurrence { interval, .. } => {
+                        format!("every {interval}")
                     }
+                    SchedulerWakeSourceInput::ExternalEvent { service, event, .. } => {
+                        format!("on {service}: {event}")
+                    }
+                    SchedulerWakeSourceInput::ProcessSettlement { command, .. } => {
+                        format!("when {command} settles")
+                    }
+                });
+                let title = match (&sc.task_id, wake) {
+                    (Some(id), Some(wake)) => format!("Update scheduled task {id} ({wake})"),
                     (Some(id), None) => format!("Update scheduled task {id}"),
-                    (None, Some(interval)) => {
-                        format!("Create scheduled task (every {interval})")
-                    }
+                    (None, Some(wake)) => format!("Create scheduled task ({wake})"),
                     (None, None) => "Create scheduled task".to_string(),
                 };
                 (title, acp::ToolKind::Other, vec![], vec![])

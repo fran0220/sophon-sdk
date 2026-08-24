@@ -27,8 +27,8 @@ pub(crate) fn reply_headless_ext_method(args: AcpArgsBox<acp::ExtRequest>) {
     // Known methods are answered without parsing params: even a malformed
     // request gets the policy reply rather than a dropped channel.
     let response = match method {
-        // Model sees the tool's NO_OPERATOR_TEXT (headless sessions are
-        // non-interactive), not the interactive "user declined" cancel text.
+        // Headless has no answer authority: close the already non-blocking
+        // elicitation truthfully as unanswered and inject no user message.
         "x.ai/ask_user_question" => ext_response_from(&AskUserQuestionExtResponse::Cancelled),
         // Model sees "Your plan has been approved. You can now start coding.".
         "x.ai/exit_plan_mode" => ext_response_from(&ExitPlanModeExtResponse {

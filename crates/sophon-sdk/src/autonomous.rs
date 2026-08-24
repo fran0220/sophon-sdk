@@ -472,6 +472,7 @@ impl AutonomousTurnLoop {
             } else {
                 run::GoalVerdict::Unverifiable
             };
+            let turn_budget_limited = matches!(receipt.outcome, TurnOutcome::BudgetLimited { .. });
             let driver_terminal_success = receipt.outcome == TurnOutcome::End;
             let finished = self
                 .runtime
@@ -491,7 +492,12 @@ impl AutonomousTurnLoop {
             snapshot = finished.snapshot;
             executed += 1;
 
-            snapshot = self.advance_finished_boundary(snapshot).await?;
+            snapshot = if turn_budget_limited {
+                self.pause_at_boundary(snapshot, run::WaitingReason::BudgetExhausted)
+                    .await?
+            } else {
+                self.advance_finished_boundary(snapshot).await?
+            };
 
             let _ = self
                 .providers
