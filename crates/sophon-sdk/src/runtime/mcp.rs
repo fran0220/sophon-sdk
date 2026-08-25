@@ -575,6 +575,39 @@ impl Runtime {
             ended: false,
         })
     }
+    /// Observes exact custom-notification methods on an already-mounted MCP
+    /// Service. This is a bounded, generation-bound stream over the Service's
+    /// existing credentialed transport; it opens no inbound listener and does
+    /// not create a second MCP client.
+    pub async fn listen_mcp_notifications(
+        &self,
+        id: &SessionId,
+        server: &str,
+        methods: Vec<String>,
+        capacity: usize,
+    ) -> Result<McpDomainNotificationSubscription, Error> {
+        validate_domain_notification_methods(&methods)?;
+        let capacity = std::num::NonZeroUsize::new(capacity)
+            .filter(|capacity| capacity.get() <= 4096)
+            .ok_or_else(|| {
+                Error::InvalidConfig("MCP notification capacity must be in 1..=4096".into())
+            })?;
+        let bridge = self
+            .inner
+            .mcp_domain_notification_subscribe(id, server.to_owned(), methods.clone(), capacity)
+            .await?;
+        Ok(McpDomainNotificationSubscription {
+            session_id: id.clone(),
+            server: server.to_owned(),
+            client_id: bridge.client_id,
+            methods,
+            events: bridge.events,
+            terminal: bridge.terminal,
+            cancel: Some(bridge.cancel),
+            pending_end: None,
+            ended: false,
+        })
+    }
     /// Completes either a `prompt` name argument or `resource` URI-template argument.
     pub async fn complete_mcp_argument(
         &self,
@@ -677,4 +710,41 @@ impl Runtime {
             names,
         })
     }
+}
+
+fn validate_domain_notification_methods(methods: &[String]) -> Result<(), Error> {
+    if methods.is_empty() || methods.len() > MAX_MCP_DOMAIN_NOTIFICATION_METHODS {
+        return Err(Error::InvalidConfig(format!(
+            "MCP domain notification methods must contain 1..={MAX_MCP_DOMAIN_NOTIFICATION_METHODS} entries"
+        )));
+    }
+    const RESERVED: [&str; 12] = [
+        "notifications/cancelled",
+        "notifications/elicitation/response",
+        "notifications/initialized",
+        "notifications/message",
+        "notifications/progress",
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/resources/updated",
+        "notifications/roots/list_changed",
+        "notifications/subscriptions/acknowledged",
+        "notifications/tasks",
+        "notifications/tools/list_changed",
+    ];
+    for (index, method) in methods.iter().enumerate() {
+        if method
+            .strip_prefix("notifications/")
+            .is_none_or(str::is_empty)
+            || method.len() > MAX_MCP_DOMAIN_NOTIFICATION_METHOD_BYTES
+            || method.chars().any(char::is_control)
+            || RESERVED.contains(&method.as_str())
+            || methods[..index].contains(method)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "'{method}' is not a unique custom MCP notification method"
+            )));
+        }
+    }
+    Ok(())
 }

@@ -168,6 +168,13 @@ enum Command {
         std::num::NonZeroUsize,
         Reply<xai_grok_shell::extensions::mcp::McpModernSubscription>,
     ),
+    McpDomainNotificationSubscribe(
+        SessionId,
+        String,
+        Vec<String>,
+        std::num::NonZeroUsize,
+        Reply<xai_grok_shell::extensions::mcp::McpDomainNotificationSubscription>,
+    ),
     Close(SessionId, Reply<()>),
     Delete(SessionId, Reply<()>),
     Unload(SessionId, Reply<()>),

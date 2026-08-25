@@ -637,6 +637,116 @@ pub enum McpSubscriptionEnd {
     Error { message: String },
 }
 
+pub const MAX_MCP_DOMAIN_NOTIFICATION_METHODS: usize = 32;
+pub const MAX_MCP_DOMAIN_NOTIFICATION_METHOD_BYTES: usize = 256;
+pub const MAX_MCP_DOMAIN_NOTIFICATION_BYTES: usize = 64 * 1024;
+const _: [(); MAX_MCP_DOMAIN_NOTIFICATION_BYTES] =
+    [(); xai_grok_mcp::servers::MAX_DOMAIN_NOTIFICATION_BYTES];
+
+/// One exact custom MCP notification from a mounted Service.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpDomainNotification {
+    pub method: String,
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum McpDomainNotificationEvent {
+    Notification(McpDomainNotification),
+    Ended(McpSubscriptionEnd),
+}
+
+/// Bounded custom-notification stream on one concrete mounted-Service
+/// connection generation. Dropping or cancelling it never opens or closes a
+/// public listener; only the Service's existing MCP transport is observed.
+pub struct McpDomainNotificationSubscription {
+    pub session_id: SessionId,
+    pub server: String,
+    pub client_id: u64,
+    pub methods: Vec<String>,
+    pub(crate) events: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    pub(crate) terminal: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    pub(crate) cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) pending_end: Option<McpSubscriptionEnd>,
+    pub(crate) ended: bool,
+}
+
+impl McpDomainNotificationSubscription {
+    pub async fn next(&mut self) -> Result<Option<McpDomainNotificationEvent>, Error> {
+        if let Some(end) = self.pending_end.take() {
+            self.ended = true;
+            return Ok(Some(McpDomainNotificationEvent::Ended(end)));
+        }
+        if self.ended {
+            return Ok(None);
+        }
+        match self.terminal.try_recv() {
+            Ok(terminal) => {
+                self.ended = true;
+                self.cancel.take();
+                return domain_subscription_end(Some(terminal));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.ended = true;
+                self.cancel.take();
+                return domain_subscription_end(None);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        let value = match self.events.try_recv() {
+            Ok(value) => value,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.ended = true;
+                self.cancel.take();
+                return domain_subscription_end((&mut self.terminal).await.ok());
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                tokio::select! {
+                    biased;
+                    terminal = &mut self.terminal => {
+                        self.ended = true;
+                        self.cancel.take();
+                        return domain_subscription_end(terminal.ok());
+                    }
+                    event = self.events.recv() => {
+                        let Some(event) = event else {
+                            self.ended = true;
+                            return Ok(Some(McpDomainNotificationEvent::Ended(
+                                McpSubscriptionEnd::Abrupt,
+                            )));
+                        };
+                        event
+                    }
+                }
+            }
+        };
+        let notification: McpDomainNotification =
+            serde_json::from_value(value).map_err(|error| {
+                Error::Operation(format!("invalid MCP domain notification: {error}"))
+            })?;
+        Ok(Some(McpDomainNotificationEvent::Notification(notification)))
+    }
+
+    pub fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+            self.pending_end = Some(McpSubscriptionEnd::Cancelled);
+        }
+    }
+}
+
+fn domain_subscription_end(
+    terminal: Option<serde_json::Value>,
+) -> Result<Option<McpDomainNotificationEvent>, Error> {
+    match parse_mcp_subscription_end(terminal)? {
+        Some(McpSubscriptionEvent::Ended(end)) => Ok(Some(McpDomainNotificationEvent::Ended(end))),
+        Some(_) => Err(Error::Operation(
+            "invalid MCP domain notification terminal event".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
 /// Bounded MCP 2026 `subscriptions/listen` stream. Streams are bound to one
 /// concrete client generation and are not resumed across reconnects.
 pub struct McpSubscription {

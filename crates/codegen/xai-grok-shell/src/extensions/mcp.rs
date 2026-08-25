@@ -1365,6 +1365,10 @@ pub struct McpModernSubscription {
     pub cancel: tokio::sync::oneshot::Sender<()>,
 }
 
+#[doc(hidden)]
+pub type McpDomainNotificationSubscription =
+    xai_grok_mcp::servers::McpDomainNotificationSubscription;
+
 async fn handle_primitive(
     agent: &MvpAgent,
     args: &acp::ExtRequest,
@@ -1665,6 +1669,26 @@ pub(crate) async fn start_mcp_modern_subscription(
         terminal,
         cancel,
     })
+}
+
+pub(crate) async fn start_mcp_domain_notification_subscription(
+    mcp_state: &Arc<TokioMutex<McpState>>,
+    server_name: &str,
+    methods: Vec<String>,
+    capacity: std::num::NonZeroUsize,
+) -> Result<McpDomainNotificationSubscription, String> {
+    let client = {
+        let state = mcp_state.lock().await;
+        Arc::clone(
+            state
+                .get_client(server_name)
+                .ok_or_else(|| format!("server '{server_name}' not found"))?,
+        )
+    };
+    client
+        .subscribe_domain_notifications(methods, capacity)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn read_mcp_resource(

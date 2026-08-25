@@ -241,6 +241,24 @@ impl Core {
                     };
                     let _ = reply.send(result);
                 }
+                Command::McpDomainNotificationSubscribe(id, server, methods, capacity, reply) => {
+                    let result = if self.options.profile == crate::RuntimeProfile::Restricted {
+                        Err(Error::Operation(
+                            "MCP operations require the Desktop profile".into(),
+                        ))
+                    } else {
+                        self.agent
+                            .mcp_domain_notification_subscribe(
+                                id.as_str(),
+                                server,
+                                methods,
+                                capacity,
+                            )
+                            .await
+                            .map_err(Error::Operation)
+                    };
+                    let _ = reply.send(result);
+                }
                 Command::ReplaceMcp(id, servers, r) => {
                     let result = if self.options.profile == crate::RuntimeProfile::Restricted {
                         Err(Error::Operation(

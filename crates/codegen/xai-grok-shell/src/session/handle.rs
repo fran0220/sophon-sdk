@@ -736,6 +736,24 @@ impl SessionHandle {
         rx.await
             .unwrap_or_else(|_| Err("session closed".to_string()))
     }
+    pub(crate) async fn mcp_domain_notification_subscribe(
+        &self,
+        server_name: String,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::extensions::mcp::McpDomainNotificationSubscription, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::McpDomainNotificationSubscribe {
+                server_name,
+                methods,
+                capacity,
+                respond_to: tx,
+            })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await
+            .unwrap_or_else(|_| Err("session closed".to_string()))
+    }
     pub(crate) async fn mcp_auth_status(&self) -> Vec<crate::extensions::mcp::McpAuthStatusEntry> {
         let (tx, rx) = oneshot::channel();
         if self

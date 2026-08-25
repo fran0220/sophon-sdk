@@ -680,6 +680,18 @@ impl EmbeddedAgent {
             .sdk_mcp_modern_subscribe(session_id, server, filter, capacity)
             .await
     }
+
+    pub async fn mcp_domain_notification_subscribe(
+        &self,
+        session_id: &str,
+        server: String,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::extensions::mcp::McpDomainNotificationSubscription, String> {
+        self.agent
+            .sdk_mcp_domain_notification_subscribe(session_id, server, methods, capacity)
+            .await
+    }
 }
 
 #[cfg(test)]

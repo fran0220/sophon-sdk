@@ -286,6 +286,21 @@ impl ModernMcpFixture {
             let _ = peer.notify("notifications/tasks", self.task()).await;
         }
     }
+
+    async fn notify_domain(&self, sequence: u64) {
+        let peer = self.peer.lock().unwrap().clone();
+        if let Some(peer) = peer {
+            let _ = peer
+                .notify(
+                    "notifications/mail/received",
+                    serde_json::json!({
+                        "sequence": sequence,
+                        "subject": "Build report"
+                    }),
+                )
+                .await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -755,6 +770,44 @@ async fn modern_mcp_mrtr_tasks_subscriptions_and_generation_safety() {
     })
     .await
     .expect("Task push event");
+
+    let mut domain = runtime
+        .listen_mcp_notifications(
+            &session,
+            "modern-fixture",
+            vec!["notifications/mail/received".into()],
+            2,
+        )
+        .await
+        .expect("domain notification subscription");
+    fixture.notify_domain(7).await;
+    assert!(matches!(
+        domain.next().await.expect("domain event"),
+        Some(McpDomainNotificationEvent::Notification(McpDomainNotification {
+            method,
+            params: Some(params),
+        })) if method == "notifications/mail/received"
+            && params["sequence"] == serde_json::json!(7)
+    ));
+    domain.cancel();
+    assert!(matches!(
+        domain.next().await.expect("domain cancellation"),
+        Some(McpDomainNotificationEvent::Ended(
+            McpSubscriptionEnd::Cancelled
+        ))
+    ));
+    assert!(
+        runtime
+            .listen_mcp_notifications(
+                &session,
+                "modern-fixture",
+                vec!["notifications/tools/list_changed".into()],
+                1,
+            )
+            .await
+            .is_err(),
+        "protocol lifecycle notifications escaped through the domain seam"
+    );
 
     let mut subscription = runtime
         .listen_mcp(

@@ -644,6 +644,13 @@ pub enum SessionCommand {
         capacity: std::num::NonZeroUsize,
         respond_to: oneshot::Sender<Result<crate::extensions::mcp::McpModernSubscription, String>>,
     },
+    McpDomainNotificationSubscribe {
+        server_name: String,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+        respond_to:
+            oneshot::Sender<Result<crate::extensions::mcp::McpDomainNotificationSubscription, String>>,
+    },
     McpAuthStatus {
         respond_to: oneshot::Sender<Vec<crate::extensions::mcp::McpAuthStatusEntry>>,
     },

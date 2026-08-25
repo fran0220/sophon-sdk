@@ -3024,6 +3024,148 @@ pub enum McpClientEvent {
     ConfigRemoved { server: McpServerName },
 }
 
+/// Maximum encoded size of one custom MCP notification exposed to an
+/// embedded Host. A Service can stream indefinitely, but no single event may
+/// turn that stream into an unbounded allocation.
+pub const MAX_DOMAIN_NOTIFICATION_BYTES: usize = 64 * 1024;
+
+/// One generation-bound, locally filtered stream of custom notifications from
+/// an already-mounted MCP Service.
+///
+/// The server transport and its credentials remain those of [`McpClient`].
+/// This bridge merely exposes notifications the server sends on that existing
+/// connection; it opens no listener and creates no parallel transport.
+#[doc(hidden)]
+pub struct McpDomainNotificationSubscription {
+    pub client_id: u64,
+    pub events: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    pub terminal: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Debug)]
+struct DomainNotificationSubscriber {
+    generation: u64,
+    methods: std::collections::BTreeSet<String>,
+    capacity: usize,
+    events: tokio::sync::mpsc::Sender<serde_json::Value>,
+    terminal: tokio::sync::oneshot::Sender<serde_json::Value>,
+}
+
+#[derive(Debug, Default)]
+struct DomainNotificationRegistry {
+    next_id: std::sync::atomic::AtomicU64,
+    subscribers: parking_lot::Mutex<HashMap<u64, DomainNotificationSubscriber>>,
+}
+
+impl DomainNotificationRegistry {
+    fn subscribe(
+        self: &Arc<Self>,
+        generation: u64,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> McpDomainNotificationSubscription {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (events_tx, events) = tokio::sync::mpsc::channel(capacity.get());
+        let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
+        self.subscribers.lock().insert(
+            id,
+            DomainNotificationSubscriber {
+                generation,
+                methods: methods.into_iter().collect(),
+                capacity: capacity.get(),
+                events: events_tx,
+                terminal: terminal_tx,
+            },
+        );
+        // Do not let a forgotten subscription keep a removed Service client
+        // alive. If the client/registry is dropped first, both stream senders
+        // close and the public SDK reports an abrupt generation end.
+        let registry = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let _ = cancel_rx.await;
+            if let Some(registry) = registry.upgrade() {
+                registry.finish(id, serde_json::json!({ "reason": "cancelled" }));
+            }
+        });
+        McpDomainNotificationSubscription {
+            client_id: generation,
+            events,
+            terminal,
+            cancel,
+        }
+    }
+
+    fn publish(&self, generation: u64, notification: rmcp::model::CustomNotification) {
+        let event = serde_json::json!({
+            "method": notification.method,
+            "params": notification.params,
+        });
+        let oversized = serde_json::to_vec(&event)
+            .map(|encoded| encoded.len() > MAX_DOMAIN_NOTIFICATION_BYTES)
+            .unwrap_or(true);
+        let method = event["method"].as_str().unwrap_or_default();
+        let mut subscribers = self.subscribers.lock();
+        let targets: Vec<u64> = subscribers
+            .iter()
+            .filter_map(|(id, subscriber)| {
+                (subscriber.generation == generation && subscriber.methods.contains(method))
+                    .then_some(*id)
+            })
+            .collect();
+        for id in targets {
+            let Some(subscriber) = subscribers.remove(&id) else {
+                continue;
+            };
+            if oversized {
+                let _ = subscriber.terminal.send(serde_json::json!({
+                    "reason": "error",
+                    "message": format!(
+                        "MCP domain notification exceeded {MAX_DOMAIN_NOTIFICATION_BYTES} bytes"
+                    ),
+                }));
+                continue;
+            }
+            match subscriber.events.try_send(event.clone()) {
+                Ok(()) => {
+                    subscribers.insert(id, subscriber);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    let _ = subscriber.terminal.send(serde_json::json!({
+                        "reason": "lagged",
+                        "capacity": subscriber.capacity,
+                    }));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+    }
+
+    fn finish(&self, id: u64, reason: serde_json::Value) {
+        if let Some(subscriber) = self.subscribers.lock().remove(&id) {
+            let _ = subscriber.terminal.send(reason);
+        }
+    }
+
+    fn retire_before(&self, generation: u64) {
+        let mut subscribers = self.subscribers.lock();
+        let stale: Vec<u64> = subscribers
+            .iter()
+            .filter_map(|(id, subscriber)| (subscriber.generation != generation).then_some(*id))
+            .collect();
+        for id in stale {
+            if let Some(subscriber) = subscribers.remove(&id) {
+                let _ = subscriber
+                    .terminal
+                    .send(serde_json::json!({ "reason": "abrupt" }));
+            }
+        }
+    }
+}
+
 /// Discriminant for [`McpClientEvent`], used as the second half of the
 /// coalescing key `(server, kind)`. Two events with the same
 /// `(server, kind)` collapse into the latest one inside the
@@ -3236,6 +3378,10 @@ pub struct McpClient {
     /// `.await`, and the handler's `emit` path is short and
     /// allocation-free.
     notify_tx: SharedEventTx,
+    /// Bounded custom notifications on this mounted Service's existing
+    /// transport. Subscriptions are retired whenever the concrete connection
+    /// generation changes.
+    domain_notifications: Arc<DomainNotificationRegistry>,
     /// RAII handle for the per-client transport-liveness poller.
     ///
     /// `Some` after [`Self::arm_liveness_watcher`] succeeds; `None`
@@ -3735,6 +3881,7 @@ impl McpClient {
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            domain_notifications: Arc::new(DomainNotificationRegistry::default()),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
             host_services: Arc::new(parking_lot::Mutex::new(None)),
             task_input_gate: Mutex::new(()),
@@ -4605,12 +4752,28 @@ impl McpClient {
     /// loop on its next notification.
     fn make_client_handler(&self, connection_generation: u64) -> GrokClientHandler {
         let host_services = self.host_services.lock().clone();
+        self.domain_notifications
+            .retire_before(connection_generation);
         GrokClientHandler {
             info: Self::make_client_info(&self.server_name, host_services.as_ref()),
             server_name: self.server_name.clone(),
             client_id: connection_generation,
             notify_tx: Arc::clone(&self.notify_tx),
+            domain_notifications: Arc::clone(&self.domain_notifications),
         }
+    }
+
+    /// Subscribe to exact custom-notification methods on this mounted
+    /// Service's current connection generation.
+    pub async fn subscribe_domain_notifications(
+        &self,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<McpDomainNotificationSubscription, McpError> {
+        let service = self.ensure_initialized().await?;
+        Ok(self
+            .domain_notifications
+            .subscribe(service.connection_generation(), methods, capacity))
     }
 
     /// Wire a sender for [`McpClientEvent`]s emitted by this client.
@@ -5655,6 +5818,7 @@ pub struct GrokClientHandler {
     /// post-handshake is supported without restarting the rmcp
     /// service loop.
     notify_tx: SharedEventTx,
+    domain_notifications: Arc<DomainNotificationRegistry>,
 }
 
 impl GrokClientHandler {
@@ -5743,6 +5907,15 @@ impl ClientHandler for GrokClientHandler {
 
     fn get_info(&self) -> ClientInfo {
         self.info.clone()
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: rmcp::model::CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.domain_notifications
+            .publish(self.client_id, notification);
     }
 }
 

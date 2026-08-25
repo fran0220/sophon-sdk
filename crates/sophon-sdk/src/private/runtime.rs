@@ -1249,6 +1249,18 @@ impl Runtime {
         self.call(|reply| Command::McpSubscribe(id.clone(), server, filter, capacity, reply))
             .await
     }
+    pub async fn mcp_domain_notification_subscribe(
+        &self,
+        id: &SessionId,
+        server: String,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<xai_grok_shell::extensions::mcp::McpDomainNotificationSubscription, Error> {
+        self.call(|reply| {
+            Command::McpDomainNotificationSubscribe(id.clone(), server, methods, capacity, reply)
+        })
+        .await
+    }
     pub async fn shutdown(&self) -> Result<(), Error> {
         if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
             self.shared.lifecycle.shutdown();

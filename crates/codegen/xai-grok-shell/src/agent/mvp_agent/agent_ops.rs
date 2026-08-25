@@ -5205,6 +5205,24 @@ impl MvpAgent {
             .mcp_modern_subscribe(server_name, filter, capacity)
             .await
     }
+
+    #[doc(hidden)]
+    pub async fn sdk_mcp_domain_notification_subscribe(
+        &self,
+        session_id: &str,
+        server_name: String,
+        methods: Vec<String>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::extensions::mcp::McpDomainNotificationSubscription, String> {
+        let session_id = acp::SessionId::new(session_id);
+        let handle = self
+            .session_handle_waiting_for_load(&session_id)
+            .await
+            .ok_or_else(|| "session not found".to_owned())?;
+        handle
+            .mcp_domain_notification_subscribe(server_name, methods, capacity)
+            .await
+    }
 }
 /// Rollback guard for mid-session bind reservation.
 #[cfg(feature = "local-workspace")]

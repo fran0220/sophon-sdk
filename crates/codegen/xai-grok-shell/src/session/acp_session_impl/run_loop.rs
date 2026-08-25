@@ -1797,6 +1797,15 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(result);
                             });
                         }
+                        SessionCommand::McpDomainNotificationSubscribe { server_name, methods, capacity, respond_to } => {
+                            let mcp_state = session.mcp_state.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = crate::extensions::mcp::start_mcp_domain_notification_subscription(
+                                    &mcp_state, &server_name, methods, capacity,
+                                ).await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
                         SessionCommand::McpAuthStatus { respond_to } => {
                             let mcp_state = session.mcp_state.clone();
                             tokio::task::spawn_local(async move {

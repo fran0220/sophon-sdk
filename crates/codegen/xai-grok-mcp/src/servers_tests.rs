@@ -2666,6 +2666,7 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             server_name: "dead".to_string(),
             client_id: 1,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            domain_notifications: Arc::new(DomainNotificationRegistry::default()),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
             client_read,
@@ -3447,6 +3448,7 @@ async fn client_handler_routes_tools_changed() {
         server_name: "test".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: handler.server_name.clone(),
@@ -3468,6 +3470,7 @@ async fn client_handler_no_dispatcher_is_silent() {
         server_name: "test".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: "test".to_string(),
@@ -3484,12 +3487,101 @@ async fn client_handler_get_info_round_trips() {
         server_name: "test-srv".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     let got = handler.get_info();
     // ClientInfo doesn't derive PartialEq; check the visible
     // fields the constructor sets.
     assert_eq!(got.client_info.name, info.client_info.name);
     assert_eq!(got.client_info.version, info.client_info.version);
+}
+
+#[tokio::test]
+async fn domain_notifications_are_exact_bounded_and_generation_bound() {
+    let registry = Arc::new(DomainNotificationRegistry::default());
+    let mut subscription = registry.subscribe(
+        7,
+        vec!["notifications/mail/received".into()],
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+
+    registry.publish(
+        7,
+        rmcp::model::CustomNotification::new(
+            "notifications/mail/ignored",
+            Some(serde_json::json!({"sequence": 0})),
+        ),
+    );
+    assert!(matches!(
+        subscription.events.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    registry.publish(
+        7,
+        rmcp::model::CustomNotification::new(
+            "notifications/mail/received",
+            Some(serde_json::json!({"sequence": 1})),
+        ),
+    );
+    registry.publish(
+        7,
+        rmcp::model::CustomNotification::new(
+            "notifications/mail/received",
+            Some(serde_json::json!({"sequence": 2})),
+        ),
+    );
+    assert_eq!(
+        subscription.events.recv().await.unwrap()["params"]["sequence"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        subscription.terminal.await.unwrap(),
+        serde_json::json!({"reason": "lagged", "capacity": 1})
+    );
+
+    let subscription = registry.subscribe(
+        8,
+        vec!["notifications/mail/received".into()],
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    registry.retire_before(9);
+    assert_eq!(
+        subscription.terminal.await.unwrap(),
+        serde_json::json!({"reason": "abrupt"})
+    );
+
+    let registry = Arc::new(DomainNotificationRegistry::default());
+    let mut subscription = registry.subscribe(
+        10,
+        vec!["notifications/mail/received".into()],
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    drop(registry);
+    assert!(subscription.events.recv().await.is_none());
+    assert!(subscription.terminal.await.is_err());
+}
+
+#[tokio::test]
+async fn oversized_domain_notification_ends_the_subscription() {
+    let registry = Arc::new(DomainNotificationRegistry::default());
+    let subscription = registry.subscribe(
+        1,
+        vec!["notifications/report".into()],
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    registry.publish(
+        1,
+        rmcp::model::CustomNotification::new(
+            "notifications/report",
+            Some(serde_json::json!({
+                "body": "x".repeat(MAX_DOMAIN_NOTIFICATION_BYTES)
+            })),
+        ),
+    );
+    let terminal = subscription.terminal.await.unwrap();
+    assert_eq!(terminal["reason"], "error");
+    assert!(terminal["message"].as_str().unwrap().contains("exceeded"));
 }
 
 // A sender wired *after* the handler is constructed must still
