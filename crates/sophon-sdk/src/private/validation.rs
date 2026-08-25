@@ -1,6 +1,21 @@
 use super::*;
 
 pub(super) fn validate(c: &RuntimeConfig, options: &RuntimeOptions) -> Result<(), Error> {
+    if options
+        .host_capabilities
+        .extension_methods
+        .iter()
+        .any(|method| method == crate::user_question::USER_QUESTION_METHOD)
+    {
+        return Err(Error::InvalidConfig(
+            "x.ai/ask_user_question is reserved; install UserQuestionUi instead".into(),
+        ));
+    }
+    if options.user_question_ui.is_some() && options.profile != crate::RuntimeProfile::Desktop {
+        return Err(Error::InvalidConfig(
+            "UserQuestionUi requires the Desktop runtime profile".into(),
+        ));
+    }
     if c.models.is_empty() {
         return Err(Error::InvalidConfig("model catalog is required".into()));
     }

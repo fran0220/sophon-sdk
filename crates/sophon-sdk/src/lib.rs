@@ -19,6 +19,7 @@ mod prime;
 mod private;
 mod program;
 mod session_state;
+mod user_question;
 
 pub use activation::{
     ACTIVATION_STORE_SCHEMA_MARKER, ACTIVATION_STORE_SCHEMA_VERSION, ActivationClaim,
@@ -142,6 +143,10 @@ pub use session_state::{
     SessionStateStoreError, TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled,
     manifest_cas_reconciled, object_put_reconciled, run_session_state_conformance,
     run_session_state_fault_conformance,
+};
+pub use user_question::{
+    UserQuestion, UserQuestionAnswer, UserQuestionMode, UserQuestionOption, UserQuestionRequest,
+    UserQuestionResponse, UserQuestionUi, UserQuestionUiError,
 };
 
 pub(crate) use std::{collections::BTreeMap, path::PathBuf, sync::Arc};

@@ -482,6 +482,10 @@ pub struct RuntimeOptions {
     pub tool_permission_handler: Option<Arc<dyn ToolPermissionHandler>>,
     pub mcp_host_services: xai_grok_mcp::servers::McpHostServices,
     pub mcp_elicitation_ui: Option<Arc<dyn McpElicitationUi>>,
+    /// Product UI for native agent questions. Unlike MCP elicitation this
+    /// reverse request does not block the Turn; the SDK Session coordinator
+    /// waits independently and consumes an accepted answer at a safe point.
+    pub user_question_ui: Option<Arc<dyn UserQuestionUi>>,
     /// In-process MCP servers mounted on every Desktop Session. Retained for
     /// compatibility with the original Runtime-wide registration contract.
     pub in_process_mcp_servers: Vec<InProcessMcpServer>,
@@ -507,6 +511,7 @@ impl Default for RuntimeOptions {
             tool_permission_handler: None,
             mcp_host_services: xai_grok_mcp::servers::McpHostServices::default(),
             mcp_elicitation_ui: None,
+            user_question_ui: None,
             in_process_mcp_servers: Vec::new(),
             session_in_process_mcp_servers: Vec::new(),
             agent_hooks: Vec::new(),

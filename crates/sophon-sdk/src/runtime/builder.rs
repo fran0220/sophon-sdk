@@ -131,6 +131,14 @@ impl RuntimeBuilder {
         self.options.mcp_elicitation_ui = Some(value);
         self
     }
+    /// Installs the sole product-UI authority for native non-blocking
+    /// questions. The typed request remains answerable while its Turn runs;
+    /// only the Session event stream says whether a submitted answer reached
+    /// a model-step boundary before settlement.
+    pub fn user_question_ui(mut self, value: Arc<dyn UserQuestionUi>) -> Self {
+        self.options.user_question_ui = Some(value);
+        self
+    }
     /// Registers typed reverse-channel hooks. Hooks are enabled only by the
     /// Desktop profile; Restricted never advertises or routes them.
     pub fn agent_hooks(mut self, value: impl IntoIterator<Item = AgentHookRegistration>) -> Self {

@@ -197,6 +197,11 @@ impl Core {
             } else {
                 None
             },
+            user_question_ui: if options.profile == crate::RuntimeProfile::Desktop {
+                options.user_question_ui.clone()
+            } else {
+                None
+            },
             host_extension_methods: options
                 .host_capabilities
                 .extension_methods

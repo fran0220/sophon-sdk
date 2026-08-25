@@ -13,6 +13,7 @@ pub(super) struct Client {
     pub(super) capacity: usize,
     pub(super) host: Option<Arc<dyn crate::HostDelegate>>,
     pub(super) tool_permission_handler: Option<Arc<dyn crate::ToolPermissionHandler>>,
+    pub(super) user_question_ui: Option<Arc<dyn crate::UserQuestionUi>>,
     pub(super) host_extension_methods: HashSet<String>,
     pub(super) agent_hooks: HashMap<String, Arc<dyn crate::AgentHookHandler>>,
     pub(super) turns: Rc<RefCell<HashMap<String, String>>>,
@@ -453,6 +454,22 @@ impl Client {
         if method == "x.ai/hooks/run" {
             return serde_json::to_value(self.dispatch_agent_hook(params).await?)
                 .map_err(|_| EmbeddedError::internal_error());
+        }
+        if method == crate::user_question::USER_QUESTION_METHOD {
+            let ui = self
+                .user_question_ui
+                .clone()
+                .ok_or_else(EmbeddedError::method_not_found)?;
+            return crate::user_question::dispatch(ui, params)
+                .await
+                .map_err(|error| match error {
+                    crate::user_question::UserQuestionDispatchError::InvalidParams => {
+                        EmbeddedError::invalid_params()
+                    }
+                    crate::user_question::UserQuestionDispatchError::Failed => {
+                        EmbeddedError::internal_error()
+                    }
+                });
         }
         if !self.host_extension_methods.contains(method) {
             return Err(EmbeddedError::method_not_found());
