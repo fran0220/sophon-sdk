@@ -1269,6 +1269,17 @@ impl acp::Agent for MvpAgent {
             .and_then(|m| m.get("screenMode"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let origin_prompt_identity = arguments.meta.as_ref().and_then(|meta| {
+            let prompt_index = meta.get("originRuntimePromptIndex")?.as_u64()?;
+            let prompt_digest = meta.get("originPromptDigest")?.as_str()?;
+            if prompt_digest.is_empty() || prompt_digest.len() > 160 {
+                return None;
+            }
+            Some(crate::session::commands::OriginPromptIdentity {
+                prompt_index,
+                prompt_digest: prompt_digest.to_owned(),
+            })
+        });
         let json_schema = arguments
             .meta
             .as_ref()
@@ -1303,6 +1314,7 @@ impl acp::Agent for MvpAgent {
             .send(SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
                 prompt_blocks: arguments.prompt.clone(),
+                origin_prompt_identity,
                 prompt_mode,
                 artifact_upload_ctx: trace_context
                     .as_ref()

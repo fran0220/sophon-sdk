@@ -161,6 +161,7 @@ impl Core {
         let meta = serde_json::json!({
             "originTurnId":t,
             "promptId":t,
+            "originRuntimePromptIndex": runtime_prompt_index,
             "originPromptDigest": prompt_digest,
             "originInputSource": serde_json::to_value(&source).map_err(op)?,
             "originMetadata": metadata

@@ -727,6 +727,11 @@ pub(crate) struct SessionActor {
     pub(crate) doom_loop_turn_tally: parking_lot::Mutex<crate::session::signals::DoomLoopTurnTally>,
     /// File state tracker for rewind functionality
     pub(crate) file_state_tracker: Arc<FileStateTracker>,
+    /// SDK-owned durable identities parallel to this residency's native
+    /// prompt indices. This stays separate from chat persistence: a resumed
+    /// embedded Session intentionally starts a new native index space.
+    pub(crate) origin_prompt_identities:
+        std::cell::RefCell<Vec<Option<crate::session::commands::OriginPromptIdentity>>>,
     /// Last prompt text before the most recent rewind.
     /// When set, the next `prompt()` compares its text to distinguish
     /// regeneration (same text) from edit-and-retry (different text).

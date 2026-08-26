@@ -343,6 +343,9 @@ impl SessionActor {
                 conversation_truncate_for_prompt(&snapshot.conversation, target_prompt_index);
             snapshot.conversation.truncate(keep_count);
             self.chat_state_handle.restore_snapshot(snapshot);
+            self.origin_prompt_identities
+                .borrow_mut()
+                .truncate(target_prompt_index);
             self.file_state_tracker
                 .truncate_from(target_prompt_index)
                 .await;

@@ -24,6 +24,7 @@ pub(super) struct RewindPointWire {
     pub(super) num_file_snapshots: u64,
     pub(super) has_file_changes: bool,
     pub(super) prompt_preview: Option<String>,
+    pub(super) origin_prompt_index: Option<u64>,
     pub(super) origin_prompt_digest: Option<String>,
 }
 #[derive(serde::Deserialize)]
@@ -63,37 +64,97 @@ enum RewindEvidence {
     Receipt(ConversationRewindReceipt),
 }
 
-pub(super) fn native_rewind_already_applied(
+pub(super) fn map_native_rewind_points(
     points: &[RewindPointWire],
-    target_prompt_index: u64,
     ledger: &SessionLedger,
-) -> Result<bool, Error> {
+) -> Result<Vec<usize>, Error> {
     for (expected, point) in points.iter().enumerate() {
         if point.prompt_index != expected as u64 {
             return Err(Error::Operation(
                 "native Grok rewind points are not a contiguous prompt history".into(),
             ));
         }
-        let expected_entry = ledger.entries.iter().find(|entry| {
-            entry.runtime_prompt_index == point.prompt_index
-                && !matches!(entry.state, LedgerTurnState::Discarded)
-        });
-        if expected_entry.is_some_and(|entry| {
-            !entry.prompt_digest.starts_with("sha256-v2:")
-                && Some(entry.prompt_digest.as_str()) != point.origin_prompt_digest.as_deref()
-        }) {
-            return Err(Error::Operation(
-                "native Grok prompt prefix differs from the durable Turn ledger".into(),
-            ));
-        }
     }
-    let prompt_count = points.len() as u64;
-    if prompt_count < target_prompt_index {
+
+    let mut mapped = vec![usize::MAX; points.len()];
+    let mut ledger_upper_bound = ledger.entries.len();
+    let mut used = std::collections::HashSet::new();
+    for (native_position, point) in points.iter().enumerate().rev() {
+        let ledger_position = match point.origin_prompt_digest.as_deref() {
+            Some(digest) => ledger.entries[..ledger_upper_bound]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(position, entry)| {
+                    !used.contains(position)
+                        && !matches!(entry.state, LedgerTurnState::Discarded)
+                        && entry.prompt_digest == digest
+                        && point
+                            .origin_prompt_index
+                            .is_none_or(|prompt_index| entry.runtime_prompt_index == prompt_index)
+                })
+                .map(|(position, _)| position),
+            None => {
+                let prompt_index = point.origin_prompt_index.unwrap_or(point.prompt_index);
+                ledger.entries[..ledger_upper_bound]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(position, entry)| {
+                        !used.contains(position)
+                            && !matches!(entry.state, LedgerTurnState::Discarded)
+                            && entry.runtime_prompt_index == prompt_index
+                    })
+                    .map(|(position, _)| position)
+            }
+        }
+        .ok_or_else(|| {
+            Error::Operation(
+                "native Grok prompt prefix differs from the durable Turn ledger".into(),
+            )
+        })?;
+        mapped[native_position] = ledger_position;
+        ledger_upper_bound = ledger_position;
+        used.insert(ledger_position);
+    }
+
+    Ok(mapped)
+}
+
+pub(super) fn native_rewind_target(
+    points: &[RewindPointWire],
+    target_prompt_index: u64,
+    target_prompt_digest: &str,
+    ledger: &SessionLedger,
+    recover_pending_intent: bool,
+) -> Result<Option<u64>, Error> {
+    let mapped = map_native_rewind_points(points, ledger)?;
+    if let Some(point) = points
+        .iter()
+        .zip(&mapped)
+        .find(|(_, ledger_position)| {
+            let entry = &ledger.entries[**ledger_position];
+            entry.runtime_prompt_index == target_prompt_index
+                && entry.prompt_digest == target_prompt_digest
+        })
+        .map(|(point, _)| point)
+    {
+        return Ok(Some(point.prompt_index));
+    }
+    if mapped.iter().any(|ledger_position| {
+        ledger.entries[*ledger_position].runtime_prompt_index >= target_prompt_index
+    }) {
         return Err(Error::Operation(
-            "native Grok conversation is behind the pending rewind target".into(),
+            "native Grok prompt prefix does not contain the durable rewind target".into(),
         ));
     }
-    Ok(prompt_count == target_prompt_index)
+    if recover_pending_intent {
+        Ok(None)
+    } else {
+        Err(Error::Operation(
+            "native Grok conversation does not contain the requested rewind target".into(),
+        ))
+    }
 }
 
 #[derive(serde::Deserialize)]

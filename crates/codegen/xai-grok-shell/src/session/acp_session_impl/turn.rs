@@ -596,6 +596,9 @@ impl SessionActor {
         }
         let user_chunk_meta = Some(chunk_meta);
         self.chat_state_handle.increment_prompt_index();
+        self.origin_prompt_identities
+            .borrow_mut()
+            .push(input_origin.origin_prompt_identity().cloned());
         let text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
             if let acp::ContentBlock::Text(t) = b {
                 acc.push_str(&t.text);

@@ -536,7 +536,7 @@ pub(super) async fn run_session(
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, origin_prompt_identity, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
                             if session.compaction.cancel.is_applying() {
                                 if let Some(admission) = admission {
@@ -624,7 +624,10 @@ pub(super) async fn run_session(
                                 .queue_input(QueueInputRequest {
                                     prompt_blocks,
                                     prompt_id,
-                                    input_origin: InputOrigin::new(origin),
+                                    input_origin: InputOrigin::with_origin_prompt_identity(
+                                        origin,
+                                        origin_prompt_identity,
+                                    ),
                                     prompt_mode,
                                     trace_gcs_config,
                                     artifact_tracker,

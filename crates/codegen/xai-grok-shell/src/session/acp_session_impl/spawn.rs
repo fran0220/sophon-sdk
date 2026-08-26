@@ -536,6 +536,7 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
+    let initial_prompt_count = initial_prompt_texts.len();
     if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
         || initial_last_compaction.is_some())
@@ -1607,6 +1608,7 @@ pub(crate) async fn spawn_session_actor(
         doom_loop_recovery,
         doom_loop_turn_tally: Default::default(),
         file_state_tracker,
+        origin_prompt_identities: std::cell::RefCell::new(vec![None; initial_prompt_count]),
         rewind_pending_prompt: std::sync::Mutex::new(None),
         delivery_tools: std::cell::RefCell::new(startup_hints.delivery_tools.clone()),
         attach_non_interactive: std::cell::Cell::new(startup_hints.non_interactive),

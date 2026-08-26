@@ -275,6 +275,13 @@ pub struct CancelOptions {
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OriginPromptIdentity {
+    pub(crate) prompt_index: u64,
+    pub(crate) prompt_digest: String,
+}
+
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
@@ -314,6 +321,11 @@ pub enum SessionCommand {
     Prompt {
         prompt_id: String,
         prompt_blocks: Vec<acp::ContentBlock>,
+        /// SDK-owned durable identity for this prompt. Native rewind keeps this
+        /// alongside its residency-local index so embedded Hosts can translate
+        /// between the two coordinate spaces without inspecting prompt text.
+        #[allow(private_interfaces)]
+        origin_prompt_identity: Option<OriginPromptIdentity>,
         /// Prompt mode parsed from request `_meta.mode`.
         prompt_mode: PromptMode,
         #[allow(private_interfaces)]

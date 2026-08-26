@@ -10,23 +10,16 @@ impl Core {
                 serde_json::json!({ "sessionId": id.0 }),
             )
             .await?;
+        let mapped = map_native_rewind_points(&response.rewind_points, &ledger)?;
         Ok(response
             .rewind_points
             .into_iter()
-            .map(|point| {
-                let prompt_digest = ledger
-                    .entries
-                    .iter()
-                    .rev()
-                    .find(|entry| {
-                        entry.runtime_prompt_index == point.prompt_index
-                            && !matches!(entry.state, LedgerTurnState::Discarded)
-                    })
-                    .map(|entry| entry.prompt_digest.clone())
-                    .or(point.origin_prompt_digest);
+            .zip(mapped)
+            .map(|(point, ledger_position)| {
+                let entry = &ledger.entries[ledger_position];
                 RewindPoint {
-                    prompt_index: point.prompt_index,
-                    prompt_digest,
+                    prompt_index: entry.runtime_prompt_index,
+                    prompt_digest: Some(entry.prompt_digest.clone()),
                     created_at: point.created_at,
                     file_snapshots: point.num_file_snapshots,
                     has_file_changes: point.has_file_changes,
@@ -192,22 +185,24 @@ impl Core {
             ));
         }
         let expected_prompt_digest = target_entry.prompt_digest.clone();
-        if pending_intent.is_none() {
-            self.save_rewind_intent(&requested_intent)?;
-        }
-
+        let recovering_pending_intent = pending_intent.is_some();
         let native_points: RewindPointsWire = self
             .extension(
                 "x.ai/rewind/points",
                 serde_json::json!({ "sessionId": id.0 }),
             )
             .await?;
-        if !native_rewind_already_applied(
+        if let Some(native_target_prompt_index) = native_rewind_target(
             &native_points.rewind_points,
             target_prompt_index,
+            &expected_prompt_digest,
             &ledger,
+            recovering_pending_intent,
         )? {
-            let target_prompt_index_wire = usize::try_from(target_prompt_index)
+            if pending_intent.is_none() {
+                self.save_rewind_intent(&requested_intent)?;
+            }
+            let target_prompt_index_wire = usize::try_from(native_target_prompt_index)
                 .map_err(|_| Error::InvalidConfig("rewind target is out of range".into()))?;
             let response: RewindResultWire = self
                 .extension(
@@ -221,7 +216,7 @@ impl Core {
                 )
                 .await?;
             if !response.success
-                || response.target_prompt_index != target_prompt_index
+                || response.target_prompt_index != native_target_prompt_index
                 || response.mode != "conversation_only"
                 || !response.reverted_files.is_empty()
                 || !response.clean_files.is_empty()
@@ -253,6 +248,10 @@ impl Core {
                     "native conversation rewind target differs from the durable Turn ledger".into(),
                 ));
             }
+        } else if pending_intent.is_none() {
+            return Err(Error::Operation(
+                "native rewind was reported as applied without a durable intent".into(),
+            ));
         }
         self.extension::<serde_json::Value>(
             "origin/session/sync",

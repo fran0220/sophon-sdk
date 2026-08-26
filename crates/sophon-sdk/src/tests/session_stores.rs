@@ -147,6 +147,91 @@ async fn host_session_state_store_replaces_covered_jsonl_and_restarts() {
     assert_no_covered_files(&config.session_storage);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_maps_residency_rewind_points_to_durable_ledger_coordinates() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = MockInferenceServer::start().await.expect("mock server");
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = runtime_config(&root, server.url());
+    let store = Arc::new(
+        LocalSessionStateStore::new(root.path().join("host-native-sessions"))
+            .expect("Host Session store"),
+    );
+    let (runtime, _) = Runtime::builder(config.clone())
+        .session_state_store(store.clone())
+        .start()
+        .await
+        .expect("runtime starts");
+    let session_config = session_config(workspace);
+    let session = runtime
+        .create_session(session_config.clone())
+        .await
+        .expect("session starts");
+    for index in 0..3 {
+        let receipt = runtime
+            .prompt(
+                &session,
+                format!("before-restart-{index}"),
+                format!("prompt before restart {index}"),
+            )
+            .await
+            .expect("pre-restart Turn settles");
+        assert_eq!(receipt.runtime_prompt_index, index);
+    }
+    runtime.shutdown().await.expect("runtime shuts down");
+
+    let (restarted, _) = Runtime::builder(config)
+        .session_state_store(store)
+        .start()
+        .await
+        .expect("runtime restarts");
+    restarted
+        .resume_session(session.clone(), session_config)
+        .await
+        .expect("Session resumes in a fresh native residency");
+    let resumed_prompt = "prompt after restart";
+    let expected_digest = prompt_digest(resumed_prompt);
+    let receipt = restarted
+        .prompt(&session, "after-restart", resumed_prompt)
+        .await
+        .expect("resumed Turn settles");
+    assert_eq!(receipt.runtime_prompt_index, 3);
+
+    let points = restarted
+        .rewind_points(&session)
+        .await
+        .expect("resumed rewind point maps to the ledger");
+    assert_eq!(points.len(), 1, "the fresh residency contains one prompt");
+    assert_eq!(points[0].prompt_index, 3);
+    assert_eq!(
+        points[0].prompt_digest.as_deref(),
+        Some(expected_digest.as_str())
+    );
+
+    let rewind = restarted
+        .rewind_conversation(&session, "rewind-resumed-turn", 3)
+        .await
+        .expect("durable target index translates back to native residency index zero");
+    assert_eq!(rewind.target_prompt_index, 3);
+    assert!(restarted.rewind_points(&session).await.unwrap().is_empty());
+    let ledger = restarted
+        .session_ledger(&session)
+        .await
+        .expect("ledger remains");
+    assert!(
+        ledger.entries[..3]
+            .iter()
+            .all(|entry| matches!(entry.state, LedgerTurnState::Completed { .. }))
+    );
+    assert!(matches!(
+        ledger.entries[3].state,
+        LedgerTurnState::Discarded
+    ));
+    restarted.shutdown().await.expect("runtime shuts down");
+}
+
 struct DeleteProbeStore {
     inner: LocalSessionStateStore,
     behavior: Mutex<DeleteProbeBehavior>,
