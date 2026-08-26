@@ -1588,11 +1588,31 @@ done
         .await
         .expect("delete scheduled loop");
     assert!(deleted.deleted);
+    let mut remaining_task_ids = desktop
+        .list_scheduled_tasks(&session)
+        .await
+        .expect("list after deleting recurrence")
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    remaining_task_ids.sort();
+    let mut expected_task_ids = vec![event_task.task.id.clone(), process_task.task.id.clone()];
+    expected_task_ids.sort();
+    assert_eq!(remaining_task_ids, expected_task_ids);
+    for task_id in [&event_task.task.id, &process_task.task.id] {
+        assert!(
+            desktop
+                .delete_scheduled_task(&session, task_id)
+                .await
+                .expect("delete remaining scheduled task")
+                .deleted
+        );
+    }
     assert!(
         desktop
             .list_scheduled_tasks(&session)
             .await
-            .expect("list after delete")
+            .expect("list after deleting every task")
             .is_empty()
     );
     desktop
