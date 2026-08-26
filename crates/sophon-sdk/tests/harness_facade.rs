@@ -680,6 +680,13 @@ async fn lost_prompt_result_recovers_the_exact_durable_binding_after_restart() {
         sophon_sdk::TurnBindingRecord::from_json_slice(&record_bytes).unwrap(),
         *before_restart
     );
+    let before_restart_events = runtime
+        .events_after(
+            &session,
+            before_restart.receipt().complete_cursor().after_sequence(),
+        )
+        .await
+        .expect("durable event suffix exists before restart");
     runtime.shutdown().await.unwrap();
 
     let (restarted, _) = Runtime::start(config).await.unwrap();
@@ -708,15 +715,21 @@ async fn lost_prompt_result_recovers_the_exact_durable_binding_after_restart() {
         recovered.receipt().binding_id(),
         before_restart.receipt().binding_id()
     );
-    assert!(
-        restarted
-            .events_after(
-                &session,
-                recovered.receipt().complete_cursor().after_sequence()
-            )
-            .await
-            .is_err(),
-        "a recovered historical cursor is evidence, not a claim that the old live journal survived"
+    let recovered_event_suffix = restarted
+        .events_after(
+            &session,
+            recovered.receipt().complete_cursor().after_sequence(),
+        )
+        .await
+        .expect("durable event journal survives Runtime restart")
+        .into_iter()
+        .take_while(|event| {
+            event.sequence <= recovered.receipt().complete_cursor().final_sequence()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovered_event_suffix, before_restart_events,
+        "the recovered cursor resolves to the exact durable event suffix"
     );
 
     let conflicting_snapshot =
