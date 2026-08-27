@@ -1,9 +1,11 @@
 //! Shared image/PDF/metadata helpers for read tools (grok_build, etc.).
 
+pub mod docx;
 pub mod image;
 pub mod metadata;
 pub mod pdf;
 pub mod pptx;
+pub mod xlsx;
 
 pub use metadata::{FileMetadata, bytes_to_metadata};
 pub use pdf::{PDF_MAX_PAGES_PER_READ, parse_page_range};

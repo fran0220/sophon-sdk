@@ -1,12 +1,13 @@
 /// Known binary file extensions — skip content reading for these.
-/// PDF is intentionally excluded since it has dedicated handling.
+/// PDF is intentionally excluded since it has dedicated handling, as are
+/// PPTX, DOCX and XLSX (extracted as text before the binary gate).
 ///
 /// NOTE: opencode has its own local copy of this list.
 pub const BINARY_EXTENSIONS: &[&str] = &[
-    "7z", "a", "avi", "avif", "bin", "bmp", "class", "dat", "dll", "doc", "docx", "dylib", "exe",
-    "gif", "gz", "ico", "jar", "jpeg", "jpg", "lib", "mov", "mp3", "mp4", "o", "obj", "odp", "ods",
-    "odt", "png", "ppt", "pyc", "pyd", "pyo", "qoi", "rar", "so", "tar", "tif", "tiff", "war",
-    "wasm", "webp", "xls", "xlsx", "zip",
+    "7z", "a", "avi", "avif", "bin", "bmp", "class", "dat", "dll", "doc", "dylib", "exe", "gif",
+    "gz", "ico", "jar", "jpeg", "jpg", "lib", "mov", "mp3", "mp4", "o", "obj", "odp", "ods", "odt",
+    "png", "ppt", "pyc", "pyd", "pyo", "qoi", "rar", "so", "tar", "tif", "tiff", "war", "wasm",
+    "webp", "xls", "zip",
 ];
 
 const SAMPLE_SIZE: usize = 8192;
@@ -77,6 +78,20 @@ mod tests {
             !is_binary("pptx", &[]),
             "pptx extension alone should not be binary"
         );
+    }
+
+    #[test]
+    fn docx_and_xlsx_not_in_binary_extensions() {
+        for ext in ["docx", "xlsx"] {
+            assert!(
+                !BINARY_EXTENSIONS.contains(&ext),
+                "{ext} must not be in BINARY_EXTENSIONS — it has dedicated handling"
+            );
+            assert!(
+                !is_binary(ext, &[]),
+                "{ext} extension alone should not be binary"
+            );
+        }
     }
 
     #[test]

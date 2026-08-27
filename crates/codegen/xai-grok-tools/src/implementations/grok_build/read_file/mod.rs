@@ -100,6 +100,50 @@ fn extract_pptx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
         .map_err(|e| format!("Failed to extract text from PPTX: {e}"))?;
     Ok(raw_text_to_file_content(text))
 }
+const MAX_DOCX_BYTES: usize = 50 * 1024 * 1024;
+const DOCX_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+async fn handle_docx(
+    file_bytes: Vec<u8>,
+    path: &std::path::Path,
+) -> Result<ReadFileOutput, xai_tool_runtime::ToolError> {
+    run_document_extraction(
+        file_bytes,
+        path,
+        "DOCX",
+        MAX_DOCX_BYTES,
+        DOCX_PROCESS_TIMEOUT,
+        extract_docx_text,
+    )
+    .await
+}
+/// Extract text from a DOCX file (zip + WordprocessingML text runs).
+fn extract_docx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
+    let text = crate::implementations::read_file::docx::extract_docx_text_from_bytes(&file_bytes)
+        .map_err(|e| format!("Failed to extract text from DOCX: {e}"))?;
+    Ok(raw_text_to_file_content(text))
+}
+const MAX_XLSX_BYTES: usize = 50 * 1024 * 1024;
+const XLSX_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+async fn handle_xlsx(
+    file_bytes: Vec<u8>,
+    path: &std::path::Path,
+) -> Result<ReadFileOutput, xai_tool_runtime::ToolError> {
+    run_document_extraction(
+        file_bytes,
+        path,
+        "XLSX",
+        MAX_XLSX_BYTES,
+        XLSX_PROCESS_TIMEOUT,
+        extract_xlsx_text,
+    )
+    .await
+}
+/// Extract text from an XLSX file (zip + SpreadsheetML cells, tab-separated).
+fn extract_xlsx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
+    let text = crate::implementations::read_file::xlsx::extract_xlsx_text_from_bytes(&file_bytes)
+        .map_err(|e| format!("Failed to extract text from XLSX: {e}"))?;
+    Ok(raw_text_to_file_content(text))
+}
 /// Description for default toolset (full/non-concise)
 pub(crate) const DESCRIPTION_FULL: &str = r#"Read a file.
 
@@ -107,7 +151,7 @@ Usage:
 - The ${{ params.read.target_file }} parameter can be a relative path in the workspace or an absolute path
 - By default, it reads up to {max_lines_read} lines starting from the beginning of the file
 - Line numbers (1-based) appear as anchors in the format LINE_NUMBER→LINE_CONTENT on the first returned line and on every 10th line of the file; the lines in between show content only. Count from the nearest anchor when referring to a specific line
-- This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
+- This tool can read PDF files (.pdf), PowerPoint files (.pptx), Word files (.docx), Excel files (.xlsx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
 - When reading an image file the contents are presented visually as this tool uses multimodal LLMs."#;
 /// Schema-only advertised default (runtime still treats omit as line 1 via unwrap_or).
 fn schema_default_offset() -> Option<i64> {
@@ -463,6 +507,12 @@ pub(crate) async fn run_read_file(
     }
     if extension == "pptx" {
         return handle_pptx(file_bytes, &path).await;
+    }
+    if extension == "docx" {
+        return handle_docx(file_bytes, &path).await;
+    }
+    if extension == "xlsx" {
+        return handle_xlsx(file_bytes, &path).await;
     }
     if crate::util::binary::is_binary(&extension, &file_bytes) {
         tracing::info!(
