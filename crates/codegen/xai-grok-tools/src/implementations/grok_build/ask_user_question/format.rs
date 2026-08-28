@@ -1,8 +1,7 @@
-//! Formatting functions for AskUserQuestion answer interjections.
+//! Formatting functions for AskUserQuestion tool results.
 //!
 //! Each function produces the **exact** model-visible string for one of the
-//! three answer paths. Dismissal and Turn settlement close an elicitation
-//! unanswered and therefore inject no synthetic user message.
+//! four user-action paths.
 //!
 //! The tests below pin the exact output strings and serve as the
 //! source-of-truth specification.
@@ -14,11 +13,33 @@ use indexmap::IndexMap;
 use super::Question;
 use super::types::QuestionAnnotation;
 
+// ── Path D: Cancel ──────────────────────────────────────────────────────
+
+/// Tool result text when the user cancels / dismisses the question UI.
+///
+/// Cancel is a normal user decision, not a tool failure, so this is a
+/// purpose-built message rather than a generic permission-denial string.
+pub const CANCEL_TEXT: &str = "User declined to answer the questions. Continue with the task using your best judgment, or ask different questions.";
+
+/// Tool result text for unanswered questionnaires in non-interactive sessions
+/// (headless `-p`, SDK): there is no user, so "user declined" would be a lie.
+pub const NO_OPERATOR_TEXT: &str = "No user is available to answer questions in this non-interactive session. Continue with your best judgment; do not wait for clarification.";
+
+/// Single source for the unanswered (cancel / timeout) tool result text, so
+/// the two paths cannot drift between interactive and non-interactive wording.
+pub fn unanswered_text(non_interactive: bool) -> &'static str {
+    if non_interactive {
+        NO_OPERATOR_TEXT
+    } else {
+        CANCEL_TEXT
+    }
+}
+
 // ── Path A: Accepted ────────────────────────────────────────────────────
 
-/// Format the answer interjection for Path A (user accepted and submitted answers).
+/// Format the tool result for Path A (user accepted and submitted answers).
 ///
-/// Produces the accepted-answers message:
+/// Produces the accepted-answers tool result:
 ///
 /// ```text
 /// User has answered your questions: "<q>"="<label>" ..., "<q>"="<label>" .... You can now continue with the user's answers in mind.
@@ -64,9 +85,9 @@ pub fn format_accepted_tool_result(
     )
 }
 
-// ── Alternate id-keyed answer formatting ────
+// ── Alternate id-keyed tool-result formatting ────
 
-/// Format the answer in the alternate id-keyed shape (Path A).
+/// Format the tool result in the alternate id-keyed shape (Path A).
 ///
 /// Answers are keyed by **id**, one question per line, with no trailing
 /// sentence:
@@ -154,7 +175,7 @@ pub fn format_id_keyed_accepted_tool_result(
 
 // ── Path B: Chat about this (plan mode) ─────────────────────────────────
 
-/// Format the answer for Path B ("Chat about this" / respond-to-agent).
+/// Format the tool result for Path B ("Chat about this" / respond-to-agent).
 ///
 /// Iterates ALL original questions. Answered questions show their label;
 /// unanswered questions show "(No answer provided)".
@@ -192,7 +213,7 @@ pub fn format_chat_about_this(
 
 // ── Path C: Skip interview (plan mode) ──────────────────────────────────
 
-/// Format the answer for Path C ("Skip interview and plan immediately").
+/// Format the tool result for Path C ("Skip interview and plan immediately").
 ///
 /// Same per-question format as Path B, but different header and NO indentation.
 pub fn format_skip_interview(

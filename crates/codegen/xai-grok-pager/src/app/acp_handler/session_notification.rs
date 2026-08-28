@@ -1295,7 +1295,7 @@ pub(super) fn handle_session_notification_with_origin(
                 true
             }
         }
-        XaiSessionUpdate::InteractionResolved { tool_call_id, .. } => {
+        XaiSessionUpdate::InteractionResolved { tool_call_id } => {
             agent.dismiss_resolved_interaction(&tool_call_id)
         }
         XaiSessionUpdate::SessionStatus(status) => {

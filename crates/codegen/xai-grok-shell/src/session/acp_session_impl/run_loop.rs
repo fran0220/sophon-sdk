@@ -193,19 +193,6 @@ pub(super) async fn run_session(
 ) {
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<super::tasks_cancel::TurnCompletionMsg>();
-    // Native compaction replay is a startup fence. In particular, install an
-    // already-published checkpoint before watchers, MCP startup, prompt-wake
-    // admission, or any command can observe or mutate the resumed Session.
-    // An uncertain observer/store outcome leaves the actor closed rather than
-    // manufacturing an ordinary resumed Session.
-    if let Err(error) = session.recover_native_compaction().await {
-        tracing::error!(
-            session_id = %session.session_info.id.0,
-            error = %error,
-            "native compaction recovery fenced Session startup"
-        );
-        return;
-    }
     let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
@@ -567,21 +554,8 @@ pub(super) async fn run_session(
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, origin_prompt_identity, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
-                            if session.compaction.cancel.is_applying() {
-                                if let Some(admission) = admission {
-                                    let _ = admission.respond_to.send(false);
-                                }
-                                let _ = respond_to.send(Err(acp::Error::internal_error().data(
-                                    "Session compaction is in progress",
-                                )));
-                                continue;
-                            }
-                            if let Err(error) = session.recover_native_compaction().await {
-                                let _ = respond_to.send(Err(error));
-                                continue;
-                            }
                             let (actor_admitted, task_wake_fallback) = match admission {
                                 Some(admission) => {
                                     let fallback = session
@@ -656,10 +630,7 @@ pub(super) async fn run_session(
                                 .queue_input(QueueInputRequest {
                                     prompt_blocks,
                                     prompt_id,
-                                    input_origin: InputOrigin::with_origin_prompt_identity(
-                                        origin,
-                                        origin_prompt_identity,
-                                    ),
+                                    input_origin: InputOrigin::new(origin),
                                     prompt_mode,
                                     trace_gcs_config,
                                     artifact_tracker,
@@ -786,22 +757,6 @@ pub(super) async fn run_session(
                                 .delete_scheduled_task(&task_id)
                                 .await
                                 .map_err(|e| e.to_string());
-                            let _ = respond_to.send(result);
-                        }
-                        SessionCommand::UpsertScheduledTask { request, respond_to } => {
-                            let result = session.agent.borrow().tool_bridge()
-                                .upsert_scheduled_task(request).await.map_err(|e| e.to_string());
-                            let _ = respond_to.send(result);
-                        }
-                        SessionCommand::DeliverScheduledTaskOccurrence { task_id, occurrence, respond_to } => {
-                            let result = session.agent.borrow().tool_bridge()
-                                .deliver_scheduled_task_occurrence(&task_id, occurrence)
-                                .await
-                                .map_err(|error| error.to_string());
-                            let _ = respond_to.send(result);
-                        }
-                        SessionCommand::ListScheduledTasks { respond_to } => {
-                            let result = session.agent.borrow().tool_bridge().list_scheduled_tasks().await;
                             let _ = respond_to.send(result);
                         }
                         SessionCommand::ListTasks { respond_to } => {
@@ -1072,36 +1027,11 @@ pub(super) async fn run_session(
                             }
                         }
                         SessionCommand::CompactSession { user_context, respond_to } => {
-                            // This extension is the out-of-Turn/manual ownership
-                            // path. A slash-command compaction runs inside the
-                            // claimed Turn itself; starting this detached path
-                            // while that task is live would both race Session
-                            // state and misattribute the compaction to that Turn.
-                            if session.state.lock().await.running_task.is_some() {
-                                let _ = respond_to.send(Err(acp::Error::internal_error().data(
-                                    "cannot start manual Session compaction while a Turn is running",
-                                )));
-                                continue;
-                            }
-                            if let Err(error) = session.recover_native_compaction().await {
-                                let _ = respond_to.send(Err(error));
-                                continue;
-                            }
-                            match session.compaction.cancel.try_begin_apply() {
-                                Some(permit) => {
-                                    let s = session.clone();
-                                    tokio::task::spawn_local(async move {
-                                        let compact_session =
-                                            s.run_compact_claimed(user_context, permit).await;
-                                        let _ = respond_to.send(compact_session);
-                                    });
-                                }
-                                None => {
-                                    let _ = respond_to.send(Err(acp::Error::internal_error().data(
-                                        "another Session compaction is already in progress",
-                                    )));
-                                }
-                            }
+                            let s = session.clone();
+                            tokio::task::spawn_local(async move {
+                                let compact_session = s.run_compact(user_context).await;
+                                let _ = respond_to.send(compact_session);
+                            });
                         }
                         SessionCommand::ReloadPlugins { registry } => {
                             // Eager fan-out: a plugin was added/removed/reloaded
@@ -1362,11 +1292,7 @@ pub(super) async fn run_session(
                         SessionCommand::UpdateAttachPolicy { startup_hints } => {
                             session.apply_attach_policy(&startup_hints);
                         }
-                        SessionCommand::UpdateMcpServers {
-                            mcp_servers,
-                            embedded_mcp,
-                            respond_to,
-                        } => {
+                        SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
                                     session_id = %session.session_info.id.0,
@@ -1394,25 +1320,11 @@ pub(super) async fn run_session(
                             // immediately after the in-memory swap
                             // completes — without holding the
                             // `mcp_state` lock across the emit.
-                            let (diff, dispatch_event_tx, generation) = {
+                            let (diff, dispatch_event_tx) = {
                                 let mut mcp_state = session.mcp_state.lock().await;
-                                let embedded_diff = embedded_mcp.and_then(|(servers, invoker)| {
-                                    mcp_state.update_acp_servers_diff(servers, invoker)
-                                });
-                                let external_diff = mcp_state.update_configs_diff(mcp_servers);
-                                let diff = match (embedded_diff, external_diff) {
-                                    (None, None) => None,
-                                    (Some(diff), None) | (None, Some(diff)) => Some(diff),
-                                    (Some(mut embedded), Some(external)) => {
-                                        embedded.added.extend(external.added);
-                                        embedded.removed.extend(external.removed);
-                                        embedded.retained.extend(external.retained);
-                                        Some(embedded)
-                                    }
-                                };
+                                let diff = mcp_state.update_configs_diff(mcp_servers);
                                 let tx = mcp_state.client_event_tx();
-                                let generation = mcp_state.generation();
-                                (diff, tx, generation)
+                                (diff, tx)
                             };
 
                             let Some(diff) = diff else {
@@ -1464,15 +1376,11 @@ pub(super) async fn run_session(
 
                             let session_for_mcp = session.clone();
                             tokio::task::spawn_local(async move {
-                                // The update response is scoped to this exact
-                                // generation. A later replacement cannot satisfy it.
-                                let result = session_for_mcp
-                                    .initialize_mcp_generation(generation)
-                                    .await;
-                                let _ = respond_to.send(result);
+                                session_for_mcp.ensure_mcp_tools_initialized().await;
+                                let _ = respond_to.send(Ok(()));
                             });
                         }
-                        SessionCommand::ToggleMcpServer { server_name, enabled, server_config, persist, respond_to } => {
+                        SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
                             session.events.emit(xai_grok_session_events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
@@ -1509,7 +1417,6 @@ pub(super) async fn run_session(
                             }
 
                             let diff = mcp_state.update_configs_diff(configs);
-                            let generation = mcp_state.generation();
                             // Snapshot the dispatcher
                             // sender BEFORE dropping the lock so the
                             // emit below survives any later mutation.
@@ -1559,20 +1466,13 @@ pub(super) async fn run_session(
                             let sname = server_name.clone();
                             let session_cwd = session.session_info.cwd.clone();
                             tokio::task::spawn_local(async move {
-                                let init_result = session_for_mcp
-                                    .initialize_mcp_generation(generation)
-                                    .await;
-                                if let Err(error) = init_result {
-                                    let _ = respond_to.send(Err(error));
-                                    return;
-                                }
-                                if persist
-                                    && let Err(e) = crate::util::config::save_mcp_server_enabled_in(
-                                        &sname,
-                                        enabled,
-                                        std::path::Path::new(&session_cwd),
-                                    )
-                                    .await
+                                session_for_mcp.ensure_mcp_tools_initialized().await;
+                                if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
+                                    &sname,
+                                    enabled,
+                                    std::path::Path::new(&session_cwd),
+                                )
+                                .await
                                 {
                                     tracing::warn!(
                                         server = sname.as_str(),
@@ -1583,7 +1483,7 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(Ok(()));
                             });
                         }
-                        SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, persist, respond_to } => {
+                        SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, respond_to } => {
                             if is_managed_gateway {
                                 let mut disabled_tools = crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(&session.session_info.cwd));
                                 if tool_name.is_empty() {
@@ -1638,11 +1538,10 @@ pub(super) async fn run_session(
                                     server_name.clone()
                                 };
                                 tokio::task::spawn_local(async move {
-                                    if persist
-                                        && let Err(e) = crate::util::config::save_mcp_disabled_tools(
-                                            &server_for_persist,
-                                            &disabled_vec,
-                                        ).await {
+                                    if let Err(e) = crate::util::config::save_mcp_disabled_tools(
+                                        &server_for_persist,
+                                        &disabled_vec,
+                                    ).await {
                                         tracing::warn!(
                                             server = server_for_persist.as_str(),
                                             error = %e,
@@ -1742,11 +1641,10 @@ pub(super) async fn run_session(
                             let session_id = session.session_info.id.0.clone();
                             let server_for_persist = server_name.clone();
                             tokio::task::spawn_local(async move {
-                                if persist
-                                    && let Err(e) = crate::util::config::save_mcp_disabled_tools(
-                                        &server_for_persist,
-                                        &disabled_vec,
-                                    ).await {
+                                if let Err(e) = crate::util::config::save_mcp_disabled_tools(
+                                    &server_for_persist,
+                                    &disabled_vec,
+                                ).await {
                                     tracing::warn!(
                                         server = server_for_persist.as_str(),
                                         error = %e,
@@ -1841,42 +1739,6 @@ pub(super) async fn run_session(
                                     &mcp_state,
                                     &server_name,
                                     &uri,
-                                ).await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        SessionCommand::McpPrimitive { server_name, operation, respond_to } => {
-                            let mcp_state = session.mcp_state.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = crate::extensions::mcp::run_mcp_primitive(
-                                    &mcp_state, &server_name, operation,
-                                ).await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        SessionCommand::McpModernOperation { server_name, operation, respond_to } => {
-                            let mcp_state = session.mcp_state.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = crate::extensions::mcp::run_mcp_modern_operation(
-                                    &mcp_state, &server_name, operation,
-                                ).await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        SessionCommand::McpModernSubscribe { server_name, filter, capacity, respond_to } => {
-                            let mcp_state = session.mcp_state.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = crate::extensions::mcp::start_mcp_modern_subscription(
-                                    &mcp_state, &server_name, filter, capacity,
-                                ).await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        SessionCommand::McpDomainNotificationSubscribe { server_name, methods, capacity, respond_to } => {
-                            let mcp_state = session.mcp_state.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = crate::extensions::mcp::start_mcp_domain_notification_subscription(
-                                    &mcp_state, &server_name, methods, capacity,
                                 ).await;
                                 let _ = respond_to.send(result);
                             });

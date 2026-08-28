@@ -19,8 +19,6 @@ pub enum WebSearchConfig {
         model: String,
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         extra_headers: IndexMap<String, String>,
-        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-        query_params: Box<IndexMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
         /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
@@ -56,7 +54,6 @@ impl WebSearchConfig {
                 base_url,
                 model,
                 extra_headers,
-                query_params,
                 allowed_domains,
                 excluded_domains,
                 ..
@@ -65,7 +62,6 @@ impl WebSearchConfig {
                 base_url: base_url.clone(),
                 model: model.clone(),
                 extra_headers: extra_headers.clone(),
-                query_params: query_params.clone(),
                 alpha_test_key: None,
                 allowed_domains: allowed_domains.clone(),
                 excluded_domains: excluded_domains.clone(),
@@ -91,7 +87,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -108,7 +103,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: headers,
-            query_params: Box::default(),
             alpha_test_key: Some("alpha-secret".to_string()),
             allowed_domains: Some(vec!["docs.x.ai".to_string()]),
             excluded_domains: None,
@@ -120,7 +114,6 @@ mod tests {
                 base_url,
                 model,
                 extra_headers,
-                query_params,
                 alpha_test_key,
                 allowed_domains,
                 excluded_domains,
@@ -129,7 +122,6 @@ mod tests {
                 assert_eq!(base_url, "https://api.x.ai/v1");
                 assert_eq!(model, "test-web-search-model");
                 assert_eq!(extra_headers.get("X-Custom").unwrap(), "value");
-                assert!(query_params.is_empty());
                 assert!(alpha_test_key.is_none());
                 // Domain filters survive redaction (not secrets).
                 assert_eq!(allowed_domains, Some(vec!["docs.x.ai".to_string()]));
@@ -146,7 +138,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,

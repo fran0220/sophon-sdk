@@ -3,7 +3,7 @@
 //! points take the handle rather than reach for a global.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use agent_client_protocol as acp;
@@ -180,18 +180,10 @@ impl SessionSource for JsonlSessionSource {
 }
 
 pub fn notify_session_updated(index: Option<&SearchIndexManager>, session_id: &str, cwd: &str) {
-    notify_session_updated_in_root(index, crate::util::grok_home::grok_home(), session_id, cwd);
-}
-
-pub(crate) fn notify_session_updated_in_root(
-    index: Option<&SearchIndexManager>,
-    root: PathBuf,
-    session_id: &str,
-    cwd: &str,
-) {
     let Some(index) = index else {
         return;
     };
+    let root = crate::util::grok_home::grok_home();
     index.enqueue(root, session_id.to_string(), cwd.to_string());
 }
 

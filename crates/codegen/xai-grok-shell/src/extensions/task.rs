@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use xai_grok_tools::types::{KillOutcome, KillSource, TaskSnapshot};
 
 use xai_grok_tools::implementations::grok_build::task::types::{
-    ActiveAgentMessageOutcome, SubagentCancelOutcome, SubagentInspection, SubagentProvenance,
-    SubagentSnapshot, SubagentSnapshotStatus,
+    SubagentCancelOutcome, SubagentInspection, SubagentProvenance, SubagentSnapshot,
+    SubagentSnapshotStatus,
 };
 
 use crate::agent::MvpAgent;
@@ -128,76 +128,6 @@ pub struct CancelSubagentResponse {
     /// Typed outcome; `None` only from an older shell. This shell always sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<SubagentCancelOutcomeDto>,
-}
-
-/// Wire DTO for the `x.ai/subagent/send` request. The root session identity is
-/// required because the coordinator only admits messages to descendants owned
-/// by that session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendSubagentMessageRequest {
-    pub session_id: String,
-    pub subagent_id: String,
-    pub text: String,
-}
-
-/// Wire mirror of the coordinator's closed active-message outcome. In
-/// particular, callers can distinguish definite rejection from uncertain
-/// admission and avoid unsafe retries.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SendSubagentMessageOutcomeDto {
-    Accepted {
-        message_id: String,
-    },
-    NotFoundOrNotOwned,
-    NotActiveOrFinalizing,
-    Saturated {
-        max_in_flight: usize,
-    },
-    AdmissionUncertain,
-    NotAcceptedBeforeDeadline,
-    Unsupported,
-    Limit {
-        max_bytes: usize,
-        observed_bytes: usize,
-    },
-    ChannelClosed,
-    /// Forward-compatible fallback. Never produced by this shell.
-    #[serde(other)]
-    Unknown,
-}
-
-impl From<ActiveAgentMessageOutcome> for SendSubagentMessageOutcomeDto {
-    fn from(outcome: ActiveAgentMessageOutcome) -> Self {
-        match outcome {
-            ActiveAgentMessageOutcome::Accepted { message_id } => Self::Accepted { message_id },
-            ActiveAgentMessageOutcome::NotFoundOrNotOwned => Self::NotFoundOrNotOwned,
-            ActiveAgentMessageOutcome::NotActiveOrFinalizing => Self::NotActiveOrFinalizing,
-            ActiveAgentMessageOutcome::Saturated { max_in_flight } => {
-                Self::Saturated { max_in_flight }
-            }
-            ActiveAgentMessageOutcome::AdmissionUncertain => Self::AdmissionUncertain,
-            ActiveAgentMessageOutcome::NotAcceptedBeforeDeadline => Self::NotAcceptedBeforeDeadline,
-            ActiveAgentMessageOutcome::Unsupported => Self::Unsupported,
-            ActiveAgentMessageOutcome::Limit {
-                max_bytes,
-                observed_bytes,
-            } => Self::Limit {
-                max_bytes,
-                observed_bytes,
-            },
-            ActiveAgentMessageOutcome::ChannelClosed => Self::ChannelClosed,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SendSubagentMessageResponse {
-    pub subagent_id: String,
-    pub outcome: SendSubagentMessageOutcomeDto,
 }
 
 // ── Subagent list_running DTOs ────────────────────────────────────────────
@@ -479,190 +409,9 @@ struct DeleteScheduledTaskResponse {
     deleted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpsertScheduledTaskRequest {
-    session_id: String,
-    #[serde(default)]
-    task_id: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    wake_source: Option<
-        xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput,
-    >,
-    #[serde(default)]
-    durable: Option<bool>,
-    #[serde(default)]
-    foreground: Option<bool>,
-}
-impl From<UpsertScheduledTaskRequest>
-    for xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput
-{
-    fn from(request: UpsertScheduledTaskRequest) -> Self {
-        Self {
-            task_id: request.task_id,
-            prompt: request.prompt,
-            wake_source: request.wake_source,
-            durable: request.durable,
-            foreground: request.foreground,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListScheduledTasksRequest {
-    session_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScheduledTaskDto {
-    id: String,
-    prompt: String,
-    wake_source: ScheduledWakeSourceDto,
-    durable: bool,
-    foreground: bool,
-    created_at: String,
-    last_fired_at: Option<String>,
-    expires_at: Option<String>,
-    last_subagent: Option<String>,
-    next_fire_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-enum ScheduledWakeSourceDto {
-    Recurrence {
-        interval_seconds: u64,
-        recurring: bool,
-    },
-    ExternalEvent {
-        service: String,
-        event: String,
-        recurring: bool,
-    },
-    ProcessSettlement {
-        process_id: String,
-        command: String,
-    },
-}
-
-impl From<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource>
-    for ScheduledWakeSourceDto
-{
-    fn from(
-        source: xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource,
-    ) -> Self {
-        use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerWakeSource;
-        match source {
-            SchedulerWakeSource::Recurrence {
-                interval_secs,
-                recurring,
-            } => Self::Recurrence {
-                interval_seconds: interval_secs,
-                recurring,
-            },
-            SchedulerWakeSource::ExternalEvent {
-                service,
-                event,
-                recurring,
-            } => Self::ExternalEvent {
-                service,
-                event,
-                recurring,
-            },
-            SchedulerWakeSource::ProcessSettlement {
-                process_id,
-                command,
-            } => Self::ProcessSettlement {
-                process_id,
-                command,
-            },
-        }
-    }
-}
-
-impl From<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>
-    for ScheduledTaskDto
-{
-    fn from(
-        t: xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
-    ) -> Self {
-        Self {
-            next_fire_at: t.next_fire_at().map(|value| value.to_rfc3339()),
-            id: t.id,
-            prompt: t.prompt,
-            wake_source: t.wake_source.into(),
-            durable: t.durable,
-            foreground: t.foreground,
-            created_at: t.created_at.to_rfc3339(),
-            last_fired_at: t.last_fired_at.map(|v| v.to_rfc3339()),
-            expires_at: t.expires_at.map(|v| v.to_rfc3339()),
-            last_subagent: t.last_subagent_id,
-        }
-    }
-}
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpsertScheduledTaskResponse {
-    task: ScheduledTaskDto,
-    updated: bool,
-}
-#[derive(Debug, Clone, Serialize)]
-struct ListScheduledTasksResponse {
-    tasks: Vec<ScheduledTaskDto>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliverScheduledTaskRequest {
-    session_id: String,
-    task_id: String,
-    occurrence: String,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliverScheduledTaskResponse {
-    task_id: String,
-    occurrence: String,
-    accepted: bool,
-}
-
 /// Handle `x.ai/scheduler/*` extension methods.
 pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
-        "x.ai/scheduler/create" => {
-            let req: UpsertScheduledTaskRequest = parse(args)?;
-            let session_id = req.session_id.clone();
-            respond(
-                agent
-                    .upsert_scheduled_task(&session_id, req.into())
-                    .await
-                    .map(|(task, updated)| UpsertScheduledTaskResponse {
-                        task: task.into(),
-                        updated,
-                    }),
-            )
-        }
-        "x.ai/scheduler/list" => {
-            let req: ListScheduledTasksRequest = parse(args)?;
-            respond(
-                agent
-                    .list_scheduled_tasks(&req.session_id)
-                    .await
-                    .map(|tasks| ListScheduledTasksResponse {
-                        tasks: tasks.into_iter().map(Into::into).collect(),
-                    }),
-            )
-        }
         "x.ai/scheduler/delete" => {
             let req: DeleteScheduledTaskRequest = parse(args)?;
             let result = agent
@@ -674,26 +423,6 @@ pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -
                 });
             respond(result)
         }
-        "x.ai/scheduler/deliver" => {
-            let request: DeliverScheduledTaskRequest = parse(args)?;
-            let occurrence = xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence {
-                id: request.occurrence.clone(),
-                detail: request.detail,
-            };
-            let result = agent
-                .deliver_scheduled_task_occurrence(
-                    &request.session_id,
-                    request.task_id.clone(),
-                    occurrence,
-                )
-                .await
-                .map(|accepted| DeliverScheduledTaskResponse {
-                    task_id: request.task_id,
-                    occurrence: request.occurrence,
-                    accepted,
-                });
-            respond(result)
-        }
         _ => Err(acp::Error::method_not_found()),
     }
 }
@@ -701,16 +430,6 @@ pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -
 /// Handle `x.ai/subagent/*` extension methods.
 pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
-        "x.ai/subagent/send" => {
-            let req: SendSubagentMessageRequest = parse(args)?;
-            let outcome = agent
-                .send_subagent_message(&req.session_id, &req.subagent_id, req.text)
-                .await;
-            respond(Ok::<_, String>(SendSubagentMessageResponse {
-                subagent_id: req.subagent_id,
-                outcome: outcome.into(),
-            }))
-        }
         "x.ai/subagent/cancel" => {
             let req: CancelSubagentRequest = parse(args)?;
             tracing::info!(subagent_id = %req.subagent_id, "Cancelling subagent via ext method");
@@ -800,30 +519,6 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("should serialize");
         assert_eq!(json["taskId"], "task-42");
         assert_eq!(json["deleted"], true);
-    }
-
-    #[test]
-    fn upsert_scheduled_task_request_preserves_camel_case_update_id() {
-        let request: UpsertScheduledTaskRequest = serde_json::from_value(serde_json::json!({
-            "sessionId": "sess-1",
-            "taskId": "task-42",
-            "wakeSource": {
-                "kind": "recurrence",
-                "interval": "10m",
-                "recurring": true,
-                "fireImmediately": false
-            },
-            "prompt": "inspect the update"
-        }))
-        .expect("should parse");
-        assert_eq!(request.session_id, "sess-1");
-        let input: xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput = request.into();
-        assert_eq!(input.task_id.as_deref(), Some("task-42"));
-        assert_eq!(input.prompt.as_deref(), Some("inspect the update"));
-        assert!(matches!(
-            input.wake_source,
-            Some(xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput::Recurrence { interval, .. }) if interval == "10m"
-        ));
     }
 
     #[test]
@@ -1221,35 +916,5 @@ mod tests {
         assert_eq!(resp.subagent_id, "sa-1");
         assert!(resp.cancelled);
         assert!(resp.outcome.is_none());
-    }
-
-    #[test]
-    fn send_subagent_message_wire_preserves_delivery_certainty() {
-        let req: SendSubagentMessageRequest = serde_json::from_str(
-            r#"{"sessionId":"parent","subagentId":"child","text":"follow up"}"#,
-        )
-        .expect("parse send request");
-        assert_eq!(req.session_id, "parent");
-        assert_eq!(req.subagent_id, "child");
-        assert_eq!(req.text, "follow up");
-
-        let response = SendSubagentMessageResponse {
-            subagent_id: "child".into(),
-            outcome: ActiveAgentMessageOutcome::AdmissionUncertain.into(),
-        };
-        let json = serde_json::to_value(response).expect("serialize response");
-        assert_eq!(json["subagentId"], "child");
-        assert_eq!(json["outcome"]["kind"], "admission_uncertain");
-
-        let accepted: SendSubagentMessageOutcomeDto = ActiveAgentMessageOutcome::Accepted {
-            message_id: "msg-1".into(),
-        }
-        .into();
-        assert_eq!(
-            accepted,
-            SendSubagentMessageOutcomeDto::Accepted {
-                message_id: "msg-1".into()
-            }
-        );
     }
 }

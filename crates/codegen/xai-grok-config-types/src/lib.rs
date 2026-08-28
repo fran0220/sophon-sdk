@@ -808,6 +808,15 @@ pub struct RemoteSettings {
     /// allow_background_operator` is set; absent → client default (allow).
     #[serde(default)]
     pub allow_background_operator: Option<bool>,
+    /// remote settings fallback for `[toolset.ask_user_question] timeout_enabled`.
+    /// When `Some(false)`, questionnaires wait forever unless a higher tier
+    /// (requirements / env / user / managed config) sets otherwise.
+    #[serde(default)]
+    pub ask_user_question_timeout_enabled: Option<bool>,
+    /// remote settings fallback for `[toolset.ask_user_question] timeout_secs`
+    /// (positive seconds). Absent → client default (1800 / 30 minutes).
+    #[serde(default)]
+    pub ask_user_question_timeout_secs: Option<u64>,
     /// When `Some(true)`, a completed subagent's isolated worktree is snapshotted
     /// into a durable git ref and its directory deleted (resume rehydrates from
     /// the ref). Fallback when no local `[features] subagent_worktree_snapshot`

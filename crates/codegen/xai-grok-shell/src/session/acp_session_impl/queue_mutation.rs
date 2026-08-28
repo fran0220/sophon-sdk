@@ -4,49 +4,27 @@ use super::*;
 use xai_agent_lifecycle::{InputPolicy, QueuePolicy, ShutdownPolicy};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InputOrigin {
-    prompt_origin: PromptOrigin,
-    origin_prompt_identity: Option<crate::session::commands::OriginPromptIdentity>,
-}
+pub(crate) struct InputOrigin(PromptOrigin);
 
 impl InputOrigin {
     pub(crate) fn from_prompt_id(prompt_id: &str) -> Self {
-        Self::new(PromptOrigin::from_prompt_id(prompt_id))
+        Self(PromptOrigin::from_prompt_id(prompt_id))
     }
 
     pub(crate) const fn new(origin: PromptOrigin) -> Self {
-        Self {
-            prompt_origin: origin,
-            origin_prompt_identity: None,
-        }
-    }
-
-    pub(crate) const fn with_origin_prompt_identity(
-        origin: PromptOrigin,
-        origin_prompt_identity: Option<crate::session::commands::OriginPromptIdentity>,
-    ) -> Self {
-        Self {
-            prompt_origin: origin,
-            origin_prompt_identity,
-        }
+        Self(origin)
     }
 
     pub(crate) fn policy(&self) -> InputPolicy {
-        self.prompt_origin.policy()
+        self.0.policy()
     }
 
     pub(crate) const fn as_prompt_origin(&self) -> &PromptOrigin {
-        &self.prompt_origin
-    }
-
-    pub(crate) const fn origin_prompt_identity(
-        &self,
-    ) -> Option<&crate::session::commands::OriginPromptIdentity> {
-        self.origin_prompt_identity.as_ref()
+        &self.0
     }
 
     pub(crate) fn is_synthetic(&self) -> bool {
-        self.prompt_origin.is_synthetic()
+        self.0.is_synthetic()
     }
 
     pub(crate) fn is_preemptible_runtime_wake(&self) -> bool {
@@ -54,7 +32,7 @@ impl InputOrigin {
     }
 
     pub(crate) fn completion_id(&self) -> Option<&str> {
-        self.prompt_origin.completion_id()
+        self.0.completion_id()
     }
 }
 

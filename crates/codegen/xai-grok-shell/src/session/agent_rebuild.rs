@@ -49,7 +49,7 @@ use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::app_builder::AppBuilderDeployerConfig;
-use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionCommand;
+use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::types::{SubagentEvent, TaskModelValidator};
@@ -68,6 +68,8 @@ use xai_grok_tools::types::memory_backend::MemoryBackend;
 pub(crate) struct ResolvedToolParamsJson {
     /// `[toolset.bash]` overrides for the bash tool(s).
     pub bash: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `[toolset.ask_user_question]` timeout policy for the ask tool.
+    pub ask_user_question: Option<serde_json::Map<String, serde_json::Value>>,
 }
 /// Cached recipe for building a session-scoped [`Agent`].
 ///
@@ -76,11 +78,6 @@ pub(crate) struct ResolvedToolParamsJson {
 /// derived — the spec lives behind an [`Arc`] and is shared by clone of
 /// that `Arc`.
 pub(crate) struct AgentRebuildSpec {
-    pub origin_embedded: bool,
-    /// MCP sources a live re-merge (plugin reload) may consult for this
-    /// session. `CallerDeclared` for an embedded runtime, whose host owns the
-    /// catalog, `Ambient` for the CLI.
-    pub mcp_source_scope: crate::session::managed_mcp::McpSourceScope,
     pub working_directory: PathBuf,
     pub terminal_backend: Arc<dyn TerminalBackend>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
@@ -131,7 +128,7 @@ pub(crate) struct AgentRebuildSpec {
         xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     >,
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
-    pub user_question_tx: UnboundedSender<UserQuestionCommand>,
+    pub user_question_tx: UnboundedSender<UserQuestionRequest>,
     pub subagent_depth: u32,
     pub subagents_max_depth: u32,
     pub session_id_str: String,
@@ -199,8 +196,6 @@ impl AgentRebuildSpec {
     ) -> Result<(Agent, std::time::Duration), AgentBuildError> {
         let build_phase_start = std::time::Instant::now();
         let Self {
-            origin_embedded: _,
-            mcp_source_scope: _,
             working_directory,
             terminal_backend,
             fs_backend,
@@ -343,6 +338,9 @@ impl AgentRebuildSpec {
         if let Some(bash_params_json) = tool_params_json.bash.clone() {
             builder = builder.with_bash_params(bash_params_json);
         }
+        if let Some(ask_user_question_params_json) = tool_params_json.ask_user_question.clone() {
+            builder = builder.with_ask_user_question_params(ask_user_question_params_json);
+        }
         if let Some(prompt_working_directory) = prompt_working_directory.clone() {
             builder = builder.with_prompt_working_directory(prompt_working_directory);
         }
@@ -444,8 +442,6 @@ impl AgentRebuildSpec {
 pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
     let (uq_tx, _uq_rx) = tokio::sync::mpsc::unbounded_channel();
     Arc::new(AgentRebuildSpec {
-        origin_embedded: false,
-        mcp_source_scope: crate::session::managed_mcp::McpSourceScope::Ambient,
         working_directory: std::env::temp_dir(),
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(
@@ -565,7 +561,6 @@ mod tests {
                 base_url: "https://api.x.ai/v1".to_string(),
                 model: "grok-4".to_string(),
                 extra_headers: Default::default(),
-                query_params: Default::default(),
                 alpha_test_key: None,
                 allowed_domains: None,
                 excluded_domains: None,

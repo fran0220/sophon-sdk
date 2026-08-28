@@ -26,36 +26,6 @@ async fn create_test_actor(
     gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
     persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
 ) -> SessionActor {
-    // Most shell tests exercise the legacy/no-observer path without a
-    // persistence actor. Keep that path explicit while still driving the
-    // same request/ack channel used in production.
-    let (actor_persistence_tx, mut actor_persistence_rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_local(async move {
-        while let Some(message) = actor_persistence_rx.recv().await {
-            match message {
-                PersistenceMsg::BeginNativeCompaction { respond_to, .. } => {
-                    let _ = respond_to.send(Ok(
-                        crate::session::state_authority::NativeCompactionBegin::Disabled,
-                    ));
-                }
-                PersistenceMsg::RecoverNativeCompaction { respond_to } => {
-                    let _ = respond_to.send(Ok(
-                        crate::session::state_authority::NativeCompactionRecovery::None,
-                    ));
-                }
-                PersistenceMsg::NativeCompactionNotApplied { respond_to, .. }
-                | PersistenceMsg::PublishNativeCompaction { respond_to, .. }
-                | PersistenceMsg::NativeCompactionApplied { respond_to, .. } => {
-                    let _ = respond_to.send(Err(
-                        crate::session::state_authority::NativeCompactionError::disabled(),
-                    ));
-                }
-                message => {
-                    let _ = persistence_tx.send(message);
-                }
-            }
-        }
-    });
     let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
     let fs = Arc::new(MockFs::new(cwd.to_path_buf()));
     let terminal = Arc::new(DummyTerminal {});
@@ -91,7 +61,6 @@ async fn create_test_actor(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
-            auth_scheme: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -108,8 +77,6 @@ async fn create_test_actor(
     SessionActor {
         status_wake: Default::default(),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
-        projects_chat_history: true,
-        origin_prompt_identities: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-auto-compact"),
             cwd: cwd.as_str().to_string(),
@@ -123,7 +90,7 @@ async fn create_test_actor(
         notifications: NotificationSender {
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            persistence_tx: actor_persistence_tx,
+            persistence_tx,
             disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: PermissionHandle::allow_all(),
@@ -192,7 +159,6 @@ async fn create_test_actor(
         rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
-        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: None,
         dream_check_timeout: None,
@@ -299,7 +265,6 @@ async fn create_test_actor(
         sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-        transcribe_user_images: false,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
@@ -1311,192 +1276,6 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
             assert!(
                 !saw_failure,
                 "successful compaction must not emit AutoCompactFailed"
-            );
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn native_intent_rejection_prevents_the_first_model_call_and_state_change() {
-    use xai_grok_test_support::MockInferenceServer;
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let mut actor =
-                create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
-            let server = MockInferenceServer::start().await.unwrap();
-            server.set_response("summary that must never be requested");
-            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            config.base_url = server.url();
-            actor.chat_state_handle.update_sampling_config(config);
-            let original = vec![
-                ConversationItem::system("system"),
-                ConversationItem::user("work to compact"),
-            ];
-            actor
-                .chat_state_handle
-                .replace_conversation(original.clone());
-            let (native_tx, mut native_rx) = mpsc::unbounded_channel();
-            actor.notifications.persistence_tx = native_tx;
-            let actor = Arc::new(actor);
-            let authority = tokio::task::spawn_local(async move {
-                let Some(PersistenceMsg::BeginNativeCompaction { input, respond_to }) =
-                    native_rx.recv().await
-                else {
-                    panic!("intent must be the first native authority operation")
-                };
-                assert!(matches!(
-                    input.owner,
-                    crate::session::state_authority::NativeCompactionOwner::Session
-                ));
-                let _ = respond_to.send(Err(
-                    crate::session::state_authority::NativeCompactionError {
-                        kind: crate::session::state_authority::NativeCompactionErrorKind::Rejected,
-                        message: "rejected by test observer".into(),
-                    },
-                ));
-                assert!(
-                    native_rx.recv().await.is_none(),
-                    "rejection must not publish or report an outcome"
-                );
-            });
-
-            assert!(actor.run_compact(None).await.is_err());
-            assert_eq!(
-                serde_json::to_value(actor.chat_state_handle.get_conversation().await).unwrap(),
-                serde_json::to_value(&original).unwrap(),
-                "intent rejection must not mutate the Session conversation"
-            );
-            drop(actor);
-            authority.await.unwrap();
-            assert!(!server.has_chat_completion_request());
-            assert!(!server.has_responses_request());
-            assert_eq!(server.messages_request_count(), 0);
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn native_checkpoint_is_prefix_finalized_before_publish_and_exactly_installed() {
-    use crate::extensions::notification::CompactionCheckpointFile;
-    use xai_grok_test_support::MockInferenceServer;
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let mut actor =
-                create_test_actor(0, 200_000, 85, gateway_tx, persistence_tx).await;
-            let server = MockInferenceServer::start().await.unwrap();
-            server.set_response("Authoritative compacted summary. ".repeat(30));
-            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            config.base_url = server.url();
-            actor.chat_state_handle.update_sampling_config(config);
-            let original = vec![
-                ConversationItem::system("system"),
-                ConversationItem::user("inherited parent"),
-                ConversationItem::assistant("parent answer"),
-                ConversationItem::user("child work"),
-            ];
-            actor.startup_hints.inherited_prefix_len = Some(3);
-            actor.chat_state_handle.replace_conversation(original.clone());
-
-            let state = actor.chat_state_handle.clone();
-            let expected: Arc<
-                std::sync::Mutex<Option<Vec<ConversationItem>>>,
-            > = Arc::new(std::sync::Mutex::new(None));
-            let expected_for_authority = expected.clone();
-            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-            let (native_tx, mut native_rx) = mpsc::unbounded_channel();
-            actor.notifications.persistence_tx = native_tx;
-            let actor = Arc::new(actor);
-            let original_for_authority = original.clone();
-            tokio::task::spawn_local(async move {
-                while let Some(message) = native_rx.recv().await {
-                    match message {
-                        PersistenceMsg::BeginNativeCompaction { respond_to, .. } => {
-                            events_tx.send("intent").unwrap();
-                            let _ = respond_to.send(Ok(
-                                crate::session::state_authority::NativeCompactionBegin::Acknowledged {
-                                    compaction_id: "cmp-shell-order".into(),
-                                },
-                            ));
-                        }
-                        PersistenceMsg::PublishNativeCompaction {
-                            publication,
-                            respond_to,
-                        } => {
-                            assert_eq!(
-                                serde_json::to_value(state.get_conversation().await).unwrap(),
-                                serde_json::to_value(&original_for_authority).unwrap(),
-                            );
-                            let checkpoint: CompactionCheckpointFile =
-                                serde_json::from_slice(&publication.payload).unwrap();
-                            *expected_for_authority.lock().unwrap() =
-                                Some(checkpoint.compacted_history);
-                            events_tx.send("publication").unwrap();
-                            let _ = respond_to.send(Ok(()));
-                        }
-                        PersistenceMsg::NativeCompactionApplied { respond_to, .. } => {
-                            let installed = state.get_conversation().await;
-                            assert_eq!(
-                                serde_json::to_value(&installed).unwrap(),
-                                serde_json::to_value(
-                                    expected_for_authority
-                                        .lock()
-                                        .unwrap()
-                                        .as_ref()
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                                "the exact proven checkpoint state must be installed"
-                            );
-                            assert_eq!(
-                                state.get_last_compaction_prompt_index().await,
-                                None,
-                                "ancillary continuation must wait for the Host outcome ack"
-                            );
-                            events_tx.send("outcome").unwrap();
-                            let _ = respond_to.send(Ok(()));
-                        }
-                        PersistenceMsg::NativeCompactionNotApplied {
-                            reason,
-                            respond_to,
-                            ..
-                        } => {
-                            let _ = respond_to.send(Ok(()));
-                            panic!("model attempt unexpectedly ended NotApplied: {reason:?}");
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            actor.run_compact(None).await.unwrap();
-            assert_eq!(events_rx.recv().await, Some("intent"));
-            assert_eq!(events_rx.recv().await, Some("publication"));
-            assert_eq!(events_rx.recv().await, Some("outcome"));
-            let installed = actor.chat_state_handle.get_conversation().await;
-            assert_eq!(
-                serde_json::to_value(&installed).unwrap(),
-                serde_json::to_value(expected.lock().unwrap().as_ref().unwrap()).unwrap(),
-            );
-            assert_eq!(
-                serde_json::to_value(&installed[1]).unwrap(),
-                serde_json::to_value(&original[1]).unwrap(),
-            );
-            assert_eq!(
-                serde_json::to_value(&installed[2]).unwrap(),
-                serde_json::to_value(&original[2]).unwrap(),
-            );
-            assert_eq!(
-                actor.chat_state_handle.get_last_compaction_prompt_index().await,
-                Some(0),
-                "ancillary continuation runs only after outcome acknowledgement"
             );
         })
         .await;

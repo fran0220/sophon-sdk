@@ -56,7 +56,6 @@ pub(crate) const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 /// Method name for the ACP push.
 pub const SERVER_STATUS_METHOD: &str = "x.ai/mcp/server_status";
-pub const TASK_STATUS_METHOD: &str = "x.ai/mcp/task_status";
 
 /// JSON payload pushed over ACP. Fields written in camelCase per ACP
 /// convention.
@@ -99,7 +98,6 @@ pub enum McpServerStatus {
     /// disabled/unconfigured.
     Unavailable,
     /// OAuth required but not yet acquired.
-    #[serde(alias = "needs_auth")]
     NeedsAuth,
 }
 
@@ -257,9 +255,7 @@ pub(crate) struct CoalescedWindow {
     /// All `TransportClosed` client identities per server seen in the
     /// window.
     pub closed: HashMap<McpServerName, HashSet<u64>>,
-    /// Task updates are ordered and never coalesced: different Tasks on the
-    /// same server must not overwrite one another inside the status window.
-    pub task_statuses: Vec<McpClientEvent>,
+    pub completes: Vec<(McpServerName, String)>,
 }
 
 /// Coalesce the buffered events for one window flush.
@@ -312,9 +308,6 @@ pub(crate) async fn collect_window(
 /// [`CoalescedWindow::closed`] (see that field's doc).
 fn insert_event(win: &mut CoalescedWindow, ev: McpClientEvent) {
     match ev {
-        event @ McpClientEvent::TaskStatus { .. } => {
-            win.task_statuses.push(event);
-        }
         McpClientEvent::ConfigDiff { added, removed } => {
             for name in added {
                 win.buf.insert(
@@ -328,6 +321,12 @@ fn insert_event(win: &mut CoalescedWindow, ev: McpClientEvent) {
                     McpClientEvent::ConfigRemoved { server: name },
                 );
             }
+        }
+        McpClientEvent::ElicitationComplete {
+            server,
+            elicitation_id,
+        } => {
+            win.completes.push((server, elicitation_id));
         }
         ev => {
             if let McpClientEvent::TransportClosed { server, client_id } = &ev {
@@ -364,8 +363,7 @@ fn kind_of(ev: &McpClientEvent) -> McpClientEventKind {
         McpClientEvent::HandshakeFailed { .. } => McpClientEventKind::HandshakeFailed,
         McpClientEvent::ToolsChanged { .. } => McpClientEventKind::ToolsChanged,
         McpClientEvent::ResourcesChanged { .. } => McpClientEventKind::ResourcesChanged,
-        McpClientEvent::PromptsChanged { .. } => McpClientEventKind::PromptsChanged,
-        McpClientEvent::TaskStatus { .. } => McpClientEventKind::TaskStatus,
+        McpClientEvent::ElicitationComplete { .. } => McpClientEventKind::ElicitationComplete,
         McpClientEvent::Ready { .. } => McpClientEventKind::Ready,
         McpClientEvent::ConfigAdded { .. } => McpClientEventKind::ConfigAdded,
         McpClientEvent::ConfigRemoved { .. } => McpClientEventKind::ConfigRemoved,
@@ -414,19 +412,16 @@ pub(crate) fn build_payload(
             McpServerStatusReason::ConfigChanged,
             None,
         ),
+        // Diverted into `CoalescedWindow::completes` by `insert_event`,
+        // so this kind never appears in `buf`.
+        (McpClientEventKind::ElicitationComplete, _) => {
+            unreachable!("ElicitationComplete is diverted into win.completes by insert_event")
+        }
         (McpClientEventKind::ResourcesChanged, _) => (
             McpServerStatus::Ready,
             McpServerStatusReason::ConfigChanged,
             None,
         ),
-        (McpClientEventKind::PromptsChanged, _) => (
-            McpServerStatus::Ready,
-            McpServerStatusReason::ConfigChanged,
-            None,
-        ),
-        (McpClientEventKind::TaskStatus, _) => {
-            unreachable!("TaskStatus events bypass MCP server-status projection")
-        }
         // `Ready` is only emitted from the first-time
         // `ensure_initialized` path. Map it to `Initialized`, NOT
         // `RestartSucceeded` (which is reserved for the
@@ -457,68 +452,6 @@ pub(crate) fn build_payload(
         detail,
         tools: None,
     }
-}
-
-fn flush_task_statuses(
-    session_id: &str,
-    events: Vec<McpClientEvent>,
-    gateway: &xai_acp_lib::AcpAgentGatewaySender,
-) {
-    for event in events {
-        let McpClientEvent::TaskStatus {
-            server,
-            client_id,
-            task,
-        } = event
-        else {
-            continue;
-        };
-        let payload = serde_json::json!({
-            "sessionId": session_id,
-            "server": server,
-            "clientId": client_id,
-            "task": task,
-        });
-        let Ok(raw) = serde_json::value::to_raw_value(&payload) else {
-            continue;
-        };
-        gateway.forward_fire_and_forget(acp::ExtNotification::new(TASK_STATUS_METHOD, raw.into()));
-    }
-}
-
-async fn retain_current_task_statuses(
-    events: &mut Vec<McpClientEvent>,
-    state: &Arc<TokioMutex<McpState>>,
-) {
-    let clients: HashMap<_, _> = {
-        let state = state.lock().await;
-        events
-            .iter()
-            .filter_map(|event| match event {
-                McpClientEvent::TaskStatus { server, .. } => state
-                    .get_client(server)
-                    .map(|client| (server.clone(), Arc::clone(client))),
-                _ => None,
-            })
-            .collect()
-    };
-    let mut current = HashMap::new();
-    for (server, client) in clients {
-        current.insert(server, client.current_connection_generation().await);
-    }
-    retain_task_statuses_for_generations(events, &current);
-}
-
-fn retain_task_statuses_for_generations(
-    events: &mut Vec<McpClientEvent>,
-    current: &HashMap<McpServerName, Option<u64>>,
-) {
-    events.retain(|event| match event {
-        McpClientEvent::TaskStatus {
-            server, client_id, ..
-        } => current.get(server).copied().flatten() == Some(*client_id),
-        _ => false,
-    });
 }
 
 /// Per-flush side effects:
@@ -578,6 +511,35 @@ pub(crate) fn flush_window(
         };
         gateway
             .forward_fire_and_forget(acp::ExtNotification::new(SERVER_STATUS_METHOD, raw.into()));
+    }
+}
+
+fn flush_elicitation_completes(
+    session_id: &str,
+    completes: Vec<(McpServerName, String)>,
+    gateway: &xai_acp_lib::AcpAgentGatewaySender,
+) {
+    for (server, elicitation_id) in completes {
+        let payload = xai_grok_tools::mcp_elicitation::McpElicitCompletePayload {
+            session_id: session_id.to_string(),
+            elicitation_id,
+            server_name: Some(server.clone()),
+        };
+        match serde_json::value::to_raw_value(&payload) {
+            Ok(raw) => {
+                gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE,
+                    raw.into(),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %e,
+                    "failed to serialize mcp/elicit_complete"
+                );
+            }
+        }
     }
 }
 
@@ -754,11 +716,10 @@ pub(crate) async fn run_dispatcher(
             );
             break;
         };
-        let mut task_statuses = std::mem::take(&mut win.task_statuses);
-        if !task_statuses.is_empty() {
-            retain_current_task_statuses(&mut task_statuses, &mcp_state).await;
-        }
-        flush_task_statuses(&session_id, task_statuses, &gateway);
+        let completes = std::mem::take(&mut win.completes);
+        // Completes are independent fire-and-forget notifications, so they
+        // flush here regardless of whether any status entries survive below.
+        flush_elicitation_completes(&session_id, completes, &gateway);
         if win.buf.is_empty() {
             continue;
         }
@@ -914,6 +875,92 @@ mod tests {
         assert!(win.buf.contains_key(&key));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_completes_accumulate_in_window() {
+        let (tx, mut rx) = unbounded_channel::<McpClientEvent>();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "a".to_string(),
+        })
+        .unwrap();
+        tx.send(McpClientEvent::ElicitationComplete {
+            server: "github".to_string(),
+            elicitation_id: "b".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let win = collect_window(&mut rx, COALESCE_WINDOW)
+            .await
+            .expect("events arrived");
+        assert!(win.buf.is_empty());
+        assert_eq!(
+            win.completes,
+            vec![
+                ("github".to_string(), "a".to_string()),
+                ("github".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    /// End-to-end: an `ElicitationComplete`-only window has an empty
+    /// status buffer (`win.buf`), and the complete notification must
+    /// still be forwarded to the client.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn run_dispatcher_forwards_completes_when_buf_is_empty() {
+        use xai_grok_mcp::servers::McpState;
+
+        let mcp_state = Arc::new(TokioMutex::new(McpState::new(vec![])));
+        let shutdown = new_shutdown_state();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gw_tx, mut gw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = xai_acp_lib::AcpAgentGatewaySender::new(gw_tx);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let dispatcher = tokio::task::spawn_local(run_dispatcher(
+                    "sess-1".to_string(),
+                    rx,
+                    gateway,
+                    mcp_state,
+                    shutdown,
+                    None,
+                    std::path::PathBuf::from("."),
+                ));
+
+                tx.send(McpClientEvent::ElicitationComplete {
+                    server: "github".to_string(),
+                    elicitation_id: "e-1".to_string(),
+                })
+                .unwrap();
+
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(60)).await;
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+
+                let msg = gw_rx
+                    .try_recv()
+                    .expect("complete must be forwarded even with an empty status buffer");
+                let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
+                    panic!("expected ExtNotification");
+                };
+                assert_eq!(
+                    args.request.method.as_ref(),
+                    xai_grok_mcp::wire::MCP_ELICIT_COMPLETE
+                );
+                let v: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
+                assert_eq!(v["sessionId"], "sess-1");
+                assert_eq!(v["elicitationId"], "e-1");
+                assert_eq!(v["serverName"], "github");
+
+                dispatcher.abort();
+            })
+            .await;
+    }
+
     /// Contract: events for different servers don't collapse,
     /// and events of different kinds for the same server also
     /// don't collapse.
@@ -938,88 +985,6 @@ mod tests {
             .await
             .expect("events arrived");
         assert_eq!(win.buf.len(), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn task_statuses_remain_ordered_and_are_never_coalesced() {
-        let (tx, mut rx) = unbounded_channel::<McpClientEvent>();
-        for task_id in ["task-a", "task-b", "task-a"] {
-            tx.send(McpClientEvent::TaskStatus {
-                server: "fixture".into(),
-                client_id: 9,
-                task: serde_json::json!({"taskId":task_id,"status":"working"}),
-            })
-            .unwrap();
-        }
-        drop(tx);
-
-        let win = collect_window(&mut rx, COALESCE_WINDOW)
-            .await
-            .expect("events arrived");
-        let task_ids: Vec<_> = win
-            .task_statuses
-            .iter()
-            .filter_map(|event| match event {
-                McpClientEvent::TaskStatus { task, .. } => task["taskId"].as_str(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(task_ids, ["task-a", "task-b", "task-a"]);
-        assert!(win.buf.is_empty());
-    }
-
-    #[tokio::test]
-    async fn task_statuses_without_a_matching_ready_generation_fail_closed() {
-        use std::sync::Arc as StdArc;
-        use xai_grok_mcp::servers::McpClient;
-
-        let current = StdArc::new(McpClient::stub("fixture"));
-        let mut state = McpState::new(vec![]);
-        state.owned_clients.insert("fixture".into(), current);
-        let state = Arc::new(TokioMutex::new(state));
-        let mut events = vec![
-            McpClientEvent::TaskStatus {
-                server: "fixture".into(),
-                client_id: 10,
-                task: serde_json::json!({"taskId":"stale","status":"completed"}),
-            },
-            McpClientEvent::TaskStatus {
-                server: "missing".into(),
-                client_id: 11,
-                task: serde_json::json!({"taskId":"missing","status":"completed"}),
-            },
-        ];
-
-        retain_current_task_statuses(&mut events, &state).await;
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn task_statuses_from_a_previous_connection_generation_are_dropped() {
-        let mut events = vec![
-            McpClientEvent::TaskStatus {
-                server: "fixture".into(),
-                client_id: 20,
-                task: serde_json::json!({"taskId":"stale","status":"completed"}),
-            },
-            McpClientEvent::TaskStatus {
-                server: "fixture".into(),
-                client_id: 21,
-                task: serde_json::json!({"taskId":"current","status":"completed"}),
-            },
-        ];
-        retain_task_statuses_for_generations(
-            &mut events,
-            &HashMap::from([("fixture".into(), Some(21))]),
-        );
-        assert!(matches!(
-            events.as_slice(),
-            [McpClientEvent::TaskStatus {
-                client_id: 21,
-                task,
-                ..
-            }] if task["taskId"] == "current"
-        ));
     }
 
     /// Contract: `ConfigDiff` is fanned out per-server, and the

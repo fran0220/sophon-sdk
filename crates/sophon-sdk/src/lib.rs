@@ -1,238 +1,52 @@
-// Copyright 2026 OriginGame contributors
+// Copyright 2026 Sophon SDK contributors
 // Licensed under the Apache License, Version 2.0.
 
-//! Send/Sync, fail-closed in-process façade for the bundled Grok Build fork.
-//! The public API is a typed SDK; protocol adapters used by the shell remain
-//! private implementation details.
+//! Thin compatibility layer over the pinned public Grok Build source.
+//!
+//! This crate owns no runtime, protocol mirror, storage authority, scheduler,
+//! or orchestration state. It only re-exports Grok Build's public Rust and ACP
+//! surfaces under one versioned dependency and reports the exact source pin.
 
-mod activation;
-mod artifact;
-mod autonomous;
-mod compaction;
-mod conversation;
-mod event_journal;
-mod evidence;
-mod evolution;
-mod harness;
-mod kernel;
-mod prime;
-mod private;
-mod program;
-mod session_state;
-mod user_question;
+pub use agent_client_protocol as acp;
+pub use xai_acp_lib as transport;
+pub use xai_grok_shell as grok_build;
+pub use xai_grok_shell::agent::config::Config;
+pub use xai_grok_shell::agent::mvp_agent::MvpAgent;
+pub use xai_grok_shell::auth::AuthManager;
 
-pub use activation::{
-    ACTIVATION_STORE_SCHEMA_MARKER, ACTIVATION_STORE_SCHEMA_VERSION, ActivationClaim,
-    ActivationClaimRequest, ActivationCoordinator, ActivationDisposition, ActivationError,
-    ActivationFencingToken, ActivationGrant, ActivationHandle, ActivationItemId,
-    ActivationItemState, ActivationLeaseState, ActivationRenewal, ActivationSettlement,
-    ActivationWake, ActivationWakeOutcome, ActivationWorkerId, LocalActivationCoordinator,
-    MAX_ACTIVATION_CLAIM_BATCH, MAX_ACTIVATION_ITEM_ID_BYTES, MAX_ACTIVATION_LEASE_MS,
-    MAX_ACTIVATION_PAYLOAD_BYTES, MAX_ACTIVATION_WORKER_ID_BYTES,
-    run_activation_coordinator_conformance,
-};
-pub use artifact::{
-    ARTIFACT_VAULT_SCHEMA_MARKER, ARTIFACT_VAULT_SCHEMA_VERSION, ArtifactDamage, ArtifactDigest,
-    ArtifactError, ArtifactHandle, ArtifactId, ArtifactIntegrity, ArtifactLabel,
-    ArtifactMaterialization, ArtifactMediaType, ArtifactObservation, ArtifactProvenance,
-    ArtifactProvenanceKind, ArtifactPut, ArtifactReceipt, ArtifactRecord, ArtifactRecovery,
-    ArtifactRetention, ArtifactUsage, ArtifactVault, ArtifactVaultHarness, ArtifactWrite,
-    LocalArtifactVault, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_LABEL_BYTES,
-    MAX_ARTIFACT_MEDIA_TYPE_BYTES, MAX_ARTIFACT_OBSERVATION_INPUTS, materialize_verified_copy,
-    run_artifact_vault_conformance,
-};
-pub use autonomous::{AutonomousActivation, AutonomousActivationResult, AutonomousTurnLoop};
-pub use compaction::{
-    COMPACTION_CHECKPOINT_DIGEST_DOMAIN, COMPACTION_INPUT_DIGEST_DOMAIN,
-    COMPACTION_INPUT_HOSTED_TOOLS_DIGEST_DOMAIN, COMPACTION_INPUT_MESSAGES_DIGEST_DOMAIN,
-    COMPACTION_INPUT_MODEL_DIGEST_DOMAIN, COMPACTION_INPUT_TOOLS_DIGEST_DOMAIN,
-    COMPACTION_STATE_DIGEST_DOMAIN, COMPACTION_SUMMARY_DIGEST_DOMAIN, CompactionAcknowledgement,
-    CompactionContentFacts, CompactionContractError, CompactionDigest, CompactionId,
-    CompactionInputFacts, CompactionIntent, CompactionNotAppliedReason, CompactionObserver,
-    CompactionObserverError, CompactionObserverErrorCode, CompactionOutcome, CompactionOwner,
-    CompactionProbe, CompactionProbeResult, CompactionProbeUncertainty,
-    CompactionPublicationRecord, CompactionPublicationReference, CompactionReason,
-    CompactionReceipt, CompactionRequestPath, CompactionStateReference, CompactionTimelineRelation,
-    CompactionTurnId, MAX_COMPACTION_ID_BYTES, MAX_COMPACTION_TURN_ID_BYTES,
-};
-pub use conversation::{
-    CONVERSATION_TOOL_SERVER, ConversationAcceptance, ConversationCreate, ConversationDelegate,
-    ConversationDelivery, ConversationDigest, ConversationError, ConversationId,
-    ConversationIdentity, ConversationLabel, ConversationRead, ConversationSend, ConversationTitle,
-    ConversationToolCall, ConversationToolDescriptor, ConversationToolOutcome, DigestFocus,
-    IdempotencyKey, InputSource, MAX_CONVERSATION_DIGEST_BYTES, MAX_CONVERSATION_ID_BYTES,
-    MAX_CONVERSATION_LABEL_BYTES, MAX_CONVERSATION_TITLE_BYTES, MAX_DIGEST_FOCUS_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_PEER_MESSAGE_BYTES, MAX_PROJECT_NAME_BYTES, PeerMessage,
-    ProjectName, conversation_tool_descriptors,
-};
-pub use event_journal::{
-    EVENT_JOURNAL_SCHEMA_MARKER, EVENT_JOURNAL_SCHEMA_VERSION, EventJournalAppend,
-    EventJournalCommit, EventJournalSnapshot, EventJournalStatus, EventJournalStoreError,
-    LocalSessionEventJournalStore, MAX_SESSION_EVENT_BYTES, SessionEventJournalStore,
-    StoredSessionEvent,
-};
-pub use evidence::{
-    LocalSessionEvidenceStore, MAX_SESSION_EVIDENCE_BYTES, SESSION_EVIDENCE_SCHEMA_MARKER,
-    SESSION_EVIDENCE_SCHEMA_VERSION, SessionEvidenceCommit, SessionEvidenceDocument,
-    SessionEvidenceKey, SessionEvidenceKind, SessionEvidenceStore, SessionEvidenceStoreError,
-    SessionEvidenceVersion, run_session_evidence_conformance,
-};
-pub use evolution::{
-    AppliedEdit, EVOLUTION_STATE_SCHEMA_VERSION, EVOLUTION_STORE_SCHEMA_MARKER,
-    EVOLUTION_STORE_SCHEMA_VERSION, EvolutionCommit, EvolutionError, EvolutionState,
-    EvolutionStore, EvolutionStoreError, HARNESS_SUPPLEMENT_BEGIN, HARNESS_SUPPLEMENT_END,
-    HarnessEntry, HarnessEntryKind, HarnessScope, HarnessSkillContract, LocalEvolutionStore,
-    MAX_EVOLUTION_STATE_BYTES, MAX_HARNESS_ENTRIES_PER_SCOPE, MAX_HARNESS_ENTRY_CONTENT_BYTES,
-    MAX_HARNESS_ENTRY_ID_BYTES, MAX_HARNESS_ENTRY_TITLE_BYTES, MAX_HARNESS_SCOPE_CONTENT_BYTES,
-    MAX_HARNESS_SKILL_ARGUMENTS, MAX_PLANNER_TRANSCRIPT_BYTES, MAX_REFINEMENT_EDITS,
-    MAX_REFINEMENT_EVENT_BYTES, MAX_REFINEMENT_TEXT_BYTES, MAX_RENDERED_REFINEMENT_HISTORY,
-    NO_REFINEMENT_REPLY, REFINEMENT_EVENT_SCHEMA_VERSION, RefinementAction, RefinementEdit,
-    RefinementEvent, RefinementEventKind, RefinementPlanner, RefinementProposal, RejectedEdit,
-    evolution_commit_reconciled, evolved_refinement, parse_planner_reply,
-    render_harness_supplement, run_evolution_store_conformance,
-};
-pub use harness::{
-    CompleteEventCursor, HARNESS_SNAPSHOT_SCHEMA_VERSION, HARNESS_STORE_SCHEMA_MARKER,
-    HARNESS_STORE_SCHEMA_VERSION, HarnessContent, HarnessDigest, HarnessError, HarnessEvidenceKind,
-    HarnessEvidenceRef, HarnessPut, HarnessRefinement, HarnessRefinementPatch, HarnessSnapshot,
-    HarnessStore, HarnessStoreError, LocalHarnessStore, MAX_HARNESS_EVIDENCE_REFS,
-    MAX_HARNESS_SNAPSHOT_BYTES, MAX_TURN_BINDING_RECORD_BYTES, MaterializedHarness, SdkProvenance,
-    TURN_BINDING_RECORD_SCHEMA_VERSION, TurnBindingKey, TurnBindingReceipt, TurnBindingRecord,
-    TurnBindingStatus, harness_put_reconciled, run_harness_store_conformance,
-};
-pub use kernel::{
-    CONFORMANCE_KERNEL_ERROR_CLASS, CONFORMANCE_KERNEL_FLOOD_BYTES, CONFORMANCE_KERNEL_SECRET,
-    CONFORMANCE_KERNEL_STATE_NAME, CONFORMANCE_KERNEL_STATE_VALUE, CONFORMANCE_KERNEL_STDERR_MARK,
-    CONFORMANCE_KERNEL_STDOUT_MARK, KERNEL_FRAME_MARK, KERNEL_RESERVED_ENVIRONMENT_NAMES,
-    KERNEL_RUNTIME_SCHEMA_MARKER, KERNEL_RUNTIME_SCHEMA_VERSION, KernelCheckpointRef, KernelDamage,
-    KernelDisposition, KernelError, KernelExecutionBounds, KernelExecutionDisposition,
-    KernelExecutionId, KernelExecutionKey, KernelExecutionReceipt, KernelExecutionStatus,
-    KernelGeneration, KernelLabel, KernelReconcileOutcome, KernelRestore, KernelRuntime,
-    KernelRuntimeHarness, KernelScript, KernelSessionBounds, KernelSessionId, KernelSessionReceipt,
-    KernelSessionStatus, KernelSpec, KernelSubmission, LOCAL_KERNEL_PROTOCOL, LocalKernelRuntime,
-    MAX_KERNEL_CAPTURE_BYTES, MAX_KERNEL_CHECKPOINT_BYTES, MAX_KERNEL_EXECUTION_DEADLINE_MS,
-    MAX_KERNEL_EXECUTION_ID_BYTES, MAX_KERNEL_IDLE_DEADLINE_MS, MAX_KERNEL_LABEL_BYTES,
-    MAX_KERNEL_NON_RESTORABLE_FACTS, MAX_KERNEL_RESTORABLE_FACTS, MAX_KERNEL_SESSION_EXECUTIONS,
-    MAX_KERNEL_SESSION_ID_BYTES, MAX_KERNEL_SOURCE_BYTES, NonRestorableFact, RestorableFact,
-    run_kernel_runtime_conformance,
-};
-pub use prime::*;
-pub use program::{
-    ArtifactVaultOutputSink, CONFORMANCE_CREDENTIAL_HANDLE, CONFORMANCE_CREDENTIAL_VARIABLE,
-    CONFORMANCE_EXIT_CODE, CONFORMANCE_FLOOD_BYTES, CONFORMANCE_SECRET, CONFORMANCE_STDERR_MARK,
-    CONFORMANCE_STDOUT_MARK, CaptureRecord, CredentialHandleName, CredentialResolver,
-    EnvironmentBinding, ExecutionId, ExecutionReceipt, ExecutionStatus, ExitDisposition, Liveness,
-    LivenessProbe, LocalProgramRuntime, MAX_PROGRAM_ARGUMENT_BYTES, MAX_PROGRAM_ARGUMENTS,
-    MAX_PROGRAM_CAPTURE_BYTES, MAX_PROGRAM_CREDENTIAL_BINDINGS, MAX_PROGRAM_DEADLINE_MS,
-    MAX_PROGRAM_ENVIRONMENT_ENTRIES, MAX_PROGRAM_ENVIRONMENT_NAME_BYTES,
-    MAX_PROGRAM_ENVIRONMENT_VALUE_BYTES, MAX_PROGRAM_EXECUTION_ID_BYTES, MAX_PROGRAM_LABEL_BYTES,
-    MAX_PROGRAM_PATH_BYTES, OsLivenessProbe, PROGRAM_RUNTIME_SCHEMA_MARKER,
-    PROGRAM_RUNTIME_SCHEMA_VERSION, ProcessIdentity, ProgramBounds, ProgramError, ProgramLabel,
-    ProgramLaunch, ProgramOutputSink, ProgramPath, ProgramRuntime, ProgramRuntimeHarness,
-    ProgramScript, ProgramStream, ReconcileOutcome, ResolvedCredential,
-    run_program_runtime_conformance,
-};
-pub use session_state::{
-    CompactionManifestState, ConformanceOpen, DeleteReceipt, LiveSessionDocument,
-    LocalSessionStateStore, MAX_SESSION_GENERATION_BYTES, MAX_SESSION_IDENTITY_BYTES,
-    MAX_SESSION_MANIFEST_BYTES, MAX_SESSION_OBJECT_BYTES, ManifestCas, ManifestVersion, ObjectPut,
-    PreparedManifestCas, PreparedSessionDelete, RewindKind, SESSION_LOG_SCHEMA_MARKER,
-    SESSION_LOG_SCHEMA_VERSION, SessionDelete, SessionGeneration, SessionKey, SessionManifest,
-    SessionObject, SessionObjectId, SessionObjectKind, SessionSlot, SessionStateFault,
-    SessionStateFaultHarness, SessionStateFaultMetrics, SessionStateLease, SessionStateStore,
-    SessionStateStoreError, TARGET_TRANSCRIPT_SEGMENT_BYTES, delete_reconciled,
-    manifest_cas_reconciled, object_put_reconciled, run_session_state_conformance,
-    run_session_state_fault_conformance,
-};
-pub use user_question::{
-    UserQuestion, UserQuestionAnswer, UserQuestionMode, UserQuestionOption, UserQuestionRequest,
-    UserQuestionResponse, UserQuestionUi, UserQuestionUiError,
-};
-
-pub(crate) use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
-pub(crate) use tokio::sync::mpsc;
-
-/// Typed MCP 2026 client-role services. SDK users implement these traits
-/// directly; no transport service or raw shell protocol is exposed.
-pub use xai_grok_mcp::servers::{
-    McpElicitationService, McpHostContext, McpHostServiceError, McpHostServices, McpIcon,
-    McpIconTheme, McpRootsService, McpSamplingService,
-};
-
-/// Authoritative data models used by the typed MCP host-service traits.
-/// Transport and service-loop internals intentionally remain private.
-pub mod mcp_model {
-    #[allow(deprecated)]
-    pub use xai_grok_mcp::rmcp::model::{
-        CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
-        ElicitationAction, ListRootsResult, Root,
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceProvenance {
+    pub upstream_release: &'static str,
+    pub upstream_grok_build_commit: &'static str,
+    pub upstream_source_rev: &'static str,
+    pub facade_version: &'static str,
 }
 
-/// Durable Run domain and provider contracts. Run IDs, Run event cursors and
-/// revisions are deliberately distinct from [`SessionId`] and session event
-/// sequences; hosts cannot accidentally cross the two namespaces.
-pub mod run {
-    pub use xai_agent_lifecycle::run::{
-        AcceptMessage, ActivateHarness, ActivationFence, ActivationLease, ActivationToken,
-        AdmitChild, ApprovalDecision, ApprovalHandler, ApprovalRequest, ArtifactMetadata,
-        ArtifactRef, ArtifactStore, BeginIteration, CURRENT_RUN_SCHEMA, CallbackResult,
-        CapabilityPolicy, ChildCallback, ChildCompletionPolicy, ChildId, ChildRun, ClaimActivation,
-        ClaimEffect, CommandId, CommandOutput, CommittedEffect, CompactionCheckpoint,
-        ControllerEpoch, CreateRunRequest, DenyApprovalHandler, EffectCallback, EffectClass,
-        EffectOutcome, EffectReceipt, EffectSpec, EffectUsage, FailClosedGateProvider,
-        FailClosedGoalVerifier, FinishIteration, FinishedOutcome, GateEvaluation, GateProvider,
-        GateRequest, GoalSpec, GoalVerdict, GoalVerification, GoalVerificationRequest,
-        GoalVerifier, HarnessGovernance, HarnessProposal, HarnessProposalState, HarnessSnapshotPin,
-        IterationContextManifest, IterationId, LocalArtifactStore, LocalRunStore,
-        MAX_RUN_ENVELOPE_BYTES, MailMessage, MessageId, MessageState, MutationRequest,
-        NoopTelemetrySink, OperationId, OperationState, PrepareOperation, PreparedIteration,
-        PreparedStoreCommit, ProgramReceiptBinding, ProposeHarness, ProviderSet, RUN_SCHEMA_MARKER,
-        RUN_SCHEMA_VERSION, ReconcileDecision, ReconcileEffect, RecoveryNeed, RecoveryPlan,
-        RecoveryResolution, ResidencyInspection, ResourceDimension, ResourceVector,
-        RollbackHarness, RunAction, RunAttach, RunCommandResult, RunDriverSpec, RunEnvelope,
-        RunError, RunEvent, RunEventCursor, RunEventKind, RunId, RunLifecycle, RunRevision,
-        RunSchemaMarker, RunStage, RunStatus, RunStore, SessionRef, SessionTurnOutcome,
-        SkillDescriptorPin, StoreCommit, StoreCommitResult, StoreConformanceOpen, TelemetryRecord,
-        TelemetrySink, TransitionMessage, ValidateHarness, WaitingReason, WakeIntent, WakeReason,
-        WakeRequest, WorkerId, migrate_legacy_goal, run_artifact_store_conformance,
-        run_run_store_conformance,
-    };
+pub fn source_provenance() -> SourceProvenance {
+    SourceProvenance {
+        upstream_release: "1.0.10",
+        upstream_grok_build_commit: include_str!("../../../UPSTREAM_GROK_BUILD_COMMIT").trim(),
+        upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
+        facade_version: env!("CARGO_PKG_VERSION"),
+    }
 }
-
-mod capability;
-mod config;
-mod hooks;
-mod mcp;
-mod provenance;
-mod runtime;
-mod session;
-mod workflow;
-
-pub use capability::{
-    AgentServiceContribution, CapabilityBinding, CapabilityError, CapabilityKind, CapabilityLayer,
-    CapabilityOrigin, CapabilityResolution, InProcessMcpContribution, MAX_CAPABILITY_LAYER_ENTRIES,
-    MAX_CAPABILITY_NAME_BYTES, MaskedCapability, SkillContribution,
-};
-pub use config::*;
-pub use hooks::*;
-pub use mcp::*;
-pub use provenance::*;
-pub use runtime::*;
-pub use session::*;
-pub use workflow::{
-    MAX_WORKFLOW_STEPS, MAX_WORKFLOW_WALL_MS, WorkflowAction, WorkflowAdmission, WorkflowCeilings,
-    WorkflowDisposition, WorkflowDriver, WorkflowStepIntent,
-};
-
-pub(crate) use capability::{ResolvedCapabilities, resolve_capabilities};
-pub(crate) use conversation::{
-    conversation_tool_server, dispatch_create, dispatch_read, dispatch_send, dispatch_tool_call,
-};
-pub(crate) use mcp::InProcessMcpOutbound;
-pub(crate) use mcp::parsing::{parse_mcp_servers, parse_task_status};
-pub(crate) use provenance::canonicalize_json;
-pub(crate) use session::{durable_turn_outcome, measured_session_turn_usage};
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provenance_matches_the_pinned_upstream_snapshot() {
+        let provenance = source_provenance();
+        assert_eq!(provenance.upstream_release, "1.0.10");
+        assert_eq!(
+            provenance.upstream_grok_build_commit,
+            "9684fa3cdbf2995e30ea8b9b637f1db008f144fc"
+        );
+        assert_eq!(
+            provenance.upstream_source_rev,
+            "70ec060ec3d28e77b9c4593be43c2ab0128bcd21"
+        );
+        assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
+    }
+}

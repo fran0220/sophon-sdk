@@ -117,7 +117,6 @@ async fn create_test_actor_with_memory(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
-            auth_scheme: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -136,8 +135,6 @@ async fn create_test_actor_with_memory(
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
     SessionActor {
-        projects_chat_history: true,
-        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
@@ -224,7 +221,6 @@ async fn create_test_actor_with_memory(
         rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
-        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config
             .as_ref()
@@ -337,7 +333,6 @@ async fn create_test_actor_with_memory(
         sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-        transcribe_user_images: false,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),

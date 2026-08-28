@@ -1317,6 +1317,20 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "toolset.ask_user_question.timeout_enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(
+                    kind_mismatch(
+                        "toolset.ask_user_question.timeout_enabled",
+                        "Bool",
+                        &value,
+                    ),
+                );
+            };
+            xai_grok_shell::util::config::set_ask_user_question_timeout_enabled(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "show_thinking_blocks" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("show_thinking_blocks", "Bool", &value));

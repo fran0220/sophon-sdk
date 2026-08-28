@@ -382,8 +382,7 @@ impl SessionActor {
                 self.signals_handle().record_edit_and_retry();
             }
         }
-        if !self.rebuild_spec.origin_embedded
-            && policy.authority != InputAuthority::ModelAuthoredUntrusted
+        if policy.authority != InputAuthority::ModelAuthoredUntrusted
             && let Some(bash_command) = Self::extract_bash_command(&prompt_blocks)
         {
             return self
@@ -402,10 +401,7 @@ impl SessionActor {
         } else {
             LoopFireMode::InSession
         };
-        let (resolved, slash_skills, workflow_registry) = if self.rebuild_spec.origin_embedded {
-            (Ok(prompt_blocks), Vec::new(), None)
-        } else {
-            match policy.authority {
+        let (resolved, slash_skills, workflow_registry) = match policy.authority {
             InputAuthority::HumanIntent => {
                 let slash_skills = self.slash_skills_for_resolve().await;
                 let skill_rewrite = if crate::session::is_cursor_user_template(
@@ -481,7 +477,6 @@ impl SessionActor {
                         unreachable!("non-human authority cannot resolve as HumanIntent")
                     }
                 }
-            }
             }
         };
         let prompt_blocks = match resolved {
@@ -682,7 +677,6 @@ impl SessionActor {
             acc
         });
         let prompt_block = if policy.authority != InputAuthority::ModelAuthoredUntrusted {
-            let enforce_prompt_block = self.should_enforce_prompt_block(&policy);
             let prompt_gate_verdict = self
                 .dispatch_prompt_submit_hook(
                     xai_grok_hooks::event::HookPayload::UserPromptSubmit {
@@ -690,10 +684,12 @@ impl SessionActor {
                         subagent_type: self.subagent_type_label(),
                     },
                     Some(prompt_id),
-                    enforce_prompt_block,
                 )
                 .await;
-            match (enforce_prompt_block, prompt_gate_verdict) {
+            match (
+                self.should_enforce_prompt_block(&policy),
+                prompt_gate_verdict,
+            ) {
                 (true, xai_grok_hooks::result::PromptDecision::Block { reason, hook_name }) => {
                     Some((hook_name, reason))
                 }
@@ -718,9 +714,6 @@ impl SessionActor {
             }
         } else {
             self.chat_state_handle.increment_prompt_index();
-            self.origin_prompt_identities
-                .borrow_mut()
-                .push(input_origin.origin_prompt_identity().cloned());
             *self.tool_context.prompt_index.lock().await = current_prompt_index;
             self.tool_context
                 .active_message_parent_prompt_index
@@ -914,7 +907,7 @@ impl SessionActor {
             self.inject_workflow_status_reminder().await;
             let user_message = if user_images.is_empty() {
                 user_message
-            } else if self.is_cursor_harness() || self.transcribe_user_images {
+            } else if self.is_cursor_harness() {
                 self.transcribe_user_images(user_message, &user_images)
                     .await?
             } else {
@@ -1150,9 +1143,7 @@ impl SessionActor {
         };
         if matches!(
             result,
-            Ok(TurnOutcome::Cancelled { .. })
-                | Ok(TurnOutcome::MaxTurnsReached { .. })
-                | Ok(TurnOutcome::StationarityEnded { .. })
+            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
         ) {
             self.cancel_running_turn_subagents(prompt_id);
         }
@@ -1176,9 +1167,7 @@ impl SessionActor {
         }
         if matches!(
             &result,
-            Ok(TurnOutcome::Completed { .. })
-                | Ok(TurnOutcome::StationarityEnded { .. })
-                | Ok(TurnOutcome::MaxTurnsReached { .. })
+            Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
         ) && let Err(error) = self.disk_full_acp_error(flush_error.as_ref())
         {
             result = Err(error);
@@ -1250,13 +1239,13 @@ impl SessionActor {
             }
             Ok(TurnOutcome::StationarityEnded { .. }) => {
                 self.emit_turn_ended(
-                    crate::session::events::TurnOutcomeLabel::Cancelled,
+                    crate::session::events::TurnOutcomeLabel::Completed,
                     None,
-                    Some(serde_json::json!({"reason": "action_stationarity"})),
+                    None,
                 );
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
                     turn_number: current_prompt_index as u64,
-                    outcome: xai_tool_protocol::turn_hook::TurnHookOutcome::Cancelled,
+                    outcome: xai_tool_protocol::turn_hook::TurnHookOutcome::Completed,
                     duration_ms: turn_duration_ms,
                     tool_call_count: turn_tool_count,
                     model_id: turn_model_id.clone(),
@@ -1269,7 +1258,7 @@ impl SessionActor {
                 .await;
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
-                        outcome: xai_grok_telemetry::events::Outcome::Cancelled,
+                        outcome: xai_grok_telemetry::events::Outcome::Completed,
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
@@ -1415,16 +1404,14 @@ impl SessionActor {
             );
         }
         match &result {
-            Ok(TurnOutcome::Completed { .. }) => {
+            Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {
                     contributor
                         .on_turn_done(&xai_agent_lifecycle::TurnDoneInput)
                         .await;
                 }
             }
-            Ok(TurnOutcome::Cancelled { .. })
-            | Ok(TurnOutcome::MaxTurnsReached { .. })
-            | Ok(TurnOutcome::StationarityEnded { .. }) => {
+            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
                 self.notify_turn_abort(
                     self.turn_report.epoch(),
                     xai_agent_lifecycle::TurnAbortReason::Interrupted,
@@ -1462,13 +1449,10 @@ impl SessionActor {
                         PromptCompletionKind::Completed,
                         structured_output,
                     ),
-                    TurnOutcome::StationarityEnded {
-                        snapshot,
-                        repeated_steps,
-                    } => (
-                        acp::StopReason::MaxTurnRequests,
+                    TurnOutcome::StationarityEnded { snapshot, .. } => (
+                        acp::StopReason::EndTurn,
                         *snapshot,
-                        PromptCompletionKind::StationarityEnded { repeated_steps },
+                        PromptCompletionKind::StationarityEnded,
                         None,
                     ),
                     TurnOutcome::Cancelled { category, context } => (
@@ -1478,7 +1462,7 @@ impl SessionActor {
                         None,
                     ),
                     TurnOutcome::MaxTurnsReached { limit } => (
-                        acp::StopReason::MaxTurnRequests,
+                        acp::StopReason::Cancelled,
                         None,
                         PromptCompletionKind::MaxTurnsReached { limit },
                         None,
@@ -1699,8 +1683,8 @@ impl SessionActor {
     /// goal is `Active` (`goal_active_now == true`):
     ///
     /// 1. **Success.** Reset `goal_continuation_streak` to 0, then call
-    ///    `maybe_queue_goal_continuation` unless `suppress_goal_continuation`.
-    ///    That helper verifies any pending
+    ///    `maybe_queue_goal_continuation` unless `suppress_goal_continuation`
+    ///    (stationarity silent EndTurn). That helper verifies any pending
     ///    completion via its turn-end drain, queues the continuation reminder
     ///    if the goal is still `Active`, and runs the stop-detector to select
     ///    the nudge flavor (generic vs. bail-specific) and emit
@@ -2271,7 +2255,6 @@ impl SessionActor {
         let mut tool_turn_count: usize = 1;
         let mut loop_index: u32 = 0;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
-        let mut similar_assistant_messages = SimilarAssistantMessageRun::default();
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
         let mut rate_limit_waits = self.rate_limit_wait_budget();
@@ -2308,17 +2291,8 @@ impl SessionActor {
         loop {
             self.emit_event(crate::session::events::Event::LoopStarted { loop_index });
             loop_index += 1;
-            let repeated_tool_calls = identical_tool_calls.should_stop();
-            let repeated_messages = similar_assistant_messages.should_stop();
-            if repeated_tool_calls || repeated_messages {
-                let run_len = match (repeated_tool_calls, repeated_messages) {
-                    (true, true) => identical_tool_calls
-                        .run_len
-                        .max(similar_assistant_messages.run_len),
-                    (true, false) => identical_tool_calls.run_len,
-                    (false, true) => similar_assistant_messages.run_len,
-                    (false, false) => unreachable!(),
-                };
+            if identical_tool_calls.run_len >= identical_tool_calls.hard_stop_threshold() {
+                let run_len = identical_tool_calls.run_len;
                 let tool_name = identical_tool_calls.tool_name.clone();
                 let true_noop = identical_tool_calls.is_true_noop_run;
                 let problematically_repeating = identical_tool_calls.is_problematically_repeating();
@@ -2327,9 +2301,7 @@ impl SessionActor {
                     tool_name = %tool_name,
                     run_len,
                     true_noop,
-                    repeated_tool_calls,
-                    repeated_messages,
-                    "loop health: ending turn after repeated steps continued past reflection"
+                    "action stationarity: ending turn after repeated identical tool calls"
                 );
                 xai_grok_telemetry::unified_log::warn(
                     "shell.turn.action_stationarity_stop",
@@ -2340,26 +2312,16 @@ impl SessionActor {
                         "run_len": run_len,
                         "true_noop": true_noop,
                         "problematically_repeating": problematically_repeating,
-                        "repeated_tool_calls": repeated_tool_calls,
-                        "repeated_messages": repeated_messages,
                     })),
                 );
-                if repeated_tool_calls {
-                    xai_grok_telemetry::session_ctx::log_event(
-                        xai_grok_telemetry::events::ActionStationarityStop {
-                            true_noop,
-                            problematically_repeating,
-                            run_len,
-                            tool_name: tool_name.clone(),
-                        },
-                    );
-                }
-                self.emit_loop_health_closing_message(format!(
-                    "I stopped this Turn because the repetition health check detected {run_len} \
-                     substantially identical successive steps after one reflection attempt. \
-                     Continue for another bounded Turn?"
-                ))
-                .await;
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::ActionStationarityStop {
+                        true_noop,
+                        problematically_repeating,
+                        run_len,
+                        tool_name: tool_name.clone(),
+                    },
+                );
                 let snapshot = self
                     .finalize_turn_bookkeeping(
                         req_id,
@@ -2370,29 +2332,17 @@ impl SessionActor {
                     .await;
                 return Ok(TurnOutcome::StationarityEnded {
                     snapshot: Box::new(snapshot),
-                    repeated_steps: u64::from(run_len),
                 });
             }
-            let repeated_tool_nudge = identical_tool_calls.take_nudge();
-            let repeated_message_nudge = similar_assistant_messages.take_nudge();
-            if repeated_tool_nudge || repeated_message_nudge {
-                let run_len = match (repeated_tool_nudge, repeated_message_nudge) {
-                    (true, true) => identical_tool_calls
-                        .run_len
-                        .max(similar_assistant_messages.run_len),
-                    (true, false) => identical_tool_calls.run_len,
-                    (false, true) => similar_assistant_messages.run_len,
-                    (false, false) => unreachable!(),
-                };
+            if identical_tool_calls.take_nudge() {
+                let run_len = identical_tool_calls.run_len;
                 let tool_name = identical_tool_calls.tool_name.clone();
                 let problematically_repeating = identical_tool_calls.is_problematically_repeating();
                 tracing::warn!(
                     session_id = %self.session_info.id,
                     tool_name = %tool_name,
                     run_len,
-                    repeated_tool_nudge,
-                    repeated_message_nudge,
-                    "loop health: injecting one reflection after repeated steps"
+                    "action stationarity: nudging model to break repeated identical tool calls"
                 );
                 xai_grok_telemetry::unified_log::warn(
                     "shell.turn.action_stationarity_nudge",
@@ -2402,32 +2352,27 @@ impl SessionActor {
                         "tool_name": tool_name,
                         "run_len": run_len,
                         "problematically_repeating": problematically_repeating,
-                        "repeated_tool_calls": repeated_tool_nudge,
-                        "repeated_messages": repeated_message_nudge,
                     })),
                 );
-                if repeated_tool_nudge {
-                    xai_grok_telemetry::session_ctx::log_event(
-                        xai_grok_telemetry::events::ActionStationarityNudge {
-                            problematically_repeating,
-                            run_len,
-                            tool_name: tool_name.clone(),
-                        },
-                    );
-                }
-                let repeated = match (repeated_tool_nudge, repeated_message_nudge) {
-                    (true, true) => format!("tool calls to `{tool_name}` and assistant messages"),
-                    (true, false) => format!("tool calls to `{tool_name}`"),
-                    (false, true) => "assistant messages".to_string(),
-                    (false, false) => unreachable!(),
-                };
-                self.push_system_reminder(&format!(
-                    "Loop-health reflection: your recent {repeated} are substantially \
-                     identical. Pause now and reconsider your assumptions and approach. Do not \
-                     repeat the same step again; either take a materially different action or \
-                     explain what is blocking progress. If the repetition continues, this Turn \
-                     will settle and ask whether to continue."
-                ));
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::ActionStationarityNudge {
+                        problematically_repeating,
+                        run_len,
+                        tool_name: tool_name.clone(),
+                    },
+                );
+                let reminder = self
+                    .tool_bridge_handle()
+                    .render_prompt(
+                        ACTION_STATIONARITY_NUDGE_TEMPLATE,
+                        &serde_json::json!({
+                            "tool_name": tool_name,
+                            "run_len": run_len,
+                        }),
+                    )
+                    .await
+                    .unwrap_or_else(|| ACTION_STATIONARITY_NUDGE_TEMPLATE.to_string());
+                self.push_system_reminder(&reminder);
             }
             self.drain_interjections_at_safe_point().await;
             self.flush_pending_skill_reminders().await;
@@ -2466,10 +2411,6 @@ impl SessionActor {
                 if Self::is_auth_compact_error(&e) {
                     return Err(self.surface_compact_auth_failure(e).await);
                 }
-                // Ordinary model-failure behavior may continue only after the
-                // native authority proves that no intent/outcome evidence is
-                // still fenced (or completes its exact idempotent recovery).
-                self.recover_native_compaction().await?;
             }
             let backend_search_active = self.backend_search_active();
             tracing::debug!(
@@ -2880,10 +2821,8 @@ impl SessionActor {
             let refusal_explanation = response.stop_message.clone();
             let final_answer_text = json_schema.is_some().then(|| response.assistant_text());
             let usage_reported = response.usage.is_some();
-            let loop_health_message = response.assistant_text();
             self.record_response_items(response.items, usage_reported)
                 .await;
-            similar_assistant_messages.observe(&loop_health_message);
             if let Some(text) = fallback_text {
                 tracing::warn!(
                     text_len = text.len(),
@@ -3135,11 +3074,6 @@ impl SessionActor {
                     limit,
                     "max-turns limit reached, stopping"
                 );
-                self.emit_loop_health_closing_message(format!(
-                    "I stopped this Turn because its {limit}-step health budget was spent. \
-                     Continue for another bounded Turn?"
-                ))
-                .await;
                 return Ok(TurnOutcome::MaxTurnsReached { limit });
             }
             tool_turn_count = next_turn;
@@ -3151,28 +3085,10 @@ impl SessionActor {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
-                    self.recover_native_compaction().await?;
                 }
                 continue;
             }
         }
-    }
-
-    /// Persist and stream the host-authored message that makes a loop-health
-    /// settlement truthful in both replay and the live transcript.
-    async fn emit_loop_health_closing_message(&self, message: String) {
-        self.record_assistant_response(
-            xai_grok_sampling_types::ConversationItem::assistant(message.clone()),
-            false,
-        )
-        .await;
-        self.send_update(
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
-                acp::TextContent::new(message),
-            ))),
-            None,
-        )
-        .await;
     }
 }
 /// Discard an egregious (2× cap) media-gen generation and re-sample this
@@ -3209,17 +3125,21 @@ fn step_is_problematically_repeating(kinds: &[Option<ToolKind>]) -> bool {
 }
 pub(super) const NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 4;
 pub(super) const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
-pub(super) const MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 =
-    NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS + 1;
-pub(super) const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = NUDGE_AFTER_IDENTICAL_TOOL_CALLS + 1;
-const NUDGE_AFTER_IDENTICAL_TRUE_NOOPS: u32 = 2;
-const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = NUDGE_AFTER_IDENTICAL_TRUE_NOOPS + 1;
-const NUDGE_AFTER_SIMILAR_ASSISTANT_MESSAGES: u32 = 3;
-const MAX_CONSECUTIVE_SIMILAR_ASSISTANT_MESSAGES: u32 = NUDGE_AFTER_SIMILAR_ASSISTANT_MESSAGES + 1;
+pub(super) const MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 8;
+pub(super) const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 12;
+const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
 const _: () = assert!(
     NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS
 );
 const _: () = assert!(NUDGE_AFTER_IDENTICAL_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+const ACTION_STATIONARITY_NUDGE_TEMPLATE: &str = "You have called the same tool \
+     (`${{ tool_name }}`) with the exact same arguments ${{ run_len }} times in a row — \
+     you appear to be stuck in a polling loop. Stop repeating this call. If you are \
+     waiting on a long-running job or command, use a background task${%- if tools.by_kind.monitor %} \
+     or the `${{ tools.by_kind.monitor }}` tool${%- endif %}, or run a single `sleep` and \
+     then check once — do not poll in a tight loop. If you cannot make progress, stop and \
+     tell the user what you are waiting for. This turn will be halted automatically if the \
+     identical call keeps repeating.";
 fn hash_step_signature(signature: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3315,17 +3235,18 @@ impl IdenticalToolCallRun {
         !self.is_true_noop_run && self.problematically_repeating_step
     }
     fn nudge_threshold(&self) -> u32 {
-        if self.is_true_noop_run {
-            NUDGE_AFTER_IDENTICAL_TRUE_NOOPS
-        } else if self.is_problematically_repeating() {
+        if self.is_problematically_repeating() {
             NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS
         } else {
             NUDGE_AFTER_IDENTICAL_TOOL_CALLS
         }
     }
     /// Once per identical run at/after the nudge threshold. Call only after results are committed.
+    ///
+    /// `true` keepalive runs are exempt: they end the turn silently at
+    /// [`MAX_CONSECUTIVE_TRUE_NOOPS`] rather than being told to stop polling.
     fn take_nudge(&mut self) -> bool {
-        let fire = self.run_len >= self.nudge_threshold() && !self.nudged;
+        let fire = !self.is_true_noop_run && self.run_len >= self.nudge_threshold() && !self.nudged;
         self.nudged |= fire;
         fire
     }
@@ -3337,118 +3258,6 @@ impl IdenticalToolCallRun {
         } else {
             MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
         }
-    }
-    fn should_stop(&self) -> bool {
-        self.nudged && self.run_len >= self.hard_stop_threshold()
-    }
-}
-
-fn normalize_assistant_message(message: &str) -> String {
-    message
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|character| character.is_alphanumeric())
-        .collect()
-}
-
-fn message_shingles(message: &str) -> std::collections::HashSet<u64> {
-    use std::hash::{Hash, Hasher};
-
-    let characters = message.chars().collect::<Vec<_>>();
-    characters
-        .windows(3)
-        .map(|window| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            window.hash(&mut hasher);
-            hasher.finish()
-        })
-        .collect()
-}
-
-fn message_edit_distance(left: &[char], right: &[char]) -> usize {
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right.len() + 1];
-    for (left_index, left_character) in left.iter().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_character) in right.iter().enumerate() {
-            current[right_index + 1] = if left_character == right_character {
-                previous[right_index]
-            } else {
-                1 + previous[right_index]
-                    .min(previous[right_index + 1])
-                    .min(current[right_index])
-            };
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[right.len()]
-}
-
-/// Unicode-friendly near-duplicate comparison. Alphanumeric normalization
-/// removes formatting noise; bounded edit distance catches short CJK changes,
-/// and trigram Jaccard similarity handles longer messages.
-fn assistant_messages_are_substantially_identical(left: &str, right: &str) -> bool {
-    let left = normalize_assistant_message(left);
-    let right = normalize_assistant_message(right);
-    let left_len = left.chars().count();
-    let right_len = right.chars().count();
-    if left_len < 12 || right_len < 12 {
-        return false;
-    }
-    if left == right {
-        return true;
-    }
-    let length_ratio = left_len.min(right_len) as f64 / left_len.max(right_len) as f64;
-    if length_ratio < 0.8 {
-        return false;
-    }
-    if left_len.max(right_len) <= 512 {
-        let left_characters = left.chars().collect::<Vec<_>>();
-        let right_characters = right.chars().collect::<Vec<_>>();
-        if message_edit_distance(&left_characters, &right_characters) * 100
-            <= left_len.max(right_len) * 18
-        {
-            return true;
-        }
-    }
-    let left_shingles = message_shingles(&left);
-    let right_shingles = message_shingles(&right);
-    let intersection = left_shingles.intersection(&right_shingles).count();
-    let union = left_shingles.union(&right_shingles).count();
-    union > 0 && intersection as f64 / union as f64 >= 0.82
-}
-
-#[derive(Default)]
-struct SimilarAssistantMessageRun {
-    last_message: String,
-    run_len: u32,
-    nudged: bool,
-}
-
-impl SimilarAssistantMessageRun {
-    fn observe(&mut self, message: &str) -> u32 {
-        if normalize_assistant_message(message).chars().count() < 12 {
-            *self = Self::default();
-            return 0;
-        }
-        if assistant_messages_are_substantially_identical(&self.last_message, message) {
-            self.run_len += 1;
-        } else {
-            self.run_len = 1;
-            self.nudged = false;
-        }
-        self.last_message = message.to_string();
-        self.run_len
-    }
-
-    fn take_nudge(&mut self) -> bool {
-        let fire = self.run_len >= NUDGE_AFTER_SIMILAR_ASSISTANT_MESSAGES && !self.nudged;
-        self.nudged |= fire;
-        fire
-    }
-
-    fn should_stop(&self) -> bool {
-        self.nudged && self.run_len >= MAX_CONSECUTIVE_SIMILAR_ASSISTANT_MESSAGES
     }
 }
 #[cfg(test)]
@@ -3476,17 +3285,13 @@ mod identical_tool_call_run_tests {
         );
     }
     #[test]
-    fn true_noops_chain_across_args_and_stop_after_one_reflection() {
+    fn true_noops_chain_across_args_and_stop_at_4() {
         let mut run = IdenticalToolCallRun::default();
-        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
+        for i in 1..=4 {
             assert_eq!(run.observe(&format!("sig{i}"), "bash", false, true), i);
-            if i == super::NUDGE_AFTER_IDENTICAL_TRUE_NOOPS {
-                assert!(run.take_nudge());
-            }
         }
         assert!(run.is_true_noop_run);
         assert_eq!(run.hard_stop_threshold(), MAX_CONSECUTIVE_TRUE_NOOPS);
-        assert!(run.should_stop());
         assert_eq!(run.observe("squeue", "bash", false, false), 1);
         assert!(!run.is_true_noop_run);
     }
@@ -3617,88 +3422,25 @@ mod identical_tool_call_run_tests {
         assert!(!step_is_problematically_repeating(&[read, exec]));
         assert!(!step_is_problematically_repeating(&[exec, read]));
     }
-    /// A `true` keepalive gets the same one-reflection contract as every
-    /// other repeated step, but at a tighter threshold.
+    /// A `true` keepalive run must end the turn silently at MAX_CONSECUTIVE_TRUE_NOOPS
+    /// instead of being told to stop polling, even though it passes the nudge threshold.
     #[test]
-    fn true_noop_runs_reflect_once_then_stop() {
+    fn true_noop_runs_are_never_nudged() {
         let mut run = IdenticalToolCallRun::default();
-        for i in 1..super::NUDGE_AFTER_IDENTICAL_TRUE_NOOPS {
+        for i in 1..=MAX_CONSECUTIVE_TRUE_NOOPS {
             assert_eq!(run.observe(&format!("sig{i}"), "bash", false, true), i);
-            assert!(!run.take_nudge());
+            assert!(
+                !run.take_nudge(),
+                "keepalive run must not nudge; run_len={i}"
+            );
         }
-        assert_eq!(
-            run.observe("reflection", "bash", false, true),
-            super::NUDGE_AFTER_IDENTICAL_TRUE_NOOPS
-        );
-        assert!(run.take_nudge());
-        assert!(!run.should_stop());
-        assert_eq!(
-            run.observe("continued", "bash", false, true),
-            MAX_CONSECUTIVE_TRUE_NOOPS
-        );
-        assert!(run.should_stop());
         assert_eq!(run.hard_stop_threshold(), MAX_CONSECUTIVE_TRUE_NOOPS);
-    }
-}
-
-#[cfg(test)]
-mod similar_assistant_message_run_tests {
-    use super::{
-        MAX_CONSECUTIVE_SIMILAR_ASSISTANT_MESSAGES, NUDGE_AFTER_SIMILAR_ASSISTANT_MESSAGES,
-        SimilarAssistantMessageRun, assistant_messages_are_substantially_identical,
-    };
-
-    #[test]
-    fn detects_formatting_noise_and_small_multilingual_changes() {
-        assert!(assistant_messages_are_substantially_identical(
-            "I am checking the same process result now.",
-            "I’m checking the same process result now!"
-        ));
-        assert!(assistant_messages_are_substantially_identical(
-            "我正在再次检查这个后台进程的执行结果。",
-            "我正在再次检查这个后台进程执行结果。"
-        ));
-        assert!(!assistant_messages_are_substantially_identical(
-            "I am checking the process result now.",
-            "The build passed, so I will update the dependency pin."
-        ));
-    }
-
-    #[test]
-    fn injects_one_reflection_then_stops_on_the_next_similar_message() {
-        let messages = [
-            "I am checking the same background process result now.",
-            "I am checking the same background process result now!",
-            "I’m checking the same background process result now.",
-        ];
-        let mut run = SimilarAssistantMessageRun::default();
-        for (index, message) in messages.iter().enumerate() {
-            assert_eq!(run.observe(message), index as u32 + 1);
+        let mut last = 0;
+        for _ in 0..NUDGE_AFTER_IDENTICAL_TOOL_CALLS {
+            last = run.observe("poll", "get_task_output", false, false);
         }
-        assert_eq!(run.run_len, NUDGE_AFTER_SIMILAR_ASSISTANT_MESSAGES);
+        assert_eq!(last, NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
         assert!(run.take_nudge());
-        assert!(!run.take_nudge());
-        assert!(!run.should_stop());
-        assert_eq!(
-            run.observe("I am checking the same background process result now."),
-            MAX_CONSECUTIVE_SIMILAR_ASSISTANT_MESSAGES
-        );
-        assert!(run.should_stop());
-    }
-
-    #[test]
-    fn materially_different_or_short_messages_reset_the_run() {
-        let mut run = SimilarAssistantMessageRun::default();
-        assert_eq!(
-            run.observe("I am checking the same background process result now."),
-            1
-        );
-        assert_eq!(
-            run.observe("The build passed, so I will update the dependency pin."),
-            1
-        );
-        assert_eq!(run.observe("Done."), 0);
-        assert_eq!(run.run_len, 0);
     }
 }
 #[cfg(test)]

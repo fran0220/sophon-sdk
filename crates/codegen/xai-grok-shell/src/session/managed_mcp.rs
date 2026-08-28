@@ -12,10 +12,6 @@
 //!                      vendor `mcps` kill switch, which matches by normalized
 //!                      URL; see `admit_client_mcp_servers`)
 //!
-//! Every layer except Client is *ambient*: it belongs to the machine's user,
-//! not to the caller. [`McpSourceScope::CallerDeclared`] skips all of them so
-//! an embedded runtime sees exactly the servers its host declared.
-//!
 //! The gateway catalog/call core lives in
 //! `xai_grok_shell_session_support::managed_mcp` and is re-exported here so
 //! `crate::session::managed_mcp::…` paths keep resolving unchanged.
@@ -49,33 +45,6 @@ pub(crate) fn mcp_server_name(s: &acp::McpServer) -> &str {
     }
 }
 
-/// Which MCP configuration sources a merge is allowed to consult.
-///
-/// The Grok CLI merges the user's ambient sources (user-global
-/// `config.toml`, `~/.claude.json`, `~/.cursor/mcp.json`, `.mcp.json`,
-/// plugins) under the client-provided servers. An embedded runtime
-/// (`grok-build-sdk`) is configured entirely by its host: whatever else the
-/// end user's machine has installed must not appear in that host's sessions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum McpSourceScope {
-    /// Merge ambient on-disk sources under the client-provided servers.
-    Ambient,
-    /// Only the embedding caller's declared servers exist.
-    CallerDeclared,
-}
-
-impl McpSourceScope {
-    /// `origin_embedded` is the runtime-embedded marker
-    /// (`MvpAgent::origin_embedded`), true for every Origin profile.
-    pub(crate) fn for_runtime(origin_embedded: bool) -> Self {
-        if origin_embedded {
-            Self::CallerDeclared
-        } else {
-            Self::Ambient
-        }
-    }
-}
-
 /// Merge/discovery map key: server NAME is the sole merge identity (two names
 /// sharing one URL are distinct servers). Every name-keyed map in this module
 /// must derive its key through this helper so merge and discovery keying
@@ -89,9 +58,8 @@ pub(crate) fn merge_managed_mcp_servers(
     cwd: &std::path::Path,
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
-    scope: McpSourceScope,
 ) -> Vec<acp::McpServer> {
-    merge_managed_mcp_servers_with_policy(client_mcp_servers, cwd, plugin_registry, compat, scope)
+    merge_managed_mcp_servers_with_policy(client_mcp_servers, cwd, plugin_registry, compat)
         .into_iter()
         .filter(|s| s.disabled_reason.is_none())
         .map(|s| s.server)
@@ -111,20 +79,13 @@ pub(crate) fn merge_and_send_managed_mcp_update(
     initial_client_mcp_servers: Vec<acp::McpServer>,
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
-    scope: McpSourceScope,
 ) -> bool {
-    let merged = merge_managed_mcp_servers(
-        initial_client_mcp_servers,
-        cwd,
-        plugin_registry,
-        compat,
-        scope,
-    );
+    let merged =
+        merge_managed_mcp_servers(initial_client_mcp_servers, cwd, plugin_registry, compat);
     let (tx, _rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(crate::session::SessionCommand::UpdateMcpServers {
             mcp_servers: merged,
-            embedded_mcp: None,
             respond_to: tx,
         })
         .is_ok()
@@ -142,13 +103,7 @@ pub(crate) fn admit_client_mcp_servers(
     client_mcp_servers: Vec<acp::McpServer>,
     cwd: &std::path::Path,
     compat: &xai_grok_tools::types::compat::CompatConfig,
-    scope: McpSourceScope,
 ) -> Vec<acp::McpServer> {
-    if scope == McpSourceScope::CallerDeclared {
-        // Vendor kill switches attribute servers to the *user's* on-disk
-        // vendor config, which an embedded host never authored.
-        return client_mcp_servers;
-    }
     let mut blocked: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !compat.cursor.mcps {
         let mut forced = *compat;
@@ -182,20 +137,7 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
     cwd: &std::path::Path,
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
-    scope: McpSourceScope,
 ) -> Vec<McpServerWithPolicy> {
-    if scope == McpSourceScope::CallerDeclared {
-        let mut merged = client_mcp_servers;
-        merged.sort_by_key(mcp_merge_key);
-        merged.dedup_by_key(|server| mcp_merge_key(server));
-        return merged
-            .into_iter()
-            .map(|server| McpServerWithPolicy {
-                server,
-                disabled_reason: None,
-            })
-            .collect();
-    }
     let mut servers: HashMap<String, acp::McpServer> =
         merge_managed_mcp_servers_sourced(cwd, plugin_registry, compat)
             .into_iter()
@@ -204,7 +146,7 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
 
     // Re-admit at merge so a caller that forgot ingress sanitization cannot
     // spawn disabled-vendor client servers.
-    for server in admit_client_mcp_servers(client_mcp_servers, cwd, compat, scope) {
+    for server in admit_client_mcp_servers(client_mcp_servers, cwd, compat) {
         servers.insert(mcp_merge_key(&server), server);
     }
 
@@ -619,8 +561,7 @@ mod tests {
         )];
         let cwd = empty_cwd();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let merged =
-            merge_managed_mcp_servers(client, cwd.path(), None, &compat, McpSourceScope::Ambient);
+        let merged = merge_managed_mcp_servers(client, cwd.path(), None, &compat);
         assert!(
             merged.iter().any(|s| matches!(
                 s,
@@ -643,57 +584,6 @@ mod tests {
         acp::McpServer::Stdio(acp::McpServerStdio::new(name.to_string(), "true"))
     }
 
-    /// The embedded-runtime scope is what keeps a downstream product's sessions
-    /// free of whatever MCP servers the end user's machine happens to
-    /// configure. Every project-scope ambient layer is planted here, so a
-    /// regression that re-consults any of them fails on any machine.
-    #[test]
-    fn caller_declared_scope_admits_only_client_servers() {
-        let cwd = empty_cwd();
-        write_cursor_project_mcp(cwd.path(), "ambient-cursor");
-        std::fs::write(
-            cwd.path().join(".mcp.json"),
-            r#"{"mcpServers": {"ambient-project": {"command": "true"}}}"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(cwd.path().join(".grok")).unwrap();
-        std::fs::write(
-            cwd.path().join(".grok").join("config.toml"),
-            "[mcp_servers.ambient_toml]\ncommand = \"true\"\n",
-        )
-        .unwrap();
-        let compat = xai_grok_tools::types::compat::CompatConfig::default();
-
-        let ambient = merge_managed_mcp_servers(
-            vec![client_stdio("declared")],
-            cwd.path(),
-            None,
-            &compat,
-            McpSourceScope::Ambient,
-        );
-        assert!(
-            ambient.len() > 1,
-            "the CLI scope must still merge ambient sources: {:?}",
-            ambient.iter().map(mcp_server_name).collect::<Vec<_>>()
-        );
-
-        let declared_only = merge_managed_mcp_servers(
-            vec![client_stdio("declared")],
-            cwd.path(),
-            None,
-            &compat,
-            McpSourceScope::CallerDeclared,
-        );
-        assert_eq!(
-            declared_only
-                .iter()
-                .map(mcp_server_name)
-                .collect::<Vec<_>>(),
-            vec!["declared"],
-            "an embedded runtime sees only the servers its host declared"
-        );
-    }
-
     /// Vendor mcps kill switch must drop client-forwarded servers that match
     /// on-disk vendor config (pager may still load with default-on compat).
     #[test]
@@ -707,7 +597,6 @@ mod tests {
             cwd.path(),
             None,
             &compat,
-            McpSourceScope::Ambient,
         );
         assert!(
             !merged
@@ -727,7 +616,6 @@ mod tests {
             cwd.path(),
             None,
             &compat,
-            McpSourceScope::Ambient,
         );
         assert!(
             merged
@@ -751,7 +639,6 @@ mod tests {
             cwd.path(),
             None,
             &compat,
-            McpSourceScope::Ambient,
         );
         assert!(
             !merged
@@ -790,7 +677,6 @@ args = ["ok"]
             cwd.path(),
             None,
             &compat,
-            McpSourceScope::Ambient,
         );
         let server = merged
             .iter()
@@ -814,12 +700,8 @@ args = ["ok"]
         let mut compat = xai_grok_tools::types::compat::CompatConfig::default();
         compat.cursor.mcps = false;
 
-        let admitted = admit_client_mcp_servers(
-            vec![client_stdio("killswitch-cache")],
-            cwd.path(),
-            &compat,
-            McpSourceScope::Ambient,
-        );
+        let admitted =
+            admit_client_mcp_servers(vec![client_stdio("killswitch-cache")], cwd.path(), &compat);
         assert!(
             !admitted
                 .iter()
@@ -829,8 +711,7 @@ args = ["ok"]
 
         std::fs::remove_file(cwd.path().join(".cursor").join("mcp.json")).unwrap();
 
-        let merged =
-            merge_managed_mcp_servers(admitted, cwd.path(), None, &compat, McpSourceScope::Ambient);
+        let merged = merge_managed_mcp_servers(admitted, cwd.path(), None, &compat);
         assert!(
             !merged
                 .iter()
@@ -866,13 +747,7 @@ args = ["ok"]
             )
             .headers(vec![]),
         );
-        let merged = merge_managed_mcp_servers(
-            vec![matching, other],
-            cwd.path(),
-            None,
-            &compat,
-            McpSourceScope::Ambient,
-        );
+        let merged = merge_managed_mcp_servers(vec![matching, other], cwd.path(), None, &compat);
         assert!(
             !merged
                 .iter()
@@ -1089,8 +964,7 @@ enabled = false
         .unwrap();
 
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let merged =
-            merge_managed_mcp_servers(vec![], cwd.path(), None, &compat, McpSourceScope::Ambient);
+        let merged = merge_managed_mcp_servers(vec![], cwd.path(), None, &compat);
         assert!(
             !merged.iter().any(|server| matches!(
                 server,
@@ -1134,8 +1008,7 @@ Authorization = "Bearer org2-token"
     fn same_url_different_names_both_survive_merge() {
         let cwd = same_url_project_repo();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let merged =
-            merge_managed_mcp_servers(vec![], cwd.path(), None, &compat, McpSourceScope::Ambient);
+        let merged = merge_managed_mcp_servers(vec![], cwd.path(), None, &compat);
 
         let auth_header = |name: &str| -> &str {
             let server = merged
@@ -1204,13 +1077,7 @@ Authorization = "Bearer org2-token"
             )
             .headers(vec![]),
         )];
-        let merged = merge_managed_mcp_servers(
-            client,
-            untrusted.path(),
-            None,
-            &compat,
-            McpSourceScope::Ambient,
-        );
+        let merged = merge_managed_mcp_servers(client, untrusted.path(), None, &compat);
         assert!(
             !merged.iter().any(|s| mcp_server_name(s) == "projsrv"),
             "untrusted workspace must drop its repo-local MCP server"
@@ -1222,13 +1089,7 @@ Authorization = "Bearer org2-token"
 
         let trusted = repo_with_project_server();
         crate::agent::folder_trust::record_for_test(trusted.path(), true);
-        let merged = merge_managed_mcp_servers(
-            vec![],
-            trusted.path(),
-            None,
-            &compat,
-            McpSourceScope::Ambient,
-        );
+        let merged = merge_managed_mcp_servers(vec![], trusted.path(), None, &compat);
         assert!(
             merged.iter().any(|s| mcp_server_name(s) == "projsrv"),
             "trusted workspace must keep its repo-local MCP server"

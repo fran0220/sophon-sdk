@@ -1,224 +1,6 @@
 use super::*;
 use std::path::PathBuf;
 
-#[test]
-fn lifecycle_policy_requires_modern_discovery() {
-    let ClientLifecycleMode::Discover { preferred_versions } = McpClient::client_lifecycle() else {
-        panic!("MCP clients must use the modern Discover lifecycle");
-    };
-    assert_eq!(
-        preferred_versions,
-        vec![rmcp::model::ProtocolVersion::V_2026_07_28]
-    );
-}
-
-#[test]
-fn connection_generations_are_unique() {
-    let first = next_connection_generation();
-    let second = next_connection_generation();
-    assert_ne!(first, second);
-}
-
-#[test]
-fn client_capabilities_only_advertise_installed_host_services_and_no_ui() {
-    let info = McpClient::make_client_info("capabilities", None, false);
-    assert!(info.capabilities.roots.is_none());
-    assert!(info.capabilities.sampling.is_none());
-    assert!(info.capabilities.elicitation.is_none());
-    let extensions = info.capabilities.extensions.unwrap_or_default();
-    assert!(extensions.contains_key(rmcp::model::TASKS_EXTENSION_ID));
-    assert!(!extensions.contains_key("io.modelcontextprotocol/ui"));
-}
-
-#[derive(Clone, Copy)]
-enum DiscoverFixtureBehavior {
-    Modern,
-    MethodNotFound,
-    Malformed,
-    Unauthorized,
-    Timeout,
-}
-
-#[derive(Clone)]
-struct DiscoverFixtureState {
-    behavior: DiscoverFixtureBehavior,
-    discovers: Arc<std::sync::atomic::AtomicUsize>,
-    initializes: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-async fn discover_fixture_handler(
-    axum::extract::State(state): axum::extract::State<DiscoverFixtureState>,
-    axum::Json(request): axum::Json<serde_json::Value>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let id = request["id"].clone();
-    match request["method"].as_str() {
-        Some("server/discover") => {
-            state
-                .discovers
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match state.behavior {
-                DiscoverFixtureBehavior::Modern => axum::Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "resultType": "complete",
-                        "supportedVersions": ["2026-07-28", "2025-11-25"],
-                        "capabilities": {"tools": {}},
-                        "ttlMs": 0,
-                        "cacheScope": "private",
-                        "_meta": {
-                            "io.modelcontextprotocol/serverInfo": {
-                                "name": "modern-fixture",
-                                "version": "1"
-                            }
-                        }
-                    }
-                }))
-                .into_response(),
-                DiscoverFixtureBehavior::MethodNotFound => axum::Json(serde_json::json!({
-                    "jsonrpc":"2.0",
-                    "id":id,
-                    "error":{"code":-32601,"message":"Method not found"}
-                }))
-                .into_response(),
-                DiscoverFixtureBehavior::Malformed => axum::Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {"resultType": "complete", "capabilities": {}}
-                }))
-                .into_response(),
-                DiscoverFixtureBehavior::Unauthorized => {
-                    axum::http::StatusCode::UNAUTHORIZED.into_response()
-                }
-                DiscoverFixtureBehavior::Timeout => {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    axum::http::StatusCode::GATEWAY_TIMEOUT.into_response()
-                }
-            }
-        }
-        Some("initialize") => {
-            state
-                .initializes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            axum::Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "serverInfo": {"name": "legacy-fixture", "version": "1"}
-                }
-            }))
-            .into_response()
-        }
-        _ => axum::http::StatusCode::NO_CONTENT.into_response(),
-    }
-}
-
-async fn start_discover_fixture(
-    behavior: DiscoverFixtureBehavior,
-) -> (
-    String,
-    Arc<std::sync::atomic::AtomicUsize>,
-    Arc<std::sync::atomic::AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-) {
-    use axum::{Router, routing::post};
-    let discovers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind discovery fixture");
-    let address = listener.local_addr().expect("discovery fixture address");
-    let router = Router::new()
-        .route("/mcp", post(discover_fixture_handler))
-        .with_state(DiscoverFixtureState {
-            behavior,
-            discovers: discovers.clone(),
-            initializes: initializes.clone(),
-        });
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("serve discovery fixture");
-    });
-    (
-        format!("http://{address}/mcp"),
-        discovers,
-        initializes,
-        task,
-    )
-}
-
-#[tokio::test]
-async fn modern_discovery_negotiates_2026_without_legacy_initialize() {
-    let (url, discovers, initializes, task) =
-        start_discover_fixture(DiscoverFixtureBehavior::Modern).await;
-    let client = McpClient::new_http(
-        "modern".to_owned(),
-        HttpConfig {
-            url,
-            headers: Vec::new(),
-        },
-        None,
-        None,
-    );
-    let service = client
-        .ensure_initialized()
-        .await
-        .expect("modern MCP discovery succeeds");
-    let peer = service.peer().peer_info().expect("negotiated peer info");
-    assert_eq!(
-        peer.protocol_version,
-        rmcp::model::ProtocolVersion::V_2026_07_28
-    );
-    assert_eq!(discovers.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(initializes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    task.abort();
-}
-
-#[tokio::test]
-async fn modern_discovery_failures_never_downgrade() {
-    for behavior in [
-        DiscoverFixtureBehavior::MethodNotFound,
-        DiscoverFixtureBehavior::Malformed,
-        DiscoverFixtureBehavior::Unauthorized,
-        DiscoverFixtureBehavior::Timeout,
-    ] {
-        let (url, discovers, initializes, task) = start_discover_fixture(behavior).await;
-        let client = McpClient::new_http(
-            "no-downgrade".to_owned(),
-            HttpConfig {
-                url,
-                headers: Vec::new(),
-            },
-            Some(&McpClientTimeoutOverrides {
-                startup_timeout_sec: Some(1),
-                ..Default::default()
-            }),
-            None,
-        );
-        assert!(
-            client.ensure_initialized().await.is_err(),
-            "discover failure must fail closed"
-        );
-        assert_eq!(discovers.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(
-            initializes.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "modern discovery failures must never trigger legacy initialize"
-        );
-        task.abort();
-    }
-}
-
-/// A single undecodable line on an MCP stdio server's stdout must NOT
-/// collapse the transport: if the decode error surfaced as `None`, the
-/// service would read it as EOF → "Transport closed" → `tools/list` fails
-/// and the connector "shows but doesn't work". The resilient transport
-/// skips the bad line and keeps reading, so a stray stdout log line never
-/// takes the whole server down.
 #[tokio::test]
 async fn resilient_transport_skips_undecodable_line_and_keeps_stream_alive() {
     let (mut server_out, client_in) = tokio::io::duplex(64 * 1024);
@@ -607,10 +389,7 @@ async fn acp_servers_survive_update_configs_clear() {
         }
     }
 
-    let mut state = McpState::new(vec![
-        make_http_server("http-srv", "http://localhost"),
-        make_http_server("sdk-tools", "http://must-not-shadow"),
-    ]);
+    let mut state = McpState::new(vec![make_http_server("http-srv", "http://localhost")]);
     state.set_acp_servers(
         vec![AcpServerEntry {
             name: "sdk-tools".to_string(),
@@ -619,26 +398,11 @@ async fn acp_servers_survive_update_configs_clear() {
         Arc::new(NoopInvoker),
     );
     assert!(state.has_acp_servers());
-    assert!(
-        state
-            .configs
-            .iter()
-            .all(|config| mcp_server_name(config) != "sdk-tools"),
-        "an in-process registration must evict a colliding external config"
-    );
     assert_eq!(state.build_pending_acp_clients(&HashMap::new()).len(), 1);
 
-    // A config change clears owned clients/configs (proven by the generation bump)
-    // but must NOT drop the separately-held acp servers — otherwise the in-process
-    // SDK tools would silently vanish on every `update_configs`.
-    let changed = state.update_configs(vec![
-        make_http_server("other", "http://other"),
-        make_http_server("sdk-tools", "http://still-must-not-shadow"),
-    ]);
+    let changed = state.update_configs(vec![make_http_server("other", "http://other")]);
     assert!(changed);
     assert_eq!(state.generation, 1);
-    assert_eq!(state.configs.len(), 1);
-    assert_eq!(mcp_server_name(&state.configs[0]), "other");
     assert!(
         state.has_acp_servers(),
         "acp servers must survive update_configs"
@@ -1936,30 +1700,6 @@ async fn fake_handle_post(
         })
     };
     match req["method"].as_str() {
-        Some("server/discover") => {
-            state.handles.inits.fetch_add(1, Ordering::Relaxed);
-            state
-                .handles
-                .init_user_agents
-                .lock()
-                .extend(header_values(&headers, axum::http::header::USER_AGENT));
-            let result = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id.clone(),
-                "result": {
-                    "resultType": "complete",
-                    "supportedVersions": ["2026-07-28"],
-                    "capabilities": {},
-                    "ttlMs": 0,
-                    "cacheScope": "private",
-                    "_meta": {"io.modelcontextprotocol/serverInfo": {
-                        "name": "fake",
-                        "version": "0.0.0"
-                    }},
-                },
-            });
-            ([("mcp-session-id", "fake-session")], axum::Json(result)).into_response()
-        }
         Some("initialize") => {
             state.handles.inits.fetch_add(1, Ordering::Relaxed);
             *state.handles.init_version.lock() =
@@ -2138,8 +1878,8 @@ async fn try_call_tool_http_mcperror_recovers_then_retry_succeeds() {
     );
     assert_eq!(
         handles.init_version.lock().as_deref(),
-        None,
-        "modern discovery must not send a legacy initialize request"
+        Some("2025-11-25"),
+        "initialize must offer protocolVersion 2025-11-25"
     );
 
     let jsonl = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
@@ -2443,16 +2183,10 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
                 .and_then(|m| m.as_str())
                 .unwrap_or_default();
             let result = match method {
-                "server/discover" => serde_json::json!({
-                    "resultType": "complete",
-                    "supportedVersions": ["2026-07-28"],
+                "initialize" => serde_json::json!({
+                    "protocolVersion": message["params"]["protocolVersion"],
                     "capabilities": { "tools": {} },
-                    "ttlMs": 0,
-                    "cacheScope": "private",
-                    "_meta": {"io.modelcontextprotocol/serverInfo": {
-                        "name": "echo",
-                        "version": "0.0.0"
-                    }},
+                    "serverInfo": { "name": "echo", "version": "0.0.0" },
                 }),
                 "tools/call" => serde_json::json!({
                     "content": [{
@@ -2469,10 +2203,6 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
         }
     }
 
-    // A real `RunningService` whose transport is already closed: the
-    // server answers `server/discover`, then drops its duplex ends. The
-    // next `call_tool` therefore observes a real
-    // `ServiceError::TransportClosed`.
     async fn dead_service() -> McpService {
         let (client_read, server_write) = tokio::io::duplex(64 * 1024);
         let (server_read, client_write) = tokio::io::duplex(64 * 1024);
@@ -2488,48 +2218,38 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                     continue;
                 };
-                if msg.get("method").and_then(|m| m.as_str()) == Some("server/discover") {
+                if msg.get("method").and_then(|m| m.as_str()) == Some("initialize") {
                     let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
                     let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
-                        "resultType": "complete",
-                        "supportedVersions": ["2026-07-28"],
+                        "protocolVersion": msg["params"]["protocolVersion"],
                         "capabilities": { "tools": {} },
-                        "ttlMs": 0,
-                        "cacheScope": "private",
-                        "_meta": {"io.modelcontextprotocol/serverInfo": {
-                            "name": "dead",
-                            "version": "0.0.0"
-                        }},
+                        "serverInfo": { "name": "dead", "version": "0.0.0" },
                     }});
                     let mut encoded = serde_json::to_string(&resp).unwrap();
                     encoded.push('\n');
                     let _ = writer.write_all(encoded.as_bytes()).await;
                     let _ = writer.flush().await;
+                    let _ = reader.read_line(&mut line).await;
                     return;
                 }
             }
         });
         let handler = GrokClientHandler {
-            info: McpClient::make_client_info("dead", None, false),
+            info: McpClient::make_client_info("dead", /* advertise_elicitation */ true),
             server_name: "dead".to_string(),
-            client_id: 1,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
-            domain_notifications: Arc::new(DomainNotificationRegistry::default()),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
             client_read,
             client_write,
         );
-        McpService {
-            inner: Arc::new(
-                handler
-                    .serve_with_lifecycle(transport, McpClient::client_lifecycle())
-                    .await
-                    .expect("dead-service handshake"),
-            ),
-            connection_generation: next_connection_generation(),
-        }
+        Arc::new(
+            handler
+                .serve(transport)
+                .await
+                .expect("dead-service handshake"),
+        )
     }
 
     let client = Arc::new(McpClient::new_acp(
@@ -2540,8 +2260,6 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
         None,
     ));
     let dead = dead_service().await;
-    let original_client_id = client.client_id();
-    let stale_generation = dead.connection_generation();
     *client.state.lock().await = ClientState::Ready {
         service: dead,
         _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
@@ -2585,40 +2303,117 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
         !is_timeout,
         "successful retry must not be flagged as timeout"
     );
-    // reset_transport + re-handshake replaced the dead service with a live one.
     assert!(matches!(
         &*client.state.lock().await,
         ClientState::Ready { .. }
     ));
-    let current_generation = client
-        .current_connection_generation()
-        .await
-        .expect("replacement is ready");
-    assert_ne!(stale_generation, current_generation);
-    assert_eq!(original_client_id, client.client_id());
+    assert!(
+        xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.get() >= 1,
+        "a Ready client must hold a connected-gauge slot"
+    );
+}
+
+async fn watched_live_client(name: &str) -> Arc<McpClient> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (client_read, server_write) = tokio::io::duplex(64 * 1024);
+    let (server_read, client_write) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(server_read);
+        let mut writer = server_write;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if msg.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+                let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                    "protocolVersion": msg["params"]["protocolVersion"],
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "live", "version": "0.0.0" },
+                }});
+                let mut encoded = serde_json::to_string(&resp).unwrap();
+                encoded.push('\n');
+                let _ = writer.write_all(encoded.as_bytes()).await;
+                let _ = writer.flush().await;
+            }
+        }
+    });
+    let handler = GrokClientHandler {
+        info: McpClient::make_client_info(name, /* advertise_elicitation */ true),
+        server_name: name.to_string(),
+        notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
+    };
+    let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
+        client_read,
+        client_write,
+    );
+    let service: McpService = Arc::new(
+        handler
+            .serve(transport)
+            .await
+            .expect("live-service handshake"),
+    );
+
+    let client = Arc::new(McpClient::new_http(
+        name.to_string(),
+        HttpConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            headers: Vec::new(),
+        },
+        None,
+        None,
+    ));
+    *client.state.lock().await = ClientState::Ready {
+        service,
+        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+    };
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_event_tx(Some(event_tx));
     assert!(
         client
-            .get_task_json(stale_generation, "stale-task".to_owned())
-            .await
-            .is_err()
+            .arm_liveness_watcher(std::time::Duration::from_secs(3600))
+            .await,
+        "watcher must arm on a healthy Ready client"
     );
-    assert!(
-        client
-            .update_task_if_current(
-                stale_generation,
-                "stale-task".to_owned(),
-                serde_json::Value::Null,
-                Default::default(),
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        client
-            .cancel_task(stale_generation, "stale-task".to_owned())
-            .await
-            .is_err()
-    );
+    client
+}
+
+async fn assert_watcher_releases(weak: std::sync::Weak<McpClient>, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while weak.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} must cancel the watcher and release its client Arc"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn evicting_a_watched_client_releases_the_watcher_arc() {
+    let client = watched_live_client("evict").await;
+    let weak = Arc::downgrade(&client);
+    let mut owned = crate::owned_clients::OwnedClients::new();
+    owned.insert("evict".to_string(), client);
+    owned.remove("evict");
+    assert_watcher_releases(weak, "eviction").await;
+}
+
+#[tokio::test]
+async fn dropping_the_owned_map_releases_watched_clients() {
+    let client = watched_live_client("teardown").await;
+    let weak = Arc::downgrade(&client);
+    let mut owned = crate::owned_clients::OwnedClients::new();
+    owned.insert("teardown".to_string(), client);
+    drop(owned);
+    assert_watcher_releases(weak, "map teardown").await;
 }
 
 #[test]
@@ -3063,29 +2858,6 @@ fn state_label(s: &ClientState) -> &'static str {
     }
 }
 
-// -- is_healthy / state_kind --------------------------------------
-//
-// These tests cover the cheap, non-blocking predicate. They focus
-// on the state-machine inspection: any
-// non-`Ready` variant returns `false` for `is_healthy`, and
-// `state_kind` projects every variant onto the matching
-// [`ClientStateKind`].
-//
-// The two `Ready` cases
-// (`is_healthy_ready_open_returns_true` and
-// `is_healthy_transport_closed_returns_false`) require a real
-// `RunningService<RoleClient, InitializeRequestParams>`, which can
-// only be constructed through rmcp's `serve_client` path. That
-// path needs a peer that responds to the MCP initialize
-// handshake, and this crate intentionally does NOT enable rmcp's
-// `server` feature (see `Cargo.toml`). Wiring up a hand-rolled
-// JSON-RPC responder over `tokio::io::duplex` would balloon the
-// test scaffolding far beyond what these tests need. We therefore
-// exercise the `Ready` arm indirectly: the cheap predicate is a
-// single `match` on the state mutex plus
-// `Peer::is_transport_closed`, which is upstream-tested in rmcp
-// itself (in its `test_close_connection` integration test).
-
 #[tokio::test]
 async fn is_healthy_empty_returns_false() {
     let client = McpClient::stub("empty");
@@ -3146,16 +2918,14 @@ async fn is_healthy_pending_does_not_block_on_handshake() {
 #[test]
 fn make_client_info_pins_protocol_version() {
     assert_eq!(
-        McpClient::make_client_info("test-srv", None, false).protocol_version,
-        rmcp::model::ProtocolVersion::V_2026_07_28
+        McpClient::make_client_info("test-srv", /* advertise_elicitation */ true).protocol_version,
+        rmcp::model::ProtocolVersion::V_2025_11_25
     );
 }
 
 #[test]
 fn make_client_info_advertises_form_and_url_elicitation() {
-    let info = McpClient::make_client_info(
-        "test-srv", None, /* advertise_legacy_elicitation */ true,
-    );
+    let info = McpClient::make_client_info("test-srv", /* advertise_elicitation */ true);
     let elicitation = info
         .capabilities
         .elicitation
@@ -3201,7 +2971,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
         None,
         None,
     );
-    let acp_info = acp.make_client_handler(1).get_info();
+    let acp_info = acp.make_client_handler().get_info();
     assert!(
         acp_info.capabilities.elicitation.is_none(),
         "ACP zero-IPC cannot deliver elicitation/create"
@@ -3210,7 +2980,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
     let no_bridge = McpClient::stub("stdio");
     assert!(
         no_bridge
-            .make_client_handler(1)
+            .make_client_handler()
             .get_info()
             .capabilities
             .elicitation
@@ -3221,7 +2991,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
     let hitl = McpClient::stub("stdio");
     hitl.set_elicitation_tx(Some(crate::elicitation::ElicitationInbox::new()));
     assert!(
-        hitl.make_client_handler(1)
+        hitl.make_client_handler()
             .get_info()
             .capabilities
             .elicitation
@@ -3234,12 +3004,10 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
 async fn client_handler_routes_tools_changed() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<McpClientEvent>();
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test", None, false),
+        info: McpClient::make_client_info("test", /* advertise_elicitation */ true),
         server_name: "test".to_string(),
-        client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
-        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: handler.server_name.clone(),
@@ -3254,12 +3022,10 @@ async fn client_handler_routes_tools_changed() {
 #[tokio::test]
 async fn client_handler_no_dispatcher_is_silent() {
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test", None, false),
+        info: McpClient::make_client_info("test", /* advertise_elicitation */ true),
         server_name: "test".to_string(),
-        client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
-        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
         server: "test".to_string(),
@@ -3268,14 +3034,12 @@ async fn client_handler_no_dispatcher_is_silent() {
 
 #[tokio::test]
 async fn client_handler_get_info_round_trips() {
-    let info = McpClient::make_client_info("test-srv", None, false);
+    let info = McpClient::make_client_info("test-srv", /* advertise_elicitation */ true);
     let handler = GrokClientHandler {
         info: info.clone(),
         server_name: "test-srv".to_string(),
-        client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
-        domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     let got = handler.get_info();
     assert_eq!(got.client_info.name, info.client_info.name);
@@ -3283,109 +3047,11 @@ async fn client_handler_get_info_round_trips() {
 }
 
 #[tokio::test]
-async fn domain_notifications_are_exact_bounded_and_generation_bound() {
-    let registry = Arc::new(DomainNotificationRegistry::default());
-    let mut subscription = registry.subscribe(
-        7,
-        vec!["notifications/mail/received".into()],
-        std::num::NonZeroUsize::new(1).unwrap(),
-    );
-
-    registry.publish(
-        7,
-        rmcp::model::CustomNotification::new(
-            "notifications/mail/ignored",
-            Some(serde_json::json!({"sequence": 0})),
-        ),
-    );
-    assert!(matches!(
-        subscription.events.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-
-    registry.publish(
-        7,
-        rmcp::model::CustomNotification::new(
-            "notifications/mail/received",
-            Some(serde_json::json!({"sequence": 1})),
-        ),
-    );
-    registry.publish(
-        7,
-        rmcp::model::CustomNotification::new(
-            "notifications/mail/received",
-            Some(serde_json::json!({"sequence": 2})),
-        ),
-    );
-    assert_eq!(
-        subscription.events.recv().await.unwrap()["params"]["sequence"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        subscription.terminal.await.unwrap(),
-        serde_json::json!({"reason": "lagged", "capacity": 1})
-    );
-
-    let subscription = registry.subscribe(
-        8,
-        vec!["notifications/mail/received".into()],
-        std::num::NonZeroUsize::new(1).unwrap(),
-    );
-    registry.retire_before(9);
-    assert_eq!(
-        subscription.terminal.await.unwrap(),
-        serde_json::json!({"reason": "abrupt"})
-    );
-
-    let registry = Arc::new(DomainNotificationRegistry::default());
-    let mut subscription = registry.subscribe(
-        10,
-        vec!["notifications/mail/received".into()],
-        std::num::NonZeroUsize::new(1).unwrap(),
-    );
-    drop(registry);
-    assert!(subscription.events.recv().await.is_none());
-    assert!(subscription.terminal.await.is_err());
-}
-
-#[tokio::test]
-async fn oversized_domain_notification_ends_the_subscription() {
-    let registry = Arc::new(DomainNotificationRegistry::default());
-    let subscription = registry.subscribe(
-        1,
-        vec!["notifications/report".into()],
-        std::num::NonZeroUsize::new(1).unwrap(),
-    );
-    registry.publish(
-        1,
-        rmcp::model::CustomNotification::new(
-            "notifications/report",
-            Some(serde_json::json!({
-                "body": "x".repeat(MAX_DOMAIN_NOTIFICATION_BYTES)
-            })),
-        ),
-    );
-    let terminal = subscription.terminal.await.unwrap();
-    assert_eq!(terminal["reason"], "error");
-    assert!(terminal["message"].as_str().unwrap().contains("exceeded"));
-}
-
-// A sender wired *after* the handler is constructed must still
-// reach the live rmcp service loop. This test exercises the
-// post-construction wiring path: build a handler from a client
-// whose slot is `None`, then install a sender via
-// `client.set_event_tx` and verify the handler picks it up (the
-// handler holds a clone of the same shared Arc slot).
-#[tokio::test]
 async fn client_handler_observes_post_handshake_set_event_tx() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<McpClientEvent>();
     let client = Arc::new(McpClient::stub("test"));
 
-    // Build the handler BEFORE wiring the sender — emulates
-    // the production flow where `make_client_handler` is called
-    // during `try_handshake` and the dispatcher is wired
-    // separately.
-    let handler = client.make_client_handler(next_connection_generation());
+    let handler = client.make_client_handler();
 
     assert!(handler.notify_tx.lock().is_none());
 
@@ -3704,36 +3370,6 @@ fn mcp_icon_from_rmcp_caps_mime_type_and_sizes() {
     )
     .unwrap();
     assert_eq!(converted.sizes.as_deref(), Some(&["48x48".to_string()][..]));
-}
-
-#[test]
-fn mcp_icon_wire_sanitization_uses_the_discovery_policy() {
-    let icons = vec![
-        McpIcon {
-            src: " http://insecure.example/icon.png ".to_string(),
-            mime_type: None,
-            sizes: None,
-            theme: None,
-        },
-        McpIcon {
-            src: " https://example.com/icon.png ".to_string(),
-            mime_type: Some(" image/png ".to_string()),
-            sizes: Some(vec![
-                " 48x48 ".to_string(),
-                "x".repeat(MAX_MCP_ICON_SIZE_TOKEN_BYTES + 1),
-            ]),
-            theme: Some(McpIconTheme::Dark),
-        },
-    ];
-    let sanitized = McpIcon::sanitized_list(icons);
-    assert_eq!(sanitized.len(), 1);
-    assert_eq!(sanitized[0].src, "https://example.com/icon.png");
-    assert_eq!(sanitized[0].mime_type.as_deref(), Some("image/png"));
-    assert_eq!(
-        sanitized[0].sizes.as_deref(),
-        Some(&["48x48".to_string()][..])
-    );
-    assert_eq!(sanitized[0].theme, Some(McpIconTheme::Dark));
 }
 
 #[test]

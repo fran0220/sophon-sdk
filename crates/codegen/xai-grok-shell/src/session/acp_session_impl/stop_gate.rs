@@ -57,8 +57,11 @@ fn stop_cron_from_scheduled(
 ) -> StopSessionCron {
     StopSessionCron {
         id: task.id.clone(),
-        schedule: task.human_schedule(),
-        recurring: task.is_recurring(),
+        schedule:
+            xai_grok_tools::implementations::grok_build::scheduler::interval::interval_to_human(
+                task.interval_secs,
+            ),
+        recurring: task.recurring,
         prompt: clip_stop_entry_text(&task.prompt),
     }
 }

@@ -24,7 +24,6 @@ fn test_config_with_window(context_window: u64) -> SamplingConfig {
         temperature: None,
         top_p: None,
         api_backend: Default::default(),
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -742,43 +741,6 @@ async fn replace_conversation_persists_and_emits_reset() {
 }
 
 #[tokio::test]
-async fn install_published_compaction_skips_persistence_and_acks_exact_state() {
-    let mut h = TestHarness::new();
-    h.handle.begin_turn_capture();
-    h.handle
-        .push_user_message(ConversationItem::user("x".repeat(4_000)));
-    h.handle.record_token_usage(51_000);
-    let _ = h.handle.get_conversation().await;
-    h.drain_persistence();
-
-    let published = vec![
-        ConversationItem::system("published system"),
-        ConversationItem::user("published summary ".repeat(200)),
-    ];
-    let ack = h
-        .handle
-        .install_published_compaction(published.clone())
-        .await;
-
-    assert_eq!(ack, Some(()));
-    let installed = h.handle.get_conversation().await;
-    assert_eq!(
-        serde_json::to_value(&installed).unwrap(),
-        serde_json::to_value(&published).unwrap()
-    );
-    let base_estimate = crate::estimate_conversation_tokens(&published);
-    let expected = (base_estimate as f64 * 51_000f64 / 1_000f64).round() as u64;
-    assert_eq!(h.handle.get_total_tokens().await, expected.min(51_000));
-    let capture = h
-        .handle
-        .take_turn_messages()
-        .await
-        .expect("capture was active");
-    assert!(capture.compaction_occurred);
-    assert!(h.drain_persistence().is_empty());
-}
-
-#[tokio::test]
 async fn strip_conversation_images_replaces_only_listed_urls_and_persists() {
     let mut user = match ConversationItem::user("look at this") {
         ConversationItem::User(u) => u,
@@ -1383,7 +1345,6 @@ async fn update_sampling_config_is_queryable() {
         temperature: Some(0.5),
         top_p: None,
         api_backend: Default::default(),
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -1799,7 +1760,6 @@ async fn build_request_uses_sampling_config() {
         temperature: Some(0.7),
         top_p: Some(0.9),
         api_backend: Default::default(),
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -3943,7 +3903,6 @@ async fn sampling_config_survives_compaction_replacement() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -4029,7 +3988,6 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: Default::default(),
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -4120,7 +4078,6 @@ async fn context_window_downgrade_triggers_auto_compact() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
-        auth_scheme: Default::default(),
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),

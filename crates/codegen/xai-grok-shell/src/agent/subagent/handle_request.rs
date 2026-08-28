@@ -14,31 +14,6 @@ use xai_grok_telemetry::region::Parent;
 use xai_grok_telemetry::subagent_spawn::{SubagentSpawnPhase, phase_region};
 use xai_grok_telemetry::{instrument_task, region};
 use xai_grok_tools::implementations::{grok_build, opencode};
-
-struct EmbeddedChildRegistration(Option<String>);
-
-impl EmbeddedChildRegistration {
-    fn register(child_session_id: &str, parent_session_id: &str) -> Option<Self> {
-        if !xai_grok_shared::session::inherit_session_root(child_session_id, parent_session_id) {
-            return None;
-        }
-        if !crate::origin_runtime::register_child_session(child_session_id, parent_session_id) {
-            xai_grok_shared::session::unregister_inherited_session(child_session_id);
-            return None;
-        }
-        Some(Self(Some(child_session_id.to_owned())))
-    }
-}
-
-impl Drop for EmbeddedChildRegistration {
-    fn drop(&mut self) {
-        if let Some(session_id) = self.0.take() {
-            crate::origin_runtime::unregister_child_session(&session_id);
-            xai_grok_shared::session::unregister_inherited_session(&session_id);
-        }
-    }
-}
-
 const INITIAL_PROMPT_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Budget for the pre-completion child transcript flush (replay buffer +
 /// persistence to disk). Mirrors the workflow-shutdown persistence bound.
@@ -86,32 +61,6 @@ pub(crate) async fn run_shell_child(
     }
     let spawn_prepare_span = phase_region(SubagentSpawnPhase::SpawnPrepare);
     let mut completion_data = ShellCompletionData::from_context(&ctx);
-    // Storage/root correlation remains embedded for both Origin profiles.
-    let origin_embedded = ctx
-        .agent_config
-        .as_ref()
-        .is_some_and(|config| config.origin_embedded);
-    let origin_restricted = ctx.origin_restricted;
-    if origin_restricted
-        && (request
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| !cwd.trim().is_empty())
-            || request.runtime_overrides.isolation
-                == Some(xai_tool_types::SubagentIsolationMode::Worktree)
-            || request.runtime_overrides.model.is_some()
-            || request.runtime_overrides.reasoning_effort.is_some()
-            || request.runtime_overrides.harness_agent_type.is_some())
-    {
-        return child_run_output(
-            failure_result(
-                &request,
-                "Origin-hosted subagents inherit the parent route and project; model, reasoning, harness, cwd, and worktree overrides are unavailable",
-            ),
-            completion_data,
-            None,
-        );
-    }
     if request.owner.is_workflow() && cancel_token.is_cancelled() {
         return child_run_output(
             cancelled_result(&request, "Subagent was cancelled"),
@@ -152,11 +101,7 @@ pub(crate) async fn run_shell_child(
     }
     resolve_subagent_toolset(
         &request.subagent_type,
-        if origin_restricted {
-            None
-        } else {
-            request.runtime_overrides.harness_agent_type.as_deref()
-        },
+        request.runtime_overrides.harness_agent_type.as_deref(),
         &ctx,
         &mut definition,
     );
@@ -172,18 +117,6 @@ pub(crate) async fn run_shell_child(
         cwd,
         &definition,
     );
-    if origin_restricted {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
-        effective_runtime.reasoning_effort = None;
-        effective_runtime.capability_mode = None;
-        effective_runtime.isolation = xai_tool_types::SubagentIsolationMode::None;
-        definition.model = xai_grok_agent::config::ModelOverride::Inherit;
-        definition.capability_mode = None;
-        definition.permission_mode = xai_grok_agent::config::PermissionMode::BypassPermissions;
-        definition.memory = None;
-        definition.agents_md = false;
-        definition.discover_skills = false;
-    }
     let prompt = request.prompt.clone();
     if let Some(ref err) = effective_runtime.persona_error {
         tracing::error!(
@@ -503,8 +436,7 @@ pub(crate) async fn run_shell_child(
             effective_model_id = parent_mid;
         }
     }
-    if !origin_restricted
-        && let Some(ref source) = resume_source
+    if let Some(ref source) = resume_source
         && let Some(ref source_model) = source.model_id
         && effective_model_id.0.as_ref() != source_model.as_str()
     {
@@ -544,24 +476,6 @@ pub(crate) async fn run_shell_child(
     }
     let subagent_id = request.id.clone();
     let child_session_id = acp::SessionId::new(subagent_id.clone());
-    let _embedded_child_registration = if origin_embedded {
-        let Some(registration) = EmbeddedChildRegistration::register(
-            child_session_id.0.as_ref(),
-            &ctx.parent_session_id,
-        ) else {
-            return child_run_output(
-                failure_result(
-                    &request,
-                    "Origin-hosted subagent could not inherit its parent session root",
-                ),
-                completion_data,
-                None,
-            );
-        };
-        Some(registration)
-    } else {
-        None
-    };
     let override_cwd = select_override_cwd(resume_source.as_ref(), request.cwd.as_deref());
     let effective_cwd = resolve_child_cwd(worktree_path.as_deref(), override_cwd, &ctx.parent_cwd)
         .to_string_lossy()
@@ -754,7 +668,6 @@ pub(crate) async fn run_shell_child(
         effective_model_id.clone(),
         sampling_client,
         effective_sampling_config.model.clone(),
-        !origin_embedded,
     )
     .await
     {
@@ -801,13 +714,7 @@ pub(crate) async fn run_shell_child(
     tool_ctx.sampler_retry_only_before_output = task_output_budget.is_some();
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
     tool_ctx.subagent_depth = child_depth;
-    tool_ctx.origin_embedded = origin_restricted;
-    tool_ctx.origin_runtime_embedded = origin_embedded;
-    tool_ctx.lsp = if origin_restricted {
-        None
-    } else {
-        ctx.lsp.clone()
-    };
+    tool_ctx.lsp = ctx.lsp.clone();
     tool_ctx.process_scope = ctx.process_scope.clone();
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
     let tracker_child_cwd = child_session_info.cwd.clone();
@@ -834,12 +741,12 @@ pub(crate) async fn run_shell_child(
             "effective_model": effective_model_id.0.as_ref(),
             "effective_model_raw": &effective_sampling_config.model,
             "base_url": &effective_sampling_config.base_url,
-            "has_key": effective_sampling_config.api_key.is_some(),
+            "key_prefix": key_prefix(&effective_sampling_config.api_key),
             "auth_type": format!("{:?}", inherited_auth_type),
             "model_has_own_creds": model_has_own_creds,
             "auth_method_id": ctx.auth_method_id.0.as_ref(),
             "parent_model": ctx.model_id.0.as_ref(),
-            "parent_has_key": ctx.sampling_config.api_key.is_some(),
+            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
             "context_window": effective_sampling_config.context_window,
         })),
     );
@@ -848,16 +755,13 @@ pub(crate) async fn run_shell_child(
     let agent_memory_scope = definition.memory;
     let agent_name_for_memory = definition.name.clone();
     let is_plugin_agent = definition.plugin_name.is_some();
-    let agent_permission_mode = if origin_restricted {
-        xai_grok_agent::config::PermissionMode::BypassPermissions
-    } else {
-        resolve_subagent_permission_mode(
-            definition.permission_mode.clone(),
-            is_plugin_agent,
-            xai_grok_workspace::permission::resolution::yolo_disabled_by_policy(),
-        )
-    };
-    if !origin_restricted && agent_permission_mode != definition.permission_mode {
+    let yolo_policy_block = xai_grok_workspace::permission::resolution::yolo_disabled_by_policy();
+    let agent_permission_mode = resolve_subagent_permission_mode(
+        definition.permission_mode.clone(),
+        is_plugin_agent,
+        yolo_policy_block,
+    );
+    if agent_permission_mode != definition.permission_mode {
         if is_plugin_agent {
             tracing::warn!(
                 agent = %definition.name,
@@ -956,19 +860,14 @@ pub(crate) async fn run_shell_child(
             }
         }
     }
-    let agent_mcp_servers: Vec<_> = if !agent_owned_mcp_servers_allowed(
-        is_plugin_agent,
-        origin_restricted,
-    ) {
-        if !definition.mcp_servers.is_empty() {
-            tracing::warn!(
-                agent = %definition.name,
-                plugin = ?definition.plugin_name,
-                "ignoring mcpServers on plugin agent (not supported for security)"
-            );
-        }
+    let agent_mcp_servers: Vec<_> = if definition.mcp_servers.is_empty() {
         vec![]
-    } else if definition.mcp_servers.is_empty() {
+    } else if is_plugin_agent {
+        tracing::warn!(
+            agent = %definition.name,
+            plugin = ?definition.plugin_name,
+            "ignoring mcpServers on plugin agent (not supported for security)"
+        );
         vec![]
     } else if !crate::agent::folder_trust::agent_inline_hooks_allowed(definition.scope, || {
         crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd)
@@ -1123,7 +1022,6 @@ pub(crate) async fn run_shell_child(
         Default::default(),
         parent_mcp_pool,
         Vec::new(),
-        None,
         true,
         false,
         None,
@@ -1244,7 +1142,6 @@ pub(crate) async fn run_shell_child(
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
         ctx.image_description_model.clone(),
-        ctx.transcribe_user_images,
         ctx.hook_registry.clone(),
         ctx.workspace_ops.clone(),
         vec![],

@@ -2,7 +2,7 @@
 //!
 //! Two responsibilities:
 //!
-//! 1. **Quarantines `rmcp` 3.1 and `reqwest` 0.13.** `rmcp` requires
+//! 1. **Quarantines `rmcp` 2.1 and `reqwest` 0.13.** `rmcp` 2.1 requires
 //!    `reqwest >= 0.13.2`. The rest of the workspace consumes `reqwest` 0.12
 //!    and a transitive ecosystem (`opentelemetry-otlp`, `oauth2`,
 //!    `xai-mixpanel`, `xai-grok-tools`, ...) also pinned to 0.12. Bumping every
@@ -29,10 +29,6 @@
 pub use rmcp;
 
 pub mod acp_transport;
-/// Protocol-neutral process-local MCP host boundary for embedded runtimes.
-pub mod embedded_transport {
-    pub use crate::acp_transport::EmbeddedMcpInvoker;
-}
 pub mod credentials;
 pub mod elicitation;
 pub mod liveness;

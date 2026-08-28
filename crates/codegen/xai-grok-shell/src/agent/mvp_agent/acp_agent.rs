@@ -48,12 +48,10 @@ impl acp::Agent for MvpAgent {
         arguments: acp::InitializeRequest,
     ) -> Result<acp::InitializeResponse, acp::Error> {
         tracing::debug!(target: "sampling_log", "Received initialize request");
-        if !self.origin_embedded {
-            xai_grok_telemetry::unified_log::info("agent initialized", None, None);
-            xai_grok_telemetry::startup::mark_agent_serving();
-        }
+        xai_grok_telemetry::unified_log::info("agent initialized", None, None);
+        xai_grok_telemetry::startup::mark_agent_serving();
         self.start_subagent_coordinator();
-        if !self.origin_embedded && self.cfg.borrow().remote_settings.is_none() {
+        if self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
         }
         let remote_settled = self.remote_settings_settled();
@@ -63,24 +61,24 @@ impl acp::Agent for MvpAgent {
                 "auto worktree gc and session search deferred until remote_settings arrive"
             );
         }
-        if !self.origin_embedded {
-            let grok_home = xai_fast_worktree::resolve_grok_home();
-            tokio::task::spawn_blocking(move || {
-                crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
-                if !remote_settled {
-                    return;
-                }
-                Self::reclaim_worktrees(grok_home, auto_gc_policy);
-            });
-            tokio::task::spawn_blocking(|| {
-                crate::session::persistence::cleanup_stale_sessions(None);
-            });
-            if remote_settled {
-                self.start_search_index_once();
+        let grok_home = xai_fast_worktree::resolve_grok_home();
+        tokio::task::spawn_blocking(move || {
+            crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
+            if !remote_settled {
+                return;
             }
-            const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
-            static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
-            CLEANUP_PERMISSIONS_ONCE.call_once(|| {
+            Self::reclaim_worktrees(grok_home, auto_gc_policy);
+        });
+        tokio::task::spawn_blocking(|| {
+            crate::session::persistence::cleanup_stale_sessions(None);
+        });
+        if remote_settled {
+            self.start_search_index_once();
+        }
+        const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
+        static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
+        CLEANUP_PERMISSIONS_ONCE
+            .call_once(|| {
                 tokio::task::spawn(
                     xai_grok_workspace::permission::cleanup_stale_permission_state(
                         std::time::Duration::from_secs(
@@ -89,8 +87,7 @@ impl acp::Agent for MvpAgent {
                     ),
                 );
             });
-            xai_grok_workspace::trust::migrate_legacy_hook_trust();
-        }
+        xai_grok_workspace::trust::migrate_legacy_hook_trust();
         if let Some(auth) = self.auth_manager.current() {
             let user_id = auth.user_id.trim();
             let needs_user_info = user_id.is_empty()
@@ -117,9 +114,7 @@ impl acp::Agent for MvpAgent {
         if !self.tier_allowed.get() {
             self.spawn_tier_recheck();
         }
-        if !self.origin_embedded {
-            self.maybe_sync_bundle_in_background(false);
-        }
+        self.maybe_sync_bundle_in_background(false);
         let mut client_type = arguments
             .meta
             .as_ref()
@@ -195,9 +190,7 @@ impl acp::Agent for MvpAgent {
                     .as_deref()
                     .map(|t| xai_grok_auth::bearer_suffix(t).to_owned()),
             ));
-        if !self.origin_embedded {
-            self.auth_manager.force_reload_from_disk();
-        }
+        self.auth_manager.force_reload_from_disk();
         let post = self
             .auth_manager
             .current()
@@ -232,8 +225,7 @@ impl acp::Agent for MvpAgent {
             }),
             ),
         );
-        if !self.origin_embedded
-            && !self.cfg.borrow().grok_com_config.api_key_auth_disabled()
+        if !self.cfg.borrow().grok_com_config.api_key_auth_disabled()
             && auth_method::read_xai_api_key_env().is_err()
             && let Some(api_key) = crate::auth::read_api_key(
                 &crate::util::grok_home::grok_home(),
@@ -276,9 +268,7 @@ impl acp::Agent for MvpAgent {
             .models()
             .values()
             .any(crate::agent::config::ModelEntry::has_own_credentials);
-        let first_party_env_ok = if self.origin_embedded {
-            true
-        } else if crate::auth::should_probe_first_party_env_key(
+        let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
             auth_method::has_xai_api_key_env(),
@@ -429,23 +419,17 @@ impl acp::Agent for MvpAgent {
         let current_working_directory = self.launch_cwd.clone();
         let hostname = gethostname::gethostname();
         let mcp_servers: Vec<crate::extensions::mcp::McpServerEntry> = Vec::new();
-        if !self.origin_restricted() {
-            self.spawn_initialize_launch_mcp_setup();
-            self.spawn_managed_gateway_tool_catalog_fetch();
-            {
-                let agent_ref = LocalRef::new(self);
-                tokio::task::spawn_local(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    agent_ref
-                        .get()
-                        .emit_announcements(AnnouncementsPushMode::SeedNewClient);
-                });
-            }
-            self.spawn_announcements_refresh();
+        self.spawn_initialize_launch_mcp_setup();
+        self.spawn_managed_gateway_tool_catalog_fetch();
+        {
+            let agent_ref = LocalRef::new(self);
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                agent_ref.get().emit_announcements(AnnouncementsPushMode::SeedNewClient);
+            });
         }
-        if !self.origin_embedded {
-            self.spawn_heap_profile_monitor();
-        }
+        self.spawn_announcements_refresh();
+        self.spawn_heap_profile_monitor();
         let init_model_state = if crate::agent::chat_modes::process_chat_mode_enabled() {
             self.chat_modes.model_state().await
         } else {
@@ -483,10 +467,7 @@ impl acp::Agent for MvpAgent {
                                 .cloned(),
                         )
                         .prompt_capabilities(
-                            acp::PromptCapabilities::new()
-                                .image(true)
-                                .audio(true)
-                                .embedded_context(true),
+                            acp::PromptCapabilities::new().embedded_context(true),
                         )
                         .mcp_capabilities(
                             acp::McpCapabilities::new().http(true).sse(true),
@@ -1270,17 +1251,6 @@ impl acp::Agent for MvpAgent {
             .and_then(|m| m.get("screenMode"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let origin_prompt_identity = arguments.meta.as_ref().and_then(|meta| {
-            let prompt_index = meta.get("originRuntimePromptIndex")?.as_u64()?;
-            let prompt_digest = meta.get("originPromptDigest")?.as_str()?;
-            if prompt_digest.is_empty() || prompt_digest.len() > 160 {
-                return None;
-            }
-            Some(crate::session::commands::OriginPromptIdentity {
-                prompt_index,
-                prompt_digest: prompt_digest.to_owned(),
-            })
-        });
         let json_schema = arguments
             .meta
             .as_ref()
@@ -1315,7 +1285,6 @@ impl acp::Agent for MvpAgent {
             .send(SessionCommand::Prompt {
                 prompt_id: prompt_id.clone(),
                 prompt_blocks: arguments.prompt.clone(),
-                origin_prompt_identity,
                 prompt_mode,
                 artifact_upload_ctx: trace_context
                     .as_ref()
@@ -1379,7 +1348,6 @@ impl acp::Agent for MvpAgent {
                                 last_turn_usage: None,
                                 prompt_usage: None,
                                 cancellation_category: None,
-                                loop_health_limit: None,
                                 cancellation_context: None,
                                 cancel_trigger: None,
                                 structured_output: None,
@@ -1939,8 +1907,6 @@ impl acp::Agent for MvpAgent {
                                     last_turn_usage: last_turn_usage.as_ref(),
                                     prompt_usage,
                                     cancellation_category,
-                                    loop_health_limit: completion_kind
-                                        .loop_health_limit_reason(),
                                     cancellation_context,
                                     cancel_trigger,
                                     structured_output,
@@ -2260,15 +2226,13 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth::handle(self, &args).await
             }
             "x.ai/session/info" | "x.ai/session/close" | "x.ai/session/list"
-            | "origin/session/unload"
-            | "origin/session/sync"
             | "x.ai/sessions/list" => {
                 crate::agent::handlers::session::handle(self, &args).await
             }
             "x.ai/workspaces/list" => {
                 crate::agent::handlers::workspaces::handle(self, &args).await
             }
-            crate::cli_models::MODELS_LIST_METHOD => {
+            "x.ai/models/list" => {
                 crate::agent::handlers::models::handle(self, &args).await
             }
             "x.ai/session/updates" => {
@@ -2637,8 +2601,7 @@ impl acp::Agent for MvpAgent {
         args: acp::ExtNotification,
     ) -> Result<(), acp::Error> {
         tracing::info!("Received extension notification: method={}", args.method);
-        if !self.origin_restricted()
-            && args.method.as_ref() == "x.ai/yolo_mode_changed"
+        if args.method.as_ref() == "x.ai/yolo_mode_changed"
             && let Ok(params) = serde_json::from_str::<
                 serde_json::Value,
             >(args.params.get())

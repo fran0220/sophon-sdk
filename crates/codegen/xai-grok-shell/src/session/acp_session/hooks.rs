@@ -5,8 +5,6 @@
 //! file hooks):
 //! - **Gates** (awaited reverse *requests* `x.ai/hooks/run`):
 //!   - `PreToolUse`: a `deny` blocks the tool.
-//!   - `UserPromptSubmit`: a `block`/`deny` rejects a top-level human prompt
-//!     before it is committed. Synthetic and subagent prompts remain observe-only.
 //!   - `Stop` / `SubagentStop` (turn-end gate): a `deny` blocks the agent from
 //!     stopping (its `systemMessage` becomes the feedback), `continue: false`
 //!     (+ `stopReason`) force-stops overriding blocks, and `additionalContext`
@@ -318,93 +316,6 @@ impl SessionActor {
             }
         }
         Ok(None)
-    }
-
-    /// Run client `UserPromptSubmit` gates and choose the first block in
-    /// registration order. Requests execute concurrently, but completion order
-    /// never changes which callback is attributed as the blocker.
-    pub(super) async fn run_prompt_submit_client_hooks(
-        &self,
-        envelope: &HookEventEnvelope,
-    ) -> xai_grok_hooks::dispatcher::PromptGateResult {
-        use xai_grok_hooks::result::{HookRunResult, PromptDecision};
-
-        let Some(groups) = self
-            .client_hooks
-            .borrow()
-            .get(&HookEventName::UserPromptSubmit)
-            .cloned()
-        else {
-            return xai_grok_hooks::dispatcher::PromptGateResult {
-                decision: PromptDecision::Allow,
-                results: Vec::new(),
-            };
-        };
-
-        let match_value = envelope.payload.match_value();
-        let mut pending = self.client_gate_responses(&groups, match_value, envelope);
-        let mut responses = std::collections::HashMap::new();
-        while let Some((callback_id, response, elapsed, outcome)) = pending.next().await {
-            responses.insert(callback_id, (response, elapsed, outcome));
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        let callback_ids = matching_callback_ids(&groups, match_value)
-            .into_iter()
-            .filter(|callback_id| seen.insert(*callback_id));
-        let mut decision = PromptDecision::Allow;
-        let mut results = Vec::new();
-        for callback_id in callback_ids {
-            let Some((response, elapsed, outcome)) = responses.remove(callback_id) else {
-                continue;
-            };
-            let hook_name = format!("client:{callback_id}");
-            if response.decision == ClientHookDecision::Deny {
-                let reason = response
-                    .system_message
-                    .filter(|message| !message.trim().is_empty())
-                    .unwrap_or_else(|| "blocked by client hook".to_owned());
-                if matches!(decision, PromptDecision::Allow) {
-                    decision = PromptDecision::Block {
-                        reason: reason.clone(),
-                        hook_name: hook_name.clone(),
-                    };
-                }
-                results.push(HookRunResult::Blocked {
-                    hook_name,
-                    detail: reason,
-                    elapsed,
-                    http_info: None,
-                });
-                continue;
-            }
-            let failure = match outcome {
-                ClientHookGateOutcome::TimedOut => Some("client hook timed out"),
-                ClientHookGateOutcome::TransportError => Some("client hook transport error"),
-                ClientHookGateOutcome::Malformed => {
-                    Some("client hook returned a malformed response")
-                }
-                ClientHookGateOutcome::UnknownDecision => {
-                    Some("client hook returned an unknown decision")
-                }
-                ClientHookGateOutcome::Denied | ClientHookGateOutcome::Proceeded => None,
-            };
-            results.push(if let Some(error) = failure {
-                HookRunResult::Failed {
-                    hook_name,
-                    error: error.to_owned(),
-                    elapsed,
-                    http_info: None,
-                }
-            } else {
-                HookRunResult::Success {
-                    hook_name,
-                    elapsed,
-                    http_info: None,
-                }
-            });
-        }
-        xai_grok_hooks::dispatcher::PromptGateResult { decision, results }
     }
 
     /// Run the client `Stop`/`SubagentStop` gate for a turn-end envelope.

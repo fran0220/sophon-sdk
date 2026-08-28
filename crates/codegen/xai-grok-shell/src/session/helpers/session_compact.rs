@@ -3,9 +3,8 @@
 
 use crate::sampling::{
     ApiBackend, ChatCompletionRequest, ChatRequestMessage, Client as OaiCompatClient,
-    ConversationItem, ConversationRequest, ConversationToolChoice, CreateResponseWrapper,
-    HostedTool, MessagesRequestWrapper, SamplingError, ToolChoice, ToolDefinition, ToolSpec,
-    build_messages_request, conversation_to_chat_messages,
+    ConversationRequest, ConversationToolChoice, HostedTool, SamplingError, ToolChoice,
+    ToolDefinition, ToolSpec, conversation_to_chat_messages,
 };
 use agent_client_protocol as acp;
 use async_openai::types::responses::ResponseStreamEvent;
@@ -246,246 +245,6 @@ pub(crate) struct CompactOutput {
     pub itl_max_ms: Option<u64>,
 }
 
-/// Final credential-free semantic request used by a compaction model call.
-/// Tracking headers and request/session/client identifiers are added only when
-/// this value is dispatched and are intentionally absent from its digest
-/// leaves. Preparing once lets the native authority observe the same message,
-/// tool, hosted-tool, and model-parameter values that the sampler applies.
-#[derive(Clone)]
-pub(crate) enum PreparedCompactionRequest {
-    Chat(ChatCompletionRequest),
-    Responses(CreateResponseWrapper),
-    Messages(MessagesRequestWrapper),
-}
-
-pub(crate) struct PreparedCompactionDigestBytes {
-    pub messages: Vec<u8>,
-    pub message_count: usize,
-    pub tools: Vec<u8>,
-    pub tool_count: usize,
-    pub hosted_tools: Vec<u8>,
-    pub hosted_tool_count: usize,
-    pub model_parameters: Vec<u8>,
-}
-
-impl PreparedCompactionRequest {
-    pub(crate) fn digest_bytes(&self) -> Result<PreparedCompactionDigestBytes, serde_json::Error> {
-        match self {
-            Self::Chat(request) => {
-                let mut body = serde_json::to_value(request)?;
-                body["stream"] = serde_json::Value::Bool(true);
-                body["stream_options"] = serde_json::json!({ "include_usage": true });
-                let object = body
-                    .as_object_mut()
-                    .expect("ChatCompletionRequest serializes as an object");
-                let messages = object
-                    .remove("messages")
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                let tools = object
-                    .remove("tools")
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                let message_count = messages.as_array().map_or(0, Vec::len);
-                let tool_count = tools.as_array().map_or(0, Vec::len);
-                Ok(PreparedCompactionDigestBytes {
-                    messages: serde_json::to_vec(&messages)?,
-                    message_count,
-                    tools: serde_json::to_vec(&tools)?,
-                    tool_count,
-                    hosted_tools: serde_json::to_vec(&Vec::<serde_json::Value>::new())?,
-                    hosted_tool_count: 0,
-                    model_parameters: serde_json::to_vec(&body)?,
-                })
-            }
-            Self::Responses(request) => {
-                let mut body = serde_json::to_value(&request.inner)?;
-                if request.stream_tool_calls {
-                    body["stream_tool_calls"] = serde_json::Value::Bool(true);
-                }
-                if !request.extra_tool_entries.is_empty() {
-                    if let Some(tools) =
-                        body.get_mut("tools").and_then(|value| value.as_array_mut())
-                    {
-                        tools.extend(request.extra_tool_entries.clone());
-                    } else {
-                        body["tools"] =
-                            serde_json::Value::Array(request.extra_tool_entries.clone());
-                    }
-                }
-                xai_grok_sampling_types::patch_reasoning_text_types(&mut body);
-                let object = body
-                    .as_object_mut()
-                    .expect("CreateResponse serializes as an object");
-                let messages = object
-                    .remove("input")
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                let message_count = messages.as_array().map_or(1, Vec::len);
-                let tools = object
-                    .remove("tools")
-                    .and_then(|value| value.as_array().cloned())
-                    .unwrap_or_default();
-                let (tools, hosted_tools): (Vec<_>, Vec<_>) = tools.into_iter().partition(|tool| {
-                    tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
-                });
-                Ok(PreparedCompactionDigestBytes {
-                    messages: serde_json::to_vec(&messages)?,
-                    message_count,
-                    tools: serde_json::to_vec(&tools)?,
-                    tool_count: tools.len(),
-                    hosted_tools: serde_json::to_vec(&hosted_tools)?,
-                    hosted_tool_count: hosted_tools.len(),
-                    model_parameters: serde_json::to_vec(&body)?,
-                })
-            }
-            Self::Messages(request) => {
-                let mut body = serde_json::to_value(&request.inner)?;
-                let object = body
-                    .as_object_mut()
-                    .expect("MessagesRequest serializes as an object");
-                let messages = object
-                    .remove("messages")
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                let system = object.remove("system");
-                let message_count =
-                    messages.as_array().map_or(0, Vec::len) + usize::from(system.is_some());
-                let messages = serde_json::json!({
-                    "system": system,
-                    "messages": messages,
-                });
-                let tools = object
-                    .remove("tools")
-                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                let tool_count = tools.as_array().map_or(0, Vec::len);
-                Ok(PreparedCompactionDigestBytes {
-                    messages: serde_json::to_vec(&messages)?,
-                    message_count,
-                    tools: serde_json::to_vec(&tools)?,
-                    tool_count,
-                    hosted_tools: serde_json::to_vec(&Vec::<serde_json::Value>::new())?,
-                    hosted_tool_count: 0,
-                    model_parameters: serde_json::to_vec(&body)?,
-                })
-            }
-        }
-    }
-
-    fn message_count(&self) -> usize {
-        match self {
-            Self::Chat(request) => request.messages.len(),
-            Self::Responses(request) => match &request.inner.input {
-                crate::sampling::rs::InputParam::Text(_) => 1,
-                crate::sampling::rs::InputParam::Items(items) => items.len(),
-            },
-            Self::Messages(request) => {
-                request.inner.messages.len() + usize::from(request.inner.system.is_some())
-            }
-        }
-    }
-}
-
-pub(crate) fn prepare_compaction_request(
-    chat_history: Vec<ConversationItem>,
-    tools: Vec<ToolSpec>,
-    hosted_tools: Vec<HostedTool>,
-    sampling_config: &SamplingConfig,
-    tool_choice: crate::util::config::CompactionToolChoice,
-) -> PreparedCompactionRequest {
-    let wire_tool_choice = match tool_choice {
-        crate::util::config::CompactionToolChoice::Auto => ToolChoice::auto(),
-        crate::util::config::CompactionToolChoice::None => ToolChoice::none(),
-    };
-    let conversation_tool_choice = match tool_choice {
-        crate::util::config::CompactionToolChoice::Auto => ConversationToolChoice::Auto,
-        crate::util::config::CompactionToolChoice::None => ConversationToolChoice::None,
-    };
-    match sampling_config.api_backend {
-        ApiBackend::ChatCompletions => {
-            // Fold `Reasoning` siblings into the following assistant via `conversation_to_chat_messages`.
-            let chat_messages: Vec<ChatRequestMessage> =
-                conversation_to_chat_messages(chat_history);
-            let mut request =
-                ChatCompletionRequest::new(sampling_config.model.to_owned(), chat_messages)
-                    .with_temperature(1.0);
-            request.max_tokens = sampling_config.max_completion_tokens;
-            request.top_p = sampling_config.top_p;
-            if !tools.is_empty() {
-                request = request
-                    .with_tools(
-                        tools
-                            .into_iter()
-                            .map(|tool| {
-                                ToolDefinition::function(
-                                    tool.name,
-                                    tool.description,
-                                    tool.parameters,
-                                )
-                            })
-                            .collect(),
-                    )
-                    .with_tool_choice(wire_tool_choice);
-            }
-            PreparedCompactionRequest::Chat(request)
-        }
-        ApiBackend::Responses => {
-            // The Responses conversion gives a hosted declaration precedence
-            // over a same-named function tool. Normalize that rule now so the
-            // frozen request and its ordinary-tool digest cannot include a
-            // definition that dispatch later drops.
-            let mut tools = tools;
-            tools.retain(|tool| {
-                !hosted_tools
-                    .iter()
-                    .any(|hosted| hosted.wire_name() == tool.name)
-            });
-            let request = ConversationRequest {
-                items: chat_history,
-                tool_choice: (!tools.is_empty()).then_some(conversation_tool_choice),
-                tools,
-                hosted_tools: hosted_tools.clone(),
-                model: Some(sampling_config.model.to_owned()),
-                temperature: Some(1.0),
-                max_output_tokens: sampling_config.max_completion_tokens,
-                top_p: sampling_config.top_p,
-                reasoning_effort: sampling_config.reasoning_effort,
-                ..Default::default()
-            };
-            let extra_tool_entries = xai_grok_sampling_types::extra_tool_entries(&hosted_tools);
-            let mut request = CreateResponseWrapper::new((&request).into());
-            request.inner.store = Some(false);
-            let includes = request.inner.include.get_or_insert_with(Vec::new);
-            if !includes.contains(&crate::sampling::rs::IncludeEnum::ReasoningEncryptedContent) {
-                includes.push(crate::sampling::rs::IncludeEnum::ReasoningEncryptedContent);
-            }
-            request.inner.stream = Some(true);
-            request.stream_tool_calls = sampling_config.stream_tool_calls;
-            request.extra_tool_entries = extra_tool_entries;
-            PreparedCompactionRequest::Responses(request)
-        }
-        ApiBackend::Messages => {
-            let request = ConversationRequest {
-                items: chat_history,
-                tools,
-                // The Messages wire format has no backend-hosted declaration;
-                // retaining these here would attest tools the model never sees.
-                hosted_tools: Vec::new(),
-                model: Some(sampling_config.model.to_owned()),
-                temperature: Some(1.0),
-                max_output_tokens: sampling_config.max_completion_tokens,
-                top_p: sampling_config.top_p,
-                reasoning_effort: sampling_config.reasoning_effort,
-                ..Default::default()
-            };
-            let mut request = build_messages_request(&request);
-            if request.max_tokens == 0 {
-                request.max_tokens = sampling_config
-                    .max_completion_tokens
-                    .unwrap_or(xai_grok_sampler::ANTHROPIC_DEFAULT_MAX_TOKENS);
-            }
-            request.stream = Some(true);
-            PreparedCompactionRequest::Messages(MessagesRequestWrapper::new(request))
-        }
-    }
-}
-
 impl CompactOutput {
     pub(crate) fn model_wait_ms(&self) -> Option<u64> {
         match (self.ttft_ms, self.stream_ms) {
@@ -678,39 +437,38 @@ pub(crate) async fn generate_session_compact(
             "Applied image budget to compaction request"
         );
     }
-    let prepared = prepare_compaction_request(
-        prepared_history.items,
-        tools,
-        hosted_tools,
-        sampling_config,
-        tool_choice,
-    );
-    generate_prepared_session_compact(
-        prepared,
-        client,
-        session_id,
-        idle_timeout,
-        wall_clock_budget_secs,
-        cancel,
-    )
-    .await
-}
+    let chat_history = prepared_history.items;
+    let num_messages = chat_history.len();
+    let wire_tool_choice = match tool_choice {
+        crate::util::config::CompactionToolChoice::Auto => ToolChoice::auto(),
+        crate::util::config::CompactionToolChoice::None => ToolChoice::none(),
+    };
+    let conversation_tool_choice = match tool_choice {
+        crate::util::config::CompactionToolChoice::Auto => ConversationToolChoice::Auto,
+        crate::util::config::CompactionToolChoice::None => ConversationToolChoice::None,
+    };
 
-pub(crate) async fn generate_prepared_session_compact(
-    prepared: PreparedCompactionRequest,
-    client: OaiCompatClient,
-    session_id: acp::SessionId,
-    idle_timeout: std::time::Duration,
-    wall_clock_budget_secs: u64,
-    cancel: &tokio_util::sync::CancellationToken,
-) -> Result<CompactOutput, CompactFailure> {
-    if cancel.is_cancelled() {
-        return Err(CompactFailure::Cancelled);
-    }
-    let num_messages = prepared.message_count();
-    let output = match prepared {
-        PreparedCompactionRequest::Chat(mut message) => {
-            let model = message.model.clone().unwrap_or_default();
+    let output = match sampling_config.api_backend {
+        ApiBackend::ChatCompletions => {
+            // Fold `Reasoning` siblings into the following assistant via `conversation_to_chat_messages`.
+            let chat_messages: Vec<ChatRequestMessage> =
+                conversation_to_chat_messages(chat_history);
+            let mut message =
+                ChatCompletionRequest::new(sampling_config.model.to_owned(), chat_messages)
+                    .with_temperature(1.0);
+            // Prefix-cache alignment (see doc comment). `tool_choice` only
+            // when tools are present — Chat Completions rejects it otherwise.
+            if !tools.is_empty() {
+                message = message
+                    .with_tools(
+                        tools
+                            .into_iter()
+                            .map(|t| ToolDefinition::function(t.name, t.description, t.parameters))
+                            .collect(),
+                    )
+                    .with_tool_choice(wire_tool_choice);
+            }
+
             let sid = session_id.to_string();
             message.x_grok_conv_id = Some(sid.clone());
             message.x_grok_req_id = Some(format!("xai-compact-{}", uuid::Uuid::new_v4()));
@@ -718,7 +476,7 @@ pub(crate) async fn generate_prepared_session_compact(
             message.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
 
             tracing::info!(
-                compact_model = %model,
+                compact_model = %sampling_config.model,
                 num_messages = num_messages,
                 "Sending compact request (streaming)"
             );
@@ -799,13 +557,24 @@ pub(crate) async fn generate_prepared_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
-        PreparedCompactionRequest::Responses(mut request) => {
-            request.x_grok_conv_id = Some(session_id.to_string());
-            request.x_grok_req_id = Some(format!("xai-compact-{}", uuid::Uuid::new_v4()));
-            request.x_grok_session_id = Some(session_id.to_string());
-            request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+        ApiBackend::Responses => {
+            // ConversationItem directly — preserves encrypted reasoning.
+            let request = ConversationRequest {
+                items: chat_history,
+                tool_choice: (!tools.is_empty()).then_some(conversation_tool_choice),
+                tools,
+                hosted_tools,
+                model: Some(sampling_config.model.to_owned()),
+                temperature: Some(1.0),
+                x_grok_conv_id: Some(session_id.to_string()),
+                x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
+                x_grok_session_id: Some(session_id.to_string()),
+                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                ..Default::default()
+            };
             let stream_result =
-                await_unless_cancelled(cancel, client.create_response_stream(request)).await?;
+                await_unless_cancelled(cancel, client.conversation_stream_responses(request))
+                    .await?;
             let mut stream = match stream_result {
                 Ok((s, _metadata, _doom_loop)) => s,
                 Err(e) => return Err(classify_sampling_error(e)),
@@ -912,13 +681,24 @@ pub(crate) async fn generate_prepared_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
-        PreparedCompactionRequest::Messages(mut request) => {
-            request.x_grok_conv_id = Some(session_id.to_string());
-            request.x_grok_req_id = Some(format!("xai-compact-{}", uuid::Uuid::new_v4()));
-            request.x_grok_session_id = Some(session_id.to_string());
-            request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+        ApiBackend::Messages => {
+            // Messages API uses similar streaming to Responses.
+            let request = ConversationRequest {
+                items: chat_history,
+                // Prefix-cache alignment (see doc comment).
+                tools,
+                hosted_tools,
+                model: Some(sampling_config.model.to_owned()),
+                temperature: Some(1.0),
+                x_grok_conv_id: Some(session_id.to_string()),
+                x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
+                x_grok_session_id: Some(session_id.to_string()),
+                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                ..Default::default()
+            };
             let stream_result =
-                await_unless_cancelled(cancel, client.create_message_stream(request)).await?;
+                await_unless_cancelled(cancel, client.conversation_stream_messages(request))
+                    .await?;
             let mut stream = match stream_result {
                 Ok((s, _metadata)) => s,
                 Err(e) => return Err(classify_sampling_error(e)),

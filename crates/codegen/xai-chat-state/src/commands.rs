@@ -142,13 +142,6 @@ pub enum ChatStateCommand {
         is_compaction: bool,
     },
 
-    /// Install an already-durably-published compaction in memory without
-    /// persisting it again, then acknowledge the completed installation.
-    InstallPublishedCompaction {
-        items: Vec<ConversationItem>,
-        reply: oneshot::Sender<()>,
-    },
-
     /// Out-of-band history repair (`x.ai/session/repair`): run
     /// [`crate::compaction_utils::repair_history`] and persist when changed;
     /// `dry_run` only reports.
@@ -436,7 +429,6 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
-                auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -457,11 +449,6 @@ mod tests {
         let _ = ChatStateCommand::ReplaceConversation {
             items: vec![],
             is_compaction: false,
-        };
-        let (tx, _rx) = oneshot::channel();
-        let _ = ChatStateCommand::InstallPublishedCompaction {
-            items: vec![],
-            reply: tx,
         };
         let _ = ChatStateCommand::CachePromptText {
             text: "prompt".to_string(),

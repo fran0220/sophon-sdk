@@ -447,24 +447,6 @@ pub(crate) mod chat_rebuild {
         }
     }
 
-    /// Rebuild the derived conversation in memory for backends that do not
-    /// project the canonical update stream to `chat_history.jsonl`.
-    pub(crate) fn rebuild_chat_history_in_memory(
-        updates: &[SessionUpdate],
-    ) -> Vec<ConversationItem> {
-        let mut reducer = ChatReducer::new();
-        let mut chat = Vec::new();
-        for update in updates {
-            chat.extend(reducer.process(update));
-            if reducer.should_truncate() {
-                reducer.clear_truncate_flag();
-                chat.clear();
-            }
-        }
-        chat.extend(reducer.flush());
-        chat
-    }
-
     /// Extract displayable text from a completed ToolCallUpdate.
     fn extract_tool_result_text(fields: &acp::ToolCallUpdateFields) -> String {
         if let Some(content) = &fields.content {
@@ -729,9 +711,6 @@ pub struct PersistedDataLight {
     /// Persisted goal mode orchestration state (None for sessions without goal mode)
     pub goal_mode_state: Option<crate::session::goal_tracker::GoalOrchestration>,
     pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
-    /// In-memory canonical replay stream for authorities that deliberately do
-    /// not expose or project an `updates.jsonl` path.
-    pub canonical_updates: Option<Vec<SessionUpdate>>,
 }
 
 /// Result of copying session data
@@ -946,7 +925,7 @@ impl UserRunTurnTracker {
 /// How many items to keep for `target_prompt_index` (0-based, inclusive):
 /// the scan cuts at the opening chunk of the next counted turn. Unmarked
 /// user runs count as turns only before the first `_meta.promptIndex`.
-pub(crate) fn truncate_for_prompt_by<T>(
+fn truncate_for_prompt_by<T>(
     items: &[T],
     target_prompt_index: usize,
     classify: impl Fn(&T) -> RewindStep,
@@ -1288,47 +1267,6 @@ pub trait StorageAdapter: Send + Sync {
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()>;
 
-    async fn begin_native_compaction(
-        &self,
-        _input: crate::session::state_authority::NativeCompactionInput,
-    ) -> Result<
-        crate::session::state_authority::NativeCompactionBegin,
-        crate::session::state_authority::NativeCompactionError,
-    > {
-        Ok(crate::session::state_authority::NativeCompactionBegin::Disabled)
-    }
-
-    async fn native_compaction_not_applied(
-        &self,
-        _compaction_id: String,
-        _reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        Err(crate::session::state_authority::NativeCompactionError::disabled())
-    }
-
-    async fn publish_native_compaction(
-        &self,
-        _publication: crate::session::state_authority::NativeCompactionPublication,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        Err(crate::session::state_authority::NativeCompactionError::disabled())
-    }
-
-    async fn native_compaction_applied(
-        &self,
-        _compaction_id: String,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        Err(crate::session::state_authority::NativeCompactionError::disabled())
-    }
-
-    async fn recover_native_compaction(
-        &self,
-    ) -> Result<
-        crate::session::state_authority::NativeCompactionRecovery,
-        crate::session::state_authority::NativeCompactionError,
-    > {
-        Ok(crate::session::state_authority::NativeCompactionRecovery::None)
-    }
-
     /// Write a compaction request artifact to `compaction_requests/{request_id}.json`.
     /// Captures the exact request sent to the compaction model and the response
     /// (or final error) it produced. Used for offline prompt iteration.
@@ -1361,18 +1299,6 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         checkpoint_file: &str,
     ) -> io::Result<crate::extensions::notification::CompactionCheckpointFile>;
-
-    /// Rebuild a Host-authority conversation across a compaction boundary.
-    /// Legacy callers continue to use the streaming JSONL replay path.
-    async fn replay_authority_to_prompt(
-        &self,
-        _target_prompt_index: usize,
-    ) -> io::Result<crate::session::helpers::replay::ReplayResult> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "canonical authority replay is not configured",
-        ))
-    }
 }
 
 /// Backup-gated strip rewrite: the destructive rewrite runs only when the
@@ -1440,7 +1366,7 @@ pub(crate) struct RawChunkMetaPeek {
 
 /// Role of one item in the rewind timeline, as seen by [`filter_rewind_by`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RewindStep {
+enum RewindStep {
     /// Rewind marker: truncate survivors back to `target`'s prompt boundary.
     Rewind { target: usize },
     /// User-message chunk opening (or continuing) a prompt run.
@@ -1454,7 +1380,7 @@ pub(crate) enum RewindStep {
 /// truncates survivors back to the target prompt. [`filter_rewind_lines`] and
 /// [`filter_rewind_updates`] wrap this over raw JSONL and typed updates so the
 /// two paths share one algorithm.
-pub(crate) fn filter_rewind_by<T>(items: Vec<T>, classify: impl Fn(&T) -> RewindStep) -> Vec<T> {
+fn filter_rewind_by<T>(items: Vec<T>, classify: impl Fn(&T) -> RewindStep) -> Vec<T> {
     let mut result: Vec<T> = Vec::with_capacity(items.len());
     let mut prompt_starts: Vec<usize> = Vec::new();
     let mut tracker = UserRunTurnTracker::new();
@@ -1518,7 +1444,7 @@ fn rewind_step_for_line(line: &str) -> RewindStep {
 }
 
 /// Classify a typed `SessionUpdate`.
-pub(crate) fn rewind_step_for_update(update: &SessionUpdate) -> RewindStep {
+fn rewind_step_for_update(update: &SessionUpdate) -> RewindStep {
     if let SessionUpdate::Xai(n) = update
         && let crate::extensions::notification::SessionUpdate::RewindMarker {
             target_prompt_index,

@@ -51,7 +51,7 @@ impl MvpAgent {
         parent_session_id: &str,
     ) -> crate::agent::subagent::SubagentValidationContext {
         let parent_sid = acp::SessionId::new(parent_session_id);
-        let (parent_cwd, allowed_subagent_types, plugin_registry) = {
+        let (parent_cwd, allowed_subagent_types) = {
             let ps = self.resident_handle(&parent_sid);
             warn_on_missing_parent_session_for_validate_type(parent_session_id, ps.is_some());
             (
@@ -59,7 +59,6 @@ impl MvpAgent {
                     .map(|h| std::path::PathBuf::from(&h.info.cwd))
                     .unwrap_or_default(),
                 ps.as_ref().and_then(|h| h.allowed_subagent_types.clone()),
-                ps.as_ref().and_then(|h| h.plugin_registry.clone()),
             )
         };
         let (cli_agent_names, subagent_toggle) = {
@@ -71,12 +70,10 @@ impl MvpAgent {
         };
         crate::agent::subagent::SubagentValidationContext {
             parent_cwd,
-            plugin_registry,
+            plugin_registry: self.plugin_registry_handle.snapshot(),
             subagent_toggle,
             allowed_subagent_types,
             cli_agent_names,
-            // Downstream validation uses this as a feature restriction gate.
-            origin_embedded: self.origin_restricted(),
         }
     }
     /// Test-only infallible wrapper; production uses the fallible variant.
@@ -201,7 +198,7 @@ impl MvpAgent {
             None => (None, None),
         };
         let project_trusted = crate::agent::folder_trust::project_scope_allowed(&parent_cwd);
-        let (base_roles, base_personas, mut subagent_model_overrides, subagent_toggle) = {
+        let (base_roles, base_personas, subagent_model_overrides, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
                 cfg.subagent_roles.clone(),
@@ -210,13 +207,6 @@ impl MvpAgent {
                 cfg.subagent_toggle.clone(),
             )
         };
-        // A per-session agent-service route masks the global one of the same
-        // name; nested subagents inherit their registered root's layer.
-        let capability_root = crate::origin_runtime::resolve_root_session(parent_session_id, None)
-            .unwrap_or_else(|| parent_session_id.to_owned());
-        subagent_model_overrides.extend(crate::agent::session_capabilities::agent_services_for(
-            &capability_root,
-        ));
         let (subagent_roles, subagent_personas) =
             crate::config::SubagentsConfig::effective_definition_maps(
                 &base_roles,
@@ -228,7 +218,6 @@ impl MvpAgent {
             .as_ref()
             .and_then(|ps| ps.resolved_tool_overrides.load_full().map(|o| (*o).clone()));
         let mut ctx = crate::agent::subagent::SubagentSpawnContext {
-            origin_restricted: self.origin_restricted(),
             lsp: parent_lsp,
             process_scope: parent_process_scope,
             client_hooks: Default::default(),
@@ -303,9 +292,7 @@ impl MvpAgent {
                 .is_feature_enabled(crate::agent::config::Feature::BackendTools),
             respect_gitignore: self.cfg.borrow().respect_gitignore,
             path_not_found_hints: self.cfg.borrow().path_not_found_hints,
-            plugin_registry: parent_handle
-                .as_ref()
-                .and_then(|session| session.plugin_registry.clone()),
+            plugin_registry: self.plugin_registry_handle.snapshot(),
             models_manager: self.models_manager.clone(),
             file_tool_overrides: {
                 let cfg = self.cfg.borrow();
@@ -324,12 +311,10 @@ impl MvpAgent {
             hook_registry: parent_hook_registry,
             permission_handle: parent_handle.as_ref().map(|h| h.permission_handle.clone()),
             worktree_type: self.worktree_type,
-            api_key_provider: (!self.origin_embedded).then(|| {
-                Arc::new(crate::auth::manager::SharedAuthKeyProvider(am.clone()))
-                    as xai_grok_tools::types::SharedApiKeyProvider
-            }),
+            api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
+                am.clone(),
+            ))),
             image_description_model: self.resolve_image_description_model(),
-            transcribe_user_images: self.cfg.borrow().transcribe_user_images,
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

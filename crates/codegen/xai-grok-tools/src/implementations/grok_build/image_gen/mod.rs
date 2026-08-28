@@ -53,7 +53,6 @@ pub(crate) const TIER_RESTRICTED_UPSELL: &str = "Image generation is a SuperGrok
 pub struct ImageGenClient {
     http: reqwest::Client,
     base_url: String,
-    query_params: indexmap::IndexMap<String, String>,
     /// Imagine model slug used by `generate()`. Selected at construction
     /// from `ImageGenConfig::model_override` (falling back to
     /// [`XAI_IMAGINE_MODEL`]). `image_edit` uses its own model and is
@@ -86,10 +85,8 @@ impl ImageGenClient {
             api_key,
             base_url,
             extra_headers,
-            query_params,
             model_override,
             edit_model_override,
-            use_dynamic_api_key_provider,
             tier_restricted,
             ..
         } = config
@@ -157,15 +154,10 @@ impl ImageGenClient {
         Ok(Self {
             http,
             base_url: base_url.clone(),
-            query_params: query_params.as_ref().clone(),
             model,
             edit_model,
             writer: super::storage::SessionFileWriter::new(DEFAULT_IMAGE_DIR, "jpg"),
-            api_key_provider: if *use_dynamic_api_key_provider {
-                api_key_provider
-            } else {
-                None
-            },
+            api_key_provider,
             attribution_callback: None,
             tier_restricted: *tier_restricted,
             session_header: None,
@@ -222,7 +214,7 @@ impl ImageGenClient {
         payload: &serde_json::Value,
         sent_bearer: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let mut req = self.http.post(url).query(&self.query_params).json(payload);
+        let mut req = self.http.post(url).json(payload);
         if let Some(key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -324,7 +316,6 @@ pub enum ImageGenConfig {
         api_key: String,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
-        query_params: Box<indexmap::IndexMap<String, String>>,
         image_gen_enabled: bool,
         image_edit_enabled: bool,
         /// Optional Imagine model override for `image_gen`. When `Some(non-empty)`,
@@ -333,9 +324,6 @@ pub enum ImageGenConfig {
         /// `image_gen_model_override` config flag. `image_edit` is unaffected.
         model_override: Option<String>,
         edit_model_override: Option<String>,
-        /// Allow the session's rotating sampling credential to override the
-        /// static key. Custom embedded media providers set this to false.
-        use_dynamic_api_key_provider: bool,
         /// `true` when the user is on a tier the Imagine server zero-limits
         /// (free / X Basic). The tools stay advertised to the model, but
         /// `image_gen` / `image_edit` short-circuit at call time with the
@@ -539,12 +527,10 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
-            query_params: Box::default(),
             image_gen_enabled: false,
             image_edit_enabled: true,
             model_override: Some("grok-imagine-image".into()),
             edit_model_override: None,
-            use_dynamic_api_key_provider: true,
             tier_restricted: false,
         };
         assert!(cfg.has_credentials());
@@ -563,12 +549,10 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: preset,
-            query_params: Box::default(),
             image_gen_enabled: true,
             image_edit_enabled: true,
             model_override: None,
             edit_model_override: None,
-            use_dynamic_api_key_provider: true,
             tier_restricted: false,
         };
         let client = ImageGenClient::new(&cfg, None)
@@ -640,12 +624,10 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
-            query_params: Box::default(),
             image_gen_enabled: true,
             image_edit_enabled: true,
             model_override: model_override.map(String::from),
             edit_model_override: None,
-            use_dynamic_api_key_provider: true,
             tier_restricted: false,
         };
         // No override → default quality model.
@@ -673,12 +655,10 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
-            query_params: Box::default(),
             image_gen_enabled: true,
             image_edit_enabled: true,
             model_override: None,
             edit_model_override: edit_model_override.map(String::from),
-            use_dynamic_api_key_provider: true,
             tier_restricted: false,
         };
         assert_eq!(
@@ -728,12 +708,10 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
-            query_params: Box::default(),
             image_gen_enabled: true,
             image_edit_enabled: true,
             model_override: None,
             edit_model_override: None,
-            use_dynamic_api_key_provider: true,
             tier_restricted: true,
         };
         let mut resources = crate::types::resources::Resources::new();

@@ -1,28 +1,22 @@
 <div align="center">
 
-<h1>Sophon SDK</h1>
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
+    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
+  </picture>
+  <br>
+  Grok Build (<code>grok</code>)
+</h1>
 
-**Sophon SDK** is an Apache-2.0, embeddable Rust SDK built from the published
-Grok Build source tree. Its `sophon-sdk` crate gives trusted
-desktop main processes explicit control over model providers, subagents,
-auxiliary inference, image/video services, MCP transports, host filesystem and
-terminal delegation, typed model-catalog discovery, sessions, replay, and
-extensions without requiring Grok account login or ambient credentials.
-
-This repository retains the upstream CLI/TUI source and provenance so SDK
-consumers can audit the implementation. It is an independent redistribution;
-it is not an official xAI SDK. See [`SOURCE_REV`](SOURCE_REV),
-[`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT),
-[`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES), and the SDK's
-[capability and trust-boundary documentation](crates/sophon-sdk/README.md).
-
-The upstream **Grok Build** application is SpaceXAI's terminal-based AI coding agent. It runs as a
+**Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
 full-screen TUI that understands your codebase, edits files, executes shell
 commands, searches the web, and manages long-running tasks — interactively,
 headlessly for scripting/CI, or embedded in editors via the Agent Client
 Protocol (ACP).
 
-[Installing the upstream binary](#installing-the-upstream-binary) ·
+[Installing the released binary](#installing-the-released-binary) ·
 [Building from source](#building-from-source) ·
 [Documentation](#documentation) ·
 [Repository layout](#repository-layout) ·
@@ -39,52 +33,24 @@ runtime. It is synced periodically from the SpaceXAI monorepo.
 
 A small `SOURCE_REV` file at the root records the full monorepo commit SHA
 for the version of the code present in this tree.
-`UPSTREAM_GROK_BUILD_COMMIT` records the corresponding public
-`xai-org/grok-build` snapshot used by the SDK's automated upstream sync.
-
-The synchronized public snapshot reports the upstream 1.0.10 source line at
-commit `9684fa3cdbf2995e30ea8b9b637f1db008f144fc`, including the public source
-syncs through 2026-08-27. Its embedded monorepo revision is
-`70ec060ec3d28e77b9c4593be43c2ab0128bcd21`. Release labels are informative;
-the commit and source-revision files are the authoritative identities. This
-does not claim equivalence to a newer npm or prebuilt-binary release.
 
 </div>
 
 ---
 
-## Synchronized upstream baseline
+## Thin SDK overlay
 
-This update advances the prior public pin
-`19d42e35c07a9c9244f03f6df0c4c353f970d4f9` to
-`9684fa3cdbf2995e30ea8b9b637f1db008f144fc`, covering the published 1.0.7,
-1.0.8, 1.0.9, and 1.0.10 source changes plus the later August 25 and August 27
-source syncs. The complete source delta is retained rather than selectively
-backported.
+This fork adds [`sophon-sdk`](crates/sophon-sdk), a thin compatibility crate
+that re-exports Grok Build's public Rust and ACP APIs without owning another
+runtime or protocol layer. The upstream tree is pinned by
+[`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
+`9684fa3cdbf2995e30ea8b9b637f1db008f144fc` (source metadata 1.0.10,
+`SOURCE_REV` `70ec060ec3d28e77b9c4593be43c2ab0128bcd21`). This is an independent
+redistribution, not an official xAI SDK.
 
-Highlights relevant to embedders include:
+## Installing the released binary
 
-- active follow-up messages to running subagents, with bounded admission and
-  explicit accepted, rejected, and uncertain outcomes;
-- segmented compaction as the native default, two-pass compaction enabled by
-  default, and an explicit max-token length policy that remains fail-closed for
-  normal SDK Turns;
-- MCP form/URL elicitation, server-name-keyed configuration (so two names may
-  share one URL), non-blocking connection startup, and newer rmcp 3.x transport
-  behavior;
-- centralized rustls client policy for OS/Mozilla trust roots and optional
-  `GROK_EXTRA_CA_BUNDLE` / `SSL_CERT_FILE` roots;
-- faster concurrent subagents, richer workflow controls, prompt stashing,
-  worktree lifecycle improvements, and persistent dashboard workspace state;
-- internal extraction of shared directory and terminal ownership into
-  `xai-dirs` and `xai-grok-shell-terminal`.
-
-The SDK-specific typed surfaces and trust-boundary details are documented in
-[`crates/sophon-sdk/README.md`](crates/sophon-sdk/README.md).
-
-## Installing the upstream binary
-
-The upstream project publishes prebuilt binaries for macOS, Linux, and Windows:
+Prebuilt binaries are published for macOS, Linux, and Windows:
 
 ```sh
 curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
@@ -140,15 +106,12 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 
 | Path | Contents |
 |------|----------|
-| `crates/sophon-sdk` | Public Rust embedding boundary for trusted desktop main processes |
+| `crates/sophon-sdk` | Thin re-export and source-provenance compatibility crate |
 | `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
 | `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
 | `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
-| `crates/codegen/xai-grok-shell-terminal` | Shared local/ACP terminal backends extracted from the shell |
-| `crates/codegen/xai-grok-dashboard-store` | SQLite dashboard workspace membership, layout, and grouping state |
 | `crates/codegen/xai-grok-tools` | Tool implementations (terminal, file edit, search, ...) |
 | `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
-| `crates/codegen/xai-dirs` | Shared application-directory resolution used by config and worktrees |
 | `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
 | `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
 | `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
@@ -165,20 +128,9 @@ cargo check -p <crate>        # always target specific crates; full-workspace bu
 cargo test -p xai-grok-config # per-crate tests
 cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
 cargo fmt --all               # rustfmt.toml at the repo root
-```
 
-## SDK release status
-
-`sophon-sdk` is suitable for an Apache-2.0 public source repository and
-pinned Git-tag consumption. It is not currently a crates.io-publishable
-standalone crate: the runtime depends on the bundled workspace's local
-`xai-grok-*` crate closure and workspace patches. See the SDK
-[release-status documentation](crates/sophon-sdk/README.md#public-release-status)
-before cutting a public version.
-
-```toml
-[dependencies]
-sophon-sdk = { git = "https://github.com/fran0220/sophon-sdk", tag = "v0.3.0" }
+# verify the fork has not modified upstream-owned paths
+crates/sophon-sdk/scripts/check-upstream-sync.sh
 ```
 
 ## Contributing

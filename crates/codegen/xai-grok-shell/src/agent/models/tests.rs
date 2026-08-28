@@ -1079,38 +1079,6 @@ fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
         .collect()
 }
 
-#[tokio::test]
-async fn origin_fixed_catalog_is_ready_and_ignores_identity_changes() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
-    let models = make_prefetched(&["host-model"]);
-    let mgr =
-        ModelsManager::from_origin_fixed(models.clone(), auth_manager, config::Config::default())
-            .unwrap();
-
-    assert!(
-        mgr.wait_for_first_catalog_inner(/*remote_fetch_enabled*/ true)
-            .await,
-        "the host-owned catalog must be immediately ready",
-    );
-    mgr.on_auth_changed().await;
-    mgr.refresh_if_new_etag("ambient-etag".into()).await;
-    mgr.reload_from_disk_cache();
-
-    let actual = mgr.models();
-    assert_eq!(
-        actual.keys().cloned().collect::<Vec<_>>(),
-        models.keys().cloned().collect::<Vec<_>>()
-    );
-    assert_eq!(
-        actual["host-model"].info.base_url,
-        models["host-model"].info.base_url
-    );
-    assert_eq!(mgr.current_model_id().0.as_ref(), "host-model");
-    assert!(mgr.has_fetched_real_catalog());
-    assert_eq!(*mgr.inner.catalog_progress.borrow(), CatalogProgress::Ready);
-}
-
 // ── startup background refresh ─────────────────────────────────────
 
 #[test]
@@ -2071,7 +2039,6 @@ fn make_entry_config_with_id(
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
         extra_headers: IndexMap::new(),
-        query_params: IndexMap::new(),
         api_base_url: None,
         use_concise: false,
         agent_type: config::default_agent_type(),

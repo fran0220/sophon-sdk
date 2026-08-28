@@ -90,7 +90,6 @@ pub(crate) enum TurnOutcome {
     /// Completed so recovery/goal/stop-hook cannot re-open the sampling loop.
     StationarityEnded {
         snapshot: Box<Option<TurnDeltaSnapshot>>,
-        repeated_steps: u64,
     },
 }
 

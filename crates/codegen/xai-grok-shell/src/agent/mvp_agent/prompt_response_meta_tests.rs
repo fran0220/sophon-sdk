@@ -17,7 +17,6 @@ fn args<'a>(
         last_turn_usage: None,
         prompt_usage: None,
         cancellation_category: None,
-        loop_health_limit: None,
         cancellation_context: None,
         cancel_trigger: None,
         structured_output: None,
@@ -123,21 +122,6 @@ fn cancel_trigger_lands_as_camelcase_meta_key() {
     // Absent for non-cancel completions — the key must not appear.
     let none = build_prompt_response_meta(args("s", "p", 0, "m"));
     assert!(none.get("cancelTrigger").is_none());
-}
-
-#[test]
-fn loop_health_limit_lands_as_typed_camelcase_meta() {
-    let meta = build_prompt_response_meta(PromptResponseMetaArgs {
-        loop_health_limit: Some(
-            crate::session::commands::LoopHealthLimitReason::Repetition { repeated_steps: 16 },
-        ),
-        ..args("s", "p", 0, "m")
-    });
-    assert_eq!(meta["loopHealthLimit"]["kind"], "repetition");
-    assert_eq!(meta["loopHealthLimit"]["repeatedSteps"], 16);
-
-    let none = build_prompt_response_meta(args("s", "p", 0, "m"));
-    assert!(none.get("loopHealthLimit").is_none());
 }
 
 #[test]

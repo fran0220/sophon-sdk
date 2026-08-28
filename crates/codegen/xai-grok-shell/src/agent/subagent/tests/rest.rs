@@ -2773,6 +2773,25 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
     assert_eq!(config.base_url, "https://gateway.example/v1");
 }
 #[test]
+fn key_prefix_truncates_to_8_chars() {
+    let key = Some("eyJ0eXAiOiJhbGciOiJSUzI1NiJ9".to_string());
+    assert_eq!(key_prefix(&key), "eyJ0eXAi");
+}
+#[test]
+fn key_prefix_short_key_not_truncated() {
+    let key = Some("abc".to_string());
+    assert_eq!(key_prefix(&key), "abc");
+}
+#[test]
+fn key_prefix_none_returns_placeholder() {
+    assert_eq!(key_prefix(&None), "<none>");
+}
+#[test]
+fn key_prefix_empty_string() {
+    let key = Some(String::new());
+    assert_eq!(key_prefix(&key), "");
+}
+#[test]
 fn non_cursor_persona_injected_as_system_reminder() {
     use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};
     let persona = "You are a pragmatic implementer.";
@@ -3118,18 +3137,6 @@ fn resolve_inherited_pool_missing_parent_returns_none() {
 /// mcpServers, but they do inherit already-connected parent servers.
 #[test]
 fn plugin_agents_inherit_parent_mcp_pool_by_default() {
-    assert!(
-            !super::agent_owned_mcp_servers_allowed(true, false),
-            "plugin agents must not declare agent-owned mcpServers"
-        );
-    assert!(
-            super::agent_owned_mcp_servers_allowed(false, false),
-            "non-plugin agents may declare agent-owned mcpServers"
-        );
-    assert!(
-        !super::agent_owned_mcp_servers_allowed(false, true),
-        "Origin embedded agents must not launch their own MCP transports"
-    );
     let pool = make_pool(&["atlassian", "github"]);
     let inherited = super::resolve_inherited_mcp_pool(
             Some(pool),

@@ -80,7 +80,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 acp::ModelId::new("test-model"),
                 sampling_client,
                 crate::test_support::TEST_MODEL.to_owned(),
-                true,
             )
             .await
             .expect("persistence actor should start");
@@ -97,7 +96,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
-                    auth_scheme: Default::default(),
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -114,8 +112,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 tokio_util::sync::CancellationToken::new(),
             );
             let actor = Arc::new(SessionActor {
-                projects_chat_history: true,
-                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -210,7 +206,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
-                pending_elicitation_answers: ElicitationAnswerBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
@@ -318,7 +313,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -420,7 +414,6 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     acp::ModelId::new("test-model"),
                     sampling_client,
                     crate::test_support::TEST_MODEL.to_owned(),
-                    true,
                 )
                 .await
                 .expect("persistence actor should start");
@@ -440,7 +433,6 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
-                    auth_scheme: Default::default(),
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -557,7 +549,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 acp::ModelId::new("test-model"),
                 sampling_client,
                 crate::test_support::TEST_MODEL.to_owned(),
-                true,
             )
             .await
             .expect("persistence actor should start");
@@ -579,7 +570,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
-                    auth_scheme: Default::default(),
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -613,8 +603,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
-                projects_chat_history: true,
-                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -712,7 +700,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
-                pending_elicitation_answers: ElicitationAnswerBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
@@ -820,7 +807,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -920,8 +906,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 )
                 .await;
             let actor = SessionActor {
-                projects_chat_history: true,
-                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
@@ -1021,7 +1005,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
-                pending_elicitation_answers: ElicitationAnswerBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
@@ -1148,7 +1131,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
@@ -2477,8 +2459,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 )
                 .await;
             let actor = SessionActor {
-                projects_chat_history: true,
-                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
@@ -2578,7 +2558,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
-                pending_elicitation_answers: ElicitationAnswerBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
@@ -2705,7 +2684,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

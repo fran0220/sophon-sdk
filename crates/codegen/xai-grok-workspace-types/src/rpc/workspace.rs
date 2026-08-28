@@ -216,8 +216,8 @@ pub struct ScheduledTaskSnapshotWire {
     pub prompt: String,
     /// Human-readable schedule, e.g. "every 5 minutes".
     pub human_schedule: String,
-    /// RFC3339 timestamp of the next fire; absent for host-delivered wake sources.
-    pub next_fire_at: Option<String>,
+    /// RFC3339 timestamp of the next fire.
+    pub next_fire_at: String,
     pub recurring: bool,
     /// RFC3339 creation timestamp.
     pub created_at: String,

@@ -405,8 +405,6 @@ async fn run_forked_rewind_scenario() {
         },
         "test-agent",
         None,
-        None,
-        None,
     )
     .await
     .expect("fork_session ok");

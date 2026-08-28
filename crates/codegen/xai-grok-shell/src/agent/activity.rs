@@ -53,8 +53,8 @@ struct SessionActivityEntry {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
     /// `Some` while a turn is running (relay- or IPC-driven alike).
     current_prompt_id: Arc<Mutex<Option<String>>>,
-    /// Non-empty while a blocking permission/plan approval or non-blocking
-    /// structured question remains open.
+    /// Non-empty while a blocking reverse-request (permission / question /
+    /// plan approval) is parked.
     pending_interactions: PendingInteractions,
 }
 

@@ -37,10 +37,6 @@ impl SessionActor {
             Some(ref s) => (s.prompt_texts.clone(), s.prompt_index),
             None => (vec![], 0),
         };
-        let origin_root =
-            crate::origin_runtime::resolve_root_session(self.session_info.id.0.as_ref(), None)
-                .is_some();
-        let origin_prompt_identities = self.origin_prompt_identities.borrow();
 
         // Build a lookup of which prompt indices have file snapshots.
         let file_meta_map: std::collections::HashMap<
@@ -73,9 +69,6 @@ impl SessionActor {
                 let created_at = file_meta
                     .map(|m| m.created_at.to_rfc3339())
                     .unwrap_or_default();
-                let origin_identity = origin_root
-                    .then(|| origin_prompt_identities.get(idx).cloned().flatten())
-                    .flatten();
 
                 RewindPointInfo {
                     prompt_index: idx,
@@ -83,10 +76,6 @@ impl SessionActor {
                     num_file_snapshots,
                     has_file_changes: num_file_snapshots > 0,
                     prompt_preview,
-                    origin_prompt_index: origin_identity
-                        .as_ref()
-                        .and_then(|identity| usize::try_from(identity.prompt_index).ok()),
-                    origin_prompt_digest: origin_identity.map(|identity| identity.prompt_digest),
                 }
             })
             .collect();
@@ -351,34 +340,21 @@ impl SessionActor {
             let mut replay_compaction_marker: Option<Option<usize>> = None;
 
             if needs_replay {
-                let replay_result =
-                    if self.projects_chat_history {
-                        // Legacy JSONL replay performs synchronous file I/O.
-                        let replay_updates = updates_path.clone();
-                        let replay_session_dir = session_dir.clone();
-                        let replay_target = target_index;
-                        tokio::task::spawn_blocking(move || {
-                            crate::session::helpers::replay::replay_to_prompt(
-                                &replay_updates,
-                                &replay_session_dir,
-                                replay_target,
-                            )
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?
-                    } else {
-                        let (respond_to, response) = tokio::sync::oneshot::channel();
-                        self.notifications
-                        .persistence_tx
-                        .send(crate::session::persistence::PersistenceMsg::ReplayAuthorityToPrompt {
-                            target_index,
-                            respond_to,
-                        })
-                        .map_err(|_| anyhow::anyhow!("session persistence stopped"))?;
-                        response
-                            .await
-                            .map_err(|_| anyhow::anyhow!("session persistence stopped"))?
-                    };
+                // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
+                // Run on the blocking pool since replay does synchronous file I/O
+                // (reading checkpoint files + scanning updates.jsonl).
+                let replay_updates = updates_path.clone();
+                let replay_session_dir = session_dir.clone();
+                let replay_target = target_index;
+                let replay_result = tokio::task::spawn_blocking(move || {
+                    crate::session::helpers::replay::replay_to_prompt(
+                        &replay_updates,
+                        &replay_session_dir,
+                        replay_target,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
                 match replay_result {
                     Ok(replay_result) => {
                         tracing::info!(
@@ -473,9 +449,6 @@ impl SessionActor {
                 snap.last_compaction_prompt_index = new_marker;
                 self.chat_state_handle.restore_snapshot(snap);
             }
-            self.origin_prompt_identities
-                .borrow_mut()
-                .truncate(target_index);
 
             // Conversation shrank — clear budget-based (size/schema) and stale
             // per-turn suppression so compaction can run against the smaller context.

@@ -3,6 +3,60 @@ use super::super::mcp::{McpConfig, parse_mcp_config_with_oauth};
 use super::*;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
+/// The `[toolset.ask_user_question]` settings write merges only that
+/// sub-table: the toggled field lands, hand-written sibling keys survive,
+/// and no other `[toolset]` defaults (bash/web_search) are splatted into
+/// the user file. All-None leaves the file untouched.
+#[test]
+fn ask_user_question_merge_writes_subtable_without_splatting_toolset() {
+    let root_val: TomlValue =
+        toml::from_str("[toolset.ask_user_question]\ntimeout_secs = 30\n").unwrap();
+    let mut root = root_val.as_table().unwrap().clone();
+    let ask = crate::tools::config::AskUserQuestionToolConfig {
+        timeout_enabled: Some(false),
+        ..Default::default()
+    };
+    merge_ask_user_question_section(&mut root, &ask);
+    let toolset = root.get("toolset").and_then(|v| v.as_table()).unwrap();
+    assert_eq!(toolset.len(), 1, "only ask_user_question may be written");
+    let ask_tbl = toolset
+        .get("ask_user_question")
+        .and_then(|v| v.as_table())
+        .unwrap();
+    assert_eq!(
+        ask_tbl.get("timeout_enabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        ask_tbl.get("timeout_secs").and_then(|v| v.as_integer()),
+        Some(30),
+        "hand-written sibling keys must survive the merge"
+    );
+    let reparsed = load_config_from_toml(&TomlValue::Table(root.clone()));
+    assert_eq!(reparsed.ask_user_question.timeout_enabled, Some(false));
+    assert_eq!(reparsed.ask_user_question.timeout_secs, Some(30));
+    let mut empty_root: TomlMap<String, TomlValue> = TomlMap::new();
+    merge_ask_user_question_section(
+        &mut empty_root,
+        &crate::tools::config::AskUserQuestionToolConfig::default(),
+    );
+    assert!(
+        empty_root.is_empty(),
+        "all-None must not create an empty [toolset] header"
+    );
+    let mut scalar_root: TomlMap<String, TomlValue> = TomlMap::new();
+    scalar_root.insert("toolset".into(), TomlValue::String("bogus".into()));
+    merge_ask_user_question_section(&mut scalar_root, &ask);
+    assert_eq!(
+        scalar_root
+            .get("toolset")
+            .and_then(|v| v.get("ask_user_question"))
+            .and_then(|a| a.get("timeout_enabled"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "scalar [toolset] must be replaced so the write lands"
+    );
+}
 /// The `[telemetry]` write merges only `trace_upload`: hand-written sibling
 /// telemetry keys survive, and an all-None config leaves the section alone.
 #[test]

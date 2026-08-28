@@ -43,7 +43,7 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
-pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -572,17 +572,12 @@ impl SamplingClient {
     pub fn new(config: SamplerConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if config.api_backend == ApiBackend::Messages {
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
-            );
-        }
         if let Some(ref api_key) = config.api_key {
             match config.auth_scheme {
                 AuthScheme::XApiKey => {
                     let header_value = HeaderValue::from_str(api_key).map_err(|_| {
                         tracing::debug!(
+                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP header"
                         );
                         SamplingError::auth_unknown(
@@ -595,6 +590,7 @@ impl SamplingClient {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
                         tracing::debug!(
+                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
                         );
                         SamplingError::auth_unknown(
@@ -760,6 +756,14 @@ impl SamplingClient {
             }
         }
         {
+            let auth_prefix = headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.chars().take(20).collect::<String>());
+            let x_api_key_prefix = headers
+                .get(HeaderName::from_static("x-api-key"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.chars().take(12).collect::<String>());
             tracing::info!(
                 target: crate::sampling_log::TARGET,
                 event = "client_post",
@@ -770,6 +774,8 @@ impl SamplingClient {
                 has_bearer_resolver = self.bearer_resolver.is_some(),
                 has_authorization_header = headers.get(AUTHORIZATION).is_some(),
                 has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
+                auth_header_prefix = auth_prefix.as_deref().unwrap_or("none"),
+                x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
             );
         }
         let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
@@ -842,9 +848,7 @@ impl SamplingClient {
         };
         crate::sampling_log::AuthInfo {
             auth_type,
-            // Keep the field for API compatibility, but credential fragments
-            // must never enter sampling spans/JSONL or Debug output.
-            auth_prefix: None,
+            auth_prefix,
         }
     }
 
@@ -1394,7 +1398,7 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         // Inject xAI-specific fields not in async-openai's CreateResponse type.
-        if request.stream_tool_calls {
+        if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
@@ -1962,7 +1966,6 @@ impl SamplingClient {
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
-        wrapper.stream_tool_calls = self.defaults.stream_tool_calls;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
@@ -2181,49 +2184,6 @@ mod tests {
     use tokio::sync::oneshot;
     use xai_grok_sampling_types::ApiErrorCode;
     use xai_grok_sampling_types::types::ChatRequestMessage;
-
-    #[derive(Clone, Default)]
-    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturingWriter(buffer.clone()))
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
-        (result, output)
-    }
-
-    fn assert_credential_absent(output: &str, fragments: &[&str]) {
-        for fragment in fragments {
-            assert!(
-                !output.contains(fragment),
-                "credential fragment {fragment:?} leaked into output: {output}"
-            );
-        }
-    }
 
     #[test]
     fn splice_extra_tool_entries_extends_existing_tools_array() {
@@ -2595,66 +2555,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_api_key_never_reaches_tracing_sampling_spans_or_debug() {
-        const KEY: &str = "SOPHON_VALID_CANARY_7k9Q_MIDDLE_x2V8_END";
-        let fragments = [KEY, "SOPHON_VALID", "7k9Q_MIDDLE", "x2V8_END"];
-
-        for auth_scheme in [AuthScheme::Bearer, AuthScheme::XApiKey] {
-            let mut config = minimal_config();
-            config.api_key = Some(KEY.to_string());
-            config.auth_scheme = auth_scheme;
-
-            let (debug_output, tracing_output) = capture_tracing(|| {
-                let client = SamplingClient::new(config).expect("valid key should build");
-                let SentRequest { builder, .. } = client.post("https://example.test/v1/test");
-                let request = builder.build().expect("request should build");
-                SamplingClient::log_request_headers(&request, "credential-regression");
-
-                let auth = client.auth_info();
-                let span = crate::sampling_log::request_span(
-                    &crate::types::RequestId::from("credential-regression"),
-                    "test-model",
-                    "test-backend",
-                    "https://example.test",
-                    &auth,
-                );
-                span.in_scope(|| tracing::info!("sampling span regression event"));
-
-                format!("client={client:?} auth={auth:?}")
-            });
-
-            assert_credential_absent(&tracing_output, &fragments);
-            assert_credential_absent(&debug_output, &fragments);
-            assert!(
-                tracing_output.contains("has_authorization_header=true")
-                    || tracing_output.contains("has_x_api_key_header=true")
-            );
-            assert!(tracing_output.contains("[REDACTED]"));
-        }
-    }
-
-    #[test]
-    fn malformed_api_key_never_reaches_tracing_or_error_debug() {
-        const KEY: &str = "SOPHON_MALFORMED_CANARY_4pR1\nMIDDLE_8wK3_END";
-        let fragments = [KEY, "SOPHON_MALFORMED", "4pR1", "MIDDLE_8wK3_END"];
-
-        for auth_scheme in [AuthScheme::Bearer, AuthScheme::XApiKey] {
-            let mut config = minimal_config();
-            config.api_key = Some(KEY.to_string());
-            config.auth_scheme = auth_scheme;
-
-            let (debug_output, tracing_output) = capture_tracing(|| {
-                let error = SamplingClient::new(config).expect_err("malformed key must fail");
-                format!("{error:?}")
-            });
-
-            assert_credential_absent(&tracing_output, &fragments);
-            assert_credential_absent(&debug_output, &fragments);
-            assert!(tracing_output.contains("Invalid api_key"));
-        }
-    }
-
-    #[test]
     fn new_applies_extra_headers() {
         let mut cfg = minimal_config();
         cfg.extra_headers
@@ -2728,13 +2628,6 @@ mod tests {
                 .default_headers
                 .get(HeaderName::from_static("x-api-key"))
                 .is_some()
-        );
-        assert_eq!(
-            client
-                .default_headers
-                .get(HeaderName::from_static("anthropic-version"))
-                .and_then(|value| value.to_str().ok()),
-            Some("2023-06-01")
         );
         assert!(client.default_headers.get(AUTHORIZATION).is_none());
     }

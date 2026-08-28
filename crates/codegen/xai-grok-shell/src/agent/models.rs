@@ -143,9 +143,6 @@ struct Inner {
     /// Set once the user explicitly picks a model (`/model`); guards the
     /// first-catalog reselect from clobbering that choice.
     user_selected_model: AtomicBool,
-    /// Construction-time SDK boundary: the catalog is host-owned and must
-    /// never be replaced from auth state, disk cache, or remote refreshes.
-    fixed_catalog: AtomicBool,
 }
 
 /// Clears an in-flight flag on drop so a panicking task can't wedge future refreshes.
@@ -290,42 +287,12 @@ impl ModelsManagerBuilder {
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
-                fixed_catalog: AtomicBool::new(false),
             }),
         }
     }
 }
 
 impl ModelsManager {
-    /// Origin embedded boundary: install exactly the caller's catalog without
-    /// cache reads, network fetches, or bundled-model merging.
-    pub fn from_origin_fixed(
-        models: IndexMap<String, ModelEntry>,
-        auth_manager: Arc<AuthManager>,
-        cfg: config::Config,
-    ) -> Result<Self, String> {
-        let first = models
-            .keys()
-            .next()
-            .cloned()
-            .ok_or_else(|| "Origin fixed model catalog must not be empty".to_string())?;
-        validate_selectable(&cfg, &models)?;
-        let manager = Self::new(
-            Some(models.clone()),
-            models,
-            acp::ModelId::new(Arc::from(first)),
-            auth_manager,
-            cfg,
-        );
-        manager.inner.catalog.write().has_fetched_real_catalog = true;
-        manager.inner.fixed_catalog.store(true, Ordering::Release);
-        manager
-            .inner
-            .catalog_progress
-            .send_replace(CatalogProgress::Ready);
-        Ok(manager)
-    }
-
     pub(crate) fn new(
         prefetched: Option<IndexMap<String, ModelEntry>>,
         models: IndexMap<String, ModelEntry>,
@@ -723,9 +690,6 @@ impl ModelsManager {
 
     /// Refresh models when the etag changes.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         let same_etag = {
             let cat = self.inner.catalog.read();
             cat.etag.as_deref() == Some(etag.as_str())
@@ -744,9 +708,6 @@ impl ModelsManager {
 
     /// Auth identity changed: invalidate the disk cache and refresh the catalog.
     pub(crate) async fn on_auth_changed(&self) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         let config = self.inner.cfg.read().clone();
         crate::agent::init::update_telemetry_config(&config, &self.inner.auth_manager);
         self.inner.cache.invalidate();
@@ -836,9 +797,6 @@ impl ModelsManager {
 
     /// Hot-reload the catalog from `~/.grok/models_cache.json` after an external write (config-watcher detected).
     pub(crate) fn reload_from_disk_cache(&self) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         self.reload_from_cache_manager(&self.inner.cache);
     }
 
@@ -891,9 +849,6 @@ impl ModelsManager {
         remote_fetch_enabled: bool,
         backoff: crate::tools::retry::BackoffConfig,
     ) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         if !remote_fetch_enabled {
             return;
         }
@@ -983,9 +938,6 @@ impl ModelsManager {
 
     /// Refresh the model catalog on every auth token refresh.
     pub fn start_auth_refresh_watcher(&self, notify: Arc<tokio::sync::Notify>) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         let mgr = self.clone();
         let had_catalog_at_start = self.inner.catalog.read().has_fetched_real_catalog;
         xai_grok_telemetry::unified_log::info(
@@ -1140,9 +1092,6 @@ impl ModelsManager {
     }
 
     fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
@@ -1197,9 +1146,6 @@ impl ModelsManager {
     }
 
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
-        if self.inner.fixed_catalog.load(Ordering::Acquire) {
-            return;
-        }
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;

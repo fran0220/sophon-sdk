@@ -395,9 +395,6 @@ impl SessionActor {
                 conversation_truncate_for_prompt(&snapshot.conversation, target_prompt_index);
             snapshot.conversation.truncate(keep_count);
             self.chat_state_handle.restore_snapshot(snapshot);
-            self.origin_prompt_identities
-                .borrow_mut()
-                .truncate(target_prompt_index);
             self.file_state_tracker
                 .truncate_from(target_prompt_index)
                 .await;
@@ -930,7 +927,6 @@ impl SessionActor {
                 .expect("current_prompt_id mutex poisoned");
             *current_prompt_id = None;
         }
-        self.pending_elicitation_answers.clear();
         let turn_stopped = cancelled_prompt_id.is_some() && cancel_reason.is_some();
         // Announced for every cancel that stopped a turn, including a rewind and a
         // cancel-and-send. A no-op if the turn task announced first.

@@ -46,7 +46,7 @@ impl SessionActor {
         }
         self.chat_state_handle
             .replace_conversation(messages.clone());
-        persist_chat_history_jsonl_sync(self.projects_chat_history, &self.session_info, &messages);
+        persist_chat_history_jsonl_sync(&self.session_info, &messages);
     }
     /// Ensure the conversation carries the correct baseline skill (and
     /// workflow) `<system-reminder>`: exactly one for an agent that has
@@ -203,13 +203,7 @@ impl SessionActor {
     #[tracing::instrument(skip_all)]
     pub(super) async fn reload_skills_from_disk(&self) -> usize {
         let cwd = &self.session_info.cwd;
-        // A host-bound per-session layer is authoritative for this session; the
-        // global `[skills]` table applies only when no layer is bound.
-        let skills_config =
-            match crate::agent::session_capabilities::skills_for(self.session_info.id.0.as_ref()) {
-                Some(config) => config,
-                None => crate::util::config::load_config().await.skills,
-            };
+        let skills_config = crate::util::config::load_config().await.skills;
         let plugin_snapshot = self.plugin_registry.borrow().clone();
         let new_skills = xai_grok_agent::prompt::skills::list_skills_with_plugins(
             Some(cwd),

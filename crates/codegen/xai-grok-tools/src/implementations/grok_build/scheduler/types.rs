@@ -166,20 +166,8 @@ pub enum SchedulerError {
     #[error("no scheduled task with id {0}; call scheduler_list to see active task ids")]
     TaskNotFound(String),
 
-    #[error("scheduled task {0} does not accept host-delivered occurrences")]
-    DeliveryUnsupported(String),
-
-    #[error("invalid scheduled occurrence: {0}")]
-    InvalidOccurrence(String),
-
-    #[error("cannot replace wake source for scheduled task {0} while occurrences are pending")]
-    WakeSourceUpdatePending(String),
-
     #[error("failed to persist scheduler resources: {0}")]
     Persistence(#[source] std::io::Error),
-
-    #[error("scheduler durability outcome is unknown: {0}")]
-    DurabilityOutcomeUnknown(String),
 
     #[error("failed to publish scheduler tombstone: {0}")]
     Notification(#[source] crate::notification::NotificationAcknowledgementError),
@@ -201,12 +189,8 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
     let code = match &error {
         SchedulerError::InvalidInterval(_)
         | SchedulerError::TaskLimitReached(_)
-        | SchedulerError::TaskNotFound(_)
-        | SchedulerError::DeliveryUnsupported(_)
-        | SchedulerError::InvalidOccurrence(_)
-        | SchedulerError::WakeSourceUpdatePending(_) => "scheduler_invalid_request",
+        | SchedulerError::TaskNotFound(_) => "scheduler_invalid_request",
         SchedulerError::Persistence(_) => "scheduler_persistence",
-        SchedulerError::DurabilityOutcomeUnknown(_) => "scheduler_durability_unknown",
         SchedulerError::Notification(_) => "scheduler_notification",
         SchedulerError::NoDurableNotificationConsumer => "scheduler_durability_unavailable",
         SchedulerError::RemovalPending(_) => "scheduler_removal_pending",
@@ -216,48 +200,14 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
     xai_tool_runtime::ToolError::custom(code, error.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum SchedulerWakeSource {
-    Recurrence {
-        interval_secs: u64,
-        recurring: bool,
-    },
-    ExternalEvent {
-        service: String,
-        event: String,
-        recurring: bool,
-    },
-    ProcessSettlement {
-        process_id: String,
-        command: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingScheduledOccurrence {
-    pub id: String,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeliveredScheduledOccurrence {
-    pub task_id: String,
-    pub occurrence_id: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTask {
     pub id: String,
+    pub interval_secs: u64,
     pub prompt: String,
-    pub wake_source: SchedulerWakeSource,
+    #[serde(default = "default_recurring")]
+    pub recurring: bool,
     #[serde(default)]
     pub durable: bool,
     #[serde(default)]
@@ -275,10 +225,6 @@ pub struct ScheduledTask {
     /// iteration.
     #[serde(default)]
     pub chain_reset_pending: bool,
-    #[serde(default)]
-    pub pending_occurrences: Vec<PendingScheduledOccurrence>,
-    #[serde(default)]
-    pub delivered_occurrences: Vec<String>,
 }
 
 pub const LOOP_FRESH_CHAIN_EVERY: u32 = 10;
@@ -291,6 +237,10 @@ pub const LOOP_COMPLETION_OUTPUT_CAP: usize = 4_000;
 pub const RECURRING_TASK_TTL_DAYS: i64 = 7;
 
 const MAX_SCHEDULER_TRANSITIONS: usize = 50;
+
+fn default_recurring() -> bool {
+    true
+}
 
 impl ScheduledTask {
     pub fn new(interval_secs: u64, prompt: String, recurring: bool, durable: bool) -> Self {
@@ -314,11 +264,9 @@ impl ScheduledTask {
         };
         Self {
             id: uuid::Uuid::now_v7().to_string().replace('-', "")[..12].to_string(),
+            interval_secs,
             prompt,
-            wake_source: SchedulerWakeSource::Recurrence {
-                interval_secs,
-                recurring,
-            },
+            recurring,
             durable,
             foreground: false,
             created_at,
@@ -331,77 +279,23 @@ impl ScheduledTask {
             last_subagent_id: None,
             iterations_since_fresh: 0,
             chain_reset_pending: false,
-            pending_occurrences: Vec::new(),
-            delivered_occurrences: Vec::new(),
-        }
-    }
-
-    pub fn from_wake_source(
-        prompt: String,
-        wake_source: SchedulerWakeSource,
-        durable: bool,
-    ) -> Self {
-        let now = Utc::now();
-        let recurring = wake_source.is_recurring();
-        Self {
-            id: uuid::Uuid::now_v7().to_string().replace('-', "")[..12].to_string(),
-            prompt,
-            wake_source,
-            durable,
-            foreground: false,
-            created_at: now,
-            last_fired_at: None,
-            expires_at: recurring.then(|| now + chrono::Duration::days(RECURRING_TASK_TTL_DAYS)),
-            last_subagent_id: None,
-            iterations_since_fresh: 0,
-            chain_reset_pending: false,
-            pending_occurrences: Vec::new(),
-            delivered_occurrences: Vec::new(),
-        }
-    }
-
-    pub fn is_recurring(&self) -> bool {
-        self.wake_source.is_recurring()
-    }
-
-    pub fn interval_secs(&self) -> Option<u64> {
-        self.wake_source.interval_secs()
-    }
-
-    pub fn accepts_delivery(&self) -> bool {
-        !matches!(self.wake_source, SchedulerWakeSource::Recurrence { .. })
-    }
-
-    pub fn human_schedule(&self) -> String {
-        match &self.wake_source {
-            SchedulerWakeSource::Recurrence { interval_secs, .. } => {
-                super::interval::interval_to_human(*interval_secs)
-            }
-            SchedulerWakeSource::ExternalEvent { service, event, .. } => {
-                format!("{service}: {event}")
-            }
-            SchedulerWakeSource::ProcessSettlement { command, .. } => {
-                format!("when {command} settles")
-            }
         }
     }
 
     /// Next fire time, computed from `last_fired_at` (or `created_at` if never fired).
-    pub fn next_fire_at(&self) -> Option<DateTime<Utc>> {
+    pub fn next_fire_at(&self) -> DateTime<Utc> {
         let anchor = self.last_fired_at.unwrap_or(self.created_at);
-        self.interval_secs()
-            .map(|seconds| anchor + chrono::Duration::seconds(seconds as i64))
+        anchor + chrono::Duration::seconds(self.interval_secs as i64)
     }
 
     /// Next moment the actor must wake for this task: the sooner of the next fire and the
     /// auto-expiry deadline. Sleeping purely on `next_fire_at` would let a task whose interval
     /// stretches past `expires_at` outlive the TTL (an 8-day interval must still expire at day
     /// 7, not when its first fire comes due).
-    pub fn next_wake_at(&self) -> Option<DateTime<Utc>> {
-        match (self.next_fire_at(), self.expires_at) {
-            (Some(next), Some(expires_at)) => Some(next.min(expires_at)),
-            (Some(next), None) => Some(next),
-            (None, expires_at) => expires_at,
+    pub fn next_wake_at(&self) -> DateTime<Utc> {
+        match self.expires_at {
+            Some(expires_at) => self.next_fire_at().min(expires_at),
+            None => self.next_fire_at(),
         }
     }
 
@@ -412,28 +306,10 @@ impl ScheduledTask {
 
     /// The next run still to come; `None` for an expired task or a one-shot that already ran.
     pub fn pending_fire_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if self.is_expired(now) || (!self.is_recurring() && self.last_fired_at.is_some()) {
+        if self.is_expired(now) || (!self.recurring && self.last_fired_at.is_some()) {
             return None;
         }
-        self.next_fire_at()
-    }
-}
-
-impl SchedulerWakeSource {
-    pub fn is_recurring(&self) -> bool {
-        match self {
-            Self::Recurrence { recurring, .. } | Self::ExternalEvent { recurring, .. } => {
-                *recurring
-            }
-            Self::ProcessSettlement { .. } => false,
-        }
-    }
-
-    pub fn interval_secs(&self) -> Option<u64> {
-        match self {
-            Self::Recurrence { interval_secs, .. } => Some(*interval_secs),
-            Self::ExternalEvent { .. } | Self::ProcessSettlement { .. } => None,
-        }
+        Some(self.next_fire_at())
     }
 }
 
@@ -442,10 +318,6 @@ impl SchedulerWakeSource {
 pub struct SchedulerState {
     #[serde(default)]
     pub tasks: Vec<ScheduledTask>,
-    /// Durable idempotency receipts for delivered one-shot event/process
-    /// tasks, whose task row is removed after firing.
-    #[serde(default)]
-    pub delivered_occurrences: Vec<DeliveredScheduledOccurrence>,
     #[serde(
         default,
         rename = "occurrenceJournal",
@@ -477,13 +349,8 @@ pub enum SchedulerCommand {
     Update {
         id: String,
         prompt: Option<String>,
-        wake_source: Option<SchedulerWakeSource>,
+        interval_secs: Option<u64>,
         reply: oneshot::Sender<Result<ScheduledTask, SchedulerError>>,
-    },
-    Deliver {
-        id: String,
-        occurrence: PendingScheduledOccurrence,
-        reply: oneshot::Sender<Result<bool, SchedulerError>>,
     },
     Delete {
         id: String,
@@ -517,7 +384,7 @@ mod tests {
     fn next_fire_at_uses_created_at_when_never_fired() {
         let task = ScheduledTask::new(300, "test".into(), true, false);
         let expected = task.created_at + chrono::Duration::seconds(300);
-        assert_eq!(task.next_fire_at(), Some(expected));
+        assert_eq!(task.next_fire_at(), expected);
     }
 
     #[test]
@@ -526,7 +393,7 @@ mod tests {
         let fired = Utc::now();
         task.last_fired_at = Some(fired);
         let expected = fired + chrono::Duration::seconds(300);
-        assert_eq!(task.next_fire_at(), Some(expected));
+        assert_eq!(task.next_fire_at(), expected);
     }
 
     #[test]
@@ -549,45 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn host_delivered_sources_have_no_timer_deadline() {
-        for source in [
-            SchedulerWakeSource::ExternalEvent {
-                service: "github".into(),
-                event: "pull_request.updated".into(),
-                recurring: true,
-            },
-            SchedulerWakeSource::ProcessSettlement {
-                process_id: "process-1".into(),
-                command: "cargo test".into(),
-            },
-        ] {
-            let task = ScheduledTask::from_wake_source("inspect".into(), source, false);
-            assert!(task.accepts_delivery());
-            assert_eq!(task.next_fire_at(), None);
-        }
-    }
-
-    #[test]
-    fn wake_source_wire_is_camel_case_and_round_trips() {
-        let source = SchedulerWakeSource::ExternalEvent {
-            service: "github".into(),
-            event: "pull_request.updated".into(),
-            recurring: true,
-        };
-        let encoded = serde_json::to_value(&source).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({
-                "kind": "externalEvent",
-                "service": "github",
-                "event": "pull_request.updated",
-                "recurring": true
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<SchedulerWakeSource>(encoded).unwrap(),
-            source
-        );
+    fn legacy_state_defaults_recurring_and_durable_fields() {
+        let json = r#"{"id":"abc123","intervalSecs":300,"prompt":"check",
+                       "createdAt":"2026-01-01T00:00:00Z",
+                       "lastFiredAt":null,"expiresAt":null}"#;
+        let task: ScheduledTask = serde_json::from_str(json).unwrap();
+        assert!(task.recurring && !task.durable);
     }
 
     #[test]

@@ -362,7 +362,7 @@ impl SessionActor {
             wire_name,
             parsed,
         )
-        .and_then(|value| value.as_object().cloned())
+        .and_then(|v| v.as_object().cloned())
     }
     #[tracing::instrument(
         name = "tools.execute",
@@ -886,7 +886,7 @@ impl SessionActor {
             Result<ToolRunResult, xai_tool_runtime::ToolError>,
             u64,
         )>();
-        let drainer = tokio::task::spawn_local(
+        let drainer = tokio::spawn(
             async move {
                 while let Some(item) = dispatch_stream.next().await {
                     if dispatch_tx.send(item).is_err() {
@@ -1272,21 +1272,6 @@ impl SessionActor {
                 return Ok(Err(ToolLoop::ToolParsingError));
             }
         };
-        // Grok 1.0.0 normally discovers MCP tools through the stable
-        // `use_tool` meta-tool. Its wire name is not itself qualified, so the
-        // older direct-name check above cannot recognize that this call needs
-        // the SDK MCP handshake. Embedded sessions are blocking by contract:
-        // finish discovery before permission classification and dispatch.
-        if self.rebuild_spec.origin_embedded
-            && matches!(
-                &tool_input,
-                ToolInput::UseTool(input) if input.tool_name.contains("__")
-            )
-            && !self.mcp_state.lock().await.is_initialized()
-        {
-            let _span = tracing::info_span!("tool.wait_mcp_init", via = "use_tool").entered();
-            self.wait_for_mcp_initialized().await;
-        }
         let _recovered_raw_input = if concatenated_json_count > 0 {
             Some(raw_input.clone())
         } else {
@@ -1959,7 +1944,7 @@ impl SessionActor {
             ),
             ToolInput::SearchReplace(sr) => {
                 let display_path = self.tool_context.cwd.join(&sr.file_path).to_path_buf();
-                let meta = if !self.rebuild_spec.origin_embedded && !sr.old_string.is_empty() {
+                let meta = if !sr.old_string.is_empty() {
                     let _span = tracing::info_span!("tool.sr_line_lookup").entered();
                     self.tool_context
                         .fs
@@ -2252,22 +2237,14 @@ impl SessionActor {
                 vec![],
             ),
             ToolInput::SchedulerCreate(ref sc) => {
-                use xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerWakeSourceInput;
-                let wake = sc.wake_source.as_ref().map(|source| match source {
-                    SchedulerWakeSourceInput::Recurrence { interval, .. } => {
-                        format!("every {interval}")
+                let title = match (&sc.task_id, &sc.interval) {
+                    (Some(id), Some(interval)) => {
+                        format!("Update scheduled task {id} (every {interval})")
                     }
-                    SchedulerWakeSourceInput::ExternalEvent { service, event, .. } => {
-                        format!("on {service}: {event}")
-                    }
-                    SchedulerWakeSourceInput::ProcessSettlement { command, .. } => {
-                        format!("when {command} settles")
-                    }
-                });
-                let title = match (&sc.task_id, wake) {
-                    (Some(id), Some(wake)) => format!("Update scheduled task {id} ({wake})"),
                     (Some(id), None) => format!("Update scheduled task {id}"),
-                    (None, Some(wake)) => format!("Create scheduled task ({wake})"),
+                    (None, Some(interval)) => {
+                        format!("Create scheduled task (every {interval})")
+                    }
                     (None, None) => "Create scheduled task".to_string(),
                 };
                 (title, acp::ToolKind::Other, vec![], vec![])

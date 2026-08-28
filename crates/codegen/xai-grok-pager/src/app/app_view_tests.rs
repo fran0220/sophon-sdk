@@ -191,6 +191,7 @@ pub(crate) fn test_app() -> AppView {
         coding_data_write_seq: 0,
         show_tips: None,
         auto_update: None,
+        ask_user_question_timeout_enabled: None,
         zdr_access_enabled: false,
         usage_billing_redirect_url: None,
         access_gate_shown_logged: false,

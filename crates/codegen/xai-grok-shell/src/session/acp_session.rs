@@ -688,7 +688,6 @@ pub(crate) struct ModelAuthMemo {
 /// Phase 3: Post-flight handling after dispatch (inline in execute_tool_calls for now).
 pub(crate) struct SessionActor {
     pub(crate) session_info: SessionInfo,
-    pub(crate) projects_chat_history: bool,
     /// Shared live handle to the current ACP auth method. Normal sessions hold a
     /// clone of `MvpAgent::auth_method_id`, so a mid-session `/login` is picked
     /// up by the per-turn auth gate without re-spawning; subagents instead get a
@@ -750,8 +749,8 @@ pub(crate) struct SessionActor {
     /// Current running prompt/turn id, shared with SessionHandle.
     pub(crate) current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) unattributed_background_usage: std::sync::atomic::AtomicBool,
-    /// Open interactions (blocking permission / plan approval and non-blocking
-    /// questions), keyed by `tool_call_id`. Shared with `SessionHandle` so the roster can
+    /// Open blocking reverse-requests (permission / question / plan-approval),
+    /// keyed by `tool_call_id`. Shared with `SessionHandle` so the roster can
     /// read it synchronously to surface `NeedsInput`. Mutated by
     /// `PendingInteractionGuard` at each reverse-request site. Never persisted.
     pub(crate) pending_interactions: crate::session::pending_interaction::PendingInteractions,
@@ -779,11 +778,6 @@ pub(crate) struct SessionActor {
     pub(crate) doom_loop_turn_tally: parking_lot::Mutex<crate::session::signals::DoomLoopTurnTally>,
     /// File state tracker for rewind functionality
     pub(crate) file_state_tracker: Arc<FileStateTracker>,
-    /// SDK-owned durable identities parallel to this residency's native
-    /// prompt indices. This stays separate from chat persistence: a resumed
-    /// embedded Session intentionally starts a new native index space.
-    pub(crate) origin_prompt_identities:
-        std::cell::RefCell<Vec<Option<crate::session::commands::OriginPromptIdentity>>>,
     /// Last prompt text before the most recent rewind.
     /// When set, the next `prompt()` compares its text to distinguish
     /// regeneration (same text) from edit-and-retry (different text).
@@ -826,10 +820,6 @@ pub(crate) struct SessionActor {
     /// Pushed by `SessionCommand::Interject` handler, drained at safe
     /// points in `process_conversation_turn`. Internally synchronized.
     pub(crate) pending_interjections: InterjectionBuffer<acp::ImageContent>,
-    /// Structured-elicitation answers accepted while the owning Turn remains
-    /// consumable. Moved into `pending_interjections` only at a model step
-    /// boundary; leftovers are discarded when that Turn settles.
-    pub(crate) pending_elicitation_answers: ElicitationAnswerBuffer,
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered
@@ -1219,9 +1209,6 @@ pub(crate) struct SessionActor {
     /// Resolved vision model ID for auxiliary image processing.
     /// Populated from `Config.image_description_model` at spawn.
     pub(crate) image_description_model: String,
-    /// Whether image blocks are transcribed through the auxiliary model
-    /// instead of being persisted as paths for the main agent.
-    pub(crate) transcribe_user_images: bool,
     /// Cache auxiliary image outputs by content and prompt fingerprint.
     pub(crate) image_describe_cache: Arc<crate::session::image_describe::ImageDescribeCache>,
     /// Per-subagent token state keyed by `subagent_id`; sums into
@@ -1529,14 +1516,7 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// distinct temp suffix (`.sync.tmp`) avoids clobbering the persistence actor's
 /// own `chat_history.jsonl.tmp`; whichever atomic `rename` lands last wins and
 /// the content is identical, so the two writers can never produce a torn file.
-fn persist_chat_history_jsonl_sync(
-    enabled: bool,
-    session_info: &SessionInfo,
-    conversation: &[ConversationItem],
-) {
-    if !enabled {
-        return;
-    }
+fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
     let dir = match crate::session::persistence::ensure_owner_only_session_dir(session_info) {
         Ok(dir) => dir,
         Err(e) => {

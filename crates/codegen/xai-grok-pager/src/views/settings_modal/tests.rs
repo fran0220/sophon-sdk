@@ -675,6 +675,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHELL-owned default_selected_permission (Agent category,
             // colocated with permission_mode / plan_mode).
             "default_selected_permission",
+            // SHELL-owned ask_user_question timeout (Agent category,
+            // registered directly above plan_mode).
+            "toolset.ask_user_question.timeout_enabled",
             // PAGER-owned plan_mode (Agent category).
             "plan_mode",
             // SHELL-owned coding_data_sharing (Privacy category).

@@ -23,13 +23,6 @@ pub(crate) async fn apply(
         Some(serde_json::json!({"model": args.model_id.0.as_ref()})),
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
-    let origin_route_only = agent.origin_embedded
-        && args
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("originRouteOnly"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
     let acp::SetSessionModelRequest {
         session_id,
         model_id,
@@ -39,9 +32,6 @@ pub(crate) async fn apply(
         .session_handle_waiting_for_load(&session_id)
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-    if origin_route_only && handle.is_busy().await {
-        return Err(acp::Error::invalid_request().data("cannot change route while session is busy"));
-    }
     let model = agent.resolve_model_id(&model_id)?;
     let use_concise = model.info().use_concise;
     let session_default = handle
@@ -86,7 +76,7 @@ pub(crate) async fn apply(
             is_mismatch,
             "set_session_model: agent type compatibility check"
         );
-        if is_mismatch && (origin_route_only || turn_count > 0) {
+        if is_mismatch && turn_count > 0 {
             tracing::warn!(
                 session_id = %session_id.0,
                 model_id = %model_id.0,
@@ -113,7 +103,7 @@ pub(crate) async fn apply(
             };
             return Err(err_payload.into_acp_error());
         }
-        if is_mismatch && turn_count == 0 && !origin_route_only {
+        if is_mismatch && turn_count == 0 {
             let cwd = handle.tool_context.cwd.as_path();
             let resolved = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
                 required,
@@ -217,7 +207,7 @@ pub(crate) async fn apply(
         use_concise,
         is_family_switch,
         apply_prompt_override,
-        skip_prompt_rewrite: origin_route_only || did_rebuild || model_unchanged,
+        skip_prompt_rewrite: did_rebuild || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
         responds_to: tx,
     });

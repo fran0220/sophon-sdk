@@ -2,6 +2,7 @@ use crate::types::requirements::{Expr, ToolRequirement};
 
 use crate::types::tool::{ToolKind, ToolNamespace};
 
+use super::interval::interval_to_human;
 use super::types::{SchedulerCommand, SchedulerHandle};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -12,8 +13,8 @@ pub struct SchedulerListInput {}
 pub struct ScheduledTaskSummary {
     pub id: String,
     pub prompt: String,
-    pub wake_source: String,
-    pub next_fire_at: Option<String>,
+    pub interval_human: String,
+    pub next_fire_at: String,
     pub created_at: String,
     pub recurring: bool,
 }
@@ -38,7 +39,7 @@ impl crate::types::tool_metadata::ToolMetadata for SchedulerListTool {
     }
 
     fn description_template(&self) -> &str {
-        "List all active scheduled tasks with their IDs, prompts, wake sources, and next fire times."
+        "List all active scheduled tasks with their IDs, prompts, intervals, and next fire times."
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
@@ -121,10 +122,8 @@ impl xai_tool_runtime::Tool for SchedulerListTool {
             .tasks
             .into_iter()
             .map(|t| {
-                let next_fire = t.next_fire_at().map(|value| value.to_rfc3339());
+                let next_fire = t.next_fire_at().to_rfc3339();
                 let created = t.created_at.to_rfc3339();
-                let wake_source = t.human_schedule();
-                let recurring = t.is_recurring();
                 let prompt = if t.prompt.len() > 80 {
                     let cut = crate::util::floor_char_boundary(&t.prompt, 80);
                     format!("{}...", &t.prompt[..cut])
@@ -134,10 +133,10 @@ impl xai_tool_runtime::Tool for SchedulerListTool {
                 ScheduledTaskSummary {
                     id: t.id,
                     prompt,
-                    wake_source,
+                    interval_human: interval_to_human(t.interval_secs),
                     next_fire_at: next_fire,
                     created_at: created,
-                    recurring,
+                    recurring: t.recurring,
                 }
             })
             .collect();

@@ -141,7 +141,7 @@ pub(super) fn cancel_reason_for_completion(
             None => StopCancelledReason::Unknown,
         }),
         PromptCompletionKind::MaxTurnsReached { .. } => Some(StopCancelledReason::MaxTurns),
-        PromptCompletionKind::StationarityEnded { .. } => Some(StopCancelledReason::NoProgress),
+        PromptCompletionKind::StationarityEnded => Some(StopCancelledReason::NoProgress),
         // `Completed` fires `Stop`; the other two never ran a turn.
         PromptCompletionKind::Completed
         | PromptCompletionKind::Rewound

@@ -301,7 +301,6 @@ args = ["ok"]
             repo.path(),
             None,
             &compat,
-            crate::session::managed_mcp::McpSourceScope::Ambient,
         );
         let discovered_names: HashSet<_> = discovered.keys().cloned().collect();
         let merged_names: HashSet<_> = merged
@@ -338,7 +337,6 @@ url = "https://dup.example.com/mcp"
             repo.path(),
             None,
             &compat,
-            crate::session::managed_mcp::McpSourceScope::Ambient,
         );
         let merged_names: HashSet<_> = merged
             .iter()

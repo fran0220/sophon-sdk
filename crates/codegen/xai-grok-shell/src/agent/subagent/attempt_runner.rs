@@ -94,7 +94,6 @@ pub(super) async fn run_one_turn_attempt(
         prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
             input.task_prompt_text.to_owned(),
         ))],
-        origin_prompt_identity: None,
         prompt_mode: crate::session::plan_mode::PromptMode::Agent,
         artifact_upload_ctx: input.gcs_bucket_url.and_then(|_| {
             input

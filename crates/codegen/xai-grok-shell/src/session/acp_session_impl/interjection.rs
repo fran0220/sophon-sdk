@@ -19,26 +19,6 @@ pub(crate) use xai_interjection_core::{
 /// Shell instantiation of the shared entry type: images are ACP content.
 pub(crate) type PendingInterjection = xai_interjection_core::PendingInterjection<acp::ImageContent>;
 
-#[derive(Clone, Default)]
-pub(crate) struct ElicitationClaim(Arc<std::sync::atomic::AtomicBool>);
-
-impl ElicitationClaim {
-    /// Claim the answer for either withdrawal or injection. Both paths race
-    /// through this transition, so exactly one can win.
-    pub(crate) fn claim(&self) -> bool {
-        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
-    }
-}
-
-pub(crate) struct PendingElicitationAnswer {
-    pub(crate) interjection: PendingInterjection,
-    pub(crate) claim: ElicitationClaim,
-    pub(crate) consumed: tokio::sync::oneshot::Sender<()>,
-}
-
-pub(crate) type ElicitationAnswerBuffer =
-    xai_interjection_core::EventQueue<PendingElicitationAnswer>;
-
 /// Prompt-id prefix for interjections that missed their turn and were
 /// converted into standalone prompt turns (arrived while idle, or after the
 /// running turn's final drain). The prefix keeps the turn's user echo
@@ -330,28 +310,12 @@ impl SessionActor {
         // Manual drain (not `drain_formatted`): skill parsing needs the raw
         // text — parsed post-wrap, the envelope's closing `</user_query>` tag
         // would pollute the trailing skill's args.
-        let mut entries = self
-            .pending_interjections
-            .drain_all()
-            .into_iter()
-            .map(|interjection| (interjection, None))
-            .collect::<Vec<_>>();
-        entries.extend(
-            self.pending_elicitation_answers
-                .drain_all()
-                .into_iter()
-                .map(|answer| (answer.interjection, Some((answer.claim, answer.consumed)))),
-        );
+        let entries = self.pending_interjections.drain_all();
         if entries.is_empty() {
             return false;
         }
 
-        for (PendingInterjection { text, attachments }, consumed) in entries {
-            if let Some((claim, _)) = consumed.as_ref()
-                && !claim.claim()
-            {
-                continue;
-            }
+        for PendingInterjection { text, attachments } in entries {
             // Sanitizer drops `[Image #N: <path>]` → `[Image #N]` before the
             // text reaches the model, covering legacy-client raw text AND the
             // queue-interject harvest. Wrapping and truncation stay in the
@@ -383,9 +347,6 @@ impl SessionActor {
             }
             self.inject_synthetic_user_message(&wrapped, item, false, &images)
                 .await;
-            if let Some((_, consumed)) = consumed {
-                let _ = consumed.send(());
-            }
             tracing::info!("Injected mid-turn interjection as standalone synthetic user message");
         }
         // An interjection never cancels the turn, so it leaves no marker on the

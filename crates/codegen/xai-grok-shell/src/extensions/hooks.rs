@@ -115,7 +115,6 @@ pub(crate) struct ClientHookDispatch<'a> {
 
 pub(crate) const ADVERTISED_BLOCKING_EVENTS: &[xai_grok_hooks::event::HookEventName] = &[
     xai_grok_hooks::event::HookEventName::PreToolUse,
-    xai_grok_hooks::event::HookEventName::UserPromptSubmit,
     xai_grok_hooks::event::HookEventName::Stop,
     xai_grok_hooks::event::HookEventName::SubagentStop,
 ];

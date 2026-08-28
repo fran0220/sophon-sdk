@@ -2,10 +2,8 @@ use crate::types::requirements::{Expr, ToolRequirement};
 
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-use super::interval::parse_interval;
-use super::types::{
-    ScheduledTask, SchedulerCommand, SchedulerHandle, SchedulerWakeSource, scheduler_tool_error,
-};
+use super::interval::{interval_to_human, parse_interval};
+use super::types::{ScheduledTask, SchedulerCommand, SchedulerHandle, scheduler_tool_error};
 
 // Canonical /loop wording lives in the light API crate so other consumers can
 // link it without the tools implementation crate; re-exported to keep paths stable.
@@ -24,16 +22,23 @@ pub struct SchedulerCreateInput {
     pub task_id: Option<String>,
 
     #[serde(default)]
+    #[schemars(
+        description = "Interval between executions, e.g. \"5m\", \"2h\", \"1d\". \
+                       Required to create; optional with task_id"
+    )]
+    pub interval: Option<String>,
+
+    #[serde(default)]
     #[schemars(description = "The prompt text to execute on each scheduled fire. \
                        Required to create; optional with task_id")]
     pub prompt: Option<String>,
 
-    #[serde(default)]
-    #[schemars(
-        description = "Exactly one source that wakes the task. Required to create; \
-                       optional with task_id"
+    #[serde(
+        default = "default_true",
+        deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
-    pub wake_source: Option<SchedulerWakeSourceInput>,
+    #[schemars(skip)]
+    pub recurring: bool,
 
     /// Whether the task persists across sessions. Default false (session-only).
     #[serde(
@@ -56,160 +61,23 @@ pub struct SchedulerCreateInput {
                        Default: false. Create-only: ignored with task_id"
     )]
     pub foreground: Option<bool>,
-}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum SchedulerWakeSourceInput {
-    Recurrence {
-        #[schemars(description = "Cadence such as 5m, 2h, or 1d")]
-        interval: String,
-        #[serde(default = "default_true")]
-        recurring: bool,
-        #[serde(
-            default,
-            deserialize_with = "crate::types::schema::deserialize_lenient_bool"
-        )]
-        fire_immediately: bool,
-    },
-    ExternalEvent {
-        service: String,
-        event: String,
-        #[serde(default = "default_true")]
-        recurring: bool,
-    },
-    ProcessSettlement {
-        process_id: String,
-        command: String,
-    },
+    /// Whether to fire immediately on creation. Default false (wait for the
+    /// first interval — a "scheduled" task should not run on creation unless
+    /// explicitly asked to).
+    #[serde(
+        default,
+        deserialize_with = "crate::types::schema::deserialize_lenient_bool"
+    )]
+    #[schemars(
+        description = "Whether to fire immediately on creation (true) or wait for the first \
+                       interval (false). Default: false. Create-only: ignored with task_id"
+    )]
+    pub fire_immediately: bool,
 }
 
 fn default_true() -> bool {
     true
-}
-
-impl SchedulerWakeSourceInput {
-    fn parse(self) -> Result<(SchedulerWakeSource, bool), xai_tool_runtime::ToolError> {
-        let required = |label: &str, value: String| {
-            let value = value.trim().to_owned();
-            if value.is_empty() {
-                Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "{label} cannot be empty"
-                )))
-            } else {
-                Ok(value)
-            }
-        };
-        match self {
-            Self::Recurrence {
-                interval,
-                recurring,
-                fire_immediately,
-            } => Ok((
-                SchedulerWakeSource::Recurrence {
-                    interval_secs: parse_interval(&interval).map_err(|error| {
-                        xai_tool_runtime::ToolError::invalid_arguments(error.to_string())
-                    })?,
-                    recurring,
-                },
-                fire_immediately,
-            )),
-            Self::ExternalEvent {
-                service,
-                event,
-                recurring,
-            } => Ok((
-                SchedulerWakeSource::ExternalEvent {
-                    service: required("service", service)?,
-                    event: required("event", event)?,
-                    recurring,
-                },
-                false,
-            )),
-            Self::ProcessSettlement {
-                process_id,
-                command,
-            } => Ok((
-                SchedulerWakeSource::ProcessSettlement {
-                    process_id: required("process_id", process_id)?,
-                    command: required("command", command)?,
-                },
-                false,
-            )),
-        }
-    }
-}
-
-/// Execute the scheduler control-plane operation after its shared resource has
-/// been resolved. Kept here so model tool calls and headless callers have
-/// exactly the same validation and actor-command semantics.
-pub(crate) async fn upsert_with_sender(
-    sender: tokio::sync::mpsc::UnboundedSender<SchedulerCommand>,
-    input: SchedulerCreateInput,
-) -> Result<(ScheduledTask, bool), xai_tool_runtime::ToolError> {
-    let wake_source = input
-        .wake_source
-        .map(SchedulerWakeSourceInput::parse)
-        .transpose()?;
-    let send_and_wait = |cmd: SchedulerCommand,
-                         rx: tokio::sync::oneshot::Receiver<
-        Result<ScheduledTask, super::types::SchedulerError>,
-    >| async {
-        sender.send(cmd).map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
-        })?;
-        rx.await
-            .map_err(|_| {
-                xai_tool_runtime::ToolError::custom(
-                    "process_manager",
-                    "Scheduler actor dropped reply",
-                )
-            })?
-            .map_err(scheduler_tool_error)
-    };
-    if let Some(task_id) = input.task_id {
-        if input.prompt.is_none() && wake_source.is_none() {
-            return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                "nothing to update: provide wake_source and/or prompt alongside task_id",
-            ));
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let task = send_and_wait(
-            SchedulerCommand::Update {
-                id: task_id,
-                prompt: input.prompt,
-                wake_source: wake_source.map(|(source, _)| source),
-                reply: tx,
-            },
-            rx,
-        )
-        .await?;
-        return Ok((task, true));
-    }
-    let (wake_source, fire_immediately) = wake_source.ok_or_else(|| {
-        xai_tool_runtime::ToolError::invalid_arguments(
-            "wake_source is required when creating a task",
-        )
-    })?;
-    let prompt = input.prompt.ok_or_else(|| {
-        xai_tool_runtime::ToolError::invalid_arguments("prompt is required when creating a task")
-    })?;
-    let mut task =
-        ScheduledTask::from_wake_source(prompt, wake_source, input.durable.unwrap_or(false));
-    if fire_immediately {
-        let interval_secs = task
-            .interval_secs()
-            .expect("only recurrence accepts fire_immediately");
-        task.created_at -= chrono::Duration::seconds(interval_secs as i64);
-    }
-    task.foreground = input.foreground.unwrap_or(false);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let task = send_and_wait(SchedulerCommand::Create { task, reply: tx }, rx).await?;
-    Ok((task, false))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -240,16 +108,19 @@ impl crate::types::tool_metadata::ToolMetadata for SchedulerCreateTool {
         // being pinned by a duplicate literal.
         static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             format!(
-                r#"Create a scheduled task with one wake source, or update an existing one in place.
+                r#"Create a scheduled task that runs a prompt on a recurring interval, or update an existing one in place.
 
-The source is a recurrence, a mounted Service event, or a detached process settlement. A recurrence may be one-time or recurring and may fire immediately. Service and process occurrences are delivered by the Host.
+Use this tool when a user asks you to loop, repeat, or schedule a prompt or a task.
 
-To change an existing task, pass its task_id: provided fields replace old values and omitted ones are unchanged. An unknown id errors.
+Set fire_immediately: true to also fire once on creation; by default the first run waits for the interval.
+
+To change an existing task, pass its task_id: provided fields replace old values, omitted ones are unchanged, and the schedule keeps its phase. An unknown id errors.
 
 Usage notes:
 - Interval format: "5m" (minutes), "2h" (hours), "1d" (days), "60s" (seconds, min 60)
 - Maximum 50 scheduled tasks at once
-- Recurring tasks auto-expire after {} days"#,
+- Tasks auto-expire after {} days
+- For one-time delayed work, run a background terminal command (e.g. `sleep 1800 && <command>`) instead; its completion notifies you"#,
                 super::types::RECURRING_TASK_TTL_DAYS
             )
         });
@@ -297,7 +168,7 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
     #[tracing::instrument(
         name = "tool.scheduler_create",
         skip_all,
-        fields(task_id = input.task_id.as_deref().unwrap_or(""))
+        fields(interval = input.interval.as_deref().unwrap_or(""), task_id = input.task_id.as_deref().unwrap_or(""))
     )]
     async fn run(
         &self,
@@ -306,6 +177,13 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
     ) -> Result<SchedulerCreateOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
+
+        let interval_secs = input
+            .interval
+            .as_deref()
+            .map(parse_interval)
+            .transpose()
+            .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
 
         let sender = {
             let res = resources.lock().await;
@@ -317,11 +195,91 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
                 .clone()
         };
 
-        let (created, updated) = upsert_with_sender(sender, input).await?;
+        let send_and_wait = |cmd: SchedulerCommand,
+                             reply_rx: tokio::sync::oneshot::Receiver<
+            Result<ScheduledTask, super::types::SchedulerError>,
+        >| async move {
+            sender.send(cmd).map_err(|_| {
+                xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
+            })?;
+            reply_rx
+                .await
+                .map_err(|_| {
+                    xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        "Scheduler actor dropped reply",
+                    )
+                })?
+                .map_err(scheduler_tool_error)
+        };
+
+        if let Some(task_id) = input.task_id {
+            if input.prompt.is_none() && interval_secs.is_none() {
+                return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                    "nothing to update: provide interval and/or prompt alongside task_id",
+                ));
+            }
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let updated = send_and_wait(
+                SchedulerCommand::Update {
+                    id: task_id,
+                    prompt: input.prompt,
+                    interval_secs,
+                    reply: reply_tx,
+                },
+                reply_rx,
+            )
+            .await?;
+
+            return Ok(SchedulerCreateOutput {
+                id: updated.id,
+                human_schedule: interval_to_human(updated.interval_secs),
+                updated: true,
+            });
+        }
+
+        if !input.recurring {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "one-shot tasks are not supported; run a background terminal command instead \
+                 (`sleep <secs> && <command>`, background: true) or do the work now",
+            ));
+        }
+
+        let interval_secs = interval_secs.ok_or_else(|| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "interval is required when creating a task",
+            )
+        })?;
+        let prompt = input.prompt.ok_or_else(|| {
+            xai_tool_runtime::ToolError::invalid_arguments(
+                "prompt is required when creating a task",
+            )
+        })?;
+
+        let durable = input.durable.unwrap_or(false);
+        let mut task = ScheduledTask::with_fire_immediately(
+            interval_secs,
+            prompt,
+            true,
+            durable,
+            input.fire_immediately,
+        );
+        task.foreground = input.foreground.unwrap_or(false);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let created = send_and_wait(
+            SchedulerCommand::Create {
+                task,
+                reply: reply_tx,
+            },
+            reply_rx,
+        )
+        .await?;
+
         Ok(SchedulerCreateOutput {
-            human_schedule: created.human_schedule(),
             id: created.id,
-            updated,
+            human_schedule: interval_to_human(interval_secs),
+            updated: false,
         })
     }
 }
@@ -372,26 +330,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_requires_wake_source_and_prompt() {
+    async fn create_requires_interval_and_prompt() {
         let (resources, cancel) = scheduler_resources();
 
         let err = SchedulerCreateTool
             .run(test_ctx(resources.clone()), input(serde_json::json!({})))
             .await
-            .expect_err("create without wake source must fail");
-        assert!(err.to_string().contains("wake_source is required"));
+            .expect_err("create without interval must fail");
+        assert!(err.to_string().contains("interval is required"));
 
         let err = SchedulerCreateTool
             .run(
                 test_ctx(resources.clone()),
-                input(serde_json::json!({
-                    "wake_source": {
-                        "kind": "recurrence",
-                        "interval": "5m",
-                        "recurring": true,
-                        "fireImmediately": false
-                    }
-                })),
+                input(serde_json::json!({"interval": "5m"})),
             )
             .await
             .expect_err("create without prompt must fail");
@@ -402,26 +353,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_recurrence_is_a_supported_wake_source() {
+    async fn recurring_false_errors_with_sleep_guidance() {
         let (resources, cancel) = scheduler_resources();
 
-        let created = SchedulerCreateTool
+        let err = SchedulerCreateTool
             .run(
                 test_ctx(resources.clone()),
                 input(serde_json::json!({
-                    "wake_source": {
-                        "kind": "recurrence",
-                        "interval": "5m",
-                        "recurring": false,
-                        "fireImmediately": false
-                    },
-                    "prompt": "check"
+                    "interval": "5m", "prompt": "check", "recurring": false
                 })),
             )
             .await
-            .expect("one-shot recurrence is supported");
-        assert!(!created.updated);
-        assert_eq!(task_count(&resources).await, 1);
+            .expect_err("one-shot must be rejected");
+        assert!(err.to_string().contains("sleep"), "steers to sleep: {err}");
+        assert_eq!(task_count(&resources).await, 0);
         cancel.cancel();
     }
 
@@ -448,19 +393,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_replaces_the_typed_wake_source() {
+    async fn update_ignores_legacy_recurring_flag() {
         let (resources, cancel) = scheduler_resources();
 
         let created = SchedulerCreateTool
             .run(
                 test_ctx(resources.clone()),
-                input(serde_json::json!({
-                    "wake_source": {
-                        "kind": "recurrence", "interval": "5m",
-                        "recurring": true, "fireImmediately": false
-                    },
-                    "prompt": "check deploy"
-                })),
+                input(serde_json::json!({"interval": "5m", "prompt": "check deploy"})),
             )
             .await
             .expect("create succeeds");
@@ -469,19 +408,13 @@ mod tests {
             .run(
                 test_ctx(resources.clone()),
                 input(serde_json::json!({
-                    "task_id": created.id,
-                    "wake_source": {
-                        "kind": "externalEvent",
-                        "service": "github",
-                        "event": "pull_request.updated",
-                        "recurring": true
-                    }
+                    "task_id": created.id, "interval": "10m", "recurring": false
                 })),
             )
             .await
-            .expect("typed wake source update succeeds");
+            .expect("update succeeds despite legacy flag");
         assert!(updated.updated);
-        assert_eq!(updated.human_schedule, "github: pull_request.updated");
+        assert_eq!(updated.human_schedule, "every 10 minutes");
         cancel.cancel();
     }
 
@@ -507,13 +440,7 @@ mod tests {
         let created = SchedulerCreateTool
             .run(
                 test_ctx(resources.clone()),
-                input(serde_json::json!({
-                    "wake_source": {
-                        "kind": "recurrence", "interval": "5m",
-                        "recurring": true, "fireImmediately": false
-                    },
-                    "prompt": "check deploy"
-                })),
+                input(serde_json::json!({"interval": "5m", "prompt": "check deploy"})),
             )
             .await
             .expect("create succeeds");
@@ -523,13 +450,7 @@ mod tests {
         let updated = SchedulerCreateTool
             .run(
                 test_ctx(resources.clone()),
-                input(serde_json::json!({
-                    "task_id": created.id,
-                    "wake_source": {
-                        "kind": "recurrence", "interval": "10m",
-                        "recurring": true, "fireImmediately": false
-                    }
-                })),
+                input(serde_json::json!({"task_id": created.id, "interval": "10m"})),
             )
             .await
             .expect("update succeeds");
@@ -541,13 +462,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_advertises_typed_wake_sources_and_task_id() {
+    fn schema_hides_recurring_and_advertises_task_id() {
         let schema = schemars::schema_for!(SchedulerCreateInput);
         let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            !json.contains("recurring"),
+            "recurring must not be advertised: {json}"
+        );
         assert!(json.contains("task_id"));
-        assert!(json.contains("wake_source"));
-        assert!(json.contains("externalEvent"));
-        assert!(json.contains("processSettlement"));
     }
 
     #[test]

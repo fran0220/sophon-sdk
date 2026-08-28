@@ -1032,19 +1032,18 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         planning: Option<bool>,
     },
-    /// An ephemeral interaction is now pending, keyed by `tool_call_id`.
-    /// Permission and plan approval block their operation; structured
-    /// elicitation does not block the Turn. Subscribers show NeedsInput.
+    /// A blocking reverse-request (permission / `ask_user_question` /
+    /// plan-approval) is now **pending** on the agent, keyed by `tool_call_id`
+    /// Fire-and-forget, **never persisted** — it is a request,
+    /// not a notification. Subscribers show ⏳ NeedsInput for this session.
     PendingInteraction {
         tool_call_id: String,
         kind: crate::session::pending_interaction::PendingKind,
     },
-    /// A previously-pending interaction resolved. `resolution` distinguishes
-    /// consumed answers from truthful unanswered closure.
-    InteractionResolved {
-        tool_call_id: String,
-        resolution: crate::session::pending_interaction::InteractionResolution,
-    },
+    /// A previously-pending reverse-request **resolved** (answered, cancelled,
+    /// or errored). Fire-and-forget, **never persisted**. Subscribers clear the
+    /// pending ⏳ for this `tool_call_id`.
+    InteractionResolved { tool_call_id: String },
     /// The durable, replayable signal that a turn reached its terminal
     /// outcome. Rides the persisted `_x.ai/session/update` rail (unlike the
     /// fire-and-forget `x.ai/session/prompt_complete` notification), so a

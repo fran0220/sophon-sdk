@@ -111,7 +111,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
-                    auth_scheme: Default::default(),
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -131,8 +130,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
-                projects_chat_history: true,
-                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-idle-resume"),
@@ -234,7 +231,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
-                pending_elicitation_answers: ElicitationAnswerBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
@@ -342,7 +338,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-                transcribe_user_images: false,
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

@@ -71,7 +71,7 @@ fn classifies_every_completion_kind() {
             Some(Reason::MaxTurns),
         ),
         (
-            PromptCompletionKind::StationarityEnded { repeated_steps: 16 },
+            PromptCompletionKind::StationarityEnded,
             Some(Reason::NoProgress),
         ),
         (PromptCompletionKind::Completed, None),

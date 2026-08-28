@@ -43,28 +43,13 @@ pub enum SideQuestionError {
     #[error("No response from model")]
     EmptyResponse,
 }
-/// Typed reason why the native agent stopped a Turn at a loop-health boundary.
-/// This is carried in ACP response metadata so embedded hosts can distinguish
-/// a healthy bounded pause from cancellation or normal completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum LoopHealthLimitReason {
-    StepBudget { limit: u64 },
-    Repetition { repeated_steps: u64 },
-}
 /// Prompt completion kind returned to the ACP layer.
 #[derive(Debug, Clone)]
 pub enum PromptCompletionKind {
     Completed,
     /// Silent EndTurn after stationarity/true-noop thrash. Distinct from
     /// Completed so goal continuation is not re-queued under an active goal.
-    StationarityEnded {
-        repeated_steps: u64,
-    },
+    StationarityEnded,
     Cancelled {
         category: Option<xai_grok_session_events::types::CancellationCategory>,
         context: Option<CancellationContext>,
@@ -108,20 +93,6 @@ pub fn meta_category_str(
     }
 }
 impl PromptCompletionKind {
-    pub fn loop_health_limit_reason(&self) -> Option<LoopHealthLimitReason> {
-        match self {
-            Self::MaxTurnsReached { limit } => Some(LoopHealthLimitReason::StepBudget {
-                limit: *limit as u64,
-            }),
-            Self::StationarityEnded { repeated_steps } => Some(LoopHealthLimitReason::Repetition {
-                repeated_steps: *repeated_steps,
-            }),
-            Self::Completed | Self::Cancelled { .. } | Self::Rewound | Self::RemovedFromQueue => {
-                None
-            }
-        }
-    }
-
     /// The completion's `_meta.cancellationCategory`, shared by every terminal
     /// rail (`PromptResponse` `_meta`, legacy `prompt_complete`, durable
     /// `TurnCompleted`) so the wires never disagree.
@@ -131,7 +102,7 @@ impl PromptCompletionKind {
                 category.map(|cat| meta_category_str(cat).to_string())
             }
             Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_string()),
-            Self::StationarityEnded { .. } => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
+            Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
             Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
         }
     }
@@ -297,13 +268,6 @@ pub struct CancelOptions {
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OriginPromptIdentity {
-    pub(crate) prompt_index: u64,
-    pub(crate) prompt_digest: String,
-}
-
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
@@ -343,11 +307,6 @@ pub enum SessionCommand {
     Prompt {
         prompt_id: String,
         prompt_blocks: Vec<acp::ContentBlock>,
-        /// SDK-owned durable identity for this prompt. Native rewind keeps this
-        /// alongside its residency-local index so embedded Hosts can translate
-        /// between the two coordinate spaces without inspecting prompt text.
-        #[allow(private_interfaces)]
-        origin_prompt_identity: Option<OriginPromptIdentity>,
         /// Prompt mode parsed from request `_meta.mode`.
         prompt_mode: PromptMode,
         #[allow(private_interfaces)]
@@ -598,10 +557,6 @@ pub enum SessionCommand {
     /// completes (or immediately if configs are unchanged).
     UpdateMcpServers {
         mcp_servers: Vec<acp::McpServer>,
-        embedded_mcp: Option<(
-            Vec<xai_grok_mcp::servers::AcpServerEntry>,
-            std::sync::Arc<dyn xai_grok_mcp::acp_transport::AcpReverseInvoker>,
-        )>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Re-apply per-attachment policy (MCP init strategy, delivery tools)
@@ -622,8 +577,6 @@ pub enum SessionCommand {
         /// caller via `merge_managed_mcp_servers` (with OAuth headers injected).
         /// `None` when disabling.
         server_config: Option<acp::McpServer>,
-        /// Whether the change should also update the user's on-disk preference.
-        persist: bool,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Toggle a single MCP tool on/off within a server. The server stays connected;
@@ -633,8 +586,6 @@ pub enum SessionCommand {
         tool_name: String,
         enabled: bool,
         is_managed_gateway: bool,
-        /// Whether the change should also update the user's on-disk preference.
-        persist: bool,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Read MCP status: which servers are configured, which clients are healthy, what tools.
@@ -678,29 +629,6 @@ pub enum SessionCommand {
         respond_to:
             oneshot::Sender<Result<crate::extensions::mcp::McpReadResourceResponse, String>>,
     },
-    McpPrimitive {
-        server_name: String,
-        operation: crate::extensions::mcp::McpPrimitiveOperation,
-        respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
-    },
-    McpModernOperation {
-        server_name: String,
-        operation: crate::extensions::mcp::McpModernOperation,
-        respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
-    },
-    McpModernSubscribe {
-        server_name: String,
-        filter: crate::extensions::mcp::McpModernSubscriptionFilter,
-        capacity: std::num::NonZeroUsize,
-        respond_to: oneshot::Sender<Result<crate::extensions::mcp::McpModernSubscription, String>>,
-    },
-    McpDomainNotificationSubscribe {
-        server_name: String,
-        methods: Vec<String>,
-        capacity: std::num::NonZeroUsize,
-        respond_to:
-            oneshot::Sender<Result<crate::extensions::mcp::McpDomainNotificationSubscription, String>>,
-    },
     McpAuthStatus {
         respond_to: oneshot::Sender<Vec<crate::extensions::mcp::McpAuthStatusEntry>>,
     },
@@ -728,30 +656,6 @@ pub enum SessionCommand {
     DeleteScheduledTask {
         task_id: String,
         respond_to: oneshot::Sender<Result<bool, String>>,
-    },
-    UpsertScheduledTask {
-        request:
-            xai_grok_tools::implementations::grok_build::scheduler::create::SchedulerCreateInput,
-        respond_to: oneshot::Sender<
-            Result<
-                (
-                    xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask,
-                    bool,
-                ),
-                String,
-            >,
-        >,
-    },
-    DeliverScheduledTaskOccurrence {
-        task_id: String,
-        occurrence:
-            xai_grok_tools::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
-        respond_to: oneshot::Sender<Result<bool, String>>,
-    },
-    ListScheduledTasks {
-        respond_to: oneshot::Sender<
-            Vec<xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask>,
-        >,
     },
     /// List all background tasks.
     /// Routes through the ToolBridge's TerminalBackend.
@@ -962,10 +866,10 @@ pub enum SessionCommand {
     ///
     /// Fired by the client after a turn completes. The session builds a
     /// compact text-only transcript of the recent conversation, makes one
-    /// tool-free call through the selected model's catalog provider, sanitizes
-    /// the output, and returns the predicted prompt via `respond_to`. It never
-    /// falls back to the session model. Best-effort: any failure returns
-    /// `None`.
+    /// tool-free model call (default `grok-4.6` when available via
+    /// `model_override`, else the session model), sanitizes the output, and
+    /// returns the predicted prompt via `respond_to`. Best-effort: any
+    /// failure returns `None`.
     SuggestPrompt {
         model_override: Option<String>,
         respond_to: oneshot::Sender<Option<String>>,
@@ -1081,7 +985,7 @@ mod cancellation_category_meta_tests {
                 Some("max_turns_reached"),
             ),
             (
-                PromptCompletionKind::StationarityEnded { repeated_steps: 16 },
+                PromptCompletionKind::StationarityEnded,
                 Some("action_stationarity"),
             ),
             (PromptCompletionKind::Completed, None),

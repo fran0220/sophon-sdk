@@ -9,7 +9,6 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
-use tokio_util::sync::CancellationToken;
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent as SpanParent;
 use xai_grok_telemetry::subagent_spawn::phase_region_under;
@@ -203,7 +202,6 @@ pub(crate) async fn spawn_session_actor(
     mcp_meta_config_map: McpMetaConfigMap,
     parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     acp_mcp_servers: Vec<crate::session::mcp_servers::AcpServerEntry>,
-    embedded_mcp_invoker: Option<Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>>,
     support_permission: bool,
     telemetry_enabled: bool,
     auto_update: Option<bool>,
@@ -290,7 +288,6 @@ pub(crate) async fn spawn_session_actor(
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     image_description_model: String,
-    transcribe_user_images: bool,
     hook_registry_override: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     workspace_ops: xai_grok_workspace::WorkspaceOps,
     cli_permission_rules: Vec<xai_grok_workspace::permission::types::PermissionRule>,
@@ -330,18 +327,10 @@ pub(crate) async fn spawn_session_actor(
         mcp_servers.len()
     );
     let _ = support_permission;
-    let owns_permission_manager =
-        !tool_context.origin_embedded && inherited_permission_handle.is_none();
-    let (permissions, permission_events_rx, deny_read_globs) = if tool_context.origin_embedded {
-        // Embedded Grok runs with the launching OS user's authority. Do not
-        // construct the CLI permission actor or consult ambient policy.
-        let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel::<PermissionEvent>();
-        (
-            xai_grok_workspace::permission::PermissionHandle::allow_all(),
-            dummy_rx,
-            Vec::new(),
-        )
-    } else if let Some(handle) = inherited_permission_handle {
+    let owns_permission_manager = inherited_permission_handle.is_none();
+    let (permissions, permission_events_rx, deny_read_globs) = if let Some(handle) =
+        inherited_permission_handle
+    {
         let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel::<PermissionEvent>();
         let deny_read_globs = handle.deny_read_globs();
         (handle, dummy_rx, deny_read_globs)
@@ -350,23 +339,14 @@ pub(crate) async fn spawn_session_actor(
             WebFetchConfig::Enabled { params } => params.allowed_domains(),
             WebFetchConfig::Disabled => vec![],
         };
-        // An embedded runtime's host owns approval: it answers every
-        // `session/request_permission` itself. Ambient user policy
-        // (`~/.grok/config.toml` permission_mode, `~/.claude/settings.json`
-        // defaultMode / auto mode / remembered approvals) belongs to the CLI
-        // user and must never pre-approve tools behind that host's back.
-        let host_owns_permission = tool_context.origin_runtime_embedded;
-        let project_trusted = !host_owns_permission
-            && crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
-        let mut permission_config = if host_owns_permission {
-            None
-        } else {
+        let project_trusted =
+            crate::agent::folder_trust::project_scope_allowed(tool_context.cwd.as_path());
+        let mut permission_config =
             xai_grok_workspace::permission::resolution::resolve_permission_config_with_fallback(
                 tool_context.cwd.as_path(),
                 project_trusted,
             )
-            .await
-        };
+            .await;
         let yolo_pin = xai_grok_workspace::permission::resolution::yolo_disabled_by_policy();
         let (cli_permission_rules, dropped_catchalls) =
             drop_cli_catchall_allows(cli_permission_rules, yolo_pin);
@@ -435,10 +415,6 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
-        let remember_tool_approvals =
-            !host_owns_permission && crate::util::config::remember_tool_approvals_from_disk();
-        let auto_permission_mode =
-            !host_owns_permission && crate::util::config::auto_permission_mode_enabled_from_disk();
         let (permissions, permission_events_rx) =
             xai_grok_workspace::permission::spawn_permission_manager_with_hub(
                 session_info.id.clone(),
@@ -450,11 +426,11 @@ pub(crate) async fn spawn_session_actor(
                 web_fetch_allowed_domains,
                 session_yolo_mode,
                 session_client_identifier.clone(),
-                remember_tool_approvals,
+                crate::util::config::remember_tool_approvals_from_disk(),
                 hub_permission,
             );
         if crate::util::config::auto_mode_session_active(
-            auto_permission_mode,
+            crate::util::config::auto_permission_mode_enabled_from_disk(),
             session_auto_mode,
             session_yolo_mode,
         ) {
@@ -520,7 +496,6 @@ pub(crate) async fn spawn_session_actor(
                 base_url: cfg.base_url,
                 model: cfg.model,
                 extra_headers: cfg.extra_headers,
-                query_params: Box::new(cfg.query_params),
                 alpha_test_key: credentials.alpha_test_key.clone(),
                 allowed_domains: web_search_domains
                     .as_ref()
@@ -546,14 +521,10 @@ pub(crate) async fn spawn_session_actor(
         },
         |mc| mc.pruning.clone(),
     );
-    let context_window_override = if tool_context.origin_embedded {
-        None
-    } else {
-        std::env::var("GROK_DEBUG_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .and_then(std::num::NonZeroU64::new)
-    };
+    let context_window_override = std::env::var("GROK_DEBUG_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(std::num::NonZeroU64::new);
     let baseline_context_window = std::num::NonZeroU64::new(sampling_config.context_window)
         .unwrap_or_else(|| {
             std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
@@ -573,7 +544,6 @@ pub(crate) async fn spawn_session_actor(
         temperature: sampling_config.temperature,
         top_p: sampling_config.top_p,
         api_backend: sampling_config.api_backend.clone(),
-        auth_scheme: sampling_config.auth_scheme,
         extra_headers: sampling_config.extra_headers.clone(),
         query_params: sampling_config.query_params.clone(),
         env_http_headers: sampling_config.env_http_headers.clone(),
@@ -600,7 +570,6 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
-    let initial_prompt_count = initial_prompt_texts.len();
     if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
         || initial_last_compaction.is_some())
@@ -626,11 +595,7 @@ pub(crate) async fn spawn_session_actor(
         hook_block_hold: Default::default(),
         nudges_used_this_session: 0,
     });
-    let mcp_strategy = if tool_context.origin_embedded {
-        McpInitStrategy::Blocking
-    } else {
-        startup_hints.resolve_mcp_strategy()
-    };
+    let mcp_strategy = startup_hints.resolve_mcp_strategy();
     let file_state_tracker = Arc::new(match rewind_points_path {
         Some(path) => FileStateTracker::with_lazy_source(path),
         None => FileStateTracker::new(),
@@ -801,7 +766,7 @@ pub(crate) async fn spawn_session_actor(
     };
     let reminder_policy = resolve_reminder_policy(remote_settings.as_ref(), todo_gate);
     let (user_question_tx, user_question_rx) = tokio::sync::mpsc::unbounded_channel::<
-        xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionCommand,
+        xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest,
     >();
     let attribution_callback_for_spec = auth_manager.as_ref().map(|am| {
         crate::auth::attribution::ShellAttribution::new_tool_callback(
@@ -967,12 +932,6 @@ pub(crate) async fn spawn_session_actor(
     });
     let mcp_state = {
         let mut state = McpState::new_with_meta(mcp_servers.clone(), mcp_meta_config_map);
-        if let Some(services) = embedded_mcp_invoker
-            .as_ref()
-            .and_then(|invoker| invoker.host_services())
-        {
-            state.set_host_services(session_info.id.0.to_string(), services);
-        }
         if let Some(ref pool) = parent_mcp_pool {
             state.import_shared_clients(pool);
             tracing::info!(
@@ -982,16 +941,9 @@ pub(crate) async fn spawn_session_actor(
             );
         }
         if !acp_mcp_servers.is_empty() {
-            let invoker = match embedded_mcp_invoker {
-                Some(invoker) => xai_grok_mcp::acp_transport::bind_embedded_invoker(
-                    session_info.id.0.to_string(),
-                    invoker,
-                ),
-                None => std::sync::Arc::new(crate::session::acp_mcp::GatewayAcpInvoker::new(
-                    gateway.clone(),
-                    session_info.id.clone(),
-                )),
-            };
+            let invoker = std::sync::Arc::new(crate::session::acp_mcp::GatewayAcpInvoker::new(
+                gateway.clone(),
+            ));
             let acp_server_count = acp_mcp_servers.len();
             state.set_acp_servers(acp_mcp_servers, invoker);
             tracing::info!(
@@ -1003,10 +955,6 @@ pub(crate) async fn spawn_session_actor(
         Arc::new(TokioMutex::new(state))
     };
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
-        origin_embedded: tool_context.origin_embedded,
-        mcp_source_scope: crate::session::managed_mcp::McpSourceScope::for_runtime(
-            tool_context.origin_runtime_embedded,
-        ),
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),
@@ -1241,8 +1189,7 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
-    let projects_chat_history = persistence.projects_chat_history();
-    persist_chat_history_jsonl_sync(projects_chat_history, &session_info, &conversation);
+    persist_chat_history_jsonl_sync(&session_info, &conversation);
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
         let mut client =
@@ -1654,7 +1601,6 @@ pub(crate) async fn spawn_session_actor(
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         status_wake: Default::default(),
         session_info: session_info.clone(),
-        projects_chat_history,
         auth_method_id,
         model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
@@ -1686,7 +1632,6 @@ pub(crate) async fn spawn_session_actor(
         doom_loop_recovery,
         doom_loop_turn_tally: Default::default(),
         file_state_tracker,
-        origin_prompt_identities: std::cell::RefCell::new(vec![None; initial_prompt_count]),
         rewind_pending_prompt: std::sync::Mutex::new(None),
         delivery_tools: std::cell::RefCell::new(startup_hints.delivery_tools.clone()),
         attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(
@@ -1746,7 +1691,6 @@ pub(crate) async fn spawn_session_actor(
         max_retries: xai_grok_sampler::resolve_max_retries(max_retries),
         rate_limit_waits: RateLimitWaitConfig::with_max_attempts(subagent_rate_limit_max_attempts),
         pending_interjections: InterjectionBuffer::new(),
-        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config
             .as_ref()
@@ -1882,7 +1826,6 @@ pub(crate) async fn spawn_session_actor(
         sampling_gate,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
-        transcribe_user_images,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
@@ -2082,7 +2025,7 @@ pub(crate) async fn spawn_session_actor(
     {
         use agent_client_protocol::Client as _;
         use xai_grok_tools::implementations::grok_build::ask_user_question::{
-            AskUserQuestionExtRequest, AskUserQuestionExtResponse, UserQuestionCommand,
+            AskUserQuestionExtRequest, AskUserQuestionExtResponse, UserQuestionError,
             UserQuestionResponse,
         };
         let gateway = session.notifications.gateway.clone();
@@ -2091,228 +2034,77 @@ pub(crate) async fn spawn_session_actor(
         let pending_interactions = session.pending_interactions.clone();
         let session_for_hooks = session.clone();
         let mut user_question_rx = user_question_rx;
-        let open_questions = Arc::new(std::sync::Mutex::new(HashMap::<
-            String,
-            (CancellationToken, ElicitationClaim),
-        >::new()));
         tokio::task::spawn_local(async move {
-            while let Some(command) = user_question_rx.recv().await {
-                let request = match command {
-                    UserQuestionCommand::Withdraw {
-                        tool_call_id,
-                        reply,
-                    } => {
-                        let token = open_questions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&tool_call_id);
-                        let withdrawn = token.as_ref().is_some_and(|(_, claim)| claim.claim());
-                        if let Some((token, _)) = token {
-                            token.cancel();
-                        }
-                        let _ = reply.send(withdrawn);
-                        continue;
-                    }
-                    UserQuestionCommand::Open(request) => request,
+            while let Some(mut request) = user_question_rx.recv().await {
+                use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionMode;
+                let mode = match *current_prompt_mode.lock() {
+                    PromptMode::Plan => AskUserQuestionMode::Plan,
+                    _ => AskUserQuestionMode::Default,
                 };
-                let gateway = gateway.clone();
-                let session_id = session_id.clone();
-                let current_prompt_mode = current_prompt_mode.clone();
-                let pending_interactions = pending_interactions.clone();
-                let session_for_hooks = session_for_hooks.clone();
-                let open_questions = open_questions.clone();
-                let withdrawal = CancellationToken::new();
-                let claim = ElicitationClaim::default();
-                open_questions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(
-                        request.tool_call_id.clone(),
-                        (withdrawal.clone(), claim.clone()),
-                    );
-                tokio::task::spawn_local(async move {
-                    use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionMode;
-                    let mode = match *current_prompt_mode.lock() {
-                        PromptMode::Plan => AskUserQuestionMode::Plan,
-                        _ => AskUserQuestionMode::Default,
-                    };
-                    let ext_req = AskUserQuestionExtRequest {
-                        session_id: session_id.0.to_string(),
-                        tool_call_id: request.tool_call_id.clone(),
-                        questions: request.questions.clone(),
-                        mode,
-                    };
-                    debug_assert!(
-                        !ext_req.session_id.is_empty(),
-                        "ask_user_question reverse-request must carry a non-empty sessionId (design §5.4)"
-                    );
-                    let ext_request = agent_client_protocol::ExtRequest::new(
-                        "x.ai/ask_user_question",
-                        serde_json::value::to_raw_value(&ext_req)
-                            .expect("AskUserQuestionExtRequest serialization should not fail")
-                            .into(),
-                    );
-                    session_for_hooks
-                        .dispatch_notification_hook(
-                            "elicitation_dialog",
-                            Some("User question requested".into()),
-                            None,
-                            Some("info".into()),
-                        )
-                        .await;
-                    let tool_call_id = request.tool_call_id.clone();
-                    let owning_prompt_id = Some(request.owning_prompt_id.clone());
-                    let response = {
-                        let mut pending_guard =
-                            crate::session::pending_interaction::PendingInteractionGuard::new(
-                                pending_interactions.clone(),
-                                gateway.clone(),
-                                session_id.clone(),
-                                tool_call_id.clone(),
-                                crate::session::pending_interaction::PendingKind::Question,
+                let ext_req = AskUserQuestionExtRequest {
+                    session_id: session_id.0.to_string(),
+                    tool_call_id: request.tool_call_id.clone(),
+                    questions: request.questions.clone(),
+                    mode,
+                };
+                debug_assert!(
+                    !ext_req.session_id.is_empty(),
+                    "ask_user_question reverse-request must carry a non-empty sessionId (design §5.4)"
+                );
+                let ext_request = agent_client_protocol::ExtRequest::new(
+                    "x.ai/ask_user_question",
+                    serde_json::value::to_raw_value(&ext_req)
+                        .expect("AskUserQuestionExtRequest serialization should not fail")
+                        .into(),
+                );
+                session_for_hooks
+                    .dispatch_notification_hook(
+                        "elicitation_dialog",
+                        Some("User question requested".into()),
+                        None,
+                        Some("info".into()),
+                    )
+                    .await;
+                let questions_for_response = request.questions.clone();
+                let tool_call_id = request.tool_call_id.clone();
+                let result = {
+                    let _pending_guard =
+                        crate::session::pending_interaction::PendingInteractionGuard::new(
+                            pending_interactions.clone(),
+                            gateway.clone(),
+                            session_id.clone(),
+                            tool_call_id.clone(),
+                            crate::session::pending_interaction::PendingKind::Question,
+                        );
+                    tokio::select! {
+                        biased;
+                        () = request.result_tx.closed() => {
+                            tracing::info!(
+                                %tool_call_id,
+                                "ask_user_question tool receiver closed (timeout or cancel); abandoning ACP wait"
                             );
-                        let turn_settled = async {
-                            loop {
-                                let current = session_for_hooks
-                                    .current_prompt_id
-                                    .lock()
-                                    .ok()
-                                    .and_then(|prompt| prompt.clone());
-                                if owning_prompt_id.is_none() || current != owning_prompt_id {
-                                    break;
+                            Ok(UserQuestionResponse::Cancelled)
+                        }
+                        acp_result = gateway.ext_method(ext_request) => {
+                            match acp_result {
+                                Ok(raw) => {
+                                    match serde_json::from_str::<AskUserQuestionExtResponse>(
+                                        raw.0.get(),
+                                    ) {
+                                        Ok(typed) => {
+                                            Ok(typed.into_response(questions_for_response))
+                                        }
+                                        Err(e) => Err(UserQuestionError::MalformedResponse(
+                                            e.to_string(),
+                                        )),
+                                    }
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
-                        };
-                        let response = tokio::select! {
-                            biased;
-                            () = withdrawal.cancelled() => {
-                                Ok(None)
-                            }
-                            () = turn_settled => {
-                                Ok(None)
-                            }
-                            acp_result = gateway.ext_method(ext_request) => {
-                                match acp_result {
-                                    Ok(raw) => serde_json::from_str::<AskUserQuestionExtResponse>(raw.0.get())
-                                        .map(|typed| typed.into_response(request.questions.clone()))
-                                        .map_err(|error| error.to_string())
-                                        .map(Some),
-                                    Err(error) => Err(error.to_string()),
-                                }
-                            }
-                        };
-                        match response {
-                            Ok(Some(response)) => Some((response, pending_guard)),
-                            Ok(None) => {
-                                pending_guard.set_resolution(
-                                crate::session::pending_interaction::InteractionResolution::Unanswered,
-                            );
-                                None
-                            }
-                            Err(error) => {
-                                tracing::warn!(%tool_call_id, %error, "Structured elicitation closed unanswered");
-                                pending_guard.set_resolution(
-                                crate::session::pending_interaction::InteractionResolution::Unanswered,
-                            );
-                                None
+                                Err(e) => Err(UserQuestionError::TransportError(e.to_string())),
                             }
                         }
-                    };
-                    let Some((response, mut pending_guard)) = response else {
-                        open_questions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&tool_call_id);
-                        return;
-                    };
-                    let still_consumable = session_for_hooks
-                        .current_prompt_id
-                        .lock()
-                        .ok()
-                        .and_then(|prompt| prompt.clone())
-                        == owning_prompt_id;
-                    let answer = match response {
-                    UserQuestionResponse::Accepted {
-                        answers,
-                        annotations,
-                    } => Some(if request.use_id_keyed_format {
-                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_id_keyed_accepted_tool_result(
-                            &request.questions,
-                            &answers,
-                            &annotations,
-                        )
-                    } else {
-                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_accepted_tool_result(
-                            &answers,
-                            &annotations,
-                        )
-                    }),
-                    UserQuestionResponse::ChatAboutThis {
-                        questions,
-                        partial_answers,
-                    } => Some(
-                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_chat_about_this(
-                            &questions,
-                            &partial_answers,
-                        ),
-                    ),
-                    UserQuestionResponse::SkipInterview {
-                        questions,
-                        partial_answers,
-                    } => Some(
-                        xai_grok_tools::implementations::grok_build::ask_user_question::format::format_skip_interview(
-                            &questions,
-                            &partial_answers,
-                        ),
-                    ),
-                    UserQuestionResponse::Cancelled => None,
-                };
-                    if still_consumable && let Some(text) = answer {
-                        let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
-                        session_for_hooks.pending_elicitation_answers.push(
-                            PendingElicitationAnswer {
-                                interjection: PendingInterjection {
-                                    text,
-                                    attachments: Vec::new(),
-                                },
-                                claim,
-                                consumed: consumed_tx,
-                            },
-                        );
-                        let turn_settled = async {
-                            loop {
-                                let current = session_for_hooks
-                                    .current_prompt_id
-                                    .lock()
-                                    .ok()
-                                    .and_then(|prompt| prompt.clone());
-                                if current != owning_prompt_id {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
-                        };
-                        let consumed = tokio::select! {
-                            biased;
-                            consumed = consumed_rx => consumed.is_ok(),
-                            () = turn_settled => false,
-                        };
-                        pending_guard.set_resolution(if consumed {
-                            crate::session::pending_interaction::InteractionResolution::Answered
-                        } else {
-                            crate::session::pending_interaction::InteractionResolution::Unanswered
-                        });
-                    } else {
-                        pending_guard.set_resolution(
-                            crate::session::pending_interaction::InteractionResolution::Unanswered,
-                        );
                     }
-                    open_questions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&tool_call_id);
-                });
+                };
+                let _ = request.result_tx.send(result);
             }
         });
     }
@@ -2374,7 +2166,6 @@ pub(crate) async fn spawn_session_actor(
             status_line_enabled,
             mcp_servers,
             initial_client_mcp_servers,
-            plugin_registry,
             display_cwd: None,
             feedback_manager: feedback_manager.clone(),
             upload_queue: upload_queue.clone(),
@@ -2417,11 +2208,6 @@ impl SessionThread {
     pub fn is_finished(&self) -> bool {
         self.join_handle.is_finished()
     }
-    /// Consume and join the actor thread. Teardown custody uses this rather
-    /// than dropping an unfinished `JoinHandle`, which would detach the actor.
-    pub(crate) fn join(self) {
-        let _ = self.join_handle.join();
-    }
     /// Construct from a raw `JoinHandle`. Used in tests.
     #[cfg(test)]
     pub fn from_handle(handle: std::thread::JoinHandle<()>) -> Self {
@@ -2459,7 +2245,6 @@ pub(crate) async fn spawn_session_on_thread(
     mcp_meta_config_map: McpMetaConfigMap,
     parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     acp_mcp_servers: Vec<crate::session::mcp_servers::AcpServerEntry>,
-    embedded_mcp_invoker: Option<Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>>,
     support_permission: bool,
     telemetry_enabled: bool,
     auto_update: Option<bool>,
@@ -2545,7 +2330,6 @@ pub(crate) async fn spawn_session_on_thread(
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     image_description_model: String,
-    transcribe_user_images: bool,
     hook_registry_override: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     workspace_ops: xai_grok_workspace::WorkspaceOps,
     cli_permission_rules: Vec<xai_grok_workspace::permission::types::PermissionRule>,
@@ -2577,13 +2361,12 @@ pub(crate) async fn spawn_session_on_thread(
     >();
     let sid = session_info.id.0.to_string();
     let thread_name = format!("ses-{}", &sid[..sid.len().min(8)]);
-    let projects_chat_history = persistence.projects_chat_history();
     const SESSION_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
     let join_handle = std::thread::Builder::new()
         .name(thread_name)
         .stack_size(SESSION_THREAD_STACK_SIZE)
         .spawn(move || {
-            let (initial_last_compaction, initial_prompt_texts) = if projects_chat_history {
+            let (initial_last_compaction, initial_prompt_texts) = {
                 let session_dir = crate::session::persistence::session_dir(&session_info);
                 let updates_path = session_dir.join("updates.jsonl");
                 let initial_last_compaction = {
@@ -2603,10 +2386,6 @@ pub(crate) async fn spawn_session_on_thread(
                     SessionActor::load_user_prompts_from_updates(&updates_path).unwrap_or_default()
                 };
                 (initial_last_compaction, initial_prompt_texts)
-            } else {
-                // Host-authority sessions are replayed before spawn. Never
-                // consult a stale or absent local transcript projection.
-                (None, Vec::new())
             };
             let rt = match build_session_runtime() {
                 Ok(rt) => rt,
@@ -2644,7 +2423,6 @@ pub(crate) async fn spawn_session_on_thread(
                         mcp_meta_config_map,
                         parent_mcp_pool,
                         acp_mcp_servers,
-                        embedded_mcp_invoker,
                         support_permission,
                         telemetry_enabled,
                         auto_update,
@@ -2731,7 +2509,6 @@ pub(crate) async fn spawn_session_on_thread(
                         inherited_permission_handle,
                         api_key_provider,
                         image_description_model,
-                        transcribe_user_images,
                         hook_registry_override,
                         workspace_ops,
                         cli_permission_rules,

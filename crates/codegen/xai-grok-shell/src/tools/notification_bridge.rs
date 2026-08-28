@@ -438,7 +438,6 @@ async fn handle_notification(
                     .send(SessionCommand::Prompt {
                         prompt_id: prompt_id.clone(),
                         prompt_blocks,
-                        origin_prompt_identity: None,
                         prompt_mode: crate::session::plan_mode::PromptMode::Agent,
                         artifact_upload_ctx: None,
                         client_identifier: None,

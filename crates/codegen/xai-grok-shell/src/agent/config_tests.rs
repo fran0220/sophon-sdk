@@ -228,11 +228,17 @@ fn parses_toolset_overrides() {
         r#"
             [toolset.bash]
             timeout_secs = 123
+
+            [toolset.ask_user_question]
+            timeout_enabled = false
+            timeout_secs = 30
             "#,
     )
     .unwrap();
     let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
     assert_eq!(cfg.toolset.bash.timeout_secs, Some(123.0));
+    assert_eq!(cfg.toolset.ask_user_question.timeout_enabled, Some(false));
+    assert_eq!(cfg.toolset.ask_user_question.timeout_secs, Some(30));
 }
 #[test]
 fn parses_toolset_bash_float_timeout() {
@@ -2118,7 +2124,6 @@ fn model_info_from_config_propagates_use_concise() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
-        query_params: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -2280,7 +2285,6 @@ fn model_info_from_config_propagates_agent_type() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
-        query_params: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -2319,22 +2323,6 @@ fn acp_model_meta_includes_agent_type_when_present() {
     assert_eq!(meta["agentType"], "codex");
     assert_eq!(meta["totalContextTokens"], 256_000);
 }
-
-#[test]
-fn acp_model_meta_includes_model_family_when_present() {
-    let mut models = IndexMap::new();
-    let mut entry = test_model_entry("test-model", "https://test.api/v1", None, None, None);
-    entry.info.model_family = Some("xai".to_string());
-    models.insert("test-model".to_string(), entry);
-    let acp_models = to_acp_model_info(&models);
-    let meta = acp_models
-        .values()
-        .next()
-        .and_then(|model| model.meta.as_ref())
-        .expect("meta should be present");
-    assert_eq!(meta["modelFamily"], "xai");
-}
-
 #[test]
 fn acp_model_meta_always_includes_agent_type() {
     let mut models = IndexMap::new();
@@ -2750,7 +2738,6 @@ fn inference_idle_timeout_propagates_to_model_info() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
-        query_params: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -7517,67 +7504,6 @@ fn remote_settings_disarm_requires_prod_proxy_when_keys_embedded() {
         true,
     );
 }
-fn assert_no_ambient_endpoint_credentials(cfg: &Config) {
-    let endpoints = &cfg.endpoints;
-    assert!(endpoints.alpha_test_key.is_none());
-    assert!(endpoints.deployment_key.is_none());
-    assert!(endpoints.management_api_key.is_none());
-    assert!(endpoints.gcs_service_account_key.is_none());
-    assert!(endpoints.trace_upload_credentials.is_none());
-    assert!(endpoints.trace_upload_credentials_file.is_none());
-    assert!(endpoints.otel_exporter_otlp_headers.is_none());
-    assert!(endpoints.grok_internal_otlp_headers.is_none());
-    assert!(!endpoints.external_otel_master_switch);
-}
-#[test]
-fn origin_embedded_disables_ambient_products() {
-    let cfg = Config::origin_embedded();
-    assert!(cfg.origin_embedded);
-    assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
-    assert!(!cfg.is_feature_enabled(Feature::Feedback));
-    assert_eq!(cfg.features.managed_config, Some(false));
-    assert!(!cfg.is_feature_enabled(Feature::WebFetch));
-    assert!(!cfg.is_feature_enabled(Feature::SessionRecap));
-    assert!(!cfg.is_feature_enabled(Feature::TurnSummary));
-    assert_eq!(cfg.telemetry.trace_upload, Some(false));
-    assert_eq!(cfg.session.load_envrc, Some(false));
-    assert!(cfg.disable_web_search);
-    assert_eq!(cfg.memory_enabled_override, Some(false));
-    assert!(!cfg.managed_mcps_enabled);
-    assert!(!cfg.is_feature_enabled(Feature::AutoWake));
-    assert!(cfg.marketplace.sources.is_empty());
-    assert_eq!(cfg.workflows.enabled, Some(false));
-    assert_eq!(cfg.agent.name.as_deref(), Some("grok-build"));
-    assert!(cfg.cli_agent_overrides.tools.is_none());
-    assert_no_ambient_endpoint_credentials(&cfg);
-}
-#[test]
-fn normal_defaults_keep_normal_startup_gates() {
-    let cfg = Config::default();
-    assert!(cfg.managed_mcps_enabled);
-    assert!(cfg.is_feature_enabled(Feature::AutoWake));
-    assert!(!cfg.disable_web_search);
-}
-#[test]
-fn origin_desktop_keeps_features_inside_isolated_boundary() {
-    let default_marketplace_source_count = Config::defaults_without_env().marketplace.sources.len();
-    let cfg = Config::origin_desktop();
-    assert!(cfg.origin_embedded);
-    assert_ne!(cfg.feature_values.get(&Feature::WebFetch), Some(&false));
-    assert!(!cfg.disable_web_search);
-    assert_ne!(cfg.memory_enabled_override, Some(false));
-    assert_ne!(cfg.workflows.enabled, Some(false));
-    assert!(cfg.managed_mcps_enabled);
-    assert!(cfg.is_feature_enabled(Feature::AutoWake));
-    assert_eq!(
-        cfg.marketplace.sources.len(),
-        default_marketplace_source_count
-    );
-    assert_eq!(cfg.features.telemetry, Some(TelemetryMode::Disabled));
-    assert_eq!(cfg.cli.auto_update, Some(false));
-    assert_no_ambient_endpoint_credentials(&cfg);
-}
-
 #[test]
 fn a_status_line_the_parser_could_not_read_in_full_reaches_grok_inspect() {
     use super::super::config_model_override_parse::{ConfigWarningKind, WarningTarget};

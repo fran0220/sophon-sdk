@@ -1828,8 +1828,8 @@ pub(super) fn make_permission_message(
     (msg, rx)
 }
 /// Build an `x.ai/session_notification` carrying
-/// `InteractionResolved{tool_call_id, resolution}` (the first-answer-wins
-/// broadcast that tells every other pane to retract its shared interaction modal).
+/// `InteractionResolved{tool_call_id}` (the first-answer-wins broadcast that
+/// tells every other pane to retract its shared interaction modal).
 pub(super) fn interaction_resolved_ext(
     session_id: &str,
     tool_call_id: &str,
@@ -1838,8 +1838,6 @@ pub(super) fn interaction_resolved_ext(
         session_id: acp::SessionId::new(session_id),
         update: XaiSessionUpdate::InteractionResolved {
             tool_call_id: tool_call_id.into(),
-            resolution:
-                xai_grok_shell::session::pending_interaction::InteractionResolution::Resolved,
         },
         meta: None,
     };

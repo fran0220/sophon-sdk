@@ -9,10 +9,12 @@ pub(super) fn turn_result_to_hook_outcome(
 ) -> xai_tool_protocol::turn_hook::TurnHookOutcome {
     use xai_tool_protocol::turn_hook::TurnHookOutcome;
     match result {
-        Ok(TurnOutcome::Completed { .. }) => TurnHookOutcome::Completed,
-        Ok(TurnOutcome::Cancelled { .. })
-        | Ok(TurnOutcome::MaxTurnsReached { .. })
-        | Ok(TurnOutcome::StationarityEnded { .. }) => TurnHookOutcome::Cancelled,
+        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
+            TurnHookOutcome::Completed
+        }
+        Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
+            TurnHookOutcome::Cancelled
+        }
         Err(_) => TurnHookOutcome::Error,
     }
 }
@@ -264,41 +266,21 @@ impl SessionActor {
         policy.authority.is_human_intent() && !self.startup_hints.is_subagent
     }
 
-    /// Run the `UserPromptSubmit` prompt gate. For enforceable top-level human
-    /// prompts, client gates run first and the first deterministic block wins;
-    /// file gates run only if clients allow. Other origins send observe-only
-    /// client notifications and may execute file hooks, but the caller ignores
-    /// their verdict.
+    /// Run the `UserPromptSubmit` prompt gate: observe client hooks, then the
+    /// on-disk registry, with the shared scrollback and telemetry side
+    /// effects. Returns the gate verdict; the caller decides whether to
+    /// enforce it (`Block` rejects the prompt).
     pub(super) async fn dispatch_prompt_submit_hook(
         &self,
         payload: xai_grok_hooks::event::HookPayload,
         prompt_id: Option<&str>,
-        enforce_client_gate: bool,
     ) -> xai_grok_hooks::result::PromptDecision {
         let event = xai_grok_hooks::event::HookEventName::UserPromptSubmit;
         if !self.may_have_hooks_for(event) {
             return xai_grok_hooks::result::PromptDecision::Allow;
         }
-        let envelope = if enforce_client_gate {
-            self.make_hook_envelope(event, prompt_id.map(str::to_owned), payload)
-        } else {
-            self.fire_hook(event, prompt_id.map(str::to_owned), payload)
-        };
-        if enforce_client_gate {
-            let client_gate = self.run_prompt_submit_client_hooks(&envelope).await;
-            if !client_gate.results.is_empty() {
-                self.send_hook_execution(&event.to_string(), None, prompt_id, &client_gate.results)
-                    .await;
-                self.emit_hook_executed_telemetry(&event.to_string(), None, &client_gate.results)
-                    .await;
-            }
-            if matches!(
-                client_gate.decision,
-                xai_grok_hooks::result::PromptDecision::Block { .. }
-            ) {
-                return client_gate.decision;
-            }
-        }
+        // Fires observe-only client hooks before (and independent of) the on-disk registry guard below.
+        let envelope = self.fire_hook(event, prompt_id.map(|s| s.to_string()), payload);
         let Some(registry) = self.hook_registry.borrow().clone() else {
             return xai_grok_hooks::result::PromptDecision::Allow;
         };

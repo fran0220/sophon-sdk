@@ -493,6 +493,9 @@ pub enum Action {
     /// Toggle the per-tool "Always allow …" prompt options. SHELL-owned;
     /// persisted to `[ui].remember_tool_approvals`. Applies to new sessions.
     SetRememberToolApprovals(bool),
+    /// Toggle the ask_user_question timeout. SHELL-owned; persisted to
+    /// `[toolset.ask_user_question].timeout_enabled`. Applies to new sessions.
+    SetAskUserQuestionTimeoutEnabled(bool),
     /// SHELL-owned `keep_text_selection` (`flash` | `hold`); cache + persist.
     SetKeepTextSelection(crate::appearance::TextSelection),
     /// Set the mouse-wheel scroll speed multiplier (1-100). Pager-owned

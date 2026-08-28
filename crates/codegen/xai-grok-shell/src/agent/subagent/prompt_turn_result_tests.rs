@@ -191,7 +191,7 @@ fn every_completion_kind_maps_to_the_terminal_contract() {
             (true, false, None, false, false),
         ),
         (
-            PromptCompletionKind::StationarityEnded { repeated_steps: 4 },
+            PromptCompletionKind::StationarityEnded,
             (true, false, None, false, false),
         ),
         (

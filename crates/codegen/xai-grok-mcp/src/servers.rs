@@ -1,5 +1,4 @@
 //! MCP server integration using the official rmcp SDK.
-#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -18,17 +17,14 @@ use tokio::{
 };
 
 use rmcp::{
-    ClientHandler, ClientServiceExt,
+    ClientHandler, ServiceExt,
     model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, CreateMessageRequestParams,
-        CreateMessageResult, ElicitRequestParams, ElicitResult, ElicitationCapability,
-        FormElicitationCapability, Implementation, InputRequest, InputRequests, InputResponses,
-        ListRootsResult, PaginatedRequestParams, RootsCapabilities, SamplingCapability,
-        UrlElicitationCapability,
+        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
+        PaginatedRequestParams,
     },
     service::{
-        ClientInitializeError, ClientLifecycleMode, NotificationContext, RequestContext,
-        RoleClient, RunningService, ServiceError,
+        ClientInitializeError, NotificationContext, RequestContext, RoleClient, RunningService,
+        ServiceError,
     },
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{
@@ -138,19 +134,22 @@ pub struct McpIcon {
 }
 
 impl McpIcon {
-    /// Apply the protocol-icon ingest policy to an already decoded wire icon.
-    /// This is shared by rmcp discovery and embedded SDK catalog projection so
-    /// neither boundary can bypass the source and size limits.
-    pub fn sanitized(mut self) -> Option<Self> {
-        let src = self.src.trim();
+    /// Convert an rmcp icon with ingest rules: trim `src`, allow only
+    /// `https://` and `data:image/…`, drop empty/oversized values.
+    pub fn from_rmcp(icon: rmcp::model::Icon) -> Option<Self> {
+        let src = icon.src.trim();
         if src.is_empty() || src.len() > MAX_MCP_ICON_SRC_BYTES {
             return None;
         }
         if !is_allowed_mcp_icon_src(src) {
             return None;
         }
-        self.src = src.to_owned();
-        self.mime_type = self.mime_type.and_then(|mime| {
+        let theme = match icon.theme {
+            Some(rmcp::model::IconTheme::Light) => Some(McpIconTheme::Light),
+            Some(rmcp::model::IconTheme::Dark) => Some(McpIconTheme::Dark),
+            _ => None,
+        };
+        let mime_type = icon.mime_type.and_then(|mime| {
             let mime = mime.trim();
             if mime.is_empty() || mime.len() > MAX_MCP_ICON_MIME_TYPE_BYTES {
                 None
@@ -158,7 +157,7 @@ impl McpIcon {
                 Some(mime.to_owned())
             }
         });
-        self.sizes = self.sizes.map(|sizes| {
+        let sizes = icon.sizes.map(|sizes| {
             sizes
                 .into_iter()
                 .filter_map(|size| {
@@ -172,35 +171,13 @@ impl McpIcon {
                 .take(MAX_MCP_ICON_SIZES)
                 .collect::<Vec<_>>()
         });
-        self.sizes = self.sizes.filter(|sizes| !sizes.is_empty());
-        Some(self)
-    }
-
-    /// Sanitize and bound a decoded icon list using the same policy as MCP
-    /// discovery.
-    pub fn sanitized_list(icons: Vec<Self>) -> Vec<Self> {
-        icons
-            .into_iter()
-            .filter_map(Self::sanitized)
-            .take(MAX_MCP_ICONS_PER_ENTITY)
-            .collect()
-    }
-
-    /// Convert an rmcp icon with ingest rules: trim `src`, allow only
-    /// `https://` and `data:image/…`, drop empty/oversized values.
-    pub fn from_rmcp(icon: rmcp::model::Icon) -> Option<Self> {
-        let theme = match icon.theme {
-            Some(rmcp::model::IconTheme::Light) => Some(McpIconTheme::Light),
-            Some(rmcp::model::IconTheme::Dark) => Some(McpIconTheme::Dark),
-            _ => None,
-        };
-        Self {
-            src: icon.src,
-            mime_type: icon.mime_type,
-            sizes: icon.sizes,
+        let sizes = sizes.filter(|sizes| !sizes.is_empty());
+        Some(Self {
+            src: src.to_owned(),
+            mime_type,
+            sizes,
             theme,
-        }
-        .sanitized()
+        })
     }
 
     pub fn from_rmcp_list(icons: Option<Vec<rmcp::model::Icon>>) -> Vec<Self> {
@@ -251,297 +228,6 @@ pub type McpServerName = String;
 
 /// Unqualified MCP tool name (e.g. `"create_issue"`, without the `server__` prefix).
 type ToolName = String;
-
-/// Identity attached to every host-side MCP input request. The context is
-/// immutable for the lifetime of an MCP client generation, so a host can make
-/// authorization and audit decisions without inspecting transport metadata.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpHostContext {
-    pub session_id: String,
-    pub server_name: McpServerName,
-    pub client_id: u64,
-}
-
-/// Complete identity for an elicitation routed through an embedding product's
-/// UI authority. Kept separate from [`McpHostContext`] so adding UI-specific
-/// fields does not break roots or sampling service implementations.
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpUiElicitationContext {
-    pub host: McpHostContext,
-    pub task_id: Option<String>,
-    pub request_id: String,
-}
-
-/// Error returned by a typed host-side MCP service. It is converted to a
-/// JSON-RPC error without exposing transport or credential state.
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("MCP host service error {code}: {message}")]
-pub struct McpHostServiceError {
-    pub code: i32,
-    pub message: String,
-    pub data: Option<serde_json::Value>,
-}
-
-impl McpHostServiceError {
-    pub fn denied(message: impl Into<String>) -> Self {
-        Self {
-            code: rmcp::model::ErrorCode::INVALID_REQUEST.0,
-            message: message.into(),
-            data: None,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-pub trait McpRootsService: Send + Sync + 'static {
-    async fn list_roots(
-        &self,
-        context: McpHostContext,
-    ) -> Result<ListRootsResult, McpHostServiceError>;
-}
-
-#[async_trait::async_trait]
-pub trait McpSamplingService: Send + Sync + 'static {
-    async fn create_message(
-        &self,
-        context: McpHostContext,
-        request: CreateMessageRequestParams,
-    ) -> Result<CreateMessageResult, McpHostServiceError>;
-}
-
-#[async_trait::async_trait]
-pub trait McpElicitationService: Send + Sync + 'static {
-    async fn create_elicitation(
-        &self,
-        context: McpHostContext,
-        request: ElicitRequestParams,
-    ) -> Result<ElicitResult, McpHostServiceError>;
-}
-
-/// Dedicated embedding-UI elicitation service. This is distinct from the
-/// generic MCP host service so an SDK façade can reserve answers for one
-/// product-owned channel while preserving the legacy lower-level API.
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait McpUiElicitationService: Send + Sync + 'static {
-    async fn create_ui_elicitation(
-        &self,
-        context: McpUiElicitationContext,
-        request: ElicitRequestParams,
-    ) -> Result<ElicitResult, McpHostServiceError>;
-}
-
-/// Immutable host services and the exact client capabilities they authorize.
-/// A capability is absent unless the corresponding typed service is installed.
-#[derive(Clone, Default)]
-pub struct McpHostServices {
-    roots: Option<(Arc<dyn McpRootsService>, RootsCapabilities)>,
-    sampling: Option<(Arc<dyn McpSamplingService>, SamplingCapability)>,
-    elicitation: Option<(Arc<dyn McpElicitationService>, ElicitationCapability)>,
-    ui_elicitation: Option<(Arc<dyn McpUiElicitationService>, ElicitationCapability)>,
-}
-
-impl McpHostServices {
-    pub fn with_roots(mut self, service: Arc<dyn McpRootsService>, list_changed: bool) -> Self {
-        let mut capability = RootsCapabilities::default();
-        capability.list_changed = list_changed.then_some(true);
-        self.roots = Some((service, capability));
-        self
-    }
-
-    pub fn with_sampling(
-        mut self,
-        service: Arc<dyn McpSamplingService>,
-        tools: bool,
-        context: bool,
-    ) -> Self {
-        let mut capability = SamplingCapability::default();
-        capability.tools = tools.then(Default::default);
-        capability.context = context.then(Default::default);
-        self.sampling = Some((service, capability));
-        self
-    }
-
-    pub fn with_elicitation(
-        mut self,
-        service: Arc<dyn McpElicitationService>,
-        form: bool,
-        url: bool,
-        schema_validation: bool,
-    ) -> Self {
-        let mut capability = ElicitationCapability::default();
-        capability.form = form.then(|| {
-            FormElicitationCapability::default().with_schema_validation(schema_validation)
-        });
-        capability.url = url.then(UrlElicitationCapability::default);
-        self.elicitation = Some((service, capability));
-        self
-    }
-
-    /// Installs the embedding product's authoritative UI elicitation channel.
-    /// When present, the generic elicitation service is never advertised or
-    /// invoked.
-    #[doc(hidden)]
-    pub fn with_ui_elicitation(
-        mut self,
-        service: Arc<dyn McpUiElicitationService>,
-        form: bool,
-        url: bool,
-        schema_validation: bool,
-    ) -> Self {
-        let mut capability = ElicitationCapability::default();
-        capability.form = form.then(|| {
-            FormElicitationCapability::default().with_schema_validation(schema_validation)
-        });
-        capability.url = url.then(UrlElicitationCapability::default);
-        self.ui_elicitation = Some((service, capability));
-        self
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_none()
-            && self.sampling.is_none()
-            && self.elicitation.is_none()
-            && self.ui_elicitation.is_none()
-    }
-
-    /// Whether the legacy generic elicitation service was installed.
-    #[doc(hidden)]
-    pub fn has_generic_elicitation(&self) -> bool {
-        self.elicitation.is_some()
-    }
-
-    /// Whether an embedding-specific UI authority was installed directly.
-    /// SDK façades use this to reject lower-layer injection and install their
-    /// own identity-binding adapter only after configuration validation.
-    #[doc(hidden)]
-    pub fn has_ui_elicitation(&self) -> bool {
-        self.ui_elicitation.is_some()
-    }
-
-    fn client_capabilities(&self) -> ClientCapabilities {
-        let mut capabilities = ClientCapabilities::default();
-        capabilities.roots = self
-            .roots
-            .as_ref()
-            .map(|(_, capability)| capability.clone());
-        capabilities.sampling = self
-            .sampling
-            .as_ref()
-            .map(|(_, capability)| capability.clone());
-        capabilities.elicitation = self
-            .ui_elicitation
-            .as_ref()
-            .map(|(_, capability)| capability.clone())
-            .or_else(|| {
-                self.elicitation
-                    .as_ref()
-                    .map(|(_, capability)| capability.clone())
-            });
-        capabilities
-    }
-}
-
-#[derive(Clone)]
-struct BoundMcpHostServices {
-    context: McpHostContext,
-    services: McpHostServices,
-}
-
-impl BoundMcpHostServices {
-    fn error(error: McpHostServiceError) -> rmcp::ErrorData {
-        rmcp::ErrorData::new(
-            rmcp::model::ErrorCode(error.code),
-            error.message,
-            error.data,
-        )
-    }
-
-    async fn fulfill_input_requests(
-        &self,
-        connection_generation: u64,
-        task_id: Option<&str>,
-        requests: InputRequests,
-    ) -> Result<InputResponses, rmcp::ErrorData> {
-        let mut context = self.context.clone();
-        context.client_id = connection_generation;
-        let mut responses = InputResponses::new();
-        for (key, request) in requests {
-            let value = match request {
-                InputRequest::CreateMessage(request) => {
-                    let Some((service, _)) = &self.services.sampling else {
-                        return Err(rmcp::ErrorData::method_not_found::<
-                            rmcp::model::CreateMessageRequestMethod,
-                        >());
-                    };
-                    serde_json::to_value(
-                        service
-                            .create_message(context.clone(), request.params)
-                            .await
-                            .map_err(Self::error)?,
-                    )
-                }
-                InputRequest::Elicitation(request) => {
-                    if let Some((service, _)) = &self.services.ui_elicitation {
-                        serde_json::to_value(
-                            service
-                                .create_ui_elicitation(
-                                    McpUiElicitationContext {
-                                        host: context.clone(),
-                                        task_id: task_id.map(str::to_owned),
-                                        request_id: key.clone(),
-                                    },
-                                    request.params,
-                                )
-                                .await
-                                .map_err(Self::error)?,
-                        )
-                    } else {
-                        let Some((service, _)) = &self.services.elicitation else {
-                            return Err(rmcp::ErrorData::method_not_found::<
-                                rmcp::model::ElicitationCreateRequestMethod,
-                            >());
-                        };
-                        serde_json::to_value(
-                            service
-                                .create_elicitation(context.clone(), request.params)
-                                .await
-                                .map_err(Self::error)?,
-                        )
-                    }
-                }
-                InputRequest::ListRoots(_) => {
-                    let Some((service, _)) = &self.services.roots else {
-                        return Err(rmcp::ErrorData::method_not_found::<
-                            rmcp::model::ListRootsRequestMethod,
-                        >());
-                    };
-                    serde_json::to_value(
-                        service
-                            .list_roots(context.clone())
-                            .await
-                            .map_err(Self::error)?,
-                    )
-                }
-                _ => {
-                    return Err(rmcp::ErrorData::invalid_params(
-                        "unsupported MCP input request",
-                        None,
-                    ));
-                }
-            }
-            .map_err(|error| {
-                rmcp::ErrorData::internal_error(
-                    "failed to encode MCP host response",
-                    Some(serde_json::json!({"error": error.to_string()})),
-                )
-            })?;
-            responses.insert(key, value);
-        }
-        Ok(responses)
-    }
-}
 
 /// Typed state machine for MCP-pool initialization.
 ///
@@ -740,7 +426,7 @@ impl InitProgress {
 ///
 /// `Deserialize`d straight from a `_meta["x.ai/mcp/servers"]` entry, so the
 /// `serverId` wire field name is declared (and serde-checked) exactly once here.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct AcpServerEntry {
     pub name: McpServerName,
     #[serde(rename = "serverId")]
@@ -804,9 +490,6 @@ pub struct McpState {
     /// without a full MCP re-init (no need to call `list_tools` again).
     pub disabled_tool_registrations: HashMap<String, McpToolRegistration>,
     event_writer: xai_grok_session_events::EventWriter,
-    /// Runtime-installed typed MRTR services for clients owned by this
-    /// session. Shared clients retain the parent session's immutable binding.
-    host_services: Option<(String, McpHostServices)>,
     /// Sender wired by the session actor to its `StatusDispatcher`
     /// task.  When `Some`, the state — and every [`McpClient`] reached
     /// through [`Self::all_clients`] / [`Self::get_client`] — forwards
@@ -856,26 +539,8 @@ impl McpState {
             disabled_tools: HashMap::new(),
             disabled_tool_registrations: HashMap::new(),
             event_writer: xai_grok_session_events::EventWriter::noop(),
-            host_services: None,
             client_event_tx: None,
             elicitation_job_tx: None,
-        }
-    }
-
-    pub fn set_host_services(&mut self, session_id: String, services: McpHostServices) {
-        if services.is_empty() {
-            self.host_services = None;
-            return;
-        }
-        for client in self.owned_clients.values() {
-            client.set_host_services(session_id.clone(), services.clone());
-        }
-        self.host_services = Some((session_id, services));
-    }
-
-    pub fn configure_host_services(&self, client: &McpClient) {
-        if let Some((session_id, services)) = &self.host_services {
-            client.set_host_services(session_id.clone(), services.clone());
         }
     }
 
@@ -954,130 +619,7 @@ impl McpState {
         servers: Vec<AcpServerEntry>,
         invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
     ) {
-        let reserved: std::collections::HashSet<&str> =
-            servers.iter().map(|entry| entry.name.as_str()).collect();
-        self.configs
-            .retain(|config| !reserved.contains(mcp_server_name(config)));
-        self.owned_clients
-            .retain(|name, _| !reserved.contains(name.as_str()));
         self.acp_mcp = Some(AcpMcpRegistry { servers, invoker });
-    }
-
-    /// Diff and replace the Session's in-process registrations while keeping
-    /// unchanged clients alive. This is the in-process counterpart of
-    /// [`Self::update_configs_diff`].
-    pub fn update_acp_servers_diff(
-        &mut self,
-        servers: Vec<AcpServerEntry>,
-        invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
-    ) -> Option<McpConfigDiff> {
-        let old = self
-            .acp_mcp
-            .as_ref()
-            .map(|registry| registry.servers.as_slice())
-            .unwrap_or_default();
-        let invoker_changed = self
-            .acp_mcp
-            .as_ref()
-            .is_some_and(|registry| !Arc::ptr_eq(&registry.invoker, &invoker));
-        if old == servers.as_slice() && !invoker_changed {
-            return None;
-        }
-
-        let old_by_name: HashMap<&str, &str> = old
-            .iter()
-            .map(|entry| (entry.name.as_str(), entry.server_id.as_str()))
-            .collect();
-        let new_by_name: HashMap<&str, &str> = servers
-            .iter()
-            .map(|entry| (entry.name.as_str(), entry.server_id.as_str()))
-            .collect();
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        let mut retained = Vec::new();
-        for (name, old_id) in &old_by_name {
-            match new_by_name.get(name) {
-                Some(new_id) if new_id == old_id => retained.push((*name).to_owned()),
-                Some(_) | None => removed.push((*name).to_owned()),
-            }
-        }
-        for (name, new_id) in &new_by_name {
-            if old_by_name.get(name) != Some(new_id) {
-                added.push((*name).to_owned());
-            }
-        }
-
-        // A new invoker represents a new session binding even when the
-        // server registration list is unchanged. Rebuild those clients so
-        // they do not retain a transport bound to the previous actor.
-        if invoker_changed {
-            for name in old_by_name.keys() {
-                if !removed.iter().any(|removed| removed == name) {
-                    removed.push((*name).to_owned());
-                }
-            }
-            for name in new_by_name.keys() {
-                if !added.iter().any(|added| added == name) {
-                    added.push((*name).to_owned());
-                }
-            }
-            retained.clear();
-        }
-
-        let reserved: std::collections::HashSet<&str> =
-            servers.iter().map(|entry| entry.name.as_str()).collect();
-        for config in &self.configs {
-            let name = mcp_server_name(config);
-            if reserved.contains(name) && !removed.iter().any(|removed| removed == name) {
-                removed.push(name.to_owned());
-            }
-        }
-
-        for name in &removed {
-            self.owned_clients.remove(name);
-            self.auth_required.remove(name);
-            self.init_progress.mark_handshake_complete(name);
-            let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
-            self.mcp_tool_meta
-                .retain(|key, _| !key.starts_with(&prefix));
-            self.disabled_tool_registrations
-                .retain(|key, _| !key.starts_with(&prefix));
-        }
-        self.configs
-            .retain(|config| !reserved.contains(mcp_server_name(config)));
-        self.acp_mcp = (!servers.is_empty()).then_some(AcpMcpRegistry { servers, invoker });
-        self.init_progress.cancel();
-        self.generation = self.generation.wrapping_add(1);
-        Some(McpConfigDiff {
-            added,
-            removed,
-            retained,
-        })
-    }
-
-    /// In-process registrations own their tool namespace. Ignore later
-    /// external configs that try to shadow one, rather than silently routing
-    /// a registered SDK handler under the wrong transport.
-    fn remove_acp_name_collisions(&self, mut configs: Vec<acp::McpServer>) -> Vec<acp::McpServer> {
-        let Some(registry) = &self.acp_mcp else {
-            return configs;
-        };
-        let reserved: std::collections::HashSet<&str> = registry
-            .servers
-            .iter()
-            .map(|entry| entry.name.as_str())
-            .collect();
-        configs.retain(|config| {
-            let keep = !reserved.contains(mcp_server_name(config));
-            if !keep {
-                tracing::warn!(
-                    server = mcp_server_name(config),
-                    "ignoring MCP config that collides with an in-process server"
-                );
-            }
-            keep
-        });
-        configs
     }
 
     /// Whether any in-process SDK MCP servers are registered (so the session knows to
@@ -1124,15 +666,13 @@ impl McpState {
         };
         self.pending_acp_entries()
             .map(|entry| {
-                let client = McpClient::new_acp(
+                McpClient::new_acp(
                     entry.name.clone(),
                     entry.server_id.clone(),
                     acp.invoker.clone(),
                     overrides.get(&entry.name),
                     self.meta_config_map.get(&entry.name),
-                );
-                self.configure_host_services(&client);
-                client
+                )
             })
             .collect()
     }
@@ -1147,7 +687,6 @@ impl McpState {
     /// Update configs and reset initialization state.
     /// Returns true if the configs actually changed, false if they were identical.
     pub fn update_configs(&mut self, new_configs: Vec<acp::McpServer>) -> bool {
-        let new_configs = self.remove_acp_name_collisions(new_configs);
         if mcp_servers_equal(&self.configs, &new_configs) {
             tracing::debug!("MCP configs unchanged, skipping update");
             return false;
@@ -1190,7 +729,6 @@ impl McpState {
         &mut self,
         new_configs: Vec<acp::McpServer>,
     ) -> Option<McpConfigDiff> {
-        let new_configs = self.remove_acp_name_collisions(new_configs);
         if mcp_servers_equal(&self.configs, &new_configs) {
             tracing::debug!("MCP configs unchanged, skipping update");
             return None;
@@ -1704,7 +1242,7 @@ impl McpError {
 /// True when a failed refresh-token grant was a **network-level** failure
 /// that never reached the IdP (RT validity unknown, presumed good); IdP
 /// rejections and missing credentials stay terminal (escalate to browser).
-/// rmcp collapses the error into `TokenRefreshFailed(String)`, so this
+/// rmcp 2.1 collapses the error into `TokenRefreshFailed(String)`, so this
 /// anchors on the `oauth2` crate's stable `Display` texts via
 /// `starts_with` (an IdP error description can't spoof a match):
 /// `"Request failed"` = network, `"Failed to parse server response"` =
@@ -2394,12 +1932,9 @@ async fn discover_and_prepare_auth(
         )));
     }
 
-    match manager.resolve_metadata().await {
-        Ok(resolution)
-            if resolution.source
-                != rmcp::transport::auth::AuthorizationMetadataSource::LegacyEndpointFallback =>
-        {
-            manager.set_metadata(resolution.metadata);
+    match manager.discover_metadata().await {
+        Ok(metadata) => {
+            manager.set_metadata(metadata);
             if mode == OauthInteractivity::NonInteractive {
                 tracing::warn!(
                     server = server_name,
@@ -2415,7 +1950,7 @@ async fn discover_and_prepare_auth(
                 tokio::sync::Mutex::new(manager),
             )))
         }
-        Ok(_) | Err(rmcp::transport::auth::AuthError::NoAuthorizationSupport) => {
+        Err(rmcp::transport::auth::AuthError::NoAuthorizationSupport) => {
             tracing::debug!(server = server_name, "Server does not support OAuth");
             OauthProbeOutcome::Resolved(HttpOauthPrep::NoOauthSupport)
         }
@@ -3035,44 +2570,15 @@ enum PendingTransport {
     },
 }
 
-/// A connected MCP service and the immutable generation minted for its
-/// successful handshake. The generation changes on every in-place reconnect,
-/// unlike [`McpClient::client_id`], which identifies the longer-lived client
-/// object for transport-liveness eviction.
-#[derive(Clone)]
-pub struct McpService {
-    inner: Arc<RunningService<RoleClient, GrokClientHandler>>,
-    connection_generation: u64,
-}
-
-impl std::fmt::Debug for McpService {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("McpService")
-            .field("connection_generation", &self.connection_generation)
-            .finish_non_exhaustive()
-    }
-}
-
-impl McpService {
-    pub fn connection_generation(&self) -> u64 {
-        self.connection_generation
-    }
-}
-
-impl std::ops::Deref for McpService {
-    type Target = RunningService<RoleClient, GrokClientHandler>;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_ref()
-    }
-}
-
-impl AsRef<RunningService<RoleClient, GrokClientHandler>> for McpService {
-    fn as_ref(&self) -> &RunningService<RoleClient, GrokClientHandler> {
-        self.inner.as_ref()
-    }
-}
+/// A connected MCP service (rmcp's RunningService wrapped in Arc).
+/// Uses [`GrokClientHandler`] rather than rmcp's default `ClientInfo`
+/// handler: rmcp 2.1 parameterizes `RunningService` over the handler
+/// type, and `ClientInfo` is only a `ClientHandler` impl with no
+/// notification routing. The custom handler keeps the same protocol
+/// behavior (same `get_info`) while plumbing
+/// `tools/list_changed` / `resources/list_changed` notifications
+/// through to the session-actor dispatcher.
+pub type McpService = Arc<RunningService<RoleClient, GrokClientHandler>>;
 
 /// MCP client connection state machine.
 ///
@@ -3181,13 +2687,9 @@ pub enum McpClientEvent {
     ToolsChanged { server: McpServerName },
     /// Server pushed `notifications/resources/list_changed`.
     ResourcesChanged { server: McpServerName },
-    /// Server pushed `notifications/prompts/list_changed`.
-    PromptsChanged { server: McpServerName },
-    /// Server pushed SEP-2663 `notifications/tasks`.
-    TaskStatus {
+    ElicitationComplete {
         server: McpServerName,
-        client_id: u64,
-        task: serde_json::Value,
+        elicitation_id: String,
     },
     /// Client transitioned to [`ClientState::Ready`]; dispatcher uses
     /// this to surface "ready" status without polling. Emitted from
@@ -3215,148 +2717,6 @@ pub enum McpClientEvent {
     ConfigRemoved { server: McpServerName },
 }
 
-/// Maximum encoded size of one custom MCP notification exposed to an
-/// embedded Host. A Service can stream indefinitely, but no single event may
-/// turn that stream into an unbounded allocation.
-pub const MAX_DOMAIN_NOTIFICATION_BYTES: usize = 64 * 1024;
-
-/// One generation-bound, locally filtered stream of custom notifications from
-/// an already-mounted MCP Service.
-///
-/// The server transport and its credentials remain those of [`McpClient`].
-/// This bridge merely exposes notifications the server sends on that existing
-/// connection; it opens no listener and creates no parallel transport.
-#[doc(hidden)]
-pub struct McpDomainNotificationSubscription {
-    pub client_id: u64,
-    pub events: tokio::sync::mpsc::Receiver<serde_json::Value>,
-    pub terminal: tokio::sync::oneshot::Receiver<serde_json::Value>,
-    pub cancel: tokio::sync::oneshot::Sender<()>,
-}
-
-#[derive(Debug)]
-struct DomainNotificationSubscriber {
-    generation: u64,
-    methods: std::collections::BTreeSet<String>,
-    capacity: usize,
-    events: tokio::sync::mpsc::Sender<serde_json::Value>,
-    terminal: tokio::sync::oneshot::Sender<serde_json::Value>,
-}
-
-#[derive(Debug, Default)]
-struct DomainNotificationRegistry {
-    next_id: std::sync::atomic::AtomicU64,
-    subscribers: parking_lot::Mutex<HashMap<u64, DomainNotificationSubscriber>>,
-}
-
-impl DomainNotificationRegistry {
-    fn subscribe(
-        self: &Arc<Self>,
-        generation: u64,
-        methods: Vec<String>,
-        capacity: std::num::NonZeroUsize,
-    ) -> McpDomainNotificationSubscription {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (events_tx, events) = tokio::sync::mpsc::channel(capacity.get());
-        let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
-        let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
-        self.subscribers.lock().insert(
-            id,
-            DomainNotificationSubscriber {
-                generation,
-                methods: methods.into_iter().collect(),
-                capacity: capacity.get(),
-                events: events_tx,
-                terminal: terminal_tx,
-            },
-        );
-        // Do not let a forgotten subscription keep a removed Service client
-        // alive. If the client/registry is dropped first, both stream senders
-        // close and the public SDK reports an abrupt generation end.
-        let registry = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let _ = cancel_rx.await;
-            if let Some(registry) = registry.upgrade() {
-                registry.finish(id, serde_json::json!({ "reason": "cancelled" }));
-            }
-        });
-        McpDomainNotificationSubscription {
-            client_id: generation,
-            events,
-            terminal,
-            cancel,
-        }
-    }
-
-    fn publish(&self, generation: u64, notification: rmcp::model::CustomNotification) {
-        let event = serde_json::json!({
-            "method": notification.method,
-            "params": notification.params,
-        });
-        let oversized = serde_json::to_vec(&event)
-            .map(|encoded| encoded.len() > MAX_DOMAIN_NOTIFICATION_BYTES)
-            .unwrap_or(true);
-        let method = event["method"].as_str().unwrap_or_default();
-        let mut subscribers = self.subscribers.lock();
-        let targets: Vec<u64> = subscribers
-            .iter()
-            .filter_map(|(id, subscriber)| {
-                (subscriber.generation == generation && subscriber.methods.contains(method))
-                    .then_some(*id)
-            })
-            .collect();
-        for id in targets {
-            let Some(subscriber) = subscribers.remove(&id) else {
-                continue;
-            };
-            if oversized {
-                let _ = subscriber.terminal.send(serde_json::json!({
-                    "reason": "error",
-                    "message": format!(
-                        "MCP domain notification exceeded {MAX_DOMAIN_NOTIFICATION_BYTES} bytes"
-                    ),
-                }));
-                continue;
-            }
-            match subscriber.events.try_send(event.clone()) {
-                Ok(()) => {
-                    subscribers.insert(id, subscriber);
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    let _ = subscriber.terminal.send(serde_json::json!({
-                        "reason": "lagged",
-                        "capacity": subscriber.capacity,
-                    }));
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-            }
-        }
-    }
-
-    fn finish(&self, id: u64, reason: serde_json::Value) {
-        if let Some(subscriber) = self.subscribers.lock().remove(&id) {
-            let _ = subscriber.terminal.send(reason);
-        }
-    }
-
-    fn retire_before(&self, generation: u64) {
-        let mut subscribers = self.subscribers.lock();
-        let stale: Vec<u64> = subscribers
-            .iter()
-            .filter_map(|(id, subscriber)| (subscriber.generation != generation).then_some(*id))
-            .collect();
-        for id in stale {
-            if let Some(subscriber) = subscribers.remove(&id) {
-                let _ = subscriber
-                    .terminal
-                    .send(serde_json::json!({ "reason": "abrupt" }));
-            }
-        }
-    }
-}
-
 /// Discriminant for [`McpClientEvent`], used as the second half of the
 /// coalescing key `(server, kind)`. Two events with the same
 /// `(server, kind)` collapse into the latest one inside the
@@ -3371,8 +2731,7 @@ pub enum McpClientEventKind {
     HandshakeFailed,
     ToolsChanged,
     ResourcesChanged,
-    PromptsChanged,
-    TaskStatus,
+    ElicitationComplete,
     Ready,
     ConfigAdded,
     ConfigRemoved,
@@ -3391,8 +2750,7 @@ impl McpClientEvent {
             | Self::HandshakeFailed { server, .. }
             | Self::ToolsChanged { server }
             | Self::ResourcesChanged { server }
-            | Self::PromptsChanged { server }
-            | Self::TaskStatus { server, .. }
+            | Self::ElicitationComplete { server, .. }
             | Self::Ready { server }
             | Self::ConfigAdded { server }
             | Self::ConfigRemoved { server } => Some(server.as_str()),
@@ -3488,15 +2846,9 @@ fn restorable_transport(pending: &PendingTransport) -> Option<PendingTransport> 
 /// Monotonic source for [`McpClient::client_id`]. Process-global so every
 /// client instance — including test stubs — gets a unique identity.
 static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static NEXT_CONNECTION_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
 
 fn next_client_id() -> u64 {
     NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-fn next_connection_generation() -> u64 {
-    NEXT_CONNECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct McpClient {
@@ -3570,10 +2922,6 @@ pub struct McpClient {
     /// allocation-free.
     notify_tx: SharedEventTx,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
-    /// Bounded custom notifications on this mounted Service's existing
-    /// transport. Subscriptions are retired whenever the concrete connection
-    /// generation changes.
-    domain_notifications: Arc<DomainNotificationRegistry>,
     /// RAII handle for the per-client transport-liveness poller.
     ///
     /// `Some` after [`Self::arm_liveness_watcher`] succeeds; `None`
@@ -3589,13 +2937,6 @@ pub struct McpClient {
     /// internal `Arc` clone of this mutex (the same memory) so it
     /// can clear the slot before `break`.
     liveness_handle: Arc<parking_lot::Mutex<Option<crate::liveness::TransportLivenessHandle>>>,
-    /// Immutable host-side MRTR services, installed before discovery. The
-    /// shared slot lets all transport constructors stay uniform while still
-    /// making capability advertisement depend on real host authorization.
-    host_services: Arc<parking_lot::Mutex<Option<BoundMcpHostServices>>>,
-    /// Serializes Task input snapshot checks and updates on this client. MCP
-    /// has no Task-round CAS field, so two local answer paths must not race.
-    task_input_gate: Mutex<()>,
 }
 
 /// Shared sender slot type — the same Arc lives on the [`McpClient`]
@@ -3630,363 +2971,6 @@ pub struct McpClientTimeoutOverrides {
 }
 
 impl McpClient {
-    /// Negotiated modern MCP version and server capability object. Returns
-    /// `None` until discovery completes; the payload is credential-free and
-    /// safe for typed SDK capability reporting.
-    pub async fn negotiated_info_json(&self) -> Option<serde_json::Value> {
-        let guard = self.state.lock().await;
-        let ClientState::Ready { service, .. } = &*guard else {
-            return None;
-        };
-        let info = service.peer().peer_info()?;
-        Some(serde_json::json!({
-            "protocolVersion": info.protocol_version.to_string(),
-            "capabilities": info.capabilities,
-        }))
-    }
-
-    /// Lists every resource from the initialized service, preserving the MCP
-    /// payload without exporting rmcp types to callers.
-    pub async fn list_resources_json(&self) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let resources = service
-            .list_all_resources()
-            .await
-            .map_err(|e| McpError::ClientError(e.to_string()))?;
-        serde_json::to_value(resources).map_err(|e| McpError::ClientError(e.to_string()))
-    }
-
-    pub async fn list_resource_templates_json(&self) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let templates = service
-            .list_all_resource_templates()
-            .await
-            .map_err(|e| McpError::ClientError(e.to_string()))?;
-        serde_json::to_value(templates).map_err(|e| McpError::ClientError(e.to_string()))
-    }
-
-    pub async fn list_prompts_json(&self) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let prompts = service
-            .list_all_prompts()
-            .await
-            .map_err(|e| McpError::ClientError(e.to_string()))?;
-        serde_json::to_value(prompts).map_err(|e| McpError::ClientError(e.to_string()))
-    }
-
-    pub async fn get_prompt_json(
-        &self,
-        name: String,
-        arguments: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let mut params = rmcp::model::GetPromptRequestParams::new(name);
-        params.arguments = arguments;
-        let result = service
-            .get_prompt(params)
-            .await
-            .map_err(|e| McpError::ClientError(e.to_string()))?;
-        serde_json::to_value(result).map_err(|e| McpError::ClientError(e.to_string()))
-    }
-
-    /// Execute exactly one MCP `prompts/get` round. The returned JSON is a
-    /// discriminated `complete` / `input_required` outcome; no host callback
-    /// is invoked implicitly.
-    pub async fn get_prompt_once_json(
-        &self,
-        name: String,
-        arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        input_responses: Option<InputResponses>,
-        request_state: Option<String>,
-        expected_connection_generation: Option<u64>,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        if let Some(expected) = expected_connection_generation {
-            Self::require_client_generation(&service, expected)?;
-        }
-        let mut params = rmcp::model::GetPromptRequestParams::new(name);
-        params.arguments = arguments;
-        params.input_responses = input_responses;
-        params.request_state = request_state;
-        let outcome = service
-            .get_prompt_once(params)
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        match outcome {
-            rmcp::model::GetPromptResponse::Complete(result) => Ok(serde_json::json!({
-                "outcome": "complete",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            rmcp::model::GetPromptResponse::InputRequired(result) => Ok(serde_json::json!({
-                "outcome": "input_required",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            _ => Err(McpError::ClientError(
-                "unsupported prompts/get outcome".to_owned(),
-            )),
-        }
-    }
-
-    /// Execute exactly one MCP `resources/read` round.
-    pub async fn read_resource_once_json(
-        &self,
-        uri: String,
-        input_responses: Option<InputResponses>,
-        request_state: Option<String>,
-        expected_connection_generation: Option<u64>,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        if let Some(expected) = expected_connection_generation {
-            Self::require_client_generation(&service, expected)?;
-        }
-        let mut params = rmcp::model::ReadResourceRequestParams::new(uri);
-        params.input_responses = input_responses;
-        params.request_state = request_state;
-        let outcome = service
-            .read_resource_once(params)
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        match outcome {
-            rmcp::model::ReadResourceResponse::Complete(result) => Ok(serde_json::json!({
-                "outcome": "complete",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            rmcp::model::ReadResourceResponse::InputRequired(result) => Ok(serde_json::json!({
-                "outcome": "input_required",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            _ => Err(McpError::ClientError(
-                "unsupported resources/read outcome".to_owned(),
-            )),
-        }
-    }
-
-    /// Execute exactly one MCP `tools/call` round, preserving Task and MRTR
-    /// outcomes for the typed SDK.
-    pub async fn call_tool_once_json(
-        &self,
-        tool_name: String,
-        arguments: serde_json::Value,
-        input_responses: Option<InputResponses>,
-        request_state: Option<String>,
-        expected_connection_generation: Option<u64>,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        if let Some(expected) = expected_connection_generation {
-            Self::require_client_generation(&service, expected)?;
-        }
-        let mut params = CallToolRequestParams::new(tool_name);
-        params.arguments = arguments.as_object().cloned();
-        params.input_responses = input_responses;
-        params.request_state = request_state;
-        let outcome = service
-            .call_tool_once(params)
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        match outcome {
-            rmcp::model::CallToolResponse::Complete(result) => Ok(serde_json::json!({
-                "outcome": "complete",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            rmcp::model::CallToolResponse::InputRequired(result) => Ok(serde_json::json!({
-                "outcome": "input_required",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            rmcp::model::CallToolResponse::Task(result) => Ok(serde_json::json!({
-                "outcome": "task",
-                "clientId": service.connection_generation(),
-                "result": result,
-            })),
-            _ => Err(McpError::ClientError(
-                "unsupported tools/call outcome".to_owned(),
-            )),
-        }
-    }
-
-    fn require_client_generation(
-        service: &McpService,
-        expected_client_id: u64,
-    ) -> Result<(), McpError> {
-        if service.connection_generation() == expected_client_id {
-            Ok(())
-        } else {
-            Err(McpError::ClientError(format!(
-                "stale MCP generation-bound operation: expected client generation {expected_client_id}, current generation is {}",
-                service.connection_generation()
-            )))
-        }
-    }
-
-    pub async fn current_connection_generation(&self) -> Option<u64> {
-        let guard = self.state.lock().await;
-        match &*guard {
-            ClientState::Ready { service, .. } => Some(service.connection_generation()),
-            _ => None,
-        }
-    }
-
-    pub async fn get_task_json(
-        &self,
-        expected_client_id: u64,
-        task_id: String,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        Self::require_client_generation(&service, expected_client_id)?;
-        let result = service
-            .peer()
-            .get_task(rmcp::model::GetTaskParams::new(task_id))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        Ok(serde_json::json!({
-            "clientId": service.connection_generation(),
-            "result": result,
-        }))
-    }
-
-    /// Reattaches a server-assigned Task identity to the current connection
-    /// generation. Unlike `get_task_json`, this deliberately does not accept
-    /// an old generation: callers use it only after independently deciding to
-    /// recover a previously recorded stable Task identity.
-    pub async fn recover_task_json(&self, task_id: String) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let result = service
-            .peer()
-            .get_task(rmcp::model::GetTaskParams::new(task_id))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        Ok(serde_json::json!({
-            "clientId": service.connection_generation(),
-            "result": result,
-        }))
-    }
-
-    pub async fn update_task_if_current(
-        &self,
-        expected_client_id: u64,
-        task_id: String,
-        expected_task: serde_json::Value,
-        input_responses: InputResponses,
-    ) -> Result<(), McpError> {
-        let _guard = self.task_input_gate.lock().await;
-        let service = self.ensure_initialized().await?;
-        Self::require_client_generation(&service, expected_client_id)?;
-        let current = service
-            .peer()
-            .get_task(rmcp::model::GetTaskParams::new(task_id.clone()))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        let current = serde_json::to_value(current.task)
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        let same_round = [
-            "taskId",
-            "status",
-            "lastUpdatedAt",
-            "inputRequests",
-            "requestState",
-        ]
-        .into_iter()
-        .all(|field| current.get(field) == expected_task.get(field));
-        if !same_round {
-            return Err(McpError::ClientError(
-                "MCP task input changed before its answers were submitted".to_owned(),
-            ));
-        }
-        service
-            .peer()
-            .update_task(rmcp::model::UpdateTaskParams::new(task_id, input_responses))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))
-    }
-
-    pub async fn cancel_task(
-        &self,
-        expected_client_id: u64,
-        task_id: String,
-    ) -> Result<(), McpError> {
-        let service = self.ensure_initialized().await?;
-        Self::require_client_generation(&service, expected_client_id)?;
-        service
-            .peer()
-            .cancel_task(rmcp::model::CancelTaskParams::new(task_id))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))
-    }
-
-    pub async fn ping(&self) -> Result<u64, McpError> {
-        let service = self.ensure_initialized().await?;
-        let result = service
-            .peer()
-            .send_request(rmcp::model::ClientRequest::PingRequest(
-                rmcp::model::PingRequest::default(),
-            ))
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        match result {
-            rmcp::model::ServerResult::EmptyResult(_) => Ok(service.connection_generation()),
-            _ => Err(McpError::ClientError(
-                "MCP ping returned an unexpected response".to_owned(),
-            )),
-        }
-    }
-
-    pub async fn notify_roots_list_changed(&self) -> Result<u64, McpError> {
-        let authorized = self
-            .host_services
-            .lock()
-            .as_ref()
-            .and_then(|host| host.services.roots.as_ref())
-            .is_some_and(|(_, capability)| capability.list_changed == Some(true));
-        if !authorized {
-            return Err(McpError::ClientError(
-                "MCP roots/list_changed was not authorized by installed host services".to_owned(),
-            ));
-        }
-        let service = self.ensure_initialized().await?;
-        service
-            .peer()
-            .notify_roots_list_changed()
-            .await
-            .map_err(|error| McpError::ClientError(error.to_string()))?;
-        Ok(service.connection_generation())
-    }
-
-    pub async fn complete_argument_json(
-        &self,
-        reference: &str,
-        target: String,
-        argument: String,
-        value: String,
-        context: Option<std::collections::HashMap<String, String>>,
-    ) -> Result<serde_json::Value, McpError> {
-        let service = self.ensure_initialized().await?;
-        let context = context.map(rmcp::model::CompletionContext::with_arguments);
-        let result = match reference {
-            "prompt" => {
-                service
-                    .complete_prompt_argument(target, argument, value, context)
-                    .await
-            }
-            "resource" => {
-                service
-                    .complete_resource_argument(target, argument, value, context)
-                    .await
-            }
-            _ => {
-                return Err(McpError::ClientError(
-                    "completion reference must be 'prompt' or 'resource'".into(),
-                ));
-            }
-        }
-        .map_err(|e| McpError::ClientError(e.to_string()))?;
-        serde_json::to_value(result).map_err(|e| McpError::ClientError(e.to_string()))
-    }
-
     fn load_timeouts(
         overrides: Option<&McpClientTimeoutOverrides>,
         meta_config: Option<&McpServerMetaConfig>,
@@ -4074,10 +3058,7 @@ impl McpClient {
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
-            domain_notifications: Arc::new(DomainNotificationRegistry::default()),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
-            host_services: Arc::new(parking_lot::Mutex::new(None)),
-            task_input_gate: Mutex::new(()),
         }
     }
 
@@ -4469,19 +3450,6 @@ impl McpClient {
         self.client_id
     }
 
-    /// Bind runtime-wide typed host services to this concrete session/client
-    /// generation. This must be called before the discovery handshake.
-    pub fn set_host_services(&self, session_id: impl Into<String>, services: McpHostServices) {
-        *self.host_services.lock() = (!services.is_empty()).then(|| BoundMcpHostServices {
-            context: McpHostContext {
-                session_id: session_id.into(),
-                server_name: self.server_name.clone(),
-                client_id: self.client_id,
-            },
-            services,
-        });
-    }
-
     pub fn startup_timeout_sec(&self) -> u64 {
         self.startup_timeout_sec
     }
@@ -4709,6 +3677,7 @@ impl McpClient {
             let mut guard = self.state.lock().await;
             match result {
                 Ok(service) => {
+                    let service = Arc::new(service);
                     *guard = ClientState::Ready {
                         service: service.clone(),
                         _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
@@ -4762,39 +3731,41 @@ impl McpClient {
     }
 
     /// Run the MCP handshake (no lock held).
-    async fn try_handshake(&self, pending: PendingTransport) -> Result<McpService, McpError> {
+    #[tracing::instrument(
+        name = "mcp.serve",
+        skip_all,
+        parent = None,
+        fields(server = %self.server_name)
+    )]
+    async fn try_handshake(
+        &self,
+        pending: PendingTransport,
+    ) -> Result<rmcp::service::RunningService<RoleClient, GrokClientHandler>, McpError> {
         let timeout = std::time::Duration::from_secs(self.startup_timeout_sec);
         let name = &self.server_name;
-        let connection_generation = next_connection_generation();
 
-        let result = match pending {
+        match pending {
             PendingTransport::Stdio(process) => {
-                let handler = self.make_client_handler(connection_generation);
-                tokio::time::timeout(
-                    timeout,
-                    handler.serve_with_lifecycle(*process, Self::client_lifecycle()),
-                )
-                .await
-                .map_err(|_| McpError::timeout(name, timeout))?
-                .map_err(|e| McpError::HandshakeFailed {
-                    server: name.to_string(),
-                    source: Box::new(e),
-                })
+                let handler = self.make_client_handler();
+                tokio::time::timeout(timeout, handler.serve(*process))
+                    .await
+                    .map_err(|_| McpError::timeout(name, timeout))?
+                    .map_err(|e| McpError::HandshakeFailed {
+                        server: name.to_string(),
+                        source: Box::new(e),
+                    })
             }
             PendingTransport::Http(config) => {
                 let transport =
                     Self::build_http_transport(&config, name, self.warn_budget.clone())?;
-                let handler = self.make_client_handler(connection_generation);
-                tokio::time::timeout(
-                    timeout,
-                    handler.serve_with_lifecycle(transport, Self::client_lifecycle()),
-                )
-                .await
-                .map_err(|_| McpError::timeout(name, timeout))?
-                .map_err(|e| McpError::HandshakeFailed {
-                    server: name.to_string(),
-                    source: Box::new(e),
-                })
+                let handler = self.make_client_handler();
+                tokio::time::timeout(timeout, handler.serve(transport))
+                    .await
+                    .map_err(|_| McpError::timeout(name, timeout))?
+                    .map_err(|e| McpError::HandshakeFailed {
+                        server: name.to_string(),
+                        source: Box::new(e),
+                    })
             }
             PendingTransport::HttpAuth {
                 config,
@@ -4840,22 +3811,19 @@ impl McpClient {
                     StreamableHttpClientTransportConfig::with_uri(config.url.as_str());
                 let transport =
                     StreamableHttpClientTransport::with_client(mcp_http_client, transport_config);
-                let handler = self.make_client_handler(connection_generation);
-                tokio::time::timeout(
-                    timeout,
-                    handler.serve_with_lifecycle(transport, Self::client_lifecycle()),
-                )
-                .await
-                .map_err(|_| McpError::timeout(name, timeout))?
-                .map_err(|e| McpError::HandshakeFailed {
-                    server: name.to_string(),
-                    source: Box::new(e),
-                })
+                let handler = self.make_client_handler();
+                tokio::time::timeout(timeout, handler.serve(transport))
+                    .await
+                    .map_err(|_| McpError::timeout(name, timeout))?
+                    .map_err(|e| McpError::HandshakeFailed {
+                        server: name.to_string(),
+                        source: Box::new(e),
+                    })
             }
             PendingTransport::Acp { server_id, invoker } => {
                 // Per-reverse-call backstop on `x.ai/mcp/sdk_call`: the larger of the
                 // startup and tool timeouts, so it never undercuts the real outer bound
-                // (the modern discovery handshake is bounded by the serve `timeout` below;
+                // (the handshake `initialize` is bounded by the serve `timeout` below;
                 // tool calls by `tool_timeout_for` in `try_call_tool`). The bridge
                 // forwards raw JSON-RPC without the tool name, so per-TOOL overrides
                 // aren't applied here in v1; the HTTP path still honors them.
@@ -4864,63 +3832,40 @@ impl McpClient {
                 );
                 let transport =
                     crate::acp_transport::acp_bridge_transport(server_id, invoker, invoke_timeout);
-                let handler = self.make_client_handler(connection_generation);
-                tokio::time::timeout(
-                    timeout,
-                    handler.serve_with_lifecycle(transport, Self::client_lifecycle()),
-                )
-                .await
-                .map_err(|_| McpError::timeout(name, timeout))?
-                .map_err(|e| McpError::HandshakeFailed {
-                    server: name.to_string(),
-                    source: Box::new(e),
-                })
+                let handler = self.make_client_handler();
+                tokio::time::timeout(timeout, handler.serve(transport))
+                    .await
+                    .map_err(|_| McpError::timeout(name, timeout))?
+                    .map_err(|e| McpError::HandshakeFailed {
+                        server: name.to_string(),
+                        source: Box::new(e),
+                    })
             }
+        }
+    }
+
+    fn make_client_info(server_name: &str, advertise_elicitation: bool) -> ClientInfo {
+        use rmcp::model::{
+            ElicitationCapability, FormElicitationCapability, UrlElicitationCapability,
         };
-        if let Ok(service) = &result
-            && let Some(info) = service.peer().peer_info()
-        {
-            tracing::info!(
-                server = %self.server_name,
-                protocol_version = %info.protocol_version,
-                "MCP lifecycle negotiated"
-            );
-        }
-        result.map(|service| McpService {
-            inner: Arc::new(service),
-            connection_generation,
-        })
-    }
 
-    /// Require the modern discovery lifecycle. Legacy `initialize` peers are
-    /// intentionally unsupported by the headless SDK runtime.
-    fn client_lifecycle() -> ClientLifecycleMode {
-        ClientLifecycleMode::Discover {
-            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-        }
-    }
-
-    fn make_client_info(
-        server_name: &str,
-        host_services: Option<&BoundMcpHostServices>,
-        advertise_legacy_elicitation: bool,
-    ) -> ClientInfo {
-        let mut capabilities = host_services
-            .map(|host| host.services.client_capabilities())
-            .unwrap_or_default();
-        if capabilities.elicitation.is_none() && advertise_legacy_elicitation {
-            capabilities.elicitation = Some(
-                rmcp::model::ElicitationCapability::new()
-                    .with_form(
-                        rmcp::model::FormElicitationCapability::new().with_schema_validation(true),
-                    )
-                    .with_url(rmcp::model::UrlElicitationCapability::new()),
-            );
-        }
-        capabilities.extensions.get_or_insert_default().insert(
-            rmcp::model::TASKS_EXTENSION_ID.to_owned(),
-            Default::default(),
+        let mut extensions = rmcp::model::ExtensionCapabilities::new();
+        extensions.insert(
+            "io.modelcontextprotocol/ui".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "mimeTypes": ["text/html;profile=mcp-app"]
+            }))
+            .unwrap_or_default(),
         );
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.extensions = Some(extensions);
+        if advertise_elicitation {
+            capabilities.elicitation = Some(
+                ElicitationCapability::new()
+                    .with_form(FormElicitationCapability::new().with_schema_validation(true))
+                    .with_url(UrlElicitationCapability::new()),
+            );
+        }
         ClientInfo::new(
             capabilities,
             Implementation::new(
@@ -4928,47 +3873,26 @@ impl McpClient {
                 xai_grok_version::VERSION.to_string(),
             ),
         )
-        // This fork deliberately advertises the 2026-07-28 wire adopted with
-        // the modern MCP SDK exposure; the explicit setter must remain so an
-        // rmcp bump or upstream sync cannot silently move the wire.
-        .with_protocol_version(rmcp::model::ProtocolVersion::V_2026_07_28)
+        // This pin currently equals rmcp 2.1 LATEST, but the explicit setter
+        // must remain so a future rmcp bump cannot silently move the wire
+        // (including to 2026-07-28).
+        .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25)
     }
 
     /// Build the [`GrokClientHandler`] that drives `client.serve(...)`.
     ///
     /// The handler holds a **clone of `Arc<Mutex<Option<Sender>>>`**,
     /// not a snapshot — so any subsequent call to
-    /// [`Self::set_event_tx`] is observed by the live rmcp service
-    /// loop on its next notification.
-    fn make_client_handler(&self, connection_generation: u64) -> GrokClientHandler {
-        let host_services = self.host_services.lock().clone();
-        self.domain_notifications
-            .retire_before(connection_generation);
+    fn make_client_handler(&self) -> GrokClientHandler {
         GrokClientHandler {
             info: Self::make_client_info(
                 &self.server_name,
-                host_services.as_ref(),
                 !self.is_acp() && self.elicitation_tx.lock().is_some(),
             ),
             server_name: self.server_name.clone(),
-            client_id: connection_generation,
             notify_tx: Arc::clone(&self.notify_tx),
             elicitation_tx: Arc::clone(&self.elicitation_tx),
-            domain_notifications: Arc::clone(&self.domain_notifications),
         }
-    }
-
-    /// Subscribe to exact custom-notification methods on this mounted
-    /// Service's current connection generation.
-    pub async fn subscribe_domain_notifications(
-        &self,
-        methods: Vec<String>,
-        capacity: std::num::NonZeroUsize,
-    ) -> Result<McpDomainNotificationSubscription, McpError> {
-        let service = self.ensure_initialized().await?;
-        Ok(self
-            .domain_notifications
-            .subscribe(service.connection_generation(), methods, capacity))
     }
 
     /// Wire a sender for [`McpClientEvent`]s emitted by this client.
@@ -5108,7 +4032,7 @@ impl McpClient {
     /// Semantics:
     /// - `Ready(service)` with an open transport → `true`.
     /// - `Ready(service)` whose receiver-side has been dropped (typically
-    ///   because the rmcp service loop terminated) → `false`. rmcp
+    ///   because the rmcp service loop terminated) → `false`. rmcp 2.1
     ///   `Peer::is_transport_closed` reports `self.tx.is_closed()` at
     ///   `service.rs:703-705`; `RunningService` derefs to `Peer` at
     ///   `service.rs:716-722`.
@@ -5277,8 +4201,7 @@ impl McpClient {
         match &*guard {
             ClientState::Ready { service, .. } => service
                 .peer_info()
-                .and_then(|info| info.server_info.clone())
-                .map(|server_info| McpIcon::from_rmcp_list(server_info.icons))
+                .map(|info| McpIcon::from_rmcp_list(info.server_info.icons.clone()))
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -5388,133 +4311,14 @@ impl McpClient {
         arguments: serde_json::Value,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
         let mcp_service = self.ensure_initialized().await?;
-        let mut params = CallToolRequestParams::new(tool_name.to_string());
-        params.arguments = arguments.as_object().cloned();
-        for _ in 0..rmcp::model::DEFAULT_MRTR_MAX_ROUNDS {
-            match mcp_service.call_tool_once(params.clone()).await? {
-                rmcp::model::CallToolResponse::Complete(result) => return Ok(result),
-                rmcp::model::CallToolResponse::InputRequired(input) => {
-                    let host = self.host_services.lock().clone().ok_or_else(|| {
-                        McpError::ClientError(
-                            "MCP server requested host input but no typed host service is installed"
-                                .to_owned(),
-                        )
-                    })?;
-                    params.input_responses = Some(
-                        host.fulfill_input_requests(
-                            mcp_service.connection_generation(),
-                            None,
-                            input.input_requests.unwrap_or_default(),
-                        )
-                        .await
-                        .map_err(|error| McpError::ClientError(error.to_string()))?,
-                    );
-                    params.request_state = input.request_state;
-                }
-                rmcp::model::CallToolResponse::Task(task) => {
-                    return self.await_tool_task(&mcp_service, task.task).await;
-                }
-                _ => {
-                    return Err(McpError::ClientError(
-                        "unsupported tools/call outcome".to_owned(),
-                    ));
-                }
-            }
-        }
-        Err(McpError::ClientError(format!(
-            "MCP input did not complete within {} rounds",
-            rmcp::model::DEFAULT_MRTR_MAX_ROUNDS
-        )))
-    }
-
-    async fn await_tool_task(
-        &self,
-        service: &McpService,
-        mut task: rmcp::model::Task,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
-        loop {
-            let delay_ms = task.poll_interval_ms.unwrap_or(250).clamp(10, 60_000);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            let result = service
-                .peer()
-                .get_task(rmcp::model::GetTaskParams::new(task.task_id.clone()))
-                .await?;
-            task = result.task.task.clone();
-            match result.task.payload {
-                rmcp::model::TaskPayload::Working => {}
-                rmcp::model::TaskPayload::InputRequired { input_requests } => {
-                    let _guard = self.task_input_gate.lock().await;
-                    let input_snapshot = rmcp::model::DetailedTask::new(
-                        task.clone(),
-                        rmcp::model::TaskPayload::InputRequired {
-                            input_requests: input_requests.clone(),
-                        },
-                    );
-                    let current = service
-                        .peer()
-                        .get_task(rmcp::model::GetTaskParams::new(task.task_id.clone()))
-                        .await?;
-                    if current.task != input_snapshot {
-                        return Err(McpError::ClientError(
-                            "MCP task input changed before the product UI could answer".to_owned(),
-                        ));
-                    }
-                    let host = self.host_services.lock().clone().ok_or_else(|| {
-                        McpError::ClientError(
-                            "MCP task requested host input but no typed host service is installed"
-                                .to_owned(),
-                        )
-                    })?;
-                    let responses = host
-                        .fulfill_input_requests(
-                            service.connection_generation(),
-                            Some(&task.task_id),
-                            input_requests,
-                        )
-                        .await
-                        .map_err(|error| McpError::ClientError(error.to_string()))?;
-                    let current = service
-                        .peer()
-                        .get_task(rmcp::model::GetTaskParams::new(task.task_id.clone()))
-                        .await?;
-                    if current.task != input_snapshot {
-                        return Err(McpError::ClientError(
-                            "MCP task input changed while the product UI was answering".to_owned(),
-                        ));
-                    }
-                    service
-                        .peer()
-                        .update_task(rmcp::model::UpdateTaskParams::new(
-                            task.task_id.clone(),
-                            responses,
-                        ))
-                        .await?;
-                }
-                rmcp::model::TaskPayload::Completed { result } => {
-                    return serde_json::from_value(serde_json::Value::Object(result)).map_err(
-                        |error| {
-                            McpError::ClientError(format!(
-                                "MCP task returned an invalid tool result: {error}"
-                            ))
-                        },
-                    );
-                }
-                rmcp::model::TaskPayload::Failed { error } => {
-                    return Err(McpError::ClientError(format!(
-                        "MCP task failed: {}",
-                        serde_json::Value::Object(error)
-                    )));
-                }
-                rmcp::model::TaskPayload::Cancelled => {
-                    return Err(McpError::ClientError("MCP task was cancelled".to_owned()));
-                }
-                _ => {
-                    return Err(McpError::ClientError(
-                        "unsupported MCP task status".to_owned(),
-                    ));
-                }
-            }
-        }
+        let result = mcp_service
+            .call_tool({
+                let mut params = CallToolRequestParams::new(tool_name.to_string());
+                params.arguments = arguments.as_object().cloned();
+                params
+            })
+            .await?;
+        Ok(result)
     }
 }
 
@@ -6013,9 +4817,9 @@ impl McpClient {
 ///
 /// ## RPIT, not `#[async_trait]`
 ///
-/// rmcp's [`ClientHandler`] declares its async methods as
+/// rmcp 2.1's [`ClientHandler`] declares its async methods as
 /// return-position `impl Future` (see
-/// `~/.cargo/registry/src/.../rmcp-3.1.2/src/handler/client.rs`,
+/// `~/.cargo/registry/src/.../rmcp-2.1.0/src/handler/client.rs`,
 /// lines 202–217). Applying `#[async_trait]` here would produce
 /// methods whose signature mismatches the trait, and the impl would
 /// not satisfy the bound. The macro path is also unnecessary — the
@@ -6041,7 +4845,6 @@ pub struct GrokClientHandler {
     /// MCP server name this handler is bound to. Cloned into emitted
     /// events so the dispatcher can route per-server.
     server_name: McpServerName,
-    client_id: u64,
     /// **Shared** event sink — the same Arc lives on the owning
     /// [`McpClient`]. Mutating the slot via [`McpClient::set_event_tx`]
     /// is observed here on the next read, so wiring the sender
@@ -6049,7 +4852,6 @@ pub struct GrokClientHandler {
     /// service loop.
     notify_tx: SharedEventTx,
     elicitation_tx: crate::elicitation::SharedElicitationTx,
-    domain_notifications: Arc<DomainNotificationRegistry>,
 }
 
 impl GrokClientHandler {
@@ -6070,7 +4872,7 @@ impl GrokClientHandler {
 impl ClientHandler for GrokClientHandler {
     // NOTE: `async fn` here is sugar for the trait's
     // `-> impl Future<Output = ()> + Send + '_`. We INTENTIONALLY do
-    // not use `#[async_trait]` — rmcp's `ClientHandler` declares
+    // not use `#[async_trait]` — rmcp 2.1's `ClientHandler` declares
     // its notification methods as return-position `impl Future`, and
     // async_trait would produce a different (incompatible) signature.
     // See the [`GrokClientHandler`] doc-comment for the full RPIT
@@ -6087,34 +4889,20 @@ impl ClientHandler for GrokClientHandler {
         });
     }
 
-    async fn create_message(
-        &self,
-        _params: CreateMessageRequestParams,
-        _context: RequestContext<RoleClient>,
-    ) -> Result<CreateMessageResult, rmcp::ErrorData> {
-        Err(rmcp::ErrorData::method_not_found::<
-            rmcp::model::CreateMessageRequestMethod,
-        >())
-    }
-
-    async fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, rmcp::ErrorData> {
-        Err(rmcp::ErrorData::method_not_found::<
-            rmcp::model::ListRootsRequestMethod,
-        >())
-    }
-
     async fn create_elicitation(
         &self,
-        request: ElicitRequestParams,
+        request: rmcp::model::ElicitRequestParams,
         context: RequestContext<RoleClient>,
-    ) -> Result<ElicitResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::ElicitResult, rmcp::ErrorData> {
         tracing::info!(
             server = %self.server_name,
             "MCP elicitation/create received"
         );
+        // `context.ct` fires when the server cancels this request
+        // (`notifications/cancelled`). Dropping the bridge future closes the
+        // job's response channel, which the shell coordinator observes to
+        // tear down the HITL card — otherwise the popup would outlive the
+        // abandoned request and answer into the void.
         let bridged =
             crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, request);
         tokio::select! {
@@ -6129,37 +4917,29 @@ impl ClientHandler for GrokClientHandler {
         }
     }
 
-    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.emit(McpClientEvent::PromptsChanged {
-            server: self.server_name.clone(),
-        });
-    }
-
-    async fn on_task_status(
+    async fn on_url_elicitation_notification_complete(
         &self,
-        params: rmcp::model::TaskStatusNotificationParams,
+        params: rmcp::model::ElicitationResponseNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Ok(task) = serde_json::to_value(params.task) {
-            self.emit(McpClientEvent::TaskStatus {
-                server: self.server_name.clone(),
-                client_id: self.client_id,
-                task,
-            });
+        if !xai_grok_tools::mcp_elicitation::chars_within(
+            &params.elicitation_id,
+            xai_grok_tools::mcp_elicitation::MAX_ELICIT_ID_CHARS,
+        ) {
+            tracing::warn!(
+                server = %self.server_name,
+                "oversized elicitation_id on complete; dropping"
+            );
+            return;
         }
+        self.emit(McpClientEvent::ElicitationComplete {
+            server: self.server_name.clone(),
+            elicitation_id: params.elicitation_id,
+        });
     }
 
     fn get_info(&self) -> ClientInfo {
         self.info.clone()
-    }
-
-    async fn on_custom_notification(
-        &self,
-        notification: rmcp::model::CustomNotification,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        self.domain_notifications
-            .publish(self.client_id, notification);
     }
 }
 

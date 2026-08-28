@@ -78,7 +78,7 @@ public struct BotCommandParams: Codable {
 }
 
 /// `bot.vncDescriptor` result.
-///
+/// 
 /// `expires_hint` is unix milliseconds. `null` means a legacy network-token
 /// URL (valid until pod migration); a concrete value is the port-token
 /// expiry the client should refresh before.
@@ -142,7 +142,7 @@ public struct BotRosterResult: Codable {
 }
 
 /// `bot.status` result: off-box run state.
-///
+/// 
 /// `runState` is a string on the wire. Generated clients see `string` and
 /// compare against [`BotRunState`]. Unknown values degrade to `unknown`.
 public struct BotStatusResult: Codable {
@@ -229,15 +229,15 @@ public struct BotRelayErrorDetail: Codable {
 }
 
 /// Hub-owned bot-relay error object.
-///
+/// 
 /// Wire form: `{code, retryable, detail, reason?}`.
 /// `detail` is always present (empty object when unused).
 /// `reason` is set only for [`BotRelayErrorCode::CommandRejected`].
-///
+/// 
 /// On the JSON-RPC envelope this object is `error.data`. Receivers
 /// switch on `data.code`. The envelope `error.message` is the snake_case
 /// [`BotRelayErrorCode`].
-///
+/// 
 /// `code` is a string on the wire. Generated clients see `string` and
 /// compare against [`BotRelayErrorCode`]. Unknown values degrade to
 /// `upstream_error` while preserving `retryable` and `detail`.
@@ -290,20 +290,20 @@ public struct HubResyncRequiredEvent: Codable {
 }
 
 /// `bot.event` envelope v1 (`v == `[`BOT_EVENT_ENVELOPE_V`]).
-///
+/// 
 /// `seq` is a per-(connection, agent) monotonic counter starting at 1 on
 /// each `bot.subscribe`. It is an ordering reference, not a dedupe key
 /// (a redelivered event gets a fresh `seq`) and is never comparable
 /// across connections. Resync is signaled by [`HubChannel::ResyncRequired`]
 /// or a reconnect, never inferred from `seq`.
-///
+/// 
 /// [`Self::event_id`] is reserved for content-identity dedupe and is
 /// omitted from the wire when `None`.
-///
+/// 
 /// `event` is upstream-verbatim for [`BotEventChannel::Upstream`]. For
 /// [`HubChannel::TurnFinished`] it is [`HubTurnFinishedEvent`]; for
 /// [`HubChannel::ResyncRequired`] it is [`HubResyncRequiredEvent`].
-///
+/// 
 /// `channel` is a string on the wire. Typeshare cannot express the
 /// hub / hub-unknown / upstream split, so generated clients see `string`.
 /// Compare against [`HubChannel`] for the known `hub:*` values.
@@ -349,7 +349,7 @@ public enum BotRunState: String, Codable {
 }
 
 /// Closed hub-owned error code. This list is the client stability boundary.
-///
+/// 
 /// Senders emit only these codes. Receivers treat any unknown wire string
 /// as `upstream_error` and keep `retryable` / `detail`.
 public enum BotRelayErrorCode: String, Codable {

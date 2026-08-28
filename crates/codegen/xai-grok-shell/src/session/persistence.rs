@@ -252,11 +252,6 @@ pub enum PersistenceMsg {
     MergeRewindPointsFrom {
         target_index: usize,
     },
-    ReplayAuthorityToPrompt {
-        target_index: usize,
-        respond_to:
-            tokio::sync::oneshot::Sender<io::Result<crate::session::helpers::replay::ReplayResult>>,
-    },
     /// Collection ID for telemetry tracing
     CollectionId(String),
     /// Monotonic telemetry turn counter and optional request_id for trace metadata/filenames.
@@ -291,42 +286,6 @@ pub enum PersistenceMsg {
     },
     /// Persist a compaction checkpoint file to `compaction_checkpoints/{id}.json`.
     CompactionCheckpoint(crate::extensions::notification::CompactionCheckpointFile),
-    BeginNativeCompaction {
-        input: crate::session::state_authority::NativeCompactionInput,
-        respond_to: tokio::sync::oneshot::Sender<
-            Result<
-                crate::session::state_authority::NativeCompactionBegin,
-                crate::session::state_authority::NativeCompactionError,
-            >,
-        >,
-    },
-    NativeCompactionNotApplied {
-        compaction_id: String,
-        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
-        respond_to: tokio::sync::oneshot::Sender<
-            Result<(), crate::session::state_authority::NativeCompactionError>,
-        >,
-    },
-    PublishNativeCompaction {
-        publication: crate::session::state_authority::NativeCompactionPublication,
-        respond_to: tokio::sync::oneshot::Sender<
-            Result<(), crate::session::state_authority::NativeCompactionError>,
-        >,
-    },
-    NativeCompactionApplied {
-        compaction_id: String,
-        respond_to: tokio::sync::oneshot::Sender<
-            Result<(), crate::session::state_authority::NativeCompactionError>,
-        >,
-    },
-    RecoverNativeCompaction {
-        respond_to: tokio::sync::oneshot::Sender<
-            Result<
-                crate::session::state_authority::NativeCompactionRecovery,
-                crate::session::state_authority::NativeCompactionError,
-            >,
-        >,
-    },
     /// Persist a compaction request+response artifact to
     /// `compaction_requests/{request_id}.json`. Used for offline prompt
     /// iteration — captures the exact ConversationItem list sent to the
@@ -639,14 +598,7 @@ pub(crate) fn find_persisted_session_dir_by_id_in_root_result(
 }
 
 pub(crate) fn find_any_session_dir_by_id_result(session_id: &str) -> io::Result<Option<PathBuf>> {
-    find_any_session_dir_by_id_in_root_result(session_id, &grok_home().join("sessions"))
-}
-
-pub(crate) fn find_any_session_dir_by_id_in_root_result(
-    session_id: &str,
-    sessions_root: &Path,
-) -> io::Result<Option<PathBuf>> {
-    storage_view(sessions_root)
+    storage_view(&grok_home().join("sessions"))
         .and_then(|view| view.find_any_session_dir(session_id))
         .map_err(io::Error::other)
 }
@@ -1222,7 +1174,6 @@ pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
     noop: bool,
     disk_full_rx: watch::Receiver<bool>,
-    projects_chat_history: bool,
 }
 
 fn actor_channel() -> (
@@ -1238,7 +1189,6 @@ fn actor_channel() -> (
         tx,
         noop: false,
         disk_full_rx,
-        projects_chat_history: true,
     };
     (handle, rx, weak, disk_full_tx)
 }
@@ -1287,7 +1237,6 @@ impl PersistenceHandle {
             tx,
             noop: false,
             disk_full_rx,
-            projects_chat_history: true,
         }
     }
 
@@ -1297,122 +1246,11 @@ impl PersistenceHandle {
             tx,
             noop: true,
             disk_full_rx: watch::channel(false).1,
-            projects_chat_history: false,
         }
     }
 
     pub fn is_noop(&self) -> bool {
         self.noop
-    }
-
-    pub(crate) fn projects_chat_history(&self) -> bool {
-        self.projects_chat_history
-    }
-
-    pub(crate) async fn begin_native_compaction(
-        &self,
-        input: crate::session::state_authority::NativeCompactionInput,
-    ) -> Result<
-        crate::session::state_authority::NativeCompactionBegin,
-        crate::session::state_authority::NativeCompactionError,
-    > {
-        let (respond_to, response) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::BeginNativeCompaction { input, respond_to })
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "persistence stopped before compaction intent".into(),
-            })?;
-        response
-            .await
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "compaction intent acknowledgement was lost".into(),
-            })?
-    }
-
-    pub(crate) async fn native_compaction_not_applied(
-        &self,
-        compaction_id: String,
-        reason: crate::session::state_authority::NativeCompactionNotAppliedReason,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        let (respond_to, response) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::NativeCompactionNotApplied {
-                compaction_id,
-                reason,
-                respond_to,
-            })
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "persistence stopped before NotApplied acknowledgement".into(),
-            })?;
-        response
-            .await
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "NotApplied acknowledgement was lost".into(),
-            })?
-    }
-
-    pub(crate) async fn publish_native_compaction(
-        &self,
-        publication: crate::session::state_authority::NativeCompactionPublication,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        let (respond_to, response) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::PublishNativeCompaction {
-                publication,
-                respond_to,
-            })
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "persistence stopped before checkpoint publication".into(),
-            })?;
-        response
-            .await
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "checkpoint publication acknowledgement was lost".into(),
-            })?
-    }
-
-    pub(crate) async fn native_compaction_applied(
-        &self,
-        compaction_id: String,
-    ) -> Result<(), crate::session::state_authority::NativeCompactionError> {
-        let (respond_to, response) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::NativeCompactionApplied {
-                compaction_id,
-                respond_to,
-            })
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "persistence stopped before Applied acknowledgement".into(),
-            })?;
-        response
-            .await
-            .map_err(|_| crate::session::state_authority::NativeCompactionError {
-                kind: crate::session::state_authority::NativeCompactionErrorKind::Uncertain,
-                message: "Applied acknowledgement was lost".into(),
-            })?
-    }
-
-    pub(crate) async fn replay_authority_to_prompt(
-        &self,
-        target_index: usize,
-    ) -> io::Result<crate::session::helpers::replay::ReplayResult> {
-        let (respond_to, response) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::ReplayAuthorityToPrompt {
-                target_index,
-                respond_to,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "persistence stopped"))?;
-        response
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "persistence stopped"))?
     }
 
     #[cfg(test)]
@@ -2157,13 +1995,6 @@ impl SessionPersistence {
                         tracing::warn!(?e, target_index, "failed to merge rewind points");
                     }
                 }
-                PersistenceMsg::ReplayAuthorityToPrompt {
-                    target_index,
-                    respond_to,
-                } => {
-                    let result = self.storage.replay_authority_to_prompt(target_index).await;
-                    let _ = respond_to.send(result);
-                }
                 PersistenceMsg::CollectionId(collection_id) => {
                     if let Err(e) = self
                         .storage
@@ -2226,37 +2057,6 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to write compaction checkpoint file");
                     }
-                }
-                PersistenceMsg::BeginNativeCompaction { input, respond_to } => {
-                    let _ = respond_to.send(self.storage.begin_native_compaction(input).await);
-                }
-                PersistenceMsg::NativeCompactionNotApplied {
-                    compaction_id,
-                    reason,
-                    respond_to,
-                } => {
-                    let _ = respond_to.send(
-                        self.storage
-                            .native_compaction_not_applied(compaction_id, reason)
-                            .await,
-                    );
-                }
-                PersistenceMsg::PublishNativeCompaction {
-                    publication,
-                    respond_to,
-                } => {
-                    let _ =
-                        respond_to.send(self.storage.publish_native_compaction(publication).await);
-                }
-                PersistenceMsg::NativeCompactionApplied {
-                    compaction_id,
-                    respond_to,
-                } => {
-                    let _ = respond_to
-                        .send(self.storage.native_compaction_applied(compaction_id).await);
-                }
-                PersistenceMsg::RecoverNativeCompaction { respond_to } => {
-                    let _ = respond_to.send(self.storage.recover_native_compaction().await);
                 }
                 PersistenceMsg::CompactionRequest(request) => {
                     if let Err(e) = self
@@ -2573,21 +2373,6 @@ pub(crate) async fn new(
     model_id: acp::ModelId,
     deps: SessionDeps,
 ) -> io::Result<PersistenceHandle> {
-    new_with_storage_root(info, model_id, deps, true, None, None, None).await
-}
-
-/// Origin embedded boundary: persistence rooted without consulting GROK_HOME.
-pub(crate) async fn new_with_storage_root(
-    info: &Info,
-    model_id: acp::ModelId,
-    deps: SessionDeps,
-    generate_session_title: bool,
-    storage_root: Option<PathBuf>,
-    session_state_authority: Option<
-        Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
-    >,
-    native_session: Option<Arc<dyn crate::session::state_authority::NativeSession>>,
-) -> io::Result<PersistenceHandle> {
     let SessionDeps {
         sampling_client,
         storage_mode,
@@ -2599,21 +2384,8 @@ pub(crate) async fn new_with_storage_root(
         search_index,
         session_kind,
     } = deps;
-    // Origin embedded boundary: an injected root never consults process GROK_HOME.
-    let root_dir = storage_root.unwrap_or_else(grok_home);
-    let projects_chat_history = native_session.is_none();
-    let storage: Box<dyn StorageAdapter> = match (session_state_authority, native_session) {
-        (Some(authority), Some(session)) => Box::new(JsonlStorageAdapter::with_root_and_authority(
-            root_dir, authority, session,
-        )),
-        (None, None) => Box::new(JsonlStorageAdapter::with_root(root_dir)),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "native session authority and session must be supplied together",
-            ));
-        }
-    };
+    let root_dir = grok_home();
+    let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
 
     // Initialize session in storage
     let mut summary = storage.init_session(info, model_id.clone()).await?;
@@ -2638,8 +2410,7 @@ pub(crate) async fn new_with_storage_root(
         summary.current_model_id = model_id;
     }
 
-    let (mut handle, rx, summary_tx, disk_full_tx) = actor_channel();
-    handle.projects_chat_history = projects_chat_history;
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
@@ -2657,7 +2428,6 @@ pub(crate) async fn new_with_storage_root(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    enabled: generate_session_title,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2689,7 +2459,6 @@ pub(crate) async fn new_with_explicit_dir(
     model_id: acp::ModelId,
     sampling_client: OaiCompatClient,
     session_summary_model: String,
-    generate_session_title: bool,
 ) -> io::Result<PersistenceHandle> {
     let summary_path = target_dir.join("summary.json");
     let storage: Box<dyn StorageAdapter> =
@@ -2727,7 +2496,6 @@ pub(crate) async fn new_with_explicit_dir(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    enabled: generate_session_title,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2764,7 +2532,6 @@ pub struct PersistedInfo {
     /// Persisted goal mode orchestration state (None for sessions without goal mode)
     pub goal_mode_state: Option<crate::session::goal_tracker::GoalOrchestration>,
     pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
-    pub canonical_updates: Option<Vec<SessionUpdate>>,
 }
 
 /// On NotFound, try pulling from backend. Returns pulled info or the original error.
@@ -2786,12 +2553,6 @@ pub(crate) async fn load_light(
     info: &Info,
     backend: Option<&crate::remote::BackendClient>,
     deps: SessionDeps,
-    generate_session_title: bool,
-    storage_root: Option<PathBuf>,
-    session_state_authority: Option<
-        Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>,
-    >,
-    native_session: Option<Arc<dyn crate::session::state_authority::NativeSession>>,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let SessionDeps {
         sampling_client,
@@ -2804,21 +2565,9 @@ pub(crate) async fn load_light(
         search_index,
         session_kind: _,
     } = deps;
-    let root_dir = storage_root.unwrap_or_else(grok_home);
-    let projects_chat_history = native_session.is_none();
+    let root_dir = grok_home();
     let storage: Box<dyn StorageAdapter> =
-        match (session_state_authority, native_session) {
-            (Some(authority), Some(session)) => Box::new(
-                JsonlStorageAdapter::with_root_and_authority(root_dir.clone(), authority, session),
-            ),
-            (None, None) => Box::new(JsonlStorageAdapter::with_root(root_dir.clone())),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "native session authority and session must be supplied together",
-                ));
-            }
-        };
+        Box::new(JsonlStorageAdapter::with_root(root_dir.clone()));
 
     let (persisted, loaded_info) = match storage.load_session_without_updates(info).await {
         Ok(p) => (p, info.clone()),
@@ -2848,11 +2597,9 @@ pub(crate) async fn load_light(
         announcement_state: persisted.announcement_state,
         goal_mode_state: persisted.goal_mode_state,
         workflow_runs: persisted.workflow_runs,
-        canonical_updates: persisted.canonical_updates,
     };
 
-    let (mut handle, rx, summary_tx, disk_full_tx) = actor_channel();
-    handle.projects_chat_history = projects_chat_history;
+    let (handle, rx, summary_tx, disk_full_tx) = actor_channel();
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
@@ -2863,7 +2610,6 @@ pub(crate) async fn load_light(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
-                enabled: generate_session_title,
                 persistence_tx: summary_tx,
             },
         );
@@ -2973,34 +2719,12 @@ pub async fn delete_session_history(
     auth_manager: Arc<crate::auth::AuthManager>,
     search_index: Option<&xai_grok_session_search::SearchIndexManager>,
 ) -> Result<SessionDeletion, DeleteSessionError> {
-    delete_session_history_in_root(
-        session_id,
-        cwd,
-        needs_remote,
-        auth_manager,
-        crate::util::grok_home::grok_home(),
-        search_index,
-    )
-    .await
-}
-
-pub(crate) async fn delete_session_history_in_root(
-    session_id: &str,
-    cwd: Option<&str>,
-    needs_remote: bool,
-    auth_manager: Arc<crate::auth::AuthManager>,
-    root: std::path::PathBuf,
-    search_index: Option<&xai_grok_session_search::SearchIndexManager>,
-) -> Result<SessionDeletion, DeleteSessionError> {
     let sid = acp::SessionId::new(Arc::from(session_id));
-    let sessions_root = root.join("sessions");
 
     // Resolve the local session info, scoping to cwd if provided. A
     // remote-only session won't be found here — that's fine, the remote
     // delete (if applicable) still runs.
-    let storage = JsonlStorageAdapter::with_root(root.clone());
-    let summaries = storage
-        .list_sessions(cwd)
+    let summaries = list_summaries(cwd)
         .await
         .map_err(DeleteSessionError::List)?;
     let local_info = summaries
@@ -3022,39 +2746,34 @@ pub(crate) async fn delete_session_history_in_root(
         false
     };
 
-    let (local_removed, session_cwd) = if let Some(info) = local_info {
-        storage
-            .delete_session(&info)
-            .await
-            .map_err(DeleteSessionError::Local)?;
-        (true, Some(info.cwd))
-    } else if let Some(dir) = find_any_session_dir_by_id_in_root_result(session_id, &sessions_root)
-        .map_err(DeleteSessionError::Local)?
-    {
-        let cwd = dir
-            .parent()
-            .and_then(crate::util::grok_home::decode_cwd_from_dirname);
-        tokio::fs::remove_dir_all(&dir)
-            .await
-            .map_err(DeleteSessionError::Local)?;
-        (true, cwd)
-    } else {
-        (false, None)
+    let removed = match local_info {
+        Some(info) => {
+            JsonlStorageAdapter::default()
+                .delete_session(&info)
+                .await
+                .map_err(DeleteSessionError::Local)?;
+            Some(info)
+        }
+        None => None,
     };
+    let local_removed = removed.is_some();
 
     // Also evict when no workspace was named: that row outlives the directory
     // and nothing else prunes it.
     if local_removed || cwd.is_none() {
-        crate::session::storage::search::evict_session(&root, session_id).await;
+        crate::session::storage::search::evict_session(
+            &crate::util::grok_home::grok_home(),
+            session_id,
+        )
+        .await;
     }
     // The eviction above is a point in time. Queue the indexer as well so an upsert already under
     // way, which would otherwise write the row back, is followed by a re-read that finds nothing.
-    if let Some(session_cwd) = session_cwd {
-        crate::session::storage::search::notify_session_updated_in_root(
+    if let Some(info) = removed {
+        crate::session::storage::search::notify_session_updated(
             search_index,
-            root,
-            session_id,
-            &session_cwd,
+            &info.id.to_string(),
+            &info.cwd,
         );
     }
 

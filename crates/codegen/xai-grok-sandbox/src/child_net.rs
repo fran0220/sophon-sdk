@@ -327,10 +327,6 @@ pub fn restrict_child_network_std(cmd: &mut std::process::Command) {
 /// # Safety
 /// Process-wide; call after bwrap re-exec / at apply.
 #[cfg(not(target_os = "linux"))]
-/// No-op counterpart for platforms without the Linux seccomp filter.
-///
-/// # Safety
-/// This function is a no-op on non-Linux targets.
 pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     Ok(())
 }

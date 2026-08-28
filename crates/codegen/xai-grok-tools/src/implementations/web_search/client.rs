@@ -10,7 +10,6 @@ pub struct WebSearchClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
-    query_params: indexmap::IndexMap<String, String>,
     /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
     /// When set it governs the search and the model's per-call `allowed_domains`
     /// is ignored (see [`Self::resolve_filters`]). Mutually exclusive with
@@ -39,7 +38,6 @@ impl WebSearchClient {
             base_url,
             model,
             extra_headers,
-            query_params,
             alpha_test_key,
             allowed_domains,
             excluded_domains,
@@ -93,7 +91,6 @@ impl WebSearchClient {
             http,
             base_url: base_url.clone(),
             model: model.clone(),
-            query_params: query_params.as_ref().clone(),
             default_allowed_domains: allowed_domains.clone(),
             default_excluded_domains: excluded_domains.clone(),
             api_key_provider,
@@ -215,11 +212,7 @@ impl WebSearchClient {
         let request = self.build_request_json(query, allowed, excluded)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let sent_bearer = self.current_bearer().await;
-        let mut req = self
-            .http
-            .post(&url)
-            .query(&self.query_params)
-            .json(&request);
+        let mut req = self.http.post(&url).json(&request);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -288,11 +281,7 @@ impl WebSearchClient {
         let request = self.build_request_json(query, allowed, excluded)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let sent_bearer = self.current_bearer().await;
-        let mut req = self
-            .http
-            .post(&url)
-            .query(&self.query_params)
-            .json(&request);
+        let mut req = self.http.post(&url).json(&request);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -424,7 +413,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: allowed,
             excluded_domains: excluded,
@@ -502,7 +490,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "custom-enterprise-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -535,7 +522,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -562,7 +548,6 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -818,7 +803,6 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -871,7 +855,6 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
-            query_params: Box::default(),
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,

@@ -969,7 +969,7 @@ impl ToolOutput {
             },
             ToolOutput::AskUserQuestion(
                 AskUserQuestionOutput::QuestionsSent { message, .. }
-                | AskUserQuestionOutput::QuestionWithdrawn { message, .. },
+                | AskUserQuestionOutput::UserAnswered { message },
             ) => message.clone(),
             ToolOutput::SendSubagentMessage(output) => output.to_string(),
             ToolOutput::Monitor(o) => {
@@ -1137,29 +1137,31 @@ impl EnterPlanModeToolHints {
 ///
 /// This is a thin signal — the tool sends the questions to the client via
 /// a notification and returns a confirmation. The actual answers come back
-/// from the client as a later synthetic user interjection (handled by the
-/// orchestration layer).
+/// from the client as the tool result (handled by the orchestration layer).
 ///
 /// Because the answers are provided by the client asynchronously (the user
 /// interacts with a UI), the tool output here just confirms the questions
-/// were dispatched. The orchestration layer injects answers at step boundaries
-/// without blocking this tool call or the model loop.
+/// were dispatched. The orchestration layer is responsible for blocking
+/// until the user responds and injecting the answers into the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum AskUserQuestionOutput {
     /// Questions were successfully dispatched to the client for user input.
+    /// Used during migration fallback when `UserQuestionSender` is not yet
+    /// injected by the shell.
     QuestionsSent {
         /// Confirmation message for the model.
         message: String,
         /// Number of questions sent.
         question_count: usize,
-        /// Stable id used to withdraw this ask while it remains consumable.
-        request_id: String,
     },
-    /// The agent explicitly closed an earlier ask.
-    QuestionWithdrawn {
+    /// The user has responded (or cancelled). The `message` is the
+    /// fully-formatted tool result string produced by the format module.
+    ///
+    /// All four user paths (accepted, chat about this, skip interview,
+    /// cancel) return this variant with `ToolCall` status `Completed`.
+    UserAnswered {
+        /// Pre-formatted tool result string for the model.
         message: String,
-        request_id: String,
-        withdrawn: bool,
     },
 }
 /// Output from the `ExitPlanMode` tool.

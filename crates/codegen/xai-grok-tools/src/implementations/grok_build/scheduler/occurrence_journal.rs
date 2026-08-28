@@ -119,7 +119,7 @@ impl<'de> Deserialize<'de> for OneShotOccurrence {
         }
 
         let persisted = PersistedOccurrence::deserialize(deserializer)?;
-        if persisted.task.is_recurring() || !persisted.task.durable {
+        if persisted.task.recurring || !persisted.task.durable {
             return Err(serde::de::Error::custom(
                 OccurrenceJournalError::NotDurableOneShot(persisted.task.id),
             ));
@@ -409,7 +409,7 @@ impl SchedulerState {
             .iter()
             .position(|task| task.id == task_id)
             .ok_or_else(|| OccurrenceJournalError::TaskNotFound(task_id.to_owned()))?;
-        if self.tasks[index].is_recurring() || !self.tasks[index].durable {
+        if self.tasks[index].recurring || !self.tasks[index].durable {
             return Err(OccurrenceJournalError::NotDurableOneShot(
                 task_id.to_owned(),
             ));
@@ -501,7 +501,7 @@ impl SchedulerState {
             blocked_task_ids.extend(
                 self.tasks
                     .iter()
-                    .filter(|task| !task.is_recurring())
+                    .filter(|task| !task.recurring)
                     .map(|task| task.id.clone()),
             );
         }

@@ -1020,15 +1020,6 @@ pub enum ApiBackend {
     Messages,
 }
 
-/// Authentication header used by a model endpoint.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthScheme {
-    #[default]
-    Bearer,
-    XApiKey,
-}
-
 impl ApiBackend {
     /// Whether the backend enforces a response JSON schema natively alongside
     /// tool calls. The Messages API does not (a schema there blocks tool use),
@@ -1056,9 +1047,6 @@ pub struct SamplingConfig {
     /// Which API backend to use for this model
     #[serde(default)]
     pub api_backend: ApiBackend,
-    /// Authentication header to use for this model.
-    #[serde(default)]
-    pub auth_scheme: AuthScheme,
     /// Extra headers to send with requests (e.g., for BYOK scenarios).
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub extra_headers: indexmap::IndexMap<String, String>,
@@ -1090,11 +1078,6 @@ pub struct CreateResponseWrapper {
     /// The inner Responses API request.
     pub inner: crate::rs::CreateResponse,
 
-    /// Whether to request per-chunk tool-call argument deltas in the xAI
-    /// Responses extension. Kept on the prepared wrapper so callers can
-    /// attest and dispatch the same credential-free request semantics.
-    pub stream_tool_calls: bool,
-
     /// Custom header: conversation ID for tracking.
     pub x_grok_conv_id: Option<String>,
 
@@ -1121,7 +1104,6 @@ impl CreateResponseWrapper {
     pub fn new(inner: crate::rs::CreateResponse) -> Self {
         Self {
             inner,
-            stream_tool_calls: false,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,

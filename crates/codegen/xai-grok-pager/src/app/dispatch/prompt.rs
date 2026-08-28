@@ -461,6 +461,7 @@ pub(super) fn dispatch_send_prompt_inner(
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
+    let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     // Set when a plain prompt is queued while a turn is running (local path);
     // shown after the agent borrow ends so we can re-enter via the tip helper.
     let mut tip_send_now_after_queue = false;
@@ -570,6 +571,7 @@ pub(super) fn dispatch_send_prompt_inner(
                     scroll_speed: crate::appearance::cache::load_scroll_speed(),
                     respect_manual_folds: respect_manual_folds_from_app,
                     auto_mode_gate: auto_mode_gate_from_app,
+                    ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
                     // This session's own value (what its fires will actually
                     // do), seed only until the session response lands.

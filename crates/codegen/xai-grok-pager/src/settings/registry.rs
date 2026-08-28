@@ -5,6 +5,7 @@
 use agent_client_protocol as acp;
 use xai_grok_shell::agent::config::UiConfig;
 use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
+use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -292,6 +293,9 @@ pub struct PagerLocalSnapshot {
     /// permission-mode picker hides the "Auto" choice (matches the Shift+Tab
     /// cycle, which skips Auto when the feature gate is off).
     pub auto_mode_gate: bool,
+    /// `[toolset.ask_user_question].timeout_enabled` mirror (effective TOML
+    /// merge, like `show_tips`). `None` = unset in TOML → default `true`.
+    pub ask_user_question_timeout_enabled: Option<bool>,
     /// Live `voice_config.language` at snapshot time. Lets the modal show the
     /// language actually in effect when `[ui].voice_stt_language` is unset but
     /// an explicit `[voice].language` applies.
@@ -323,6 +327,7 @@ impl Default for PagerLocalSnapshot {
             scroll_speed: 50,
             respect_manual_folds: crate::appearance::ScrollConfig::default().respect_manual_folds,
             auto_mode_gate: false,
+            ask_user_question_timeout_enabled: None,
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
             // Matches `resolve_scheduler_background_loops`'s default.
             scheduler_background_loops: true,
@@ -658,6 +663,14 @@ pub fn current_value_for(
             ui.remember_tool_approvals
                 .unwrap_or(xai_grok_shell::util::config::DEFAULT_REMEMBER_TOOL_APPROVALS),
         )),
+        // ask_user_question timeout: reflects the effective TOML merge; the
+        // toggle writes the user layer, and env/remote settings tiers feed the
+        // final gate at agent build. None → the resolver-shared default (ON).
+        "toolset.ask_user_question.timeout_enabled" => Some(SettingValue::Bool(
+            pager
+                .ask_user_question_timeout_enabled
+                .unwrap_or(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED),
+        )),
         // default_selected_permission: maps `[ui].default_selected_permission`
         // onto one of the four registry canonicals. `None` / unrecognised on
         // disk → `always_allow_all_sessions` (the effective default — the
@@ -980,6 +993,16 @@ mod tests {
                         xai_grok_shell::util::config::DEFAULT_REMEMBER_TOOL_APPROVALS,
                         "remember_tool_approvals default drifts from the shared \
                          resolver const in xai-grok-shell"
+                    );
+                }
+                // ask_user_question timeout: no UiConfig mirror (lives under
+                // `[toolset]`); default anchored on the resolver-shared const.
+                ("toolset.ask_user_question.timeout_enabled", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED,
+                        "toolset.ask_user_question.timeout_enabled default drifts from the \
+                         shared resolver const in xai-grok-tools"
                     );
                 }
                 // show_thinking_blocks: Option<bool>; None → true (client default).

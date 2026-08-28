@@ -315,18 +315,7 @@ pub async fn handle(
         }
         // Resume a session in a fresh worktree.
         "x.ai/git/worktree/resume_session" => {
-            #[derive(serde::Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct HostResumeRequest {
-                #[serde(flatten)]
-                request: ResumeSessionInWorktreeRequest,
-                #[serde(default)]
-                new_session_id: Option<String>,
-            }
-            let HostResumeRequest {
-                request: req,
-                new_session_id,
-            } = serde_json::from_str(args.params.get())?;
+            let req = serde_json::from_str::<ResumeSessionInWorktreeRequest>(args.params.get())?;
             log_effective_worktree_type(
                 "x.ai/git/worktree/resume_session",
                 req.worktree_type,
@@ -345,9 +334,6 @@ pub async fn handle(
                     registry_client.as_ref(),
                     Some(agent.auth_manager.clone()),
                     &agent_id,
-                    agent.storage_root.clone(),
-                    agent.session_state_authority.clone(),
-                    new_session_id.as_deref(),
                 )
                 .await,
             )

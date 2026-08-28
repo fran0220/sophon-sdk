@@ -482,32 +482,15 @@ async fn handle_session_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
     // Always drain: even a non-resident session can still have coordinator
     // children finishing after an earlier fire-and-forget TeardownSession
     // (e.g. idle unload). hard_stop / kill_all no-op when not resident.
-    agent
-        .teardown_live_session_before_delete(&session_id)
-        .await
-        .map_err(|message| acp::Error::internal_error().data(message))?;
-
-    // In Host-authority mode, publish the permanent tombstone after all live
-    // writers are stopped and before deleting any uncovered local sidecars.
-    // Standalone mode remains current-only and performs no additional write.
-    agent
-        .tombstone_session_state(&session_id)
-        .map_err(|error| {
-            acp::Error::internal_error()
-                .data(format!("failed to tombstone native session: {error}"))
-        })?;
+    agent.teardown_live_session_before_delete(&session_id).await;
 
     // Shared delete: remote-first, then local disk + FTS eviction.
     // Mirrored by the `grok sessions delete <id>` CLI path.
-    crate::session::persistence::delete_session_history_in_root(
+    crate::session::persistence::delete_session_history(
         &req.session_id,
         req.cwd.as_deref(),
         needs_remote,
         agent.auth_manager.clone(),
-        agent
-            .storage_root
-            .clone()
-            .unwrap_or_else(crate::util::grok_home::grok_home),
         agent.search_index().writer(),
     )
     .await
@@ -560,7 +543,6 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     struct Params {
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
-        embedded_mcp_servers: Option<Vec<xai_grok_mcp::servers::AcpServerEntry>>,
     }
 
     let params: Params = parse_params(args)?;
@@ -574,55 +556,20 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
     };
 
     let compat = agent.cfg.borrow().compat_resolved;
-    let scope = agent.mcp_source_scope();
-    let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
-        params.mcp_servers,
-        &cwd,
-        &compat,
-        scope,
-    );
+    let admitted =
+        crate::session::managed_mcp::admit_client_mcp_servers(params.mcp_servers, &cwd, &compat);
     let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
         admitted.clone(),
         &cwd,
         agent.plugin_registry_handle().snapshot().as_deref(),
         &compat,
-        scope,
     );
-    let embedded_mcp = match params.embedded_mcp_servers {
-        None => None,
-        Some(selected) => {
-            let registration = agent.embedded_mcp_servers();
-            if registration.is_none() && selected.is_empty() {
-                None
-            } else {
-                let (registered, invoker) = registration.ok_or_else(|| {
-                    acp::Error::invalid_params().data("no in-process MCP servers are registered")
-                })?;
-                let mut names = std::collections::HashSet::new();
-                if selected.iter().any(|server| {
-                    !names.insert(server.name.as_str()) || !registered.contains(server)
-                }) {
-                    return Err(acp::Error::invalid_params().data(
-                        "embedded MCP selection contains an unknown or duplicate registration",
-                    ));
-                }
-                Some((
-                    selected,
-                    xai_grok_mcp::acp_transport::bind_embedded_invoker(
-                        params.session_id.0.to_string(),
-                        invoker,
-                    ),
-                ))
-            }
-        }
-    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     handle
         .cmd_tx
         .send(SessionCommand::UpdateMcpServers {
             mcp_servers: merged,
-            embedded_mcp,
             respond_to: tx,
         })
         .map_err(|_| acp::Error::internal_error().data("session closed"))?;
@@ -730,7 +677,6 @@ async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
             handle.initial_client_mcp_servers.clone(),
             agent.plugin_registry_handle().snapshot().as_deref(),
             &compat,
-            agent.mcp_source_scope(),
         ) {
             updated += 1;
         }
@@ -795,7 +741,6 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             cwd,
             agent.plugin_registry_handle().snapshot().as_deref(),
             &agent.cfg.borrow().compat_resolved,
-            agent.mcp_source_scope(),
         );
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -803,7 +748,6 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             .cmd_tx
             .send(SessionCommand::UpdateMcpServers {
                 mcp_servers: merged,
-                embedded_mcp: None,
                 respond_to: tx,
             })
             .is_ok()
@@ -1055,15 +999,9 @@ async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRes
     let request: ForkSessionRequest = parse_params(args)?;
 
     let agent_id = agent_id();
-    let response = fork_session(
-        request,
-        &agent_id,
-        Some(agent.auth_manager.clone()),
-        agent.storage_root.clone(),
-        agent.session_state_authority.clone(),
-    )
-    .await
-    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    let response = fork_session(request, &agent_id, Some(agent.auth_manager.clone()))
+        .await
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_raw_response(&response)
 }

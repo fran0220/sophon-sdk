@@ -489,22 +489,7 @@ fn by_name_in_cwd_with_plugins_and_home(
         return Some(def);
     }
 
-    by_name_in_plugins(name, plugins)
-}
-
-/// Resolve only native built-ins and agents from the supplied plugin snapshot.
-/// No project or user agent directories are scanned.
-pub fn by_name_in_builtins_or_plugins(
-    name: &str,
-    plugins: Option<&crate::plugins::PluginRegistry>,
-) -> Option<AgentDefinition> {
-    by_name_with_home(name, None, None).or_else(|| by_name_in_plugins(name, plugins))
-}
-
-fn by_name_in_plugins(
-    name: &str,
-    plugins: Option<&crate::plugins::PluginRegistry>,
-) -> Option<AgentDefinition> {
+    // Try plugin agents
     if let Some(registry) = plugins {
         // Check if name is qualified (plugin-name:agent-name)
         if let Some((plugin_name, agent_name)) = name.split_once(':')

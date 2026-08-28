@@ -389,14 +389,6 @@ pub struct RewindPointInfo {
     /// Preview of the user prompt text (truncated)
     #[serde(default)]
     pub prompt_preview: Option<String>,
-    /// SDK-owned durable prompt index emitted only for an embedded Origin root
-    /// whose prompt carried a complete SDK identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_prompt_index: Option<usize>,
-    /// Exact, domain-separated prompt identity emitted only for an embedded
-    /// Origin root session. It is not model-visible prompt content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_prompt_digest: Option<String>,
 }
 
 // ── Session info ────────────────────────────────────────────────────────
@@ -899,8 +891,6 @@ mod tests {
             num_file_snapshots: 3,
             has_file_changes: true,
             prompt_preview: Some("refactor auth".into()),
-            origin_prompt_index: None,
-            origin_prompt_digest: None,
         };
         let v = serde_json::to_value(&point).unwrap();
         assert_eq!(v["has_file_changes"], json!(true));
@@ -915,8 +905,6 @@ mod tests {
             num_file_snapshots: 0,
             has_file_changes: false,
             prompt_preview: None,
-            origin_prompt_index: None,
-            origin_prompt_digest: None,
         };
         let v = serde_json::to_value(&point).unwrap();
         assert_eq!(v["has_file_changes"], json!(false));

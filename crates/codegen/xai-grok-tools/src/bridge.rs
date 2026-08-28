@@ -611,30 +611,6 @@ impl ToolBridge {
             .unwrap_or_default()
     }
 
-    pub async fn upsert_scheduled_task(
-        &self,
-        input: crate::implementations::grok_build::scheduler::create::SchedulerCreateInput,
-    ) -> Result<
-        (
-            crate::implementations::grok_build::scheduler::types::ScheduledTask,
-            bool,
-        ),
-        xai_tool_runtime::ToolError,
-    > {
-        use crate::implementations::grok_build::scheduler::types::SchedulerHandle;
-        let sender = {
-            let res = self.registry.resources.lock().await;
-            res.get::<SchedulerHandle>()
-                .ok_or_else(|| {
-                    xai_tool_runtime::ToolError::custom("missing_resource", "SchedulerHandle")
-                })?
-                .0
-                .clone()
-        };
-        crate::implementations::grok_build::scheduler::create::upsert_with_sender(sender, input)
-            .await
-    }
-
     pub async fn delete_scheduled_task(
         &self,
         task_id: &str,
@@ -661,45 +637,6 @@ impl ToolBridge {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
         reply_rx
-            .await
-            .map_err(|_| {
-                xai_tool_runtime::ToolError::custom(
-                    "process_manager",
-                    "Scheduler actor dropped reply",
-                )
-            })?
-            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
-    }
-
-    pub async fn deliver_scheduled_task_occurrence(
-        &self,
-        task_id: &str,
-        occurrence: crate::implementations::grok_build::scheduler::types::PendingScheduledOccurrence,
-    ) -> Result<bool, xai_tool_runtime::ToolError> {
-        use crate::implementations::grok_build::scheduler::types::{
-            SchedulerCommand, SchedulerHandle,
-        };
-        let sender = {
-            let resources = self.registry.resources.lock().await;
-            resources
-                .get::<SchedulerHandle>()
-                .ok_or_else(|| {
-                    xai_tool_runtime::ToolError::custom("missing_resource", "SchedulerHandle")
-                })?
-                .0
-                .clone()
-        };
-        let (reply, response) = tokio::sync::oneshot::channel();
-        sender
-            .send(SchedulerCommand::Deliver {
-                id: task_id.to_owned(),
-                occurrence,
-                reply,
-            })
-            .map_err(|_| {
-                xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
-            })?;
-        response
             .await
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom(

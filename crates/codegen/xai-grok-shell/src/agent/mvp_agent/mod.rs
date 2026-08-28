@@ -518,11 +518,6 @@ pub(crate) struct PromptResponseMeta {
     /// completions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
-    /// Typed loop-health boundary. Its presence means the Turn paused because
-    /// it exhausted its step budget or repeated the same action, not because
-    /// the user cancelled it or because the task completed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
     /// Structured detail of an early end (hook name, reason, trigger) —
     /// `cancellation_context_meta`. `None` unless the cancel carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -553,7 +548,6 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub last_turn_usage: Option<&'a xai_grok_sampling_types::TokenUsage>,
     pub prompt_usage: Option<crate::extensions::notification::PromptUsage>,
     pub cancellation_category: Option<String>,
-    pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
     pub cancellation_context: Option<serde_json::Value>,
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
@@ -573,7 +567,6 @@ pub(crate) fn build_prompt_response_meta(
         last_turn_usage,
         prompt_usage,
         cancellation_category,
-        loop_health_limit,
         cancellation_context,
         cancel_trigger,
         structured_output,
@@ -596,7 +589,6 @@ pub(crate) fn build_prompt_response_meta(
         reasoning_tokens: last_turn_usage.map(|u| u.reasoning_tokens),
         usage: prompt_usage,
         cancellation_category,
-        loop_health_limit,
         cancellation_context,
         cancel_trigger,
         structured_output,
@@ -756,16 +748,6 @@ struct RetainedResources {
 /// `resident_roster_titles`.
 type RosterDisplayCache = HashMap<String, (Option<String>, Option<String>)>;
 pub struct MvpAgent {
-    /// Origin embedded boundary: suppresses ambient Grok startup workers.
-    pub(crate) origin_embedded: bool,
-    /// Feature policy, independent from the embedded persistence/process boundary.
-    pub(crate) origin_profile: crate::agent::config::OriginEmbeddedProfile,
-    /// Origin embedded boundary: explicit persistence root, independent of GROK_HOME.
-    pub(crate) storage_root: Option<PathBuf>,
-    /// Host-injected semantic native-session authority. When present, the
-    /// same runtime-wide instance is shared by every embedded session.
-    pub(crate) session_state_authority:
-        Option<Arc<dyn crate::session::state_authority::NativeSessionStateAuthority>>,
     /// LEADER-SAFE(shared): `Send + Sync` mirror of per-session activity for the
     /// leader's auto-update checker, which cannot read the `!Send` maps. Expires
     /// when the actor exits. See [`crate::agent::activity::AgentActivity`].
@@ -778,14 +760,6 @@ pub struct MvpAgent {
     resident_roster_titles: RefCell<RosterDisplayCache>,
     pub(crate) initialize_request: OnceLock<acp::InitializeRequest>,
     pub(crate) gateway: GatewaySender,
-    /// Process-local MCP handlers installed by the embedded SDK. These bypass
-    /// ACP reverse RPC; each session receives a bound direct dispatcher.
-    embedded_mcp: RefCell<
-        Option<(
-            Vec<xai_grok_mcp::servers::AcpServerEntry>,
-            Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
-        )>,
-    >,
     /// Agent configuration. LEADER-SAFE(init-once): never mutated after construction.
     pub(crate) cfg: RefCell<AgentConfig>,
     /// Current auth method. LEADER-SAFE(shared): all clients share the same auth;
@@ -1561,25 +1535,6 @@ pub(crate) struct OrphanedTask {
     cwd: String,
 }
 impl MvpAgent {
-    /// Install SDK-owned process-local MCP servers before creating sessions.
-    /// The registrations are cloned into each subsequently spawned root session.
-    pub fn set_embedded_mcp_servers(
-        &self,
-        servers: Vec<xai_grok_mcp::servers::AcpServerEntry>,
-        invoker: Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
-    ) {
-        *self.embedded_mcp.borrow_mut() = Some((servers, invoker));
-    }
-
-    pub(crate) fn embedded_mcp_servers(
-        &self,
-    ) -> Option<(
-        Vec<xai_grok_mcp::servers::AcpServerEntry>,
-        Arc<dyn xai_grok_mcp::acp_transport::EmbeddedMcpInvoker>,
-    )> {
-        self.embedded_mcp.borrow().clone()
-    }
-
     /// Scan persisted updates for `task_backgrounded` entries that have no
     /// matching `task_completed`. Applies rewind dead-branch filtering so
     /// tasks from rewound branches are not included.

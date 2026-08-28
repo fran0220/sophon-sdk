@@ -75,8 +75,6 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     });
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let actor = SessionActor {
-        projects_chat_history: true,
-        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-session"),
@@ -161,7 +159,6 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
-        pending_elicitation_answers: ElicitationAnswerBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: None,
         dream_check_timeout: None,
@@ -270,7 +267,6 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
-        transcribe_user_images: false,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
