@@ -2,6 +2,39 @@
 
 The `sophon-sdk` crate is a trusted, in-process Rust boundary around the bundled Grok agent. Its public contract is a typed Rust API backed by the shell's native embedded facade; no transport service or transport request types are part of the SDK. `Runtime::start` uses the restricted profile. Trusted applications that need the full agent surface should use `Runtime::builder(config).profile(RuntimeProfile::Desktop)`, explicitly advertise `HostCapabilities`, and install a `HostDelegate` when host filesystem or terminal delegation is required.
 
+## Synchronized upstream baseline
+
+This SDK bundles the public `xai-org/grok-build` snapshot
+`9684fa3cdbf2995e30ea8b9b637f1db008f144fc` (source metadata 1.0.10) with
+embedded monorepo revision `70ec060ec3d28e77b9c4593be43c2ab0128bcd21`.
+The snapshot includes later public source syncs through 2026-08-27, so the two
+commit identities—not a package or binary version label—are authoritative.
+`source_provenance()` reports both identities, the SDK fork commit, façade
+version, and dirty-build state.
+
+The synchronized runtime changes the embedding baseline in these ways:
+
+- native compaction defaults to segmented history and enables two-pass
+  compaction; the SDK's durable `SessionStateStore` publication and recovery
+  contract remains the authority when installed;
+- normal SDK Turns retain `LengthPolicy::Fail`, so a max-token truncation is
+  not misreported as a complete answer. Upstream's `CompletePartial` policy is
+  deliberately not exposed as an ambient SDK toggle;
+- top-level human prompts may be blocked before inference by a typed
+  `UserPromptSubmit` client hook, settling the Turn as `Cancelled`;
+- a Host can send a bounded follow-up to an active owned subagent through
+  `send_subagent_message`, receiving the complete admission outcome without
+  collapsing uncertainty into failure;
+- MCP uses the resolved rmcp 3.1.4 transport stack, server-name-keyed mounts,
+  non-blocking connection startup, and typed form/URL elicitation;
+- the shared HTTP stack centralizes rustls provider selection, OS and Mozilla
+  roots, and optional extra CAs. MCP's reqwest 0.13 adapter shares the provider
+  and extra-CA policy while remaining dependency-isolated;
+- upstream dashboard persistence and terminal backends now live in dedicated
+  `xai-grok-dashboard-store` and `xai-grok-shell-terminal` crates. They do not
+  create a second SDK state authority or widen the public `HostDelegate`
+  boundary.
+
 ## Explicit providers, not account login
 
 An embedding application can supply every inference credential directly. It does not need Grok account authentication:
@@ -105,6 +138,14 @@ unconsumable (`Unanswered`). Permission and plan-approval interactions retain
 their existing generic `Resolved` projection. Hosts should persist any product
 transcript projection they need from these typed events; an unanswered form is
 not represented as a fabricated user message.
+
+`UserPromptSubmit` has a narrower blocking contract. For a top-level human
+prompt, registered client handlers run concurrently; the first blocker in
+registration order wins deterministically. `AgentHookDecision::Block` stops the
+prompt before file hooks and sampling and settles it as `TurnOutcome::Cancelled`.
+Synthetic and subagent prompts remain observe-only. Callback failure, timeout,
+malformed output, or an unknown decision fails open and remains visible in hook
+execution telemetry.
 
 ## Immutable harness and Turn binding
 
@@ -219,6 +260,12 @@ a generation from the exact `SessionConfig`, so retrying the same UUID and
 config after an unknown acknowledgement reopens idempotently.
 
 ### Native Session compaction evidence
+
+The synchronized native default is
+`CompactionMode::Segments(CompactionDetail::default())`; the
+`TwoPassCompaction` feature also defaults on. Hosts may still configure the
+native mode, while the durability rules below are unchanged for either the
+single- or two-pass request path.
 
 `RuntimeBuilder::compaction_observer` installs one typed, asynchronous audit
 observer for native Session compaction. It requires `session_state_store`; the
@@ -570,9 +617,9 @@ The SDK does not wrap the TUI. It exposes the stateful agent actor below it:
 | `/loop` | Typed recurrence, Service-event and process-settlement tasks via `upsert_scheduled_task`, `list_scheduled_tasks`, `deliver_scheduled_task_occurrence` and `delete_scheduled_task`; the model-interpreted slash command remains discoverable too |
 | Session fork and worktree resume | `fork_session`, crash-retryable `fork_session_create_or_verify`, and `resume_session_in_worktree` |
 | Workflow discovery | `list_workflows` |
-| Subagent execution | Model-driven task tools in a normal Turn; live inspection and cancellation via `list_running_subagents`, `get_subagent` and `cancel_subagent` |
+| Subagent execution | Model-driven task tools in a normal Turn; live inspection, bounded active follow-up, and cancellation via `list_running_subagents`, `get_subagent`, `send_subagent_message`, and `cancel_subagent` |
 | Tool approval policy | `ToolPermissionHandler`; selected option IDs are checked against the agent's request before they are accepted |
-| Pre/post tool and lifecycle hooks | `AgentHookRegistration` / `AgentHookHandler`, including blocking `PreToolUse`, `Stop` and `SubagentStop` gates |
+| Pre/post tool and lifecycle hooks | `AgentHookRegistration` / `AgentHookHandler`, including blocking `PreToolUse`, `Stop`, `SubagentStop`, and top-level `UserPromptSubmit` gates |
 | Host filesystem, terminal and application extensions | `HostDelegate`, gated by explicit `HostCapabilities` |
 | Unknown future agent events | Lossless `Unknown` event fallback; no public generic protocol bridge |
 
@@ -580,7 +627,7 @@ Command execution intentionally goes through the agent's canonical slash-command
 
 ## MCP protocol coverage
 
-All production transports use rmcp 3.1.2 and the modern discovery lifecycle. They require `server/discover` and negotiate only protocol version `2026-07-28`. There is no legacy `initialize` fallback, including for JSON-RPC `METHOD_NOT_FOUND`; unsupported versions and malformed, unauthorized, or timed-out discovery attempts fail closed.
+All production transports resolve to rmcp 3.1.4 and use the modern discovery lifecycle. They require `server/discover` and negotiate only protocol version `2026-07-28`. There is no legacy `initialize` fallback, including for JSON-RPC `METHOD_NOT_FOUND`; unsupported versions and malformed, unauthorized, or timed-out discovery attempts fail closed. Mount identity is the configured server name rather than URL, so distinct names sharing one endpoint remain distinct. Connection work is non-blocking with respect to session startup and reports readiness through typed status events.
 
 The public session-scoped MCP API covers:
 

@@ -158,7 +158,15 @@ fn ledger_turn_state_preserves_tagged_camel_case_wire_shape() {
 #[test]
 fn provenance_is_exact_and_never_unknown() {
     let provenance = source_provenance();
-    assert_eq!(provenance.upstream_release, "1.0.6");
+    assert_eq!(provenance.upstream_release, "1.0.10");
+    assert_eq!(
+        provenance.upstream_grok_build_commit,
+        "9684fa3cdbf2995e30ea8b9b637f1db008f144fc"
+    );
+    assert_eq!(
+        provenance.upstream_source_rev,
+        "70ec060ec3d28e77b9c4593be43c2ab0128bcd21"
+    );
     assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(provenance.fork_commit.len(), 40);
     assert!(
@@ -167,7 +175,6 @@ fn provenance_is_exact_and_never_unknown() {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     );
-    assert_eq!(provenance.upstream_source_rev.len(), 40);
     assert!(
         provenance
             .upstream_source_rev

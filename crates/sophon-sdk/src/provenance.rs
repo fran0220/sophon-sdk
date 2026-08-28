@@ -5,6 +5,7 @@ use crate::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceProvenance {
     pub upstream_release: &'static str,
+    pub upstream_grok_build_commit: &'static str,
     pub fork_commit: &'static str,
     pub upstream_source_rev: &'static str,
     pub facade_version: &'static str,
@@ -12,10 +13,10 @@ pub struct SourceProvenance {
 }
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        // The public upstream snapshot currently carries the 1.0.6 crate
-        // version. No public 1.0.7 tag or release was available when this
-        // snapshot was synchronized; keep the commit fields authoritative.
-        upstream_release: "1.0.6",
+        // Release labels are informative; the public snapshot and embedded
+        // monorepo revisions below are the authoritative source identities.
+        upstream_release: "1.0.10",
+        upstream_grok_build_commit: include_str!("../../../UPSTREAM_GROK_BUILD_COMMIT").trim(),
         fork_commit: env!("SOPHON_SDK_COMMIT"),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),

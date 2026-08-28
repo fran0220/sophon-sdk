@@ -42,15 +42,45 @@ for the version of the code present in this tree.
 `UPSTREAM_GROK_BUILD_COMMIT` records the corresponding public
 `xai-org/grok-build` snapshot used by the SDK's automated upstream sync.
 
-The synchronized public snapshot is the upstream 1.0.6 source line at commit
-`19d42e35c07a9c9244f03f6df0c4c353f970d4f9` (`SOURCE_REV` records the embedded
-source revision). No public 1.0.7 tag or release was available at sync time;
-the commit and source-revision files are therefore the authoritative basis
-until an official 1.0.7 snapshot is published.
+The synchronized public snapshot reports the upstream 1.0.10 source line at
+commit `9684fa3cdbf2995e30ea8b9b637f1db008f144fc`, including the public source
+syncs through 2026-08-27. Its embedded monorepo revision is
+`70ec060ec3d28e77b9c4593be43c2ab0128bcd21`. Release labels are informative;
+the commit and source-revision files are the authoritative identities. This
+does not claim equivalence to a newer npm or prebuilt-binary release.
 
 </div>
 
 ---
+
+## Synchronized upstream baseline
+
+This update advances the prior public pin
+`19d42e35c07a9c9244f03f6df0c4c353f970d4f9` to
+`9684fa3cdbf2995e30ea8b9b637f1db008f144fc`, covering the published 1.0.7,
+1.0.8, 1.0.9, and 1.0.10 source changes plus the later August 25 and August 27
+source syncs. The complete source delta is retained rather than selectively
+backported.
+
+Highlights relevant to embedders include:
+
+- active follow-up messages to running subagents, with bounded admission and
+  explicit accepted, rejected, and uncertain outcomes;
+- segmented compaction as the native default, two-pass compaction enabled by
+  default, and an explicit max-token length policy that remains fail-closed for
+  normal SDK Turns;
+- MCP form/URL elicitation, server-name-keyed configuration (so two names may
+  share one URL), non-blocking connection startup, and newer rmcp 3.x transport
+  behavior;
+- centralized rustls client policy for OS/Mozilla trust roots and optional
+  `GROK_EXTRA_CA_BUNDLE` / `SSL_CERT_FILE` roots;
+- faster concurrent subagents, richer workflow controls, prompt stashing,
+  worktree lifecycle improvements, and persistent dashboard workspace state;
+- internal extraction of shared directory and terminal ownership into
+  `xai-dirs` and `xai-grok-shell-terminal`.
+
+The SDK-specific typed surfaces and trust-boundary details are documented in
+[`crates/sophon-sdk/README.md`](crates/sophon-sdk/README.md).
 
 ## Installing the upstream binary
 
@@ -114,8 +144,11 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 | `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
 | `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
 | `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
+| `crates/codegen/xai-grok-shell-terminal` | Shared local/ACP terminal backends extracted from the shell |
+| `crates/codegen/xai-grok-dashboard-store` | SQLite dashboard workspace membership, layout, and grouping state |
 | `crates/codegen/xai-grok-tools` | Tool implementations (terminal, file edit, search, ...) |
 | `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
+| `crates/codegen/xai-dirs` | Shared application-directory resolution used by config and worktrees |
 | `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
 | `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
 | `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
