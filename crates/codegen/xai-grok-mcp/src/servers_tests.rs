@@ -21,7 +21,7 @@ fn connection_generations_are_unique() {
 
 #[test]
 fn client_capabilities_only_advertise_installed_host_services_and_no_ui() {
-    let info = McpClient::make_client_info("capabilities", None);
+    let info = McpClient::make_client_info("capabilities", None, false);
     assert!(info.capabilities.roots.is_none());
     assert!(info.capabilities.sampling.is_none());
     assert!(info.capabilities.elicitation.is_none());
@@ -1938,6 +1938,11 @@ async fn fake_handle_post(
     match req["method"].as_str() {
         Some("server/discover") => {
             state.handles.inits.fetch_add(1, Ordering::Relaxed);
+            state
+                .handles
+                .init_user_agents
+                .lock()
+                .extend(header_values(&headers, axum::http::header::USER_AGENT));
             let result = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.clone(),
@@ -2505,10 +2510,11 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
             }
         });
         let handler = GrokClientHandler {
-            info: McpClient::make_client_info("dead", None),
+            info: McpClient::make_client_info("dead", None, false),
             server_name: "dead".to_string(),
             client_id: 1,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
             domain_notifications: Arc::new(DomainNotificationRegistry::default()),
         };
         let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
@@ -2536,7 +2542,10 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
     let dead = dead_service().await;
     let original_client_id = client.client_id();
     let stale_generation = dead.connection_generation();
-    *client.state.lock().await = ClientState::Ready(dead);
+    *client.state.lock().await = ClientState::Ready {
+        service: dead,
+        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+    };
 
     let erased = McpErasedTool {
         tool: McpTool::new(
@@ -2577,7 +2586,10 @@ async fn try_call_tool_reconnects_then_succeeds_after_retriable_transport_error(
         "successful retry must not be flagged as timeout"
     );
     // reset_transport + re-handshake replaced the dead service with a live one.
-    assert!(matches!(&*client.state.lock().await, ClientState::Ready(_)));
+    assert!(matches!(
+        &*client.state.lock().await,
+        ClientState::Ready { .. }
+    ));
     let current_generation = client
         .current_connection_generation()
         .await
@@ -3134,14 +3146,16 @@ async fn is_healthy_pending_does_not_block_on_handshake() {
 #[test]
 fn make_client_info_pins_protocol_version() {
     assert_eq!(
-        McpClient::make_client_info("test-srv", None).protocol_version,
+        McpClient::make_client_info("test-srv", None, false).protocol_version,
         rmcp::model::ProtocolVersion::V_2026_07_28
     );
 }
 
 #[test]
 fn make_client_info_advertises_form_and_url_elicitation() {
-    let info = McpClient::make_client_info("test-srv", /* advertise_elicitation */ true);
+    let info = McpClient::make_client_info(
+        "test-srv", None, /* advertise_legacy_elicitation */ true,
+    );
     let elicitation = info
         .capabilities
         .elicitation
@@ -3187,7 +3201,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
         None,
         None,
     );
-    let acp_info = acp.make_client_handler().get_info();
+    let acp_info = acp.make_client_handler(1).get_info();
     assert!(
         acp_info.capabilities.elicitation.is_none(),
         "ACP zero-IPC cannot deliver elicitation/create"
@@ -3196,7 +3210,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
     let no_bridge = McpClient::stub("stdio");
     assert!(
         no_bridge
-            .make_client_handler()
+            .make_client_handler(1)
             .get_info()
             .capabilities
             .elicitation
@@ -3207,7 +3221,7 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
     let hitl = McpClient::stub("stdio");
     hitl.set_elicitation_tx(Some(crate::elicitation::ElicitationInbox::new()));
     assert!(
-        hitl.make_client_handler()
+        hitl.make_client_handler(1)
             .get_info()
             .capabilities
             .elicitation
@@ -3220,10 +3234,11 @@ fn acp_zero_ipc_client_info_does_not_advertise_elicitation() {
 async fn client_handler_routes_tools_changed() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<McpClientEvent>();
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test", None),
+        info: McpClient::make_client_info("test", None, false),
         server_name: "test".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
@@ -3239,10 +3254,11 @@ async fn client_handler_routes_tools_changed() {
 #[tokio::test]
 async fn client_handler_no_dispatcher_is_silent() {
     let handler = GrokClientHandler {
-        info: McpClient::make_client_info("test", None),
+        info: McpClient::make_client_info("test", None, false),
         server_name: "test".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     handler.emit(McpClientEvent::ToolsChanged {
@@ -3252,12 +3268,13 @@ async fn client_handler_no_dispatcher_is_silent() {
 
 #[tokio::test]
 async fn client_handler_get_info_round_trips() {
-    let info = McpClient::make_client_info("test-srv", None);
+    let info = McpClient::make_client_info("test-srv", None, false);
     let handler = GrokClientHandler {
         info: info.clone(),
         server_name: "test-srv".to_string(),
         client_id: 1,
         notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+        elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
         domain_notifications: Arc::new(DomainNotificationRegistry::default()),
     };
     let got = handler.get_info();

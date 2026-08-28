@@ -3569,6 +3569,7 @@ pub struct McpClient {
     /// `.await`, and the handler's `emit` path is short and
     /// allocation-free.
     notify_tx: SharedEventTx,
+    elicitation_tx: crate::elicitation::SharedElicitationTx,
     /// Bounded custom notifications on this mounted Service's existing
     /// transport. Subscriptions are retired whenever the concrete connection
     /// generation changes.
@@ -3634,7 +3635,7 @@ impl McpClient {
     /// safe for typed SDK capability reporting.
     pub async fn negotiated_info_json(&self) -> Option<serde_json::Value> {
         let guard = self.state.lock().await;
-        let ClientState::Ready(service) = &*guard else {
+        let ClientState::Ready { service, .. } = &*guard else {
             return None;
         };
         let info = service.peer().peer_info()?;
@@ -3825,7 +3826,7 @@ impl McpClient {
     pub async fn current_connection_generation(&self) -> Option<u64> {
         let guard = self.state.lock().await;
         match &*guard {
-            ClientState::Ready(service) => Some(service.connection_generation()),
+            ClientState::Ready { service, .. } => Some(service.connection_generation()),
             _ => None,
         }
     }
@@ -4072,6 +4073,7 @@ impl McpClient {
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            elicitation_tx: Arc::new(parking_lot::Mutex::new(None)),
             domain_notifications: Arc::new(DomainNotificationRegistry::default()),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
             host_services: Arc::new(parking_lot::Mutex::new(None)),
@@ -4707,7 +4709,10 @@ impl McpClient {
             let mut guard = self.state.lock().await;
             match result {
                 Ok(service) => {
-                    *guard = ClientState::Ready(service.clone());
+                    *guard = ClientState::Ready {
+                        service: service.clone(),
+                        _connected: xai_grok_telemetry::activity::MCP_SERVERS_CONNECTED.enter(),
+                    };
                     tracing::info!(
                         server = %self.server_name,
                         "MCP server initialized successfully"
@@ -4898,10 +4903,20 @@ impl McpClient {
     fn make_client_info(
         server_name: &str,
         host_services: Option<&BoundMcpHostServices>,
+        advertise_legacy_elicitation: bool,
     ) -> ClientInfo {
         let mut capabilities = host_services
             .map(|host| host.services.client_capabilities())
             .unwrap_or_default();
+        if capabilities.elicitation.is_none() && advertise_legacy_elicitation {
+            capabilities.elicitation = Some(
+                rmcp::model::ElicitationCapability::new()
+                    .with_form(
+                        rmcp::model::FormElicitationCapability::new().with_schema_validation(true),
+                    )
+                    .with_url(rmcp::model::UrlElicitationCapability::new()),
+            );
+        }
         capabilities.extensions.get_or_insert_default().insert(
             rmcp::model::TASKS_EXTENSION_ID.to_owned(),
             Default::default(),
@@ -4930,10 +4945,15 @@ impl McpClient {
         self.domain_notifications
             .retire_before(connection_generation);
         GrokClientHandler {
-            info: Self::make_client_info(&self.server_name, host_services.as_ref()),
+            info: Self::make_client_info(
+                &self.server_name,
+                host_services.as_ref(),
+                !self.is_acp() && self.elicitation_tx.lock().is_some(),
+            ),
             server_name: self.server_name.clone(),
             client_id: connection_generation,
             notify_tx: Arc::clone(&self.notify_tx),
+            elicitation_tx: Arc::clone(&self.elicitation_tx),
             domain_notifications: Arc::clone(&self.domain_notifications),
         }
     }
@@ -6028,6 +6048,7 @@ pub struct GrokClientHandler {
     /// post-handshake is supported without restarting the rmcp
     /// service loop.
     notify_tx: SharedEventTx,
+    elicitation_tx: crate::elicitation::SharedElicitationTx,
     domain_notifications: Arc<DomainNotificationRegistry>,
 }
 
@@ -6087,12 +6108,25 @@ impl ClientHandler for GrokClientHandler {
 
     async fn create_elicitation(
         &self,
-        _request: ElicitRequestParams,
-        _context: RequestContext<RoleClient>,
+        request: ElicitRequestParams,
+        context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, rmcp::ErrorData> {
-        Err(rmcp::ErrorData::method_not_found::<
-            rmcp::model::ElicitationCreateRequestMethod,
-        >())
+        tracing::info!(
+            server = %self.server_name,
+            "MCP elicitation/create received"
+        );
+        let bridged =
+            crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, request);
+        tokio::select! {
+            result = bridged => Ok(result),
+            _ = context.ct.cancelled() => {
+                tracing::info!(
+                    server = %self.server_name,
+                    "elicitation/create cancelled by server; abandoning HITL bridge"
+                );
+                Ok(crate::elicitation::cancel_result())
+            }
+        }
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {

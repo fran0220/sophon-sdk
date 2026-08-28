@@ -42,6 +42,16 @@ impl OwnedClients {
         self.clients.clear();
     }
 
+    pub fn retain(&mut self, mut predicate: impl FnMut(&McpServerName, &Arc<McpClient>) -> bool) {
+        self.clients.retain(|name, client| {
+            let keep = predicate(name, client);
+            if !keep {
+                cancel_watcher(client);
+            }
+            keep
+        });
+    }
+
     pub fn get(&self, name: &str) -> Option<&Arc<McpClient>> {
         self.clients.get(name)
     }
