@@ -72,6 +72,7 @@ async fn create_test_actor(
     chat_state_handle.record_token_usage(total_tokens);
     SessionActor {
         projects_chat_history: true,
+        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-auto-compact"),
@@ -545,6 +546,7 @@ async fn create_test_actor_with_memory(
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
     SessionActor {
         projects_chat_history: true,
+        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
@@ -1340,6 +1342,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-idle-resume"),

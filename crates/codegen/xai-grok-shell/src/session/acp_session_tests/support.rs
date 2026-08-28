@@ -262,6 +262,7 @@ pub(crate) async fn create_test_actor_with_terminal(
     chat_state_handle.record_token_usage(total_tokens);
     let actor = SessionActor {
         projects_chat_history: true,
+        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-actor"),

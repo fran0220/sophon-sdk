@@ -76,6 +76,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let actor = SessionActor {
         projects_chat_history: true,
+        origin_prompt_identities: Default::default(),
         status_wake: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-session"),

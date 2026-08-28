@@ -115,6 +115,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
             );
             let actor = Arc::new(SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -613,6 +614,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
@@ -919,6 +921,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 .await;
             let actor = SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
@@ -2475,6 +2478,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 .await;
             let actor = SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),

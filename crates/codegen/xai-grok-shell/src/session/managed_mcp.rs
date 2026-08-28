@@ -186,8 +186,8 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
 ) -> Vec<McpServerWithPolicy> {
     if scope == McpSourceScope::CallerDeclared {
         let mut merged = client_mcp_servers;
-        merged.sort_by_key(mcp_server_key);
-        merged.dedup_by_key(|server| mcp_server_key(server));
+        merged.sort_by_key(mcp_merge_key);
+        merged.dedup_by_key(|server| mcp_merge_key(server));
         return merged
             .into_iter()
             .map(|server| McpServerWithPolicy {
@@ -1134,7 +1134,8 @@ Authorization = "Bearer org2-token"
     fn same_url_different_names_both_survive_merge() {
         let cwd = same_url_project_repo();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let merged = merge_managed_mcp_servers(vec![], cwd.path(), None, &compat);
+        let merged =
+            merge_managed_mcp_servers(vec![], cwd.path(), None, &compat, McpSourceScope::Ambient);
 
         let auth_header = |name: &str| -> &str {
             let server = merged

@@ -132,6 +132,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
                 projects_chat_history: true,
+                origin_prompt_identities: Default::default(),
                 status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-idle-resume"),

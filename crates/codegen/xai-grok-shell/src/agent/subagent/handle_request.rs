@@ -967,6 +967,7 @@ pub(crate) async fn run_shell_child(
                 "ignoring mcpServers on plugin agent (not supported for security)"
             );
         }
+        vec![]
     } else if definition.mcp_servers.is_empty() {
         vec![]
     } else if !crate::agent::folder_trust::agent_inline_hooks_allowed(definition.scope, || {

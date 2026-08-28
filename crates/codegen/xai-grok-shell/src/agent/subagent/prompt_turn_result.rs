@@ -48,7 +48,7 @@ pub(super) fn reduce_prompt_turn_result(
 
     match turn_result {
         Ok(Ok(turn)) => match turn.completion_kind {
-            PromptCompletionKind::Completed | PromptCompletionKind::StationarityEnded => {
+            PromptCompletionKind::Completed | PromptCompletionKind::StationarityEnded { .. } => {
                 match (mode, turn.structured_output) {
                     (
                         PromptTurnResultMode::Initial {

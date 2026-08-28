@@ -3162,9 +3162,10 @@ impl SessionActor {
     /// Persist and stream the host-authored message that makes a loop-health
     /// settlement truthful in both replay and the live transcript.
     async fn emit_loop_health_closing_message(&self, message: String) {
-        self.record_assistant_response(xai_grok_sampling_types::ConversationItem::assistant(
-            message.clone(),
-        ))
+        self.record_assistant_response(
+            xai_grok_sampling_types::ConversationItem::assistant(message.clone()),
+            false,
+        )
         .await;
         self.send_update(
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
