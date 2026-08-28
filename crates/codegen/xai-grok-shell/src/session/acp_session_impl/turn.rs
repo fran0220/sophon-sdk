@@ -682,6 +682,7 @@ impl SessionActor {
             acc
         });
         let prompt_block = if policy.authority != InputAuthority::ModelAuthoredUntrusted {
+            let enforce_prompt_block = self.should_enforce_prompt_block(&policy);
             let prompt_gate_verdict = self
                 .dispatch_prompt_submit_hook(
                     xai_grok_hooks::event::HookPayload::UserPromptSubmit {
@@ -689,12 +690,10 @@ impl SessionActor {
                         subagent_type: self.subagent_type_label(),
                     },
                     Some(prompt_id),
+                    enforce_prompt_block,
                 )
                 .await;
-            match (
-                self.should_enforce_prompt_block(&policy),
-                prompt_gate_verdict,
-            ) {
+            match (enforce_prompt_block, prompt_gate_verdict) {
                 (true, xai_grok_hooks::result::PromptDecision::Block { reason, hook_name }) => {
                     Some((hook_name, reason))
                 }

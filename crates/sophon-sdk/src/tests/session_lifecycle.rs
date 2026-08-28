@@ -5,6 +5,74 @@ use super::*;
 // domain to keep each journal assertion isolated.
 static SESSION_LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+struct PromptBlockingHook(Mutex<Vec<AgentHookInvocation>>);
+
+#[async_trait::async_trait]
+impl AgentHookHandler for PromptBlockingHook {
+    async fn handle(
+        &self,
+        invocation: AgentHookInvocation,
+    ) -> Result<AgentHookResponse, AgentHookError> {
+        self.0.lock().expect("hook calls lock").push(invocation);
+        Ok(AgentHookResponse {
+            decision: AgentHookDecision::Block,
+            system_message: Some("SDK policy blocked this prompt".into()),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn sdk_prompt_block_hook_cancels_before_inference() {
+    let _guard = SESSION_LIFECYCLE_LOCK.lock().await;
+    assert_eq!(
+        serde_json::to_value(AgentHookDecision::Block).expect("block serializes"),
+        serde_json::json!("block")
+    );
+
+    let root = TempDir::new().expect("temp root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let hook = std::sync::Arc::new(PromptBlockingHook(Mutex::new(Vec::new())));
+    let (runtime, _) = Runtime::builder(runtime_config(&root, "http://127.0.0.1:9/v1".into()))
+        .profile(RuntimeProfile::Desktop)
+        .agent_hooks([AgentHookRegistration {
+            callback_id: "sdk-prompt".into(),
+            event: AgentHookEvent::UserPromptSubmit,
+            matcher: None,
+            timeout: Some(5.0),
+            handler: hook.clone(),
+        }])
+        .start()
+        .await
+        .expect("desktop runtime starts without contacting inference");
+    let session = runtime
+        .create_session(session_config(workspace))
+        .await
+        .expect("session starts");
+
+    let receipt = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runtime.prompt(&session, "blocked-turn", "deploy to prod"),
+    )
+    .await
+    .expect("prompt gate timeout")
+    .expect("blocked prompt settles normally");
+    assert_eq!(receipt.outcome, TurnOutcome::Cancelled);
+    let calls = hook.0.lock().expect("hook calls lock");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].event, AgentHookEvent::UserPromptSubmit);
+    assert_eq!(calls[0].prompt_id.as_deref(), Some("blocked-turn"));
+    assert_eq!(calls[0].raw["prompt"], "deploy to prod");
+    drop(calls);
+
+    runtime
+        .close_session(session)
+        .await
+        .expect("session closes");
+    runtime.shutdown().await.expect("runtime shuts down");
+}
+
 #[tokio::test]
 async fn fixed_model_catalog_is_typed_and_available_in_restricted_profile() {
     let _guard = SESSION_LIFECYCLE_LOCK.lock().await;

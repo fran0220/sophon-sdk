@@ -71,6 +71,8 @@ pub enum AgentHookDecision {
     #[default]
     Continue,
     Deny,
+    /// Reject a `UserPromptSubmit` prompt before it is committed or sampled.
+    Block,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]

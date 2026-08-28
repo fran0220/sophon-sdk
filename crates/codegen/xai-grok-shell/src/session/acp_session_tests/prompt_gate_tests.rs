@@ -62,6 +62,42 @@ fn spawn_persistence_drain(
     annotations
 }
 
+fn spawn_client_prompt_blocker(
+    mut rx: mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+    observe_notifications: std::rc::Rc<std::cell::Cell<usize>>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                    assert_eq!(args.request.method.as_ref(), "x.ai/hooks/run");
+                    let params: serde_json::Value =
+                        serde_json::from_str(args.request.params.get()).unwrap();
+                    assert_eq!(params["hookCallbackId"], "sdk-prompt");
+                    assert_eq!(params["hookEventName"], "user_prompt_submit");
+                    let response: Arc<serde_json::value::RawValue> =
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "decision": "block",
+                            "systemMessage": "SDK policy blocked this prompt",
+                        }))
+                        .unwrap()
+                        .into();
+                    let _ = args.response_tx.send(Ok(acp::ExtResponse::new(response)));
+                }
+                xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
+                    if args.request.method.as_ref() == "x.ai/hooks/event" {
+                        observe_notifications.set(observe_notifications.get() + 1);
+                    }
+                }
+                xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                    let _ = args.response_tx.send(Ok(()));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 /// A blocking hook cancels a real user turn as `HookDenied` before the
 /// sampler runs: the turn resolves `Cancelled` even though no model server
 /// exists, and the context carries the hook name and the user-facing reason.
@@ -127,6 +163,81 @@ async fn blocked_user_prompt_cancels_turn_without_sampling() {
                 actor.state.lock().await.hook_block_held(),
                 "the queue hold must be armed by the turn itself"
             );
+        })
+        .await;
+}
+
+/// A client-registered prompt callback is an awaited gate (not an observe
+/// notification) for a real top-level human prompt. Its SDK `block` response
+/// must take the same pre-sampling cancellation and queue-hold path as a file
+/// hook.
+#[tokio::test(flavor = "current_thread")]
+async fn client_prompt_block_cancels_before_sampling_without_duplicate_observe() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let annotations = spawn_persistence_drain(persistence_rx);
+            let observe_notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+            spawn_client_prompt_blocker(gateway_rx, observe_notifications.clone());
+
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            actor.client_hooks.borrow_mut().insert(
+                xai_grok_hooks::event::HookEventName::UserPromptSubmit,
+                vec![crate::extensions::hooks::ClientHookGroup {
+                    matcher: None,
+                    callback_ids: vec!["sdk-prompt".to_owned()],
+                    timeout: None,
+                }],
+            );
+
+            let result = Box::pin(actor.handle_prompt(
+                "p-client-blocked",
+                text_prompt("deploy to prod"),
+                PromptMode::Agent,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("client prompt block resolves as a cancelled turn");
+
+            assert_eq!(result.stop_reason, acp::StopReason::Cancelled);
+            match result.completion_kind {
+                PromptCompletionKind::Cancelled { category, context } => {
+                    assert_eq!(
+                        category,
+                        Some(crate::session::events::CancellationCategory::HookDenied)
+                    );
+                    let context = context.expect("hook cancellation context");
+                    assert_eq!(context.hook_name.as_deref(), Some("client:sdk-prompt"));
+                    assert_eq!(
+                        context.reason.as_deref(),
+                        Some("SDK policy blocked this prompt")
+                    );
+                }
+                other => panic!("expected Cancelled(HookDenied), got {other:?}"),
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(
+                observe_notifications.get(),
+                0,
+                "an enforceable callback must receive run, not event + run"
+            );
+            assert!(actor.state.lock().await.hook_block_held());
+            assert!(annotations.borrow().iter().any(|message| {
+                message.contains("prompt blocked by hook `client:sdk-prompt`")
+                    && message.contains("SDK policy blocked this prompt")
+            }));
         })
         .await;
 }
