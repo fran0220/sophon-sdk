@@ -2,9 +2,12 @@
 //! session. Split from `acp_agent.rs`, whose trait impl delegates all four.
 //!
 //! [session setup]: https://agentclientprotocol.com/protocol/v1/session-setup
-use super::reasoning_effort::{EffortTarget, NewSessionEffort, split_new_session_effort};
-use super::*;
+use super::reasoning_effort::{
+    EffortTarget, NewSessionEffort, resolve_new_session_effort_hint, split_new_session_effort,
+};
 use super::session_lifecycle::CloseOutcome;
+use super::*;
+use crate::agent::session_metrics::SessionStartKind;
 /// Refusals resume must give verbatim, so a test cannot mistake some other
 /// `invalid_params` for the guard it is pinning.
 pub(super) const RESUME_REFUSES_CHAT: &str =
@@ -46,7 +49,6 @@ fn insert_applied_tool_overrides(
         );
     }
 }
-
 fn embedded_route_from_meta(
     meta: Option<&acp::Meta>,
 ) -> Result<(acp::ModelId, Option<acp::Meta>), acp::Error> {
@@ -68,6 +70,27 @@ fn embedded_route_from_meta(
     Ok((acp::ModelId::new(model.to_owned()), route_meta))
 }
 
+/// Parse the client-claimed `_meta.sessionKind` on `session/new`.
+/// `headless` is the only client-minted kind; the `subagent*` namespace is
+/// server-owned. Other values stay forward-compatible and leave the session
+/// unstamped.
+fn parse_client_session_kind(meta: Option<&acp::Meta>) -> Result<Option<String>, acp::Error> {
+    let Some(kind) = meta
+        .and_then(|m| m.get("sessionKind").or_else(|| m.get("session_kind")))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    if kind == "headless" {
+        return Ok(Some(kind.to_owned()));
+    }
+    if kind.starts_with("subagent") {
+        return Err(acp::Error::invalid_params()
+            .data("_meta.sessionKind uses the server-reserved subagent namespace"));
+    }
+    tracing::warn!(kind, "ignoring unsupported _meta.sessionKind claim");
+    Ok(None)
+}
 /// Per-client capabilities for one session. Leader mode injects these per
 /// request, so they belong to the request rather than to the agent.
 struct ClientCaps {
@@ -111,6 +134,14 @@ impl RestoredSignals {
 pub(super) enum AttachOperation {
     Load,
     Resume,
+}
+impl AttachOperation {
+    pub(super) fn start_kind(self) -> SessionStartKind {
+        match self {
+            Self::Load => SessionStartKind::Load,
+            Self::Resume => SessionStartKind::Resume,
+        }
+    }
 }
 /// What the two attach methods do differently, decided in one exhaustive match
 /// so a branch further down cannot quietly skip [`AttachOperation`]. Not in the
@@ -159,7 +190,6 @@ struct SessionWorkspace {
     mcp_servers: Vec<acp::McpServer>,
     mcp_meta_config_map: McpMetaConfigMap,
 }
-
 struct EmbeddedSessionRootGuard(Option<String>);
 
 impl EmbeddedSessionRootGuard {
@@ -170,15 +200,13 @@ impl EmbeddedSessionRootGuard {
         let Some(storage_root) = storage_root else {
             return Ok(Self(None));
         };
-        let inserted = xai_grok_shared::session::register_session_root(
-            session_id.0.as_ref(),
-            storage_root,
-        )
-        .ok_or_else(|| {
-            acp::Error::invalid_request().data(
-                "embedded session identity is already bound to another storage authority",
-            )
-        })?;
+        let inserted =
+            xai_grok_shared::session::register_session_root(session_id.0.as_ref(), storage_root)
+                .ok_or_else(|| {
+                    acp::Error::invalid_request().data(
+                        "embedded session identity is already bound to another storage authority",
+                    )
+                })?;
         Ok(Self(inserted.then(|| session_id.0.to_string())))
     }
 
@@ -195,24 +223,26 @@ impl Drop for EmbeddedSessionRootGuard {
     }
 }
 
-/// Open the telemetry session context, then describe the session for storage.
-/// Both pipelines start here, so both appear in session metrics identically.
-fn begin_session(
-    session_id: &acp::SessionId,
-    cwd: &AbsPathBuf,
-    emit_telemetry: bool,
-) -> SessionInfo {
-    if emit_telemetry {
-        xai_grok_telemetry::session_ctx::log_session_event(
-            crate::agent::session_metrics::SessionStarted {
-                session_id: session_id.0.to_string(),
-            },
-        );
-    }
+fn session_info_for(session_id: &acp::SessionId, cwd: &AbsPathBuf) -> SessionInfo {
     SessionInfo {
         id: session_id.clone(),
         cwd: cwd.as_str().to_owned(),
     }
+}
+fn log_session_started(
+    session_id: &acp::SessionId,
+    kind: SessionStartKind,
+    setup_duration: std::time::Duration,
+    restored_from_disk: bool,
+) {
+    xai_grok_telemetry::session_ctx::log_session_event(
+        crate::agent::session_metrics::SessionStarted::new(
+            session_id.0.to_string(),
+            kind,
+            setup_duration,
+            restored_from_disk,
+        ),
+    );
 }
 impl MvpAgent {
     /// Read this client's capabilities, falling back to the agent's own state
@@ -294,6 +324,7 @@ impl MvpAgent {
         &self,
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
+        let session_started_at = std::time::Instant::now();
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         tracing::debug!(
             cwd = ?arguments.cwd,
@@ -326,6 +357,8 @@ impl MvpAgent {
             .as_ref()
             .and_then(|m| m.get("sessionId"))
             .and_then(|v| v.as_str());
+        let client_session_kind = parse_client_session_kind(arguments.meta.as_ref())?;
+        let is_headless = client_session_kind.as_deref() == Some("headless");
         let custom_model_id = arguments
             .meta
             .as_ref()
@@ -400,11 +433,9 @@ impl MvpAgent {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             });
-        let session_info = begin_session(&session_id, &cwd, !self.origin_embedded);
-        let mut embedded_root_guard = EmbeddedSessionRootGuard::register(
-            &session_id,
-            self.storage_root.as_deref(),
-        )?;
+        let session_info = session_info_for(&session_id, &cwd);
+        let mut embedded_root_guard =
+            EmbeddedSessionRootGuard::register(&session_id, self.storage_root.as_deref())?;
         let mut model_agent_type: Option<String> = None;
         let mut session_sampling_override: Option<SamplingConfig> = None;
         let mut disallowed_custom: Option<String> = None;
@@ -507,7 +538,10 @@ impl MvpAgent {
         });
         let effort_route = split_new_session_effort(
             resolved_custom_model,
-            parse_reasoning_effort_meta(arguments.meta.as_ref()),
+            resolve_new_session_effort_hint(
+                parse_reasoning_effort_meta(arguments.meta.as_ref()),
+                self.models_manager.current_reasoning_effort(),
+            ),
         );
         let spawn_effort = match effort_route {
             NewSessionEffort::Spawn(effort) => Some(effort),
@@ -542,11 +576,13 @@ impl MvpAgent {
                         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                     Some(
                         authority
-                        .create(crate::session::state_authority::SessionIdentity {
-                            identity: session_id.0.to_string(),
-                            generation,
-                        })
-                        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+                            .create(crate::session::state_authority::SessionIdentity {
+                                identity: session_id.0.to_string(),
+                                generation,
+                            })
+                            .map_err(|error| {
+                                acp::Error::internal_error().data(error.to_string())
+                            })?,
                     )
                 }
                 None => None,
@@ -565,6 +601,7 @@ impl MvpAgent {
                     session_summary_model: summary_model,
                     registry_title_sync,
                     search_index: self.search_index_cell(),
+                    session_kind: client_session_kind,
                 },
                 !self.origin_restricted(),
                 self.storage_root.clone(),
@@ -623,9 +660,13 @@ impl MvpAgent {
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd: None,
+                    is_headless,
                     is_chat_kind: false,
                 }
             };
+            let mut spawn_timer = crate::instrumentation_timer!("session.spawn");
+            spawn_timer.with_field("session_id", session_id.0.as_ref());
+            spawn_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionSpawn);
             self.spawn_and_register_session(init, spawn_opts).await
         };
         #[cfg(all(feature = "local-workspace", unix))]
@@ -647,8 +688,7 @@ impl MvpAgent {
         }
         let bridge_attach = BridgeAttach::NotAttached;
         let product_analytics = self.product_analytics_enabled();
-        if !self.origin_embedded
-            && (product_analytics || xai_grok_telemetry::external::is_active())
+        if !self.origin_embedded && (product_analytics || xai_grok_telemetry::external::is_active())
         {
             let sid = session_id.0.to_string();
             let ci = client_identifier.clone();
@@ -794,6 +834,12 @@ impl MvpAgent {
         #[cfg(all(feature = "local-workspace", unix))]
         local_ws_reap_guard.disarm();
         embedded_root_guard.disarm();
+        log_session_started(
+            &session_id,
+            SessionStartKind::New,
+            session_started_at.elapsed(),
+            false,
+        );
         Ok(acp::NewSessionResponse::new(session_id)
             .models(Some(models))
             .meta(meta.as_object().cloned()))
@@ -813,6 +859,7 @@ impl MvpAgent {
             return Err(acp::Error::internal_error()
                 .data("native session unload reconciliation is still pending"));
         }
+        let attach_started_at = std::time::Instant::now();
         let _load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
         self.sweep_dead_sessions();
@@ -872,11 +919,9 @@ impl MvpAgent {
                 });
             }
         }
-        let session_info = begin_session(&session_id, &cwd, !self.origin_embedded);
-        let mut embedded_root_guard = EmbeddedSessionRootGuard::register(
-            &session_id,
-            self.storage_root.as_deref(),
-        )?;
+        let session_info = session_info_for(&session_id, &cwd);
+        let mut embedded_root_guard =
+            EmbeddedSessionRootGuard::register(&session_id, self.storage_root.as_deref())?;
         if !self.origin_embedded {
             let current_session_dir = crate::session::persistence::session_dir(&session_info);
             tokio::task::spawn_blocking(move || {
@@ -926,10 +971,8 @@ impl MvpAgent {
             .as_ref()
             .map(|(model, _)| model.clone())
             .unwrap_or_else(|| self.models_manager.current_model_id());
-        let mut load_session_sampling = self.resolve_sampling_config_for_model(
-            &load_model_id,
-            origin_client.clone(),
-        );
+        let mut load_session_sampling =
+            self.resolve_sampling_config_for_model(&load_model_id, origin_client.clone());
         self.models_manager.apply_supported_effort(
             &mut load_session_sampling,
             initial_reasoning_effort,
@@ -938,8 +981,9 @@ impl MvpAgent {
         );
         let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
-        let mut persistence_timer = crate::instrumentation_timer!("session.load_light");
+        let mut persistence_timer = crate::instrumentation_timer!("session.load");
         persistence_timer.with_field("session_id", session_id.0.as_ref());
+        persistence_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionLoad);
         let backend = if self.build_registry_config().is_some() {
             Some(crate::remote::BackendClient::new().with_auth_manager(self.auth_manager.clone()))
         } else {
@@ -986,6 +1030,7 @@ impl MvpAgent {
                 session_summary_model: summary_model,
                 registry_title_sync,
                 search_index: self.search_index_cell(),
+                session_kind: None,
             },
             !self.origin_restricted(),
             self.storage_root.clone(),
@@ -995,7 +1040,7 @@ impl MvpAgent {
         .await
         .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
         drop(persistence_timer);
-        let crate::session::persistence::PersistedInfoLight {
+        let crate::session::persistence::PersistedInfo {
             summary,
             chat_history,
             plan_state: _,
@@ -1091,18 +1136,18 @@ impl MvpAgent {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| summary.prompt_display_cwd.clone());
-        if !self.is_resident(&session_id) {
+        let restored_from_disk = if !self.is_resident(&session_id) {
             tracing::info!(
                 session_id = %session_id.0,
                 "load_session: spawning new session actor (session not in memory)"
             );
-            let mut spawn_timer =
-                crate::instrumentation_timer!("session.spawn_and_register_session");
+            let mut spawn_timer = crate::instrumentation_timer!("session.spawn");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
             let session_model_id = embedded_route
                 .as_ref()
                 .map(|(model, _)| model.clone())
                 .unwrap_or_else(|| summary.current_model_id.clone());
+            spawn_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionSpawn);
             let persisted_agent_name: Option<String> = summary.agent_name.clone().or_else(|| {
                 self.resolve_model_id(&session_model_id)
                     .ok()
@@ -1138,11 +1183,13 @@ impl MvpAgent {
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd,
+                    is_headless: summary.is_headless(),
                     is_chat_kind: false,
                 },
             )
             .await?;
             drop(spawn_timer);
+            true
         } else {
             tracing::info!(
                 session_id = %session_id.0,
@@ -1169,7 +1216,8 @@ impl MvpAgent {
                         respond_to: tx,
                     });
             });
-        }
+            false
+        };
         {
             let init_meta = self
                 .initialize_request
@@ -1256,6 +1304,12 @@ impl MvpAgent {
             });
         }
         embedded_root_guard.disarm();
+        log_session_started(
+            &session_id,
+            op.start_kind(),
+            attach_started_at.elapsed(),
+            restored_from_disk,
+        );
         Ok(response)
     }
     /// Restore-code phase: check the persisted HEAD out into `cwd`, then
@@ -1479,7 +1533,7 @@ impl MvpAgent {
             crate::agent::subagent::reconcile_orphaned_subagents_with_backend(
                 unfinished_subagents,
                 &xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                    self.subagent_event_tx.clone(),
+                    self.subagent_event_tx.event_sender().0,
                 ),
                 &session_dir,
                 session_id.0.as_ref(),
@@ -1668,7 +1722,8 @@ impl MvpAgent {
                 .is_some_and(|current_root| current_root == std::path::Path::new(root))
             })
         {
-            let _timer = crate::instrumentation_timer!("session.git_divergence");
+            let mut git_scan_timer = crate::instrumentation_timer!("session.git_divergence");
+            git_scan_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionGitScan);
             let cwd_path = std::path::Path::new(cwd.as_str());
             let current_head =
                 xai_grok_workspace::session::git::git_cli(cwd_path, &["rev-parse", "HEAD"])
@@ -1783,4 +1838,62 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
     acp::LoadSessionRequest::new(session_id, cwd)
         .mcp_servers(mcp_servers)
         .meta(meta.unwrap_or_default())
+}
+#[cfg(test)]
+mod session_kind_claim_tests {
+    use super::parse_client_session_kind;
+    use agent_client_protocol as acp;
+    fn meta(kind: serde_json::Value) -> acp::Meta {
+        let mut m = acp::Meta::new();
+        m.insert("sessionKind".into(), kind);
+        m
+    }
+    #[test]
+    fn absent_or_untyped_kind_is_none() {
+        assert_eq!(parse_client_session_kind(None).unwrap(), None);
+        assert_eq!(
+            parse_client_session_kind(Some(&acp::Meta::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_client_session_kind(Some(&meta(serde_json::json!(7)))).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn headless_is_the_only_accepted_claim() {
+        assert_eq!(
+            parse_client_session_kind(Some(&meta(serde_json::json!("headless")))).unwrap(),
+            Some("headless".to_owned())
+        );
+        let mut snake = acp::Meta::new();
+        snake.insert("session_kind".into(), serde_json::json!("headless"));
+        assert_eq!(
+            parse_client_session_kind(Some(&snake)).unwrap(),
+            Some("headless".to_owned())
+        );
+    }
+    #[test]
+    fn reserved_subagent_claims_are_invalid_params() {
+        for kind in [
+            "subagent",
+            "subagent_fork",
+            "subagent_resume",
+            "subagent_future",
+        ] {
+            let error = parse_client_session_kind(Some(&meta(serde_json::json!(kind))))
+                .expect_err("reserved claims must be rejected");
+            assert_eq!(error.code, acp::ErrorCode::InvalidParams, "{kind}");
+        }
+    }
+    #[test]
+    fn unknown_non_reserved_claims_are_ignored() {
+        for kind in ["fork", "worktree", "future"] {
+            assert_eq!(
+                parse_client_session_kind(Some(&meta(serde_json::json!(kind)))).unwrap(),
+                None,
+                "{kind} must not be stamped"
+            );
+        }
+    }
 }

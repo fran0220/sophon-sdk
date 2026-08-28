@@ -106,9 +106,7 @@ impl MvpAgent {
                 .session_registry
                 .unloading_ticket(id)
                 .ok_or("session is not resident or awaiting unload reconciliation")?;
-            return self
-                .drain_unloading_session(id, ticket, deadline)
-                .await;
+            return self.drain_unloading_session(id, ticket, deadline).await;
         }
         let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
             return Err("session is not resident");
@@ -173,10 +171,7 @@ impl MvpAgent {
         }
         let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
             return if self
-                .drain_old_session_thread_within(
-                    id,
-                    stage_budget(deadline, DRAIN_OLD_THREAD_WAIT),
-                )
+                .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
                 .await
             {
                 CloseOutcome::NotResident
@@ -281,10 +276,10 @@ impl MvpAgent {
         }
         let subagents_drained =
             xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-            self.subagent_event_tx.clone(),
-        )
-        .teardown_session_and_drain(&id.0, stage_budget(deadline, DRAIN_SUBAGENTS_WAIT))
-        .await;
+                self.subagent_event_tx.event_sender().0,
+            )
+            .teardown_session_and_drain(&id.0, stage_budget(deadline, DRAIN_SUBAGENTS_WAIT))
+            .await;
         let actor_drained = self
             .drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
             .await;
@@ -371,6 +366,9 @@ impl MvpAgent {
                 respond_to: None,
             });
         self.take_session(id);
+        self.resident_roster_titles
+            .borrow_mut()
+            .remove(id.0.as_ref());
         self.session_registry.release(id);
         if let Some(ops) = self.workspace_ops.borrow().as_ref() {
             ops.end_local_session(id.0.as_ref());
@@ -484,6 +482,9 @@ impl MvpAgent {
         &self,
         id: &acp::SessionId,
     ) -> Option<crate::agent::roster::RosterEntry> {
+        if self.session_registry.is_headless(id) {
+            return None;
+        }
         let session_id = id.0.to_string();
         let (cwd, is_worktree, model_id, reasoning_effort, yolo) = {
             let h = self.resident_handle(id)?;
@@ -645,7 +646,7 @@ impl MvpAgent {
     pub(crate) async fn registry_snapshot(&self) -> RegistrySnapshot {
         let subagents =
             xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
-                self.subagent_event_tx.clone(),
+                self.subagent_event_tx.event_sender().0,
             )
             .registry_counts()
             .await;

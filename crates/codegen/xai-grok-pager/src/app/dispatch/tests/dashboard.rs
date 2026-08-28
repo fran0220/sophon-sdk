@@ -885,6 +885,36 @@ fn dashboard_confirm_worktree_applies_pending_model_and_plan() {
     );
     assert_eq!(agent.plan_mode_pending, Some(true));
 }
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_confirm_worktree_carries_auto_permission_override() {
+    use crate::app::actions::PermissionModeKind;
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    app.cwd_has_git_ancestor = true;
+    if let Some(dashboard) = app.dashboard.as_mut() {
+        dashboard.pending_mode = DashboardDispatchMode::Auto;
+        dashboard.dispatch.set_text("do the thing");
+        dashboard.pending_worktree_prompt = Some(dashboard.dispatch.stash());
+        dashboard.pending_worktree_attach = true;
+    }
+    let effects = dispatch_dashboard_confirm_worktree(&mut app, Some("auto-wt".into()));
+    let agent_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::CreateWorktreeSession {
+                agent_id,
+                permission_mode_override: Some(PermissionModeKind::Auto),
+                ..
+            } => Some(*agent_id),
+            _ => None,
+        })
+        .expect("Auto must ride on the worktree create effect");
+    assert!(app.agents[&agent_id].session.is_auto());
+    assert_eq!(app.current_ui.permission_mode.as_deref(), Some("auto"));
+    assert!(!app.default_yolo);
+}
 /// Images pasted into the dispatch input survive a worktree dispatch:
 /// stashed when the dialog opens, replayed onto the worktree agent's queued
 /// prompt on confirm. Regression — the worktree branch dropped them while
@@ -1229,6 +1259,17 @@ fn apply_pending_dispatch_config_always_approve_blocked_by_policy_pin() {
     );
     apply_pending_dispatch_config(agent, None, DashboardDispatchMode::AlwaysApprove, None);
     assert!(agent.session.is_yolo());
+    assert!(!agent.session.is_auto());
+}
+#[test]
+fn apply_pending_dispatch_config_auto_sets_classifier_mode() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    agent.session.yolo_mode = true;
+    apply_pending_dispatch_config(agent, None, DashboardDispatchMode::Auto, None);
+    assert!(agent.session.is_auto());
+    assert!(!agent.session.is_yolo());
 }
 /// Dashboard per-agent toggle under the pin: refused, warning lands on
 /// the dashboard's OWN error slot (the user is looking at the
@@ -1452,6 +1493,288 @@ fn dashboard_open_without_leader_fetches_local_sessions() {
             .any(|e| matches!(e, Effect::FetchDashboardSessions)),
         "non-leader dashboard open must fetch the local idle-session list",
     );
+}
+#[test]
+fn workspace_dashboard_open_loads_one_snapshot_and_skips_rosters() {
+    let mut app = test_app_with_agent();
+    app.workspace_dashboard_enabled = true;
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let effects = dispatch_open_dashboard(&mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoadWorkspaceSnapshot { .. }]
+    ));
+    assert!(app.workspace_store_loading);
+    assert!(app.dashboard_sessions_loading);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::FetchRoster | Effect::FetchDashboardSessions))
+    );
+    let _ = dispatch_exit_dashboard(&mut app);
+    let effects = dispatch_open_dashboard(&mut app);
+    assert!(
+        effects.is_empty(),
+        "an in-flight workspace read must suppress duplicate opens"
+    );
+}
+#[test]
+fn workspace_snapshot_load_requests_live_adoption() {
+    let temp = tempfile::tempdir().unwrap();
+    let store =
+        xai_grok_dashboard_store::WorkspaceStore::open(&temp.path().join("workspace.db")).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let mut app = test_app_with_agent();
+    app.workspace_dashboard_enabled = true;
+    app.workspace_store_loading = true;
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::WorkspaceSnapshotLoaded { store, snapshot }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert!(app.workspace_store.is_some());
+    assert!(app.workspace_snapshot.is_some());
+    assert!(app.workspace_sync_requested);
+}
+#[test]
+fn workspace_dashboard_reopens_store_when_only_stale_snapshot_remains() {
+    let mut app = test_app_with_agent();
+    app.workspace_dashboard_enabled = true;
+    app.workspace_snapshot = Some(xai_grok_dashboard_store::WorkspaceSnapshot {
+        grouping: xai_grok_dashboard_store::Grouping::State,
+        members: vec![],
+        data_version: 1,
+    });
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let effects = dispatch_open_dashboard(&mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoadWorkspaceSnapshot { .. }]
+    ));
+    assert!(app.workspace_store_loading);
+}
+#[test]
+fn workspace_session_created_becomes_an_upsert_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let store =
+        xai_grok_dashboard_store::WorkspaceStore::open(&temp.path().join("workspace.db")).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let mut app = test_app_with_agent();
+    app.workspace_dashboard_enabled = true;
+    app.workspace_store = Some(store);
+    app.workspace_snapshot = Some(snapshot);
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id = None;
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionCreated {
+            agent_id: AgentId(0),
+            session_id: acp::SessionId::new("created"),
+            models: None,
+            scheduler_background_loops: None,
+        }),
+        &mut app,
+    );
+    let effects = crate::app::workspace_sync::drain(&mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::UpsertWorkspaceMembers { members, .. }]
+            if members.len() == 1 && members[0].key.session_id.as_ref() == "created"
+    ));
+}
+#[test]
+fn workspace_busy_write_retries_only_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let store =
+        xai_grok_dashboard_store::WorkspaceStore::open(&temp.path().join("workspace.db")).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let mut app = test_app();
+    app.workspace_dashboard_enabled = true;
+    app.workspace_snapshot = Some(snapshot.clone());
+    app.workspace_write_in_flight = true;
+    let attempted = xai_grok_dashboard_store::NewMember {
+        key: xai_grok_dashboard_store::MemberKey {
+            session_id: xai_grok_dashboard_store::SessionId::new("saved").unwrap(),
+            kind: xai_grok_dashboard_store::MemberKind::Build,
+        },
+        origin: xai_grok_dashboard_store::MemberOrigin::Local,
+        metadata: xai_grok_dashboard_store::MemberMetadata {
+            cwd: Some("/tmp".into()),
+            title: None,
+            model: None,
+            last_turn_summary: None,
+            is_worktree: false,
+            last_change_unix_ms: 1,
+        },
+    };
+    let mut permanent = attempted.clone();
+    permanent.key.session_id = xai_grok_dashboard_store::SessionId::new("permanent").unwrap();
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::WorkspaceMembersUpserted {
+            store,
+            snapshot: Ok(snapshot.clone()),
+            failures: vec![
+                WorkspaceMemberUpsertFailure {
+                    session_id: "saved".into(),
+                    error: "busy".into(),
+                    retryable: true,
+                },
+                WorkspaceMemberUpsertFailure {
+                    session_id: "permanent".into(),
+                    error: "all pinned".into(),
+                    retryable: false,
+                },
+            ],
+            attempted: vec![attempted.clone(), permanent.clone()],
+        }),
+        &mut app,
+    );
+    assert!(app.workspace_sync_requested);
+    assert_eq!(
+        app.workspace_retry_metadata.get(&attempted.key.session_id),
+        Some(&attempted.metadata)
+    );
+    assert!(
+        !app.workspace_retry_metadata
+            .contains_key(&permanent.key.session_id)
+    );
+    assert_eq!(
+        app.workspace_failed_metadata.get(&permanent.key.session_id),
+        Some(&permanent.metadata)
+    );
+    app.workspace_sync_requested = false;
+    app.workspace_write_in_flight = true;
+    let store = app.workspace_store.take().unwrap();
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::WorkspaceMembersUpserted {
+            store,
+            snapshot: Ok(snapshot),
+            failures: vec![WorkspaceMemberUpsertFailure {
+                session_id: "saved".into(),
+                error: "busy again".into(),
+                retryable: true,
+            }],
+            attempted: vec![attempted.clone()],
+        }),
+        &mut app,
+    );
+    assert!(!app.workspace_sync_requested);
+    assert!(
+        !app.workspace_retry_metadata
+            .contains_key(&attempted.key.session_id)
+    );
+    assert_eq!(
+        app.workspace_failed_metadata.get(&attempted.key.session_id),
+        Some(&attempted.metadata)
+    );
+    app.workspace_sync_requested = false;
+    app.workspace_write_in_flight = true;
+    let store = app.workspace_store.take().unwrap();
+    let mut changed = attempted;
+    changed.metadata.title = Some("changed".into());
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::WorkspaceMembersUpserted {
+            store,
+            snapshot: Ok(xai_grok_dashboard_store::WorkspaceSnapshot {
+                grouping: xai_grok_dashboard_store::Grouping::State,
+                members: vec![],
+                data_version: 1,
+            }),
+            failures: vec![WorkspaceMemberUpsertFailure {
+                session_id: "saved".into(),
+                error: "busy changed".into(),
+                retryable: true,
+            }],
+            attempted: vec![changed.clone()],
+        }),
+        &mut app,
+    );
+    assert!(app.workspace_sync_requested);
+    assert_eq!(
+        app.workspace_retry_metadata.get(&changed.key.session_id),
+        Some(&changed.metadata)
+    );
+}
+#[test]
+fn workspace_snapshot_failure_reopens_without_suppressing_attempted_member() {
+    let temp = tempfile::tempdir().unwrap();
+    let store =
+        xai_grok_dashboard_store::WorkspaceStore::open(&temp.path().join("workspace.db")).unwrap();
+    let mut app = test_app();
+    app.workspace_dashboard_enabled = true;
+    app.workspace_snapshot = Some(store.snapshot().unwrap());
+    app.workspace_write_in_flight = true;
+    let attempted = xai_grok_dashboard_store::NewMember {
+        key: xai_grok_dashboard_store::MemberKey {
+            session_id: xai_grok_dashboard_store::SessionId::new("saved").unwrap(),
+            kind: xai_grok_dashboard_store::MemberKind::Build,
+        },
+        origin: xai_grok_dashboard_store::MemberOrigin::Local,
+        metadata: xai_grok_dashboard_store::MemberMetadata {
+            cwd: Some("/tmp".into()),
+            title: None,
+            model: None,
+            last_turn_summary: None,
+            is_worktree: false,
+            last_change_unix_ms: 1,
+        },
+    };
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::WorkspaceMembersUpserted {
+            store,
+            snapshot: Err("snapshot failed".into()),
+            failures: vec![],
+            attempted: vec![attempted.clone()],
+        }),
+        &mut app,
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoadWorkspaceSnapshot { .. }]
+    ));
+    assert!(app.workspace_store.is_none());
+    assert!(app.workspace_store_loading);
+    assert!(
+        !app.workspace_failed_metadata
+            .contains_key(&attempted.key.session_id)
+    );
+}
+#[test]
+fn workspace_row_never_arms_permanent_delete() {
+    let mut app = test_app_with_agent();
+    ensure_dashboard_state(&mut app);
+    app.dashboard.as_mut().unwrap().selected =
+        Some(crate::views::dashboard::DashboardRowId::Workspace {
+            session_id: "saved".to_owned(),
+        });
+    assert!(dispatch_dashboard_stop(&mut app).is_empty());
+    assert!(app.dashboard.as_ref().unwrap().delete_confirm.is_none());
+}
+#[test]
+fn workspace_overlay_cycle_omits_unadopted_live_agents() {
+    let mut app = test_app_with_agent();
+    mark_agent_nonempty(&mut app, AgentId(0));
+    let second = insert_second_agent(&mut app);
+    mark_agent_nonempty(&mut app, second);
+    app.workspace_dashboard_enabled = true;
+    app.workspace_snapshot = Some(xai_grok_dashboard_store::WorkspaceSnapshot {
+        grouping: xai_grok_dashboard_store::Grouping::State,
+        members: vec![xai_grok_dashboard_store::Member {
+            session_id: xai_grok_dashboard_store::SessionId::new("test-session").unwrap(),
+            kind: xai_grok_dashboard_store::MemberKind::Build,
+            origin: xai_grok_dashboard_store::MemberOrigin::Local,
+            cwd: Some("/tmp".to_owned()),
+            title: Some("Saved".to_owned()),
+            model: None,
+            last_turn_summary: None,
+            is_worktree: false,
+            last_change_unix_ms: 1,
+            pin_rank: None,
+            order_rank: None,
+        }],
+        data_version: 1,
+    });
+    app.active_view = ActiveView::Agent(AgentId(0));
+    assert!(dispatch_dashboard_overlay_cycle(&mut app, 1).is_empty());
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
 }
 /// In leader mode the live FleetView roster is the source, so opening must
 /// fetch that roster immediately (not wait for the poll tick) and must NOT
@@ -1892,8 +2215,8 @@ fn dashboard_slash_session_modals_toast_instead_of_noop() {
         }
     }
 }
-/// Shift+Tab (`DashboardCycleMode`) rotates Normal → Plan →
-/// Always-Approve → Normal.
+/// Shift+Tab (`DashboardCycleMode`) rotates Normal → Plan → Auto →
+/// Always-Approve → Normal when Auto is enabled.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_cycle_mode_rotates_through_modes() {
@@ -1912,6 +2235,11 @@ fn dashboard_cycle_mode_rotates_through_modes() {
     let _ = dispatch(Action::DashboardCycleMode, &mut app);
     assert_eq!(
         app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Auto
+    );
+    let _ = dispatch(Action::DashboardCycleMode, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
         DashboardDispatchMode::AlwaysApprove
     );
     let _ = dispatch(Action::DashboardCycleMode, &mut app);
@@ -1920,8 +2248,31 @@ fn dashboard_cycle_mode_rotates_through_modes() {
         DashboardDispatchMode::Normal
     );
 }
-/// Under the managed-policy pin the staged-mode cycle skips
-/// Always-Approve (Normal → Plan → Normal) and explains why.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_cycle_mode_skips_auto_when_gated_off() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    app.auto_mode_gate = false;
+    open_dashboard(&mut app);
+    let _ = dispatch(Action::DashboardCycleMode, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Plan
+    );
+    let _ = dispatch(Action::DashboardCycleMode, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::AlwaysApprove
+    );
+    let _ = dispatch(Action::DashboardCycleMode, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Normal
+    );
+}
+/// Under the managed-policy pin the staged-mode cycle still visits Auto,
+/// then skips Always-Approve and explains why.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_cycle_mode_skips_always_approve_under_policy_pin() {
@@ -1933,6 +2284,11 @@ fn dashboard_cycle_mode_skips_always_approve_under_policy_pin() {
     assert_eq!(
         app.dashboard.as_ref().unwrap().pending_mode,
         DashboardDispatchMode::Plan
+    );
+    let _ = dispatch(Action::DashboardCycleMode, &mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Auto
     );
     let _ = dispatch(Action::DashboardCycleMode, &mut app);
     let d = app.dashboard.as_ref().unwrap();
@@ -1948,7 +2304,7 @@ fn dashboard_cycle_mode_skips_always_approve_under_policy_pin() {
 }
 /// Opening the dashboard re-seeds BOTH staged dispatch fields: a model
 /// staged in a previous session is cleared and the mode is reset from
-/// `app.default_yolo`, so a fresh open never inherits stale staging.
+/// the app-wide permission mode, so a fresh open never inherits stale staging.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_open_reseeds_pending_model_and_mode() {
@@ -1974,7 +2330,27 @@ fn dashboard_open_reseeds_pending_model_and_mode() {
     assert_eq!(
         d.pending_mode,
         DashboardDispatchMode::Normal,
-        "re-open must reset the mode from default_yolo (off → Normal)",
+        "re-open must reset the mode from the app-wide permission mode",
+    );
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_open_seeds_auto_from_app_permission_mode() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    app.current_ui.permission_mode = Some("auto".into());
+    open_dashboard(&mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Auto
+    );
+    app.active_view = ActiveView::Welcome;
+    app.auto_mode_gate = false;
+    open_dashboard(&mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Normal,
+        "a gated-off Auto default must seed Normal"
     );
 }
 /// Peek status follows the LIVE turn activity while running: a turn that's
@@ -2064,11 +2440,93 @@ fn dashboard_dispatch_always_approve_sets_yolo() {
     if let Some(d) = app.dashboard.as_mut() {
         d.pending_mode = DashboardDispatchMode::AlwaysApprove;
     }
-    let _ = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
+    let effects = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
     let new_id = *app.agents.keys().next().unwrap();
     assert!(
         app.agents[&new_id].session.is_yolo(),
         "Always-Approve must spawn the agent in auto-approve"
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            permission_mode_override: Some(crate::app::actions::PermissionModeKind::AlwaysApprove),
+            ..
+        }
+    )));
+    assert!(!app.default_yolo, "per-spawn mode must not change globals");
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_dispatch_auto_sets_classifier_without_changing_globals() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    app.current_ui.permission_mode = Some("ask".into());
+    open_dashboard(&mut app);
+    app.dashboard.as_mut().unwrap().pending_mode = DashboardDispatchMode::Auto;
+    let effects = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
+    let new_id = *app.agents.keys().next().unwrap();
+    assert!(app.agents[&new_id].session.is_auto());
+    assert!(!app.agents[&new_id].session.is_yolo());
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            permission_mode_override: Some(crate::app::actions::PermissionModeKind::Auto),
+            ..
+        }
+    )));
+    assert_eq!(app.current_ui.permission_mode.as_deref(), Some("ask"));
+    assert!(!app.default_yolo);
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_dispatch_auto_attach_syncs_mirror_and_new_inherits_auto() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    app.current_ui.permission_mode = Some("ask".into());
+    open_dashboard(&mut app);
+    app.dashboard.as_mut().unwrap().pending_mode = DashboardDispatchMode::Auto;
+    let _ = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), true);
+    assert_eq!(app.current_ui.permission_mode.as_deref(), Some("auto"));
+    let _ = dispatch_new_session_inner(&mut app, None);
+    assert!(
+        app.agents[&AgentId(1)].session.is_auto(),
+        "/new must inherit the active attached agent's Auto mirror"
+    );
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_dispatch_stale_auto_degrades_when_gate_is_off() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    app.dashboard.as_mut().unwrap().pending_mode = DashboardDispatchMode::Auto;
+    app.auto_mode_gate = false;
+    let effects = dispatch_dashboard_dispatch(&mut app, "do the thing".into(), false);
+    let new_id = *app.agents.keys().next().unwrap();
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Normal
+    );
+    assert!(!app.agents[&new_id].session.is_auto());
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            permission_mode_override: Some(crate::app::actions::PermissionModeKind::Ask),
+            ..
+        }
+    )));
+}
+#[test]
+fn auto_gate_kill_switch_clears_staged_dashboard_auto() {
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    app.dashboard.as_mut().unwrap().pending_mode = DashboardDispatchMode::Auto;
+    app.auto_mode_gate = false;
+    downgrade_displayed_auto_if_gated(&mut app);
+    assert_eq!(
+        app.dashboard.as_ref().unwrap().pending_mode,
+        DashboardDispatchMode::Normal
     );
 }
 /// Always-Approve staged but pinned off: plain-Send (stays on the
@@ -2212,6 +2670,26 @@ fn dashboard_new_agent_button_applies_pending_model_and_plan() {
         Some(xai_grok_tools::types::SessionMode::Plan),
     );
     assert_eq!(agent.plan_mode_pending, Some(true));
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_new_agent_button_carries_auto_permission_override() {
+    use crate::app::actions::PermissionModeKind;
+    use crate::views::dashboard::DashboardDispatchMode;
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    app.dashboard.as_mut().unwrap().pending_mode = DashboardDispatchMode::Auto;
+    let effects = dispatch(Action::DashboardCreateNewAgentWithDetail, &mut app);
+    let new_id = *app.agents.keys().next().unwrap();
+    assert!(app.agents[&new_id].session.is_auto());
+    assert_eq!(app.current_ui.permission_mode.as_deref(), Some("auto"));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateSession {
+            permission_mode_override: Some(PermissionModeKind::Auto),
+            ..
+        }
+    )));
 }
 /// The deferred plan `SessionMode` is emitted (and cleared) once the
 /// session exists, mirroring the deferred model switch.
@@ -2701,7 +3179,7 @@ fn dashboard_attach_subagent_lazily_replays_deferred_transcript() {
             .subagent_sessions
             .get(&child_sid)
             .is_some_and(|i| !i.transcript.needs_replay()),
-        "dashboard attach must settle the child transcript state"
+        "dashboard attach must record the child transcript state"
     );
     crate::app::subagent::set_replay_grok_home_for_tests(None);
 }
@@ -4026,6 +4504,8 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         None,
         &[],
         false,
+        None,
+        false,
         Some(HeaderUpgradeCta {
             label: "Upgrade Account",
             pinned: true,
@@ -4075,6 +4555,8 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         None,
         &[],
         false,
+        None,
+        false,
         Some(HeaderUpgradeCta {
             label: "Upgrade Account",
             pinned: true,
@@ -4102,6 +4584,8 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         &registry,
         None,
         &[],
+        false,
+        None,
         false,
         Some(HeaderUpgradeCta {
             label: "Upgrade Account",
@@ -4137,6 +4621,8 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         &registry,
         None,
         &[],
+        false,
+        None,
         false,
         None,
     );
@@ -4175,6 +4661,21 @@ fn dashboard_begin_rename_on_subagent_row_sets_error_toast() {
         d.selected = Some(crate::views::dashboard::DashboardRowId::Subagent {
             parent: AgentId(0),
             child_session_id: "child".into(),
+        });
+    }
+    dispatch_dashboard_begin_rename(&mut app);
+    let d = app.dashboard.as_ref().unwrap();
+    assert!(d.rename.is_none());
+    assert!(d.error_toast.is_some());
+}
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_begin_rename_on_workspace_row_refuses() {
+    let mut app = test_app_with_agent();
+    open_dashboard(&mut app);
+    if let Some(d) = app.dashboard.as_mut() {
+        d.selected = Some(crate::views::dashboard::DashboardRowId::Workspace {
+            session_id: "saved".into(),
         });
     }
     dispatch_dashboard_begin_rename(&mut app);
@@ -5838,6 +6339,8 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         &[],
         false,
         None,
+        false,
+        None,
     );
     assert!(
         app.dashboard.as_ref().unwrap().peek.is_some(),
@@ -5853,6 +6356,8 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         &reg,
         None,
         &[],
+        false,
+        None,
         false,
         None,
     );
@@ -5889,6 +6394,8 @@ fn dashboard_peek_box_grows_for_multiline_reply() {
                 &reg,
                 None,
                 &[],
+                false,
+                None,
                 false,
                 None,
             );

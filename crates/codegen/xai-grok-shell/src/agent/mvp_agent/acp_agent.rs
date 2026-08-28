@@ -3,6 +3,9 @@
 //! [`acp::Agent`] trait implementation for [`MvpAgent`].
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+use xai_grok_telemetry::instrument_task;
+use xai_grok_telemetry::region;
+use xai_grok_telemetry::region::Parent;
 use crate::auth::SilentRefresh;
 use crate::upload::trace::PromptMetadataParams;
 use crate::leader::protocol::InternalMethod;
@@ -133,13 +136,9 @@ impl acp::Agent for MvpAgent {
             tracing::info!("Client identifier set to: {}", id);
         }
         if client_type == ClientType::Generic {
-            match client_identifier.as_deref() {
-                Some("grok-web") => client_type = ClientType::GrokWeb,
-                Some("nebula") => client_type = ClientType::Nebula,
-                Some("grok-code-extension") => client_type = ClientType::Extension,
-                Some("grok-desktop") => client_type = ClientType::Desktop,
-                _ => {}
-            }
+            client_type = ClientType::from_client_identifier(
+                client_identifier.as_deref(),
+            );
         }
         *self.client_type.borrow_mut() = client_type;
         tracing::info!("Client type set to: {:?}", client_type);
@@ -527,6 +526,7 @@ impl acp::Agent for MvpAgent {
                     // away-recap poll and the manual `/recap` on this so a
                     // disabled feature produces zero `x.ai/recap` traffic.
                     "sessionRecap": self.cfg.borrow().is_session_recap_enabled(),
+                    "feedbackTraceOffer": self.feedback_trace_offer(),
                     "voiceMode": self.cfg.borrow().is_voice_mode_enabled(),
                 })
                         .as_object()
@@ -980,6 +980,7 @@ impl acp::Agent for MvpAgent {
                 &serde_json::Value::Object(meta.clone()),
             );
         }
+        let preamble_span = region!("prompt.preamble", Parent::Inherit);
         tracing::debug!(
             target: "sampling_log",
             session_id = %arguments.session_id.0,
@@ -1328,6 +1329,7 @@ impl acp::Agent for MvpAgent {
                 admission: None,
                 tool_overrides_update,
                 respond_to: tx,
+                prompt_admitted: None,
                 persist_ack: None,
                 parsed_prompt_tx,
             })
@@ -1340,15 +1342,21 @@ impl acp::Agent for MvpAgent {
             &arguments.session_id,
             crate::agent::roster::RosterActivity::Working,
         );
+        preamble_span.close();
+        let await_turn_span = region!("prompt.await_turn", Parent::Inherit);
         let stop_result = rx
             .await
             .map_err(|_| {
                 acp::Error::internal_error().data("session failed to respond")
             })?;
+        await_turn_span.close();
+        let finalize_span = region!("prompt.finalize", Parent::Inherit);
+        let turn_usage_span = region!("finalize.turn_usage", Parent::Explicit(finalize_span.span()));
         let last_turn_usage_for_meta = handle
             .chat_state_handle
             .get_last_turn_usage()
             .await;
+        turn_usage_span.close();
         let applied_tool_overrides = stop_result
             .as_ref()
             .ok()
@@ -1372,6 +1380,7 @@ impl acp::Agent for MvpAgent {
                                 prompt_usage: None,
                                 cancellation_category: None,
                                 loop_health_limit: None,
+                                cancellation_context: None,
                                 cancel_trigger: None,
                                 structured_output: None,
                                 tool_overrides: applied_tool_overrides.clone(),
@@ -1395,6 +1404,10 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .ok()
             .and_then(|ok| ok.completion_kind.cancellation_category_meta());
+        let cancellation_context: Option<serde_json::Value> = stop_result
+            .as_ref()
+            .ok()
+            .and_then(|ok| ok.completion_kind.cancellation_context_meta());
         {
             let mapped = stop_result
                 .as_ref()
@@ -1422,6 +1435,9 @@ impl acp::Agent for MvpAgent {
             }
             if let Some(ref c) = cancellation_category {
                 payload["cancellationCategory"] = serde_json::json!(c);
+            }
+            if let Some(ref ctx) = cancellation_context {
+                payload["cancellationContext"] = ctx.clone();
             }
             let params = serde_json::value::to_raw_value(&payload)
                 .expect("prompt_complete params serialization");
@@ -1571,7 +1587,12 @@ impl acp::Agent for MvpAgent {
                     } else {
                         let snapshot_clone = turn_snapshot.clone();
                         let resolved_model = resolved_model.clone();
-                        tokio::spawn(async move {
+                        tokio::spawn(
+                            instrument_task!(
+                            debug,
+                            "turn_end.snapshot_upload",
+                            Parent::Root,
+                            async move {
                             let completed = matches!(stop_reason, acp::StopReason::EndTurn);
                             let start_for_upload = snapshot_clone
                                 .as_ref()
@@ -1592,16 +1613,16 @@ impl acp::Agent for MvpAgent {
                                 error: None,
                                 finished_at: chrono::Utc::now().to_rfc3339(),
                                 signals: snapshot_clone.as_ref().map(|s| s.current.clone()),
-                                turn_delta: snapshot_clone
-                                    .as_ref()
-                                    .map(|s| s.delta.clone()),
+                                turn_delta: snapshot_clone.as_ref().map(|s| s.delta.clone()),
                                 start_prompt_mode: start_for_upload,
                                 end_prompt_mode: end_for_upload,
                                 resolved_model,
                                 subagents_spawned: subagent_refs.clone(),
                             };
                             upload_turn_result(&ctx, &result, UploadWait::Confirm).await;
-                        });
+                        }
+                        ),
+                        );
                     }
                 }
                 if let Some(ctx) = trace_context {
@@ -1648,7 +1669,12 @@ impl acp::Agent for MvpAgent {
                                     })
                         };
                         let sid = arguments.session_id.to_string();
-                        tokio::spawn(async move {
+                        tokio::spawn(
+                            instrument_task!(
+                        debug,
+                        "turn_end.git_metadata",
+                        Parent::Root,
+                        async move {
                             let git_out = |args: &[&str]| -> Option<String> {
                                 xai_tty_utils::git_command()
                                     .current_dir(&cwd_str)
@@ -1656,17 +1682,11 @@ impl acp::Agent for MvpAgent {
                                     .output()
                                     .ok()
                                     .filter(|o| o.status.success())
-                                    .map(|o| {
-                                        String::from_utf8_lossy(&o.stdout).trim().to_string()
-                                    })
+                                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .filter(|s| !s.is_empty())
                             };
-                            let repo_remote_url = git_out(
-                                &["remote", "get-url", "origin"],
-                            );
-                            let repo_branch = git_out(
-                                &["rev-parse", "--abbrev-ref", "HEAD"],
-                            );
+                            let repo_remote_url = git_out(&["remote", "get-url", "origin"]);
+                            let repo_branch = git_out(&["rev-parse", "--abbrev-ref", "HEAD"]);
                             let repo_head_at_start = git_out(&["rev-parse", "HEAD"]);
                             let reg_req = crate::agent::session_registry_client::RegisterRequest {
                                 session_id: sid.clone(),
@@ -1679,7 +1699,6 @@ impl acp::Agent for MvpAgent {
                                 hostname: Some(hostname),
                                 device_id,
                                 parent_session_id: None,
-                                session_kind: None,
                                 subagent_type: None,
                                 subagent_persona: None,
                                 subagent_role: None,
@@ -1692,54 +1711,55 @@ impl acp::Agent for MvpAgent {
                                     "session registry register failed (non-fatal)"
                                 );
                             }
+                            // Read the generated title from disk (may already
+                            // be available if the LLM call completed during the
+                            // turn) and bundle it with the first-prompt update.
                             let info = crate::session::info::Info {
                                 id: agent_client_protocol::SessionId::new(
                                     reg_req.session_id.clone(),
                                 ),
                                 cwd: reg_req.cwd.clone(),
                             };
-                            let summary_path = crate::session::persistence::session_dir(
-                                    &info,
-                                )
+                            let summary_path = crate::session::persistence::session_dir(&info)
                                 .join("summary.json");
                             let summary = if suppress {
                                 None
                             } else {
                                 std::fs::read(&summary_path)
+                                    .ok()
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<crate::session::persistence::Summary>(
+                                            &bytes,
+                                        )
                                         .ok()
-                                        .and_then(|bytes| {
-                                            serde_json::from_slice::<
-                                                crate::session::persistence::Summary,
-                                            >(&bytes)
-                                                .ok()
-                                        })
-                                        .map(|s| s.session_summary)
-                                        .filter(|s| !s.is_empty())
+                                    })
+                                    .map(|s| s.session_summary)
+                                    .filter(|s| !s.is_empty())
                             };
                             if first_prompt.is_some() || summary.is_some() {
-                                let upd_req = crate::agent::session_registry_client::UpdateRequest {
-                                    summary,
-                                    first_prompt,
-                                    last_turn_number: None,
-                                    repo_head_at_end: None,
-                                    restorable_turn_number: None,
-                                };
+                                let upd_req =
+                                    crate::agent::session_registry_client::UpdateRequest {
+                                        summary,
+                                        first_prompt,
+                                        last_turn_number: None,
+                                        repo_head_at_end: None,
+                                        restorable_turn_number: None,
+                                    };
                                 tracing::debug!(
                                     session_id = %reg_req.session_id,
                                     has_summary = upd_req.summary.is_some(),
                                     "session registry post-register update"
                                 );
-                                if let Err(e) = client
-                                    .update(&reg_req.session_id, &upd_req)
-                                    .await
-                                {
+                                if let Err(e) = client.update(&reg_req.session_id, &upd_req).await {
                                     tracing::warn!(
                                         error = %e,
                                         "session registry first-prompt update failed (non-fatal)"
                                     );
                                 }
                             }
-                        });
+                        }
+                    ),
+                        );
                     }
                     let registry_turn = i32::try_from(turn_number).unwrap_or(i32::MAX);
                     let cwd_for_git = handle.info.cwd.clone();
@@ -1867,8 +1887,10 @@ impl acp::Agent for MvpAgent {
                             }
                         }
                     } else {
-                        spawn_upload_task(
+                        spawn_linked_upload_task(
                             "after_uploads",
+                            &prompt_id,
+                            &arguments.session_id.0,
                             async move {
                                 match complete_prompt_trace(
                                         ctx,
@@ -1919,6 +1941,7 @@ impl acp::Agent for MvpAgent {
                                     cancellation_category,
                                     loop_health_limit: completion_kind
                                         .loop_health_limit_reason(),
+                                    cancellation_context,
                                     cancel_trigger,
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,
@@ -2016,8 +2039,10 @@ impl acp::Agent for MvpAgent {
                             .await;
                     } else {
                         let resolved_model = resolved_model.clone();
-                        spawn_upload_task(
+                        spawn_linked_upload_task(
                             "error_turn_result",
+                            &prompt_id,
+                            &arguments.session_id.0,
                             async move {
                                 let result = TurnResultMetadata {
                                     schema_version: GCS_SCHEMA_VERSION,
@@ -2290,9 +2315,8 @@ impl acp::Agent for MvpAgent {
                 )
             }
             "x.ai/interject" => crate::extensions::interject::handle(self, &args).await,
-            "x.ai/feedback" | "x.ai/feedback/dismiss" | "x.ai/btw" => {
-                crate::extensions::feedback::handle(self, &args).await
-            }
+            "x.ai/feedback" | "x.ai/feedback/dismiss" | "x.ai/feedback/upload-trace"
+            | "x.ai/btw" => crate::extensions::feedback::handle(self, &args).await,
             "x.ai/recap" => crate::extensions::recap::handle(self, &args).await,
             "x.ai/cloud/terminate" => {
                 crate::extensions::auth_gate::require_xai_auth(

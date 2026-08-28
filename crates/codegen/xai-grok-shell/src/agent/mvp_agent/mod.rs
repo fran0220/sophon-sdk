@@ -92,7 +92,8 @@ use crate::upload::trace::{
     upload_turn_result, upload_unified_log,
 };
 use crate::upload::turn::{
-    PromptTraceContext, UploadWait, complete_prompt_trace, spawn_upload_task,
+    PromptTraceContext, UploadWait, complete_prompt_trace, spawn_linked_upload_task,
+    spawn_upload_task,
 };
 use crate::upload::turn::{
     apply_yolo_mode_to_matching_sessions, lookup_session_model,
@@ -273,6 +274,8 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
+    /// Persisted visibility of this Build session for roster snapshots/deltas.
+    pub is_headless: bool,
     /// Sticky chat product kind for ACU / product skills sourcing.
     pub is_chat_kind: bool,
 }
@@ -449,6 +452,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
+        is_headless: false,
         is_chat_kind: true,
     }
 }
@@ -519,6 +523,10 @@ pub(crate) struct PromptResponseMeta {
     /// the user cancelled it or because the task completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
+    /// Structured detail of an early end (hook name, reason, trigger) —
+    /// `cancellation_context_meta`. `None` unless the cancel carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_context: Option<serde_json::Value>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
     /// `"esc"`); surfaced as `cancelTrigger`. `None` for non-cancel completions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -546,6 +554,7 @@ pub(crate) struct PromptResponseMetaArgs<'a> {
     pub prompt_usage: Option<crate::extensions::notification::PromptUsage>,
     pub cancellation_category: Option<String>,
     pub loop_health_limit: Option<crate::session::commands::LoopHealthLimitReason>,
+    pub cancellation_context: Option<serde_json::Value>,
     pub cancel_trigger: Option<String>,
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
@@ -565,6 +574,7 @@ pub(crate) fn build_prompt_response_meta(
         prompt_usage,
         cancellation_category,
         loop_health_limit,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         tool_overrides,
@@ -587,6 +597,7 @@ pub(crate) fn build_prompt_response_meta(
         usage: prompt_usage,
         cancellation_category,
         loop_health_limit,
+        cancellation_context,
         cancel_trigger,
         structured_output,
         structured_output_error,
@@ -724,6 +735,7 @@ const IDLE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 struct ResidentResources {
     /// Strong ref pinning the code-nav index; the manager holds only a `Weak`.
     codebase_index: Option<std::sync::Arc<xai_codebase_graph::IndexManagerHandle>>,
+    is_headless: bool,
     require_gateway: bool,
 }
 /// Per-session state that survives an idle-unload (so the session stays
@@ -905,20 +917,20 @@ pub struct MvpAgent {
     >,
     /// Unified sender for all subagent coordinator events.
     /// LEADER-SAFE(shared): channel is multi-producer, coordinator drains.
-    subagent_event_tx: tokio::sync::mpsc::UnboundedSender<
-        xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
-    >,
+    subagent_event_tx: xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     /// Receiver for subagent events. Taken once by `start_subagent_coordinator()`.
     /// `None` after the coordinator drain task has been spawned.
     subagent_event_rx: RefCell<
         Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
-            >,
+            xai_grok_tools::implementations::grok_build::task::coordinator::SubagentCoordinatorReceiver,
         >,
     >,
     /// Shell-only presentation state; lifecycle lives in the channel actor.
     subagent_presentation: RefCell<crate::agent::subagent::SubagentPresentation>,
+    /// Shared subagent turn-sampling semaphore, cloned into every
+    /// `SubagentSpawnContext`. LEADER-SAFE(shared). See
+    /// [`crate::config::SubagentsConfig::resolve_sampling_limit`].
+    subagent_sampling_semaphore: Arc<tokio::sync::Semaphore>,
     /// Shared buffer for mid-turn monitor event notifications.
     /// Pushed by the `InjectNotification` handler when a turn is active and the
     /// notification has `Next` priority. Drained by the session turn loop
@@ -1067,6 +1079,7 @@ pub struct MvpAgent {
 /// Loading TLS root certs is ~95ms; doing it here avoids a cold-start hit
 /// on the first request. Idempotent.
 pub fn warm_async_http_client() {
+    xai_grok_extra_ca::ensure_default_crypto_provider();
     std::thread::spawn(|| {
         let _timer = crate::instrumentation_timer!("startup.async_http_warmup");
         let _ = crate::http::shared_client();
@@ -1386,6 +1399,67 @@ fn resolve_inference_idle_timeout_secs(
     let remote = remote_settings.and_then(|s| s.inference_idle_timeout_secs);
     per_model.or(remote).unwrap_or(600).max(10)
 }
+/// Resolve the subagent 429 wait-attempt budget: env > config.toml (per-model) > remote > default.
+pub(crate) fn resolve_subagent_rate_limit_max_attempts(
+    config_toml: Option<u32>,
+    remote: Option<u32>,
+    env: Option<u32>,
+) -> u32 {
+    use crate::session::acp_session::RateLimitWaitConfig;
+    let requested = env
+        .or(config_toml)
+        .or(remote)
+        .unwrap_or(RateLimitWaitConfig::DEFAULT_MAX_ATTEMPTS);
+    let cap = RateLimitWaitConfig::MAX_ATTEMPTS_CAP;
+    if requested > cap {
+        tracing::info!(
+            requested,
+            clamped_to = cap,
+            "subagent_rate_limit_max_attempts clamped to the cap"
+        );
+    }
+    requested.min(cap)
+}
+pub(crate) fn subagent_rate_limit_max_attempts_env() -> Option<u32> {
+    parse_subagent_rate_limit_max_attempts(
+        std::env::var("GROK_SUBAGENT_RATE_LIMIT_MAX_ATTEMPTS").ok().as_deref(),
+    )
+}
+/// Empty is unset; an invalid value (non-numeric, negative, or overflowing
+/// `u32`) is ignored with one warning per spawn. Takes the raw value so tests
+/// never touch the process environment.
+fn parse_subagent_rate_limit_max_attempts(raw: Option<&str>) -> Option<u32> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<u32>() {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            tracing::warn!(
+                value,
+                "ignoring invalid GROK_SUBAGENT_RATE_LIMIT_MAX_ATTEMPTS"
+            );
+            None
+        }
+    }
+}
+impl MvpAgent {
+    /// Resolve the subagent 429 wait budget from the caller's `per_model` tier (remote + env read here).
+    fn resolved_subagent_rate_limit_max_attempts(&self, per_model: Option<u32>) -> u32 {
+        let remote = self
+            .cfg
+            .borrow()
+            .remote_settings
+            .as_ref()
+            .and_then(|s| s.subagent_rate_limit_max_attempts);
+        resolve_subagent_rate_limit_max_attempts(
+            per_model,
+            remote,
+            subagent_rate_limit_max_attempts_env(),
+        )
+    }
+}
 /// Parse the client-advertised `x.ai/hunkTracker.mode` string. Case-insensitive
 /// and trimmed. Absent/blank/`off`/`disabled` => `None`; unknown => `AllDirty`.
 fn resolve_hunk_tracking_mode(
@@ -1445,11 +1519,11 @@ mod heap_profile;
 mod resource_telemetry;
 mod session_registry;
 mod session_lifecycle;
-mod subagent_coordinator;
 mod agent_ops;
 mod acp_agent;
 pub(crate) mod reasoning_effort;
 mod session_setup;
+mod subagent_spawn;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
@@ -1981,6 +2055,7 @@ impl MvpAgent {
                     show_resolved_model,
                     gate,
                     subscription_tier,
+                    feedback_trace_offer: self.feedback_trace_offer(),
                 };
                 serde_json::to_value(auth_meta)
                     .ok()
@@ -2331,7 +2406,9 @@ async fn handle_synthetic_turn_trace(
     request: crate::upload::turn::SyntheticTurnTraceRequest,
 ) {
     use crate::session::SessionCommand;
-    use crate::upload::turn::{UploadWait, complete_prompt_trace, spawn_upload_task};
+    use crate::upload::turn::{
+        UploadWait, complete_prompt_trace, spawn_linked_upload_task, spawn_upload_task,
+    };
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     let (info, turn_number, user_id, user_email, client_source, client_version, model) = {
         let this = agent_ref.get();
@@ -2538,8 +2615,10 @@ async fn handle_synthetic_turn_trace(
                 });
             cap
         });
-    spawn_upload_task(
+    spawn_linked_upload_task(
         "synthetic_turn_trace",
+        &request.prompt_id,
+        &request.session_id.0,
         async move {
             match complete_prompt_trace(
                     ctx,
@@ -2554,9 +2633,9 @@ async fn handle_synthetic_turn_trace(
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(
-                    error = %e,
-                    "Synthetic turn trace upload failed (non-fatal)",
-                );
+                        error = %e,
+                        "Synthetic turn trace upload failed (non-fatal)",
+                    );
                 }
             }
         },

@@ -106,6 +106,8 @@ pub fn load_config_from_toml(root: &TomlValue) -> Config {
         session: section(table, "session"),
         privacy: section(table, "privacy"),
         consent: section(table, "consent"),
+        telemetry: section(table, "telemetry"),
+        features: section(table, "features"),
     }
 }
 #[cfg(test)]

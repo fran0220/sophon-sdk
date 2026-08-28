@@ -5,6 +5,7 @@ use crate::session::acp_session::McpReminderMode;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering::Relaxed;
 use tokio::sync::mpsc;
 use xai_grok_paths::AbsPathBuf;
 use xai_grok_workspace::file_system::MockFs;
@@ -75,6 +76,7 @@ async fn create_test_actor(
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
+        hook_block_hold: Default::default(),
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -129,7 +131,7 @@ async fn create_test_actor(
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
         delivery_tools: std::cell::RefCell::new(Vec::new()),
-        attach_non_interactive: std::cell::Cell::new(false),
+        attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
         chat_state_handle,
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
@@ -186,6 +188,7 @@ async fn create_test_actor(
         session_start: std::time::Instant::now(),
         inference_idle_timeout: std::time::Duration::from_secs(300),
         max_retries: 3,
+        rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_elicitation_answers: ElicitationAnswerBuffer::new(),
@@ -248,7 +251,7 @@ async fn create_test_actor(
         managed_mcp_handle: Default::default(),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-        mcp_announced_servers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        mcp_announcements: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),
@@ -292,6 +295,7 @@ async fn create_test_actor(
         turn_stream_drained: parking_lot::Mutex::new(None),
         pending_image_strip: parking_lot::Mutex::new(None),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+        sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         transcribe_user_images: false,
@@ -378,7 +382,6 @@ async fn test_context_window_override_to_smaller_triggers_compact() {
 #[tokio::test(flavor = "current_thread")]
 async fn suppression_gates_and_reset_is_reason_scoped() {
     use crate::session::compaction_config::{SUPPRESS_NONE, SUPPRESS_TURN, SUPPRESS_UNTIL_SUCCESS};
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -455,7 +458,6 @@ async fn suppression_gates_and_reset_is_reason_scoped() {
 #[tokio::test(flavor = "current_thread")]
 async fn model_switch_clears_sticky_suppression() {
     use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_NONE};
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -493,7 +495,6 @@ async fn model_switch_keeps_account_state_suppression() {
     use crate::session::compaction_config::{
         PreviousModelInfo, SUPPRESS_AUTH, SUPPRESS_UNTIL_SUCCESS,
     };
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -536,7 +537,6 @@ async fn model_switch_keeps_account_state_suppression() {
 #[tokio::test(flavor = "current_thread")]
 async fn auth_suppress_clears_on_credential_recovery() {
     use crate::session::compaction_config::{SUPPRESS_AUTH, SUPPRESS_NONE};
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -564,7 +564,6 @@ async fn auth_suppress_clears_on_credential_recovery() {
 #[tokio::test(flavor = "current_thread")]
 async fn clear_auth_suppress_leaves_credit_suppress() {
     use crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS;
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -588,7 +587,6 @@ async fn clear_auth_suppress_leaves_credit_suppress() {
 #[tokio::test(flavor = "current_thread")]
 async fn clear_auth_suppress_rearms_pre_sampling_compact_gate() {
     use crate::session::compaction_config::SUPPRESS_AUTH;
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -835,7 +833,6 @@ async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {
     use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
     use crate::session::compaction_config::SUPPRESS_AUTH;
     use crate::session::storage::SessionUpdate;
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -923,7 +920,6 @@ async fn e2e_model_switch_compact_401_surfaces_reauth() {
     use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
     use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_AUTH};
     use crate::session::storage::SessionUpdate;
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -991,7 +987,6 @@ async fn e2e_model_switch_compact_401_surfaces_reauth() {
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_model_switch_compact_non_auth_failure_does_not_abort() {
     use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_NONE};
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1028,7 +1023,6 @@ async fn e2e_model_switch_compact_non_auth_failure_does_not_abort() {
 #[tokio::test(flavor = "current_thread")]
 async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
     use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_AUTH, SUPPRESS_NONE};
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1090,7 +1084,6 @@ async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
 #[tokio::test(flavor = "current_thread")]
 async fn bare_manual_compact_failure_does_not_suppress_auto() {
     use crate::session::compaction_config::SUPPRESS_NONE;
-    use std::sync::atomic::Ordering::Relaxed;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1132,6 +1125,55 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
         })
         .await;
 }
+/// A successful compaction re-arms failed-server announcements: the failure
+/// reminder was dropped with the compacted context (unlike connected servers,
+/// which the compaction context carries), so the announced episodes clear and
+/// the MCP reminder goes dirty for a re-announcement at the next injection.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_rearms_failed_server_announcements() {
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Summary of prior work. ".repeat(30));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            let filler = "x".repeat(8_000);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user(format!("u0 {filler}")),
+                ConversationItem::assistant(format!("a0 {filler}")),
+                ConversationItem::user("final query"),
+            ]);
+            actor
+                .mcp_announcements
+                .lock()
+                .failed
+                .insert("dead".to_string(), Default::default());
+            actor
+                .mcp_reminder_dirty
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let result = actor.run_compact(None).await;
+            assert!(result.is_ok(), "compaction should succeed: {result:?}");
+            assert!(
+                actor.mcp_announcements.lock().failed.is_empty(),
+                "compaction must re-arm failed-server announcements"
+            );
+            assert!(
+                actor
+                    .mcp_reminder_dirty
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "compaction must mark the MCP reminder dirty"
+            );
+        })
+        .await;
+}
 /// A forked session whose whole-transcript inherited prefix alone exceeds
 /// the auto-compact threshold releases the prefix on compaction (so the
 /// conversation can actually shrink below the threshold) and keeps the
@@ -1139,7 +1181,6 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
 #[tokio::test(flavor = "current_thread")]
 async fn forked_prefix_released_under_pressure_and_stays_released() {
     use crate::session::compaction_config::SUPPRESS_NONE;
-    use std::sync::atomic::Ordering::Relaxed;
     use xai_grok_test_support::MockInferenceServer;
     let local = tokio::task::LocalSet::new();
     local
@@ -1214,7 +1255,6 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
 #[tokio::test(flavor = "current_thread")]
 async fn forked_release_still_over_threshold_suppresses_auto() {
     use crate::session::compaction_config::SUPPRESS_STICKY;
-    use std::sync::atomic::Ordering::Relaxed;
     use xai_grok_test_support::MockInferenceServer;
     let local = tokio::task::LocalSet::new();
     local

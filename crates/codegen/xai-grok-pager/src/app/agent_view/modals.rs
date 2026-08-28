@@ -1337,6 +1337,8 @@ impl AgentView {
                     state.skills_collapsed_groups.remove(group_key)
                 }
             }
+            // Workflows tab has no collapsible groups.
+            crate::views::extensions_modal::ExtensionsTab::Workflows => false,
             crate::views::extensions_modal::ExtensionsTab::Marketplace => {
                 let source_has_error = group_key
                     .parse::<usize>()
@@ -1493,12 +1495,9 @@ impl AgentView {
                 }
                 InputOutcome::Changed
             }
-            ButtonAction::ReloadSkills => {
-                if let Some(ref mut state) = self.extensions_modal {
-                    state.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-                }
-                InputOutcome::Action(Action::ReloadSkills)
-            }
+            // For the `r` reload, the router's ReloadSkills arm does the
+            // Loading writes (once a session exists) and both refetches.
+            ButtonAction::ReloadSkills => InputOutcome::Action(Action::ReloadSkills),
             ButtonAction::RefreshMcpList => InputOutcome::Action(Action::RefreshMcpList),
             ButtonAction::OpenManagedConnectors => {
                 InputOutcome::Action(Action::OpenManagedConnectors)
@@ -1656,7 +1655,12 @@ impl AgentView {
                             .iter()
                             .filter(|h| h.source_dir == *source)
                             .collect();
-                        let any_enabled = group_hooks.iter().any(|h| !h.disabled);
+                        // Direction comes from the unpinned hooks only
+                        // (all-pinned groups read enabled) — shared with the
+                        // button-label mirror so the two can't drift.
+                        let any_enabled = crate::views::extensions_modal::hook_group_any_enabled(
+                            group_hooks.iter().copied(),
+                        );
                         let hook_names: Vec<String> =
                             group_hooks.iter().map(|h| h.name.clone()).collect();
                         let action = xai_hooks_plugins_types::HooksAction::ToggleSource {
@@ -1849,7 +1853,9 @@ impl AgentView {
                                 }
                             }
                         }
-                        ExtensionsTab::Skills => {
+                        // Workflows rows carry no group keys, so only the
+                        // detail-expansion branch applies on that tab.
+                        ExtensionsTab::Skills | ExtensionsTab::Workflows => {
                             let sel = state.picker_state.selected;
                             if let Some(gk) = state
                                 .entry_group_keys
@@ -2453,6 +2459,7 @@ mod extensions_action_target_tests {
             timeout_ms: 0,
             source_dir: source_dir.into(),
             disabled,
+            pinned: false,
         }
     }
 
@@ -2890,6 +2897,7 @@ mod editor_paste_routing_tests {
             &BundleState::default(),
             None,
             None,
+            None,
         );
         agents.active_tab = AgentsTab::Personas;
         agent.agents_modal = Some(agents);
@@ -3007,6 +3015,7 @@ mod extensions_modal_confirmation_tests {
             timeout_ms: 0,
             source_dir: source_dir.into(),
             disabled: false,
+            pinned: false,
         }
     }
 

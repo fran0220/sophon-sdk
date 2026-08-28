@@ -28,6 +28,8 @@ pub enum Feature {
     WriteFile,
     /// Heuristic feedback popups and the `/feedback` command.
     Feedback,
+    /// The `/feedback` trace-consent card (the trace-upload opt-in offer).
+    FeedbackTraceCard,
     /// The per-turn summary on the agent dashboard.
     TurnSummary,
     /// Ctrl+C before a turn's first activity restores the prompt.
@@ -42,6 +44,8 @@ pub enum Feature {
     AutoWake,
     /// Save a finished subagent's working copy into the repo as a git ref, restored on resume.
     SubagentWorktreeSnapshot,
+    /// Send model-authored follow-ups to an owned active descendant.
+    ActiveAgentMessages,
 }
 
 /// How one feature is written on each surface it can be set from.
@@ -144,6 +148,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         remote: Some(|settings| settings.feedback_enabled),
     },
     FeatureSpec {
+        id: Feature::FeedbackTraceCard,
+        key: "feedback_trace_card",
+        path: "features.feedback_trace_card",
+        env: "GROK_FEEDBACK_TRACE_CARD",
+        default_enabled: false,
+        remote: Some(|settings| settings.feedback_trace_card_enabled),
+    },
+    FeatureSpec {
         id: Feature::TurnSummary,
         key: "turn_summary",
         path: "features.turn_summary",
@@ -172,7 +184,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "two_pass_compaction",
         path: "features.two_pass_compaction",
         env: "GROK_TWO_PASS_COMPACTION",
-        default_enabled: false,
+        default_enabled: true,
         remote: Some(|settings| settings.two_pass_compaction_enabled),
     },
     FeatureSpec {
@@ -199,6 +211,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         env: "GROK_SUBAGENT_WORKTREE_SNAPSHOT",
         default_enabled: false,
         remote: Some(|settings| settings.subagent_worktree_snapshot_enabled),
+    },
+    FeatureSpec {
+        id: Feature::ActiveAgentMessages,
+        key: "active_agent_messages",
+        path: "features.active_agent_messages",
+        env: "GROK_ACTIVE_AGENT_MESSAGES",
+        default_enabled: false,
+        remote: Some(|settings| settings.active_agent_messages_enabled),
     },
 ];
 

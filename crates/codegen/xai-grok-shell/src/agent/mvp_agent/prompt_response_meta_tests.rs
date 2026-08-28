@@ -18,6 +18,7 @@ fn args<'a>(
         prompt_usage: None,
         cancellation_category: None,
         loop_health_limit: None,
+        cancellation_context: None,
         cancel_trigger: None,
         structured_output: None,
     }
@@ -128,9 +129,7 @@ fn cancel_trigger_lands_as_camelcase_meta_key() {
 fn loop_health_limit_lands_as_typed_camelcase_meta() {
     let meta = build_prompt_response_meta(PromptResponseMetaArgs {
         loop_health_limit: Some(
-            crate::session::commands::LoopHealthLimitReason::Repetition {
-                repeated_steps: 16,
-            },
+            crate::session::commands::LoopHealthLimitReason::Repetition { repeated_steps: 16 },
         ),
         ..args("s", "p", 0, "m")
     });

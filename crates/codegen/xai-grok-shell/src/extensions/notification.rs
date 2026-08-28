@@ -1061,6 +1061,9 @@ pub enum SessionUpdate {
         agent_result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<PromptUsage>,
+        /// Wall-clock turn duration in milliseconds. `None` on old files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
     },
     /// One model response opened (Messages `message_start`), carrying the real
     /// message id, model, and input-side token counts. Rides the buffered chunk
@@ -1446,9 +1449,8 @@ pub struct RecapRequestFile {
     pub x_grok_req_id: String,
     /// Sampling conversation id (`recap-{uuid}`).
     pub x_grok_conv_id: String,
-    /// Whether reasoning/thinking blocks were stripped from the prefix
-    /// (Anthropic Messages backend only; other backends keep reasoning
-    /// verbatim for prompt-cache warmth).
+    /// Whether the side-call requested reasoning/thinking removal before
+    /// budgeting. The over-budget path removes reasoning independently.
     pub strip_reasoning: bool,
     /// Reminder tag used in the recap instruction (`system-reminder` or
     /// the alternate `system_reminder` form).
@@ -2330,6 +2332,7 @@ mod tests {
             stop_reason: "end_turn".into(),
             agent_result: Some("done".into()),
             usage: None,
+            elapsed_ms: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "turn_completed");
@@ -2345,10 +2348,12 @@ mod tests {
             stop_reason: "cancelled".into(),
             agent_result: None,
             usage: None,
+            elapsed_ms: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "turn_completed");
         assert!(json.get("agent_result").is_none());
+        assert!(json.get("elapsed_ms").is_none());
     }
 
     #[test]
@@ -2359,18 +2364,52 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_result: Some("result text".into()),
                 usage: None,
+                elapsed_ms: Some(1234),
             },
             SessionUpdate::TurnCompleted {
                 prompt_id: "p-min".into(),
                 stop_reason: "error".into(),
                 agent_result: None,
                 usage: None,
+                elapsed_ms: None,
             },
         ] {
             let json_str = serde_json::to_string(&update).unwrap();
             let parsed: SessionUpdate = serde_json::from_str(&json_str).unwrap();
             assert_eq!(update, parsed);
         }
+    }
+
+    #[test]
+    fn turn_completed_old_json_without_elapsed_ms_deserializes_none() {
+        let json =
+            r#"{"sessionUpdate":"turn_completed","prompt_id":"p-old","stop_reason":"end_turn"}"#;
+        let parsed: SessionUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            SessionUpdate::TurnCompleted {
+                prompt_id: "p-old".into(),
+                stop_reason: "end_turn".into(),
+                agent_result: None,
+                usage: None,
+                elapsed_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn turn_completed_elapsed_ms_some_roundtrips() {
+        let update = SessionUpdate::TurnCompleted {
+            prompt_id: "p-ms".into(),
+            stop_reason: "end_turn".into(),
+            agent_result: None,
+            usage: None,
+            elapsed_ms: Some(1234),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["elapsed_ms"], 1234);
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(update, parsed);
     }
 
     #[test]

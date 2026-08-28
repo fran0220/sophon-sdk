@@ -26,6 +26,56 @@ fn state_icon_one_per_variant() {
     assert!(!state_icon(RowState::Blocked, 0).is_empty());
 }
 
+/// The dispatch dropdown paints upward from the input, so a panel taller than the space above it
+/// used to saturate to row 0 and run off the bottom of the buffer.
+#[test]
+fn slash_dropdown_never_paints_outside_a_short_dashboard() {
+    for (top, height) in [(0u16, 24u16)]
+        .into_iter()
+        .chain((4..=24u16).map(|h| (0, h)))
+        // A non-zero `area.y` is the only term in the clamp the rest of the loop never varies.
+        .chain((6..=12u16).map(|h| (3, h)))
+    {
+        let area = Rect::new(0, top, 80, height.saturating_sub(top));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, height));
+        let mut state = DashboardState::new();
+        state.dispatch.set_text("/");
+        state
+            .dispatch
+            .refresh_slash(&crate::acp::model_state::ModelState::default());
+        assert!(
+            !state.dispatch.slash_snapshot().matches.is_empty(),
+            "`/` must offer commands, or the geometry below is never exercised"
+        );
+        let dispatch_rect = Rect::new(0, area.bottom().saturating_sub(2), 80, 1);
+
+        render_slash_dropdown(&mut buf, area, dispatch_rect, &Theme::default(), &mut state);
+
+        // Six rows above the input is well past the 3-row minimum panel, so a `None` here
+        // would mean the dropdown stopped rendering instead of clamping.
+        if area.height >= 8 {
+            assert!(
+                state.slash_dropdown_items_area.is_some(),
+                "area={area:?}: dropdown must paint when the input has room above it"
+            );
+        }
+        if let Some(items) = state.slash_dropdown_items_area {
+            assert!(
+                items.height >= 1,
+                "area={area:?}: a clamped panel must still hold an item row"
+            );
+            assert!(
+                items.bottom() <= dispatch_rect.y,
+                "area={area:?}: items ran into the dispatch input"
+            );
+            assert!(
+                items.y >= area.y && items.bottom() <= area.bottom(),
+                "area={area:?}: items ran off the buffer"
+            );
+        }
+    }
+}
+
 /// Helper: read buffer row-by-row so multi-cell substring checks
 /// see the visible text in left-to-right order.
 fn buf_to_text(buf: &Buffer) -> String {
@@ -37,6 +87,57 @@ fn buf_to_text(buf: &Buffer) -> String {
         content.push('\n');
     }
     content
+}
+
+#[test]
+fn workspace_dashboard_renders_snapshot_member_without_delete_control() {
+    let area = Rect::new(0, 0, 100, 28);
+    let mut buf = Buffer::empty(area);
+    let mut state = DashboardState::new();
+    state.hovered_row = Some(DashboardRowId::Workspace {
+        session_id: "saved-session".to_owned(),
+    });
+    let mut agents = IndexMap::new();
+    let registry = crate::actions::ActionRegistry::defaults();
+    let snapshot = xai_grok_dashboard_store::WorkspaceSnapshot {
+        grouping: xai_grok_dashboard_store::Grouping::State,
+        members: vec![xai_grok_dashboard_store::Member {
+            session_id: xai_grok_dashboard_store::SessionId::new("saved-session").unwrap(),
+            kind: xai_grok_dashboard_store::MemberKind::Build,
+            origin: xai_grok_dashboard_store::MemberOrigin::Local,
+            cwd: Some("/tmp/saved".to_owned()),
+            title: Some("Saved workspace session".to_owned()),
+            model: Some("grok-test".to_owned()),
+            last_turn_summary: Some("Stored summary".to_owned()),
+            is_worktree: false,
+            last_change_unix_ms: 1_725_000_000_000,
+            pin_rank: None,
+            order_rank: None,
+        }],
+        data_version: 1,
+    };
+
+    let _ = render_dashboard(
+        &mut buf,
+        area,
+        &mut state,
+        &mut agents,
+        &registry,
+        None,
+        &[],
+        true,
+        Some(&snapshot),
+        false,
+        None,
+    );
+
+    let content = buf_to_text(&buf);
+    assert!(content.contains("Saved workspace session"));
+    assert!(content.contains("Stored summary"));
+    assert!(
+        state.row_delete_rects.is_empty(),
+        "workspace-only rows must not expose v1's permanent delete action"
+    );
 }
 
 /// edge cases 1+25: empty state with no agents renders
@@ -84,6 +185,8 @@ fn render_dashboard_shows_roster_when_local_agents_empty() {
         &registry,
         None,
         &roster,
+        false,
+        None,
         false,
         None,
     );
@@ -135,6 +238,8 @@ fn render_dashboard_hover_shows_delete_x_only_for_settled_rows() {
             &registry,
             None,
             &roster,
+            false,
+            None,
             false,
             None,
         );
@@ -3041,6 +3146,8 @@ fn render_dashboard_paints_full_area_background() {
         &registry,
         None,
         &[],
+        false,
+        None,
         false,
         None,
     );

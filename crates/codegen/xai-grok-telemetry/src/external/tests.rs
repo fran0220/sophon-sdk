@@ -276,6 +276,10 @@ fn tool_name_sanitization() {
     assert_eq!(schema::sanitize_tool_name("memory_search"), "memory_search");
     assert_eq!(schema::sanitize_tool_name("memory_get"), "memory_get");
     assert_eq!(
+        schema::sanitize_tool_name("send_subagent_message"),
+        "send_subagent_message"
+    );
+    assert_eq!(
         schema::sanitize_tool_name("nebula__post_message"),
         "mcp_tool"
     );
@@ -381,7 +385,7 @@ fn session_new_increments_session_count_only() {
 fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
     let stream = build(gates_off());
     let mut phase_durations_ms = std::collections::BTreeMap::new();
-    phase_durations_ms.insert("load_config".into(), 12);
+    phase_durations_ms.insert("config_load".into(), 12);
     phase_durations_ms.insert("model_catalog".into(), 28_700);
     emit_event_into(
         &stream,
@@ -389,7 +393,7 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
             connect_target: crate::startup::AgentKind::Embedded,
             outcome: crate::startup::StartupOutcome::Timeout,
             stuck_in: Some("model_catalog".into()),
-            phases: "load_config=12ms, model_catalog>=28.7s".into(),
+            phases: "config_load=12ms, model_catalog>=28.7s".into(),
             phase_durations_ms,
             elapsed_ms: 30_000,
             timeout_secs: Some(30),
@@ -410,15 +414,21 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
 }
 
 #[test]
-fn startup_complete_records_the_total_histogram_only() {
+fn startup_completed_records_the_total_histogram_only() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
-        &events::StartupComplete {
+        &events::StartupCompleted {
             total_ms: 1_234,
             outcome: crate::startup::StartupOutcome::Ok,
-            phases: "load_config=12ms, session_create=800ms".into(),
+            phases: "config_load=12ms, session_create=800ms".into(),
             auth_mode: crate::startup::AuthMode::Team,
+            prefetch_wait_ms: Some(210),
+            session_load_ms: Some(120),
+            session_replay_ms: None,
+            session_git_scan_ms: Some(40),
+            session_spawn_ms: Some(300),
+            time_to_first_frame_ms: Some(650),
         },
     );
     assert!(exported_events(&stream).is_empty());
@@ -548,6 +558,7 @@ fn tool_result_gates_off_collapses_and_reduces() {
             tool_name: "nebula__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some("/Users/alice/secret-project/main.rs".into()),
             parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
         },
@@ -586,6 +597,7 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
             tool_name: "nebula__post_message".into(),
             outcome: xai_grok_session_events::types::ToolOutcome::Success,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some(path.clone()),
             parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
         },
@@ -711,6 +723,42 @@ fn mcp_connection_collapses_server_name_by_default() {
     assert_eq!(attr(ev, "mcp_server.name").as_deref(), Some("mcp_server"));
     assert_eq!(attr(ev, "error_type").as_deref(), Some("timeout"));
     assert!(!format!("{events:?}").contains("corp-internal-jira"));
+}
+
+#[test]
+fn agent_message_tool_decision_identity() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::PermissionDecisionPayload {
+            tool_name: "send_subagent_message".into(),
+            access_kind: events::AccessKind::AgentMessage,
+            decision: events::PermissionOutcome::Allow,
+            wait_ms: 10,
+            permission_mode: crate::enums::PermissionMode::Ask,
+            source: Some("allowed".into()),
+            subagent_session_id: None,
+            subagent_type: None,
+            manager_prompt_attempted: Some(true),
+            prompt_outcome: Some(events::PermissionPromptOutcome::Allow),
+            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::AllowOnce),
+            remember_tool_approvals: Some(true),
+            decision_reason: Some(events::PermissionDecisionReason::NeedsUser),
+            classifier_source: None,
+            classifier_verdict: None,
+            security_findings: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+        },
+    );
+    let events = exported_events(&stream);
+    let ev = &events[0];
+    assert_eq!(
+        attr(ev, "tool_name").as_deref(),
+        Some("send_subagent_message")
+    );
+    assert_eq!(attr(ev, "access_kind").as_deref(), Some("agent_message"));
 }
 
 #[test]

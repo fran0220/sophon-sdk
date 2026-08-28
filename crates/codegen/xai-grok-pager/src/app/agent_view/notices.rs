@@ -218,6 +218,14 @@ impl AgentView {
         self.sticky_toast = msg.map(|m| crate::glyphs::sanitize_toast_message(m).into_owned());
     }
 
+    /// Release the hook-block queue hold (see `hook_block_hold`).
+    /// Also drops the blocked-prompt context: with the hold gone there is no
+    /// card left to reopen.
+    pub(in crate::app) fn release_hook_block_hold(&mut self) {
+        self.session.hook_block_hold = false;
+        self.session.blocked_prompt = None;
+    }
+
     /// Propagate sticky status to this view and every nested subagent view.
     pub fn set_sticky_toast_recursive(&mut self, msg: Option<&str>) {
         self.set_sticky_toast(msg);
@@ -360,6 +368,26 @@ impl AgentView {
                 // Best-effort clipboard so SSH/VM users can paste into a
                 // browser on another machine without selecting TUI text.
                 let _ = crate::clipboard::SystemClipboard::try_set(url);
+                self.show_toast("Browser unavailable - URL shown above");
+            }
+        }
+    }
+
+    /// [`Self::open_url_or_show`] minus the automatic clipboard copy, for
+    /// server-controlled URLs (MCP elicitation): silently seeding the
+    /// clipboard invites pasting attacker-chosen text into a shell on the
+    /// headless fallback path. The full URL stays visible in scrollback (and
+    /// on the card) for a deliberate manual copy instead.
+    pub(crate) fn open_untrusted_url_or_show(&mut self, url: &str) {
+        use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
+        use crate::scrollback::block::RenderBlock;
+        use crate::terminal::hyperlinks::SchemeFilter;
+
+        match try_open_url(url, SchemeFilter::Standard) {
+            OpenUrlResult::Opened | OpenUrlResult::RejectedScheme => {}
+            OpenUrlResult::BrowserUnavailable => {
+                self.scrollback
+                    .push_block(RenderBlock::system(browser_unavailable_message(url)));
                 self.show_toast("Browser unavailable - URL shown above");
             }
         }

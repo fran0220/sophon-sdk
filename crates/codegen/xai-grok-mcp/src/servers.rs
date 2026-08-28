@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
+use xai_grok_telemetry::region;
+use xai_grok_telemetry::region::Parent;
 
 use agent_client_protocol as acp;
 use futures::StreamExt;
@@ -49,26 +51,20 @@ use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 /// for callers that historically imported it from this module.
 pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 
-/// Reqwest 0.13 adapter over `xai_grok_extra_ca::extra_root_ders` (DER is version-neutral).
+/// Reqwest 0.13 twin of the 0.12 adapters in `xai_grok_extra_ca`.
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    xai_grok_extra_ca::ensure_default_crypto_provider();
+    builder = builder.tls_backend_rustls();
     for der in xai_grok_extra_ca::extra_root_ders() {
         match reqwest::Certificate::from_der(der) {
             Ok(cert) => builder = builder.add_root_certificate(cert),
             Err(e) => tracing::warn!(
                 error = %e,
-                "GROK_EXTRA_CA_BUNDLE: validated DER rejected by reqwest 0.13; skipping cert"
+                "extra CA bundle: validated DER rejected by reqwest 0.13; skipping cert"
             ),
         }
     }
     builder
-}
-
-/// Normalize an MCP server URL for comparison: strip trailing slashes.
-/// Must match the normalization the host's managed-config layer uses
-/// (e.g. shell's `session::managed_mcp::normalize_url`) so refresh
-/// lookup keys agree.
-fn normalize_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
 }
 
 /// Regex for strictest cross-provider tool name validation.
@@ -770,7 +766,7 @@ pub struct McpState {
     pub configs: Vec<acp::McpServer>,
     pub meta_config_map: McpMetaConfigMap,
     /// Clients owned by this session; cleared on config changes.
-    pub owned_clients: HashMap<McpServerName, Arc<McpClient>>,
+    pub owned_clients: crate::owned_clients::OwnedClients,
     /// Clients inherited from parent via `SharedMcpPool`; never cleared by config changes.
     pub shared_clients: HashMap<McpServerName, Arc<McpClient>>,
     /// The session's in-process SDK MCP servers + their shared invoker/overrides; `None`
@@ -836,6 +832,7 @@ pub struct McpState {
     /// dropping `tools/list_changed`, `Ready`, and `HandshakeFailed`
     /// emits for them. Read access is via [`Self::client_event_tx`].
     client_event_tx: Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>>,
+    elicitation_job_tx: Option<crate::elicitation::ElicitationInbox>,
 }
 
 impl McpState {
@@ -847,7 +844,7 @@ impl McpState {
         Self {
             configs,
             meta_config_map,
-            owned_clients: HashMap::new(),
+            owned_clients: crate::owned_clients::OwnedClients::new(),
             shared_clients: HashMap::new(),
             acp_mcp: None,
             init_progress: InitProgress::default(),
@@ -861,6 +858,7 @@ impl McpState {
             event_writer: xai_grok_session_events::EventWriter::noop(),
             host_services: None,
             client_event_tx: None,
+            elicitation_job_tx: None,
         }
     }
 
@@ -918,6 +916,17 @@ impl McpState {
     /// `client_event_tx` cannot be bypassed by a direct assignment.
     pub fn client_event_tx(&self) -> Option<tokio::sync::mpsc::UnboundedSender<McpClientEvent>> {
         self.client_event_tx.clone()
+    }
+
+    pub fn set_elicitation_tx(&mut self, tx: Option<crate::elicitation::ElicitationInbox>) {
+        for client in self.owned_clients.values() {
+            client.set_elicitation_tx(tx.clone());
+        }
+        self.elicitation_job_tx = tx;
+    }
+
+    pub fn elicitation_tx(&self) -> Option<crate::elicitation::ElicitationInbox> {
+        self.elicitation_job_tx.clone()
     }
 
     pub fn set_event_writer(&mut self, writer: xai_grok_session_events::EventWriter) {
@@ -1152,8 +1161,24 @@ impl McpState {
         self.configs = new_configs;
         self.init_progress.cancel();
         self.auth_required.clear();
+        self.init_failed.clear();
         self.generation = self.generation.wrapping_add(1);
         true
+    }
+
+    /// Per-server teardown shared by config-update paths: forget every piece
+    /// of per-server state so a removed or changed server leaves nothing
+    /// stale behind.
+    fn forget_server(&mut self, name: &str) {
+        self.owned_clients.remove(name);
+        self.auth_required.remove(name);
+        self.init_failed.remove(name);
+        self.init_progress.mark_handshake_complete(name);
+        let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
+        self.mcp_tool_meta.retain(|k, _| !k.starts_with(&prefix));
+        self.mcp_tool_icons.retain(|k, _| !k.starts_with(&prefix));
+        self.disabled_tool_registrations
+            .retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Diff-based config update: only tears down servers whose config changed
@@ -1219,14 +1244,7 @@ impl McpState {
         }
 
         for name in &removed {
-            self.owned_clients.remove(name);
-            self.auth_required.remove(name);
-            self.init_progress.mark_handshake_complete(name);
-            let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
-            self.mcp_tool_meta.retain(|k, _| !k.starts_with(&prefix));
-            self.mcp_tool_icons.retain(|k, _| !k.starts_with(&prefix));
-            self.disabled_tool_registrations
-                .retain(|k, _| !k.starts_with(&prefix));
+            self.forget_server(name);
         }
 
         tracing::info!(
@@ -1412,65 +1430,6 @@ impl McpState {
         self.generation
     }
 
-    /// Replace managed MCP clients whose URL matches a fresh config entry.
-    ///
-    /// Caller passes `(endpoint, headers)` pairs from whatever source it uses
-    /// (e.g. shell's cli-chat-proxy `ManagedMcpConfig` cache). The MCP crate
-    /// stays free of the host's managed-config schema.
-    ///
-    /// Old `Arc<McpClient>` holders (in-flight tool calls) finish naturally;
-    /// new calls look up the fresh client from the map.
-    pub fn refresh_managed_clients<'a, I>(&mut self, fresh_configs: I)
-    where
-        I: IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
-    {
-        let fresh_by_url: HashMap<String, (&'a str, &'a HashMap<String, String>)> = fresh_configs
-            .into_iter()
-            .map(|(endpoint, headers)| (normalize_url(endpoint), (endpoint, headers)))
-            .collect();
-
-        for (client_name, client) in &mut self.owned_clients {
-            let Some(client_url) = self.configs.iter().find_map(|cfg| match cfg {
-                acp::McpServer::Http(acp::McpServerHttp { name, url, .. })
-                | acp::McpServer::Sse(acp::McpServerSse { name, url, .. })
-                    if name == client_name =>
-                {
-                    Some(normalize_url(url))
-                }
-                _ => None,
-            }) else {
-                continue;
-            };
-
-            let Some(&(fresh_endpoint, fresh_headers)) = fresh_by_url.get(&client_url) else {
-                continue;
-            };
-            if fresh_headers.is_empty() {
-                continue;
-            }
-            // Rebuilding drops the warm connection and forces a full
-            // re-handshake on next use; skip it when the token is unchanged.
-            if client.http_headers_match(fresh_headers) {
-                continue;
-            }
-
-            let headers = fresh_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            *client = Arc::new(McpClient::new_http(
-                client_name.clone(),
-                HttpConfig {
-                    url: fresh_endpoint.to_string(),
-                    headers,
-                },
-                None,
-                self.meta_config_map.get(client_name.as_str()),
-            ));
-            tracing::info!(server = %client_name, "Refreshed managed MCP client with fresh token");
-        }
-    }
-
     /// Look up a client by server name.
     /// Owned clients take priority (they can override inherited ones).
     pub fn get_client(&self, name: &str) -> Option<&Arc<McpClient>> {
@@ -1597,6 +1556,8 @@ const STDIO_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// Timeout for OAuth metadata discovery when building an HTTP transport.
 /// Bounds transport setup for servers without OAuth support.
 const OAUTH_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Budget for the anonymous-access tie-break request after an inconclusive OAuth probe.
+const ANONYMOUS_ACCESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Per-MCP-server config overrides from `_meta.mcpConfig` in session/new or session/load.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1974,7 +1935,15 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+        let call_span = xai_grok_telemetry::region::Region::from_span(tracing::info_span!(
+            "mcp.tool_call",
+            server_name = %self.tool.server_name,
+            tool_name = %self.tool.name,
+            reconnect = tracing::field::Empty,
+            auth_retry = tracing::field::Empty,
+        ));
         let mcp_call_start = std::time::Instant::now();
+        let state_lock_span = region!("mcp.state_lock", Parent::Explicit(call_span.span()));
         let (client, event_writer) = {
             let state = self.tool.mcp_state.lock().await;
             let c = Arc::clone(state.get_client(&self.tool.server_name).ok_or_else(|| {
@@ -1985,6 +1954,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             })?);
             (c, state.event_writer().clone())
         };
+        state_lock_span.close();
 
         let server = &self.tool.server_name;
         let tool = &self.tool.name;
@@ -2026,6 +1996,9 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             }
             Err(e) => Err(e),
         };
+        call_span.span().record("reconnect", reconnect_attempted);
+        call_span.span().record("auth_retry", auth_retry_attempted);
+        call_span.close();
 
         let call_result = match dispatch_result {
             Ok(result) => result,
@@ -2346,14 +2319,21 @@ enum HttpOauthPrep {
     NeedsInteractiveLogin,
 }
 
-impl HttpOauthPrep {
-    /// Inconclusive OAuth probe (manager-create error, discovery error, or timeout):
-    /// interactive proceeds as plain HTTP; non-interactive fails closed to avoid rmcp
-    /// auth-worker stderr noise.
+/// Result of the proactive OAuth probe. `Inconclusive` (probe error or timeout in non-interactive
+/// mode) must be settled by the anonymous-access tie-break before a connection decision exists,
+/// which [`resolve_http_oauth_prep`] enforces by type.
+enum OauthProbeOutcome {
+    Resolved(HttpOauthPrep),
+    Inconclusive,
+}
+
+impl OauthProbeOutcome {
+    /// Inconclusive probe: interactive proceeds as plain HTTP; non-interactive defers
+    /// to the anonymous-access tie-break instead of failing closed outright.
     fn on_probe_failure(mode: OauthInteractivity) -> Self {
         match mode {
-            OauthInteractivity::Interactive => Self::NoOauthSupport,
-            OauthInteractivity::NonInteractive => Self::NeedsInteractiveLogin,
+            OauthInteractivity::Interactive => Self::Resolved(HttpOauthPrep::NoOauthSupport),
+            OauthInteractivity::NonInteractive => Self::Inconclusive,
         }
     }
 }
@@ -2378,9 +2358,9 @@ async fn discover_and_prepare_auth(
     server_name: &str,
     server_url: &str,
     mode: OauthInteractivity,
-) -> HttpOauthPrep {
+) -> OauthProbeOutcome {
     let Ok(parsed_url) = url::Url::parse(server_url) else {
-        return HttpOauthPrep::NoOauthSupport;
+        return OauthProbeOutcome::Resolved(HttpOauthPrep::NoOauthSupport);
     };
     let adapter =
         crate::credentials::McpCredentialStoreAdapter::new(server_name.to_string(), parsed_url);
@@ -2389,8 +2369,7 @@ async fn discover_and_prepare_auth(
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(server = server_name, %e, "Failed to create OAuth manager");
-            // Non-interactive: fail closed — unauthenticated HTTP may still fatal in rmcp.
-            return HttpOauthPrep::on_probe_failure(mode);
+            return OauthProbeOutcome::on_probe_failure(mode);
         }
     };
     manager.set_credential_store(adapter);
@@ -2407,10 +2386,12 @@ async fn discover_and_prepare_auth(
                 error = %e,
                 "Skipping OAuth MCP in non-interactive mode (stored credentials unusable); re-authenticate in TUI"
             );
-            return HttpOauthPrep::NeedsInteractiveLogin;
+            return OauthProbeOutcome::Resolved(HttpOauthPrep::NeedsInteractiveLogin);
         }
         tracing::info!(server = server_name, "Loaded stored OAuth credentials");
-        return HttpOauthPrep::ManagerReady(Arc::new(tokio::sync::Mutex::new(manager)));
+        return OauthProbeOutcome::Resolved(HttpOauthPrep::ManagerReady(Arc::new(
+            tokio::sync::Mutex::new(manager),
+        )));
     }
 
     match manager.resolve_metadata().await {
@@ -2424,21 +2405,173 @@ async fn discover_and_prepare_auth(
                     server = server_name,
                     "Skipping OAuth MCP in non-interactive mode (no stored tokens); authenticate in TUI or set an Authorization header"
                 );
-                return HttpOauthPrep::NeedsInteractiveLogin;
+                return OauthProbeOutcome::Resolved(HttpOauthPrep::NeedsInteractiveLogin);
             }
             tracing::info!(
                 server = server_name,
                 "Server supports OAuth but has no stored tokens"
             );
-            HttpOauthPrep::ManagerReady(Arc::new(tokio::sync::Mutex::new(manager)))
+            OauthProbeOutcome::Resolved(HttpOauthPrep::ManagerReady(Arc::new(
+                tokio::sync::Mutex::new(manager),
+            )))
         }
         Ok(_) | Err(rmcp::transport::auth::AuthError::NoAuthorizationSupport) => {
             tracing::debug!(server = server_name, "Server does not support OAuth");
-            HttpOauthPrep::NoOauthSupport
+            OauthProbeOutcome::Resolved(HttpOauthPrep::NoOauthSupport)
         }
         Err(e) => {
             tracing::warn!(server = server_name, %e, "OAuth discovery failed");
-            HttpOauthPrep::on_probe_failure(mode)
+            OauthProbeOutcome::on_probe_failure(mode)
+        }
+    }
+}
+
+/// Whether an MCP server answers a request that carries no credentials.
+enum AnonymousAccess {
+    Accepted,
+    AuthChallenged,
+    Unreachable,
+}
+
+/// One POST to the MCP endpoint, judged by status class only. Not a GET, because streamable-http
+/// servers legally answer GET with a never-ending SSE stream, which is what hangs discovery.
+async fn probe_anonymous_access(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+) -> AnonymousAccess {
+    // Redirects are not followed: a gateway that redirects an anonymous POST to a
+    // login page is challenging, not accepting.
+    // reqwest 0.13; the policy chokepoint is typed for 0.12 and cannot wrap this builder.
+    #[allow(clippy::disallowed_methods)]
+    let client = match with_extra_root_certificates(reqwest::Client::builder())
+        .timeout(ANONYMOUS_ACCESS_PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe: building HTTP client failed");
+            return AnonymousAccess::Unreachable;
+        }
+    };
+    // The real transport sends the configured headers (e.g. `X-Api-Key`); the probe
+    // must too, or header-authenticated servers would fail closed. Authorization is
+    // known absent on this path.
+    let mut probe_headers = parse_config_headers(
+        server_name,
+        "anonymous-probe",
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    // Protocol-required values win over configured ones.
+    probe_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    probe_headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    apply_user_agent_policy(&mut probe_headers, server_name, url);
+    let request = client.post(url).headers(probe_headers).body("{}");
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            // 407 signals proxy credentials rather than server auth, but those are still
+            // credentials this session cannot supply headlessly.
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+                || status.is_redirection()
+            {
+                AnonymousAccess::AuthChallenged
+            } else if status.is_server_error() {
+                // Often an ingress/proxy blip that says nothing about auth; fail closed.
+                AnonymousAccess::Unreachable
+            } else {
+                // Any other response (even a 4xx complaint about the `{}` body) proves
+                // the server answers unauthenticated requests.
+                AnonymousAccess::Accepted
+            }
+        }
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe failed");
+            AnonymousAccess::Unreachable
+        }
+    }
+}
+
+/// OAuth discovery plus the anonymous-access tie-break for inconclusive results, so
+/// tokenless servers connect headless while auth-challenging (or unreachable) servers
+/// keep failing closed.
+async fn resolve_http_oauth_prep(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+    ctx: &McpSpawnCtx<'_>,
+    discovery_timeout: std::time::Duration,
+) -> HttpOauthPrep {
+    let outcome = {
+        let _auth_discovery_timer =
+            xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
+        match tokio::time::timeout(
+            discovery_timeout,
+            discover_and_prepare_auth(server_name, url, ctx.mode),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    server = server_name,
+                    url = %url,
+                    mode = ?ctx.mode,
+                    timeout_secs = discovery_timeout.as_secs(),
+                    "OAuth discovery timed out"
+                );
+                ctx.event_writer
+                    .emit(xai_grok_session_events::Event::McpOAuthDiscoveryTimeout {
+                        server_name: server_name.to_string(),
+                        url: url.to_string(),
+                    });
+                OauthProbeOutcome::on_probe_failure(ctx.mode)
+            }
+        }
+    };
+    match outcome {
+        OauthProbeOutcome::Resolved(prep) => prep,
+        OauthProbeOutcome::Inconclusive => {
+            let (verdict, prep) = match probe_anonymous_access(server_name, url, headers).await {
+                AnonymousAccess::Accepted => {
+                    tracing::info!(
+                        server = server_name,
+                        "OAuth discovery was inconclusive but the server accepts unauthenticated requests; connecting without auth"
+                    );
+                    ("accepted", HttpOauthPrep::NoOauthSupport)
+                }
+                AnonymousAccess::AuthChallenged => {
+                    tracing::warn!(
+                        server = server_name,
+                        "OAuth discovery was inconclusive and the server challenges unauthenticated requests; authenticate in TUI or set an Authorization header"
+                    );
+                    ("auth_challenged", HttpOauthPrep::NeedsInteractiveLogin)
+                }
+                AnonymousAccess::Unreachable => {
+                    tracing::warn!(
+                        server = server_name,
+                        "OAuth discovery was inconclusive and the anonymous-access probe could not reach the server; failing closed as auth required"
+                    );
+                    ("unreachable", HttpOauthPrep::NeedsInteractiveLogin)
+                }
+            };
+            ctx.event_writer
+                .emit(xai_grok_session_events::Event::McpOAuthProbeResolved {
+                    server_name: server_name.to_string(),
+                    verdict: verdict.to_string(),
+                });
+            prep
         }
     }
 }
@@ -2637,12 +2770,61 @@ pub struct SafeTokioChildProcess {
     transport: ResilientRwTransport<tokio::process::ChildStdout, tokio::process::ChildStdin>,
 }
 
+/// Holds a newly launched stdio child and its process group until ownership
+/// moves to [`SafeTokioChildProcess`]. It is built on the background thread that
+/// launches the child, so if the launch is cancelled partway (the session is
+/// closing) this value is still dropped, and dropping it stops the whole group:
+/// the child and anything it started. The caller sets `kill_on_drop(true)` so
+/// the child itself is also cleaned up on that path.
+struct SpawnGuard {
+    child: Option<tokio::process::Child>,
+    process_group: Option<Arc<ProcessGroup>>,
+}
+
+impl SpawnGuard {
+    fn new(child: tokio::process::Child, process_group: Option<Arc<ProcessGroup>>) -> Self {
+        Self {
+            child: Some(child),
+            process_group,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("guard child is present until disarm")
+    }
+
+    fn process_group(&self) -> Option<&Arc<ProcessGroup>> {
+        self.process_group.as_ref()
+    }
+
+    fn disarm(mut self) -> (tokio::process::Child, Option<Arc<ProcessGroup>>) {
+        (
+            self.child
+                .take()
+                .expect("guard child is present until disarm"),
+            self.process_group.take(),
+        )
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        if let Some(group) = &self.process_group
+            && let Err(e) = group.kill()
+        {
+            tracing::warn!("Error killing MCP child process group on spawn cancel: {e}");
+        }
+    }
+}
+
 impl SafeTokioChildProcess {
-    /// `server_name` + `event_writer` are threaded into the transport so a
-    /// skipped (undecodable) stdout line emits an `McpTransportDecodeError`
-    /// event for that server. `scope`, when set, enrolls the child's group for
-    /// session-close reaping.
-    fn spawn(
+    /// `server_name` and `event_writer` are passed to the transport so a skipped
+    /// unreadable output line reports an `McpTransportDecodeError` event for that
+    /// server. `scope`, when set, registers the child's group so it is cleaned up
+    /// when the session closes.
+    async fn spawn(
         mut cmd: Command,
         scope: Option<&ProcessScope>,
         server_name: String,
@@ -2652,8 +2834,35 @@ impl SafeTokioChildProcess {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        #[allow(clippy::disallowed_methods)] // enrolled in the session scope below
-        let mut child = cmd.spawn()?;
+        // Launch the child on a background thread so the session thread is never
+        // blocked, and take ownership of its group in that same step so the
+        // returned guard owns the child from the moment it exists (see
+        // `SpawnGuard` for what happens if the launch is cancelled).
+        let mut guard = tokio::task::spawn_blocking(move || -> std::io::Result<SpawnGuard> {
+            #[allow(clippy::disallowed_methods)] // group ownership is taken below, in this task
+            let child = cmd.spawn()?;
+            // Best effort: without a group we can still clean up the child itself.
+            let process_group = match ProcessGroup::new() {
+                Ok(mut group) => match group.attach(&child) {
+                    Ok(()) => Some(Arc::new(group)),
+                    Err(e) => {
+                        tracing::warn!("Failed to attach MCP child to process group: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to create MCP child process group: {e}");
+                    None
+                }
+            };
+            Ok(SpawnGuard::new(child, process_group))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("MCP spawn task failed: {e}")))??;
+
+        // The guard stays active through the failures below, so any early exit
+        // still cleans up the whole group instead of leaking it.
+        let child = guard.child_mut();
         let stdin = child
             .stdin
             .take()
@@ -2663,46 +2872,24 @@ impl SafeTokioChildProcess {
             .take()
             .ok_or_else(|| std::io::Error::other("stdout was already taken"))?;
         let stderr = child.stderr.take();
-
-        // Best-effort: a missing group just degrades to direct-child-only cleanup.
-        let process_group = match ProcessGroup::new() {
-            Ok(mut group) => match group.attach(&child) {
-                Ok(()) => Some(Arc::new(group)),
-                Err(e) => {
-                    tracing::warn!("Failed to attach MCP child to process group: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Failed to create MCP child process group: {e}");
-                None
-            }
+        // Tie this child to the spawning session: once that session closes,
+        // the child is cleaned up even if another session still holds the
+        // client.
+        let scope_closed = match (scope, guard.process_group()) {
+            (Some(scope), Some(group)) => !scope.register(group),
+            _ => false,
         };
-        // Enrollment ties this child to the *spawning* session's lifetime.
-        // `SharedMcpPool` may hand the resulting client Arc to subagent
-        // sessions, but subagents inherit the root session's scope, so the
-        // root's kill_all cannot strand an in-tree subagent. Residual: any
-        // detached holder of the Arc loses the transport when the spawning
-        // session closes — session close is deliberately the reap boundary.
-        if let (Some(scope), Some(group)) = (scope, process_group.as_ref())
-            && !scope.register(group)
-        {
-            // The scope latched closed (spawn raced session teardown), so
-            // `register` already killpg'd the child. Fail fast with a clear
-            // error instead of proceeding into a doomed rmcp handshake; the
-            // reap below mirrors `Drop`'s best-effort leader cleanup.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = child.kill().await;
-                });
-            } else if let Err(e) = child.start_kill() {
-                tracing::warn!("Error signaling MCP child killed by closed scope: {e}");
-            }
+        if scope_closed {
+            // `register` already stopped the group when it found the session
+            // already closing, so disarm the guard and fail fast rather than
+            // let its Drop stop the group a second time.
+            let _ = guard.disarm();
             return Err(std::io::Error::other(
                 "session is closing (process scope already reclaimed); MCP server not started",
             ));
         }
 
+        let (child, process_group) = guard.disarm();
         Ok((
             Self {
                 child: Some(child),
@@ -2717,8 +2904,9 @@ impl SafeTokioChildProcess {
         self.child.as_ref()?.id()
     }
 
-    /// SIGKILLs the whole process group (child + grandchildren). Synchronous, so
-    /// it's safe from `Drop`; the leader still needs reaping afterwards.
+    /// Force-stops the whole group: the child and anything it started. It is
+    /// synchronous, so it can run from `Drop` without a runtime; the child
+    /// itself still needs to be waited on afterwards.
     fn kill_process_group(&self) {
         if let Some(group) = &self.process_group
             && let Err(e) = group.kill()
@@ -2745,8 +2933,8 @@ impl SafeTokioChildProcess {
                 }
             }
             res = child.wait() => {
-                // Reap any grandchildren now, while the pgid is still kept alive
-                // by them and before the reaped leader's pid can be reused.
+                // Clean up anything the child started now, while the group id is
+                // still in use, and before the child's id can be reused.
                 self.kill_process_group();
                 match res {
                     Ok(status) => {
@@ -2914,7 +3102,10 @@ enum ClientState {
     /// transport on a best-effort basis so other callers can retry.
     Initializing,
     /// Handshake completed; the service is reference-counted via `Arc`.
-    Ready(McpService),
+    Ready {
+        service: McpService,
+        _connected: xai_grok_telemetry::activity::ActivityGaugeGuard,
+    },
 }
 
 /// `Copy` projection of [`ClientState`] used for cheap state-machine
@@ -4150,30 +4341,6 @@ impl McpClient {
         matches!(self.reconnect, Some(PendingTransport::Acp { .. }))
     }
 
-    /// Read-only: do `headers` equal this client's current HTTP transport
-    /// headers? Compares the full set order-insensitively (the caller's
-    /// headers originate from a `HashMap`). Returns `false` for a client
-    /// with no HTTP config.
-    pub fn http_headers_match(&self, headers: &HashMap<String, String>) -> bool {
-        let Some(config) = &self.http_config else {
-            return false;
-        };
-        // Materialize into a map so a duplicate stored key collapses to one
-        // entry, keeping the length comparison honest. HTTP header names are
-        // case-insensitive, so normalize names to lowercase on both sides (the
-        // crate already does this for `authorization`) and avoid a needless
-        // rebuild on a pure casing difference. Values stay case-sensitive.
-        let stored: HashMap<String, &str> = config
-            .headers
-            .iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v.as_str()))
-            .collect();
-        stored.len() == headers.len()
-            && headers
-                .iter()
-                .all(|(k, v)| stored.get(&k.to_ascii_lowercase()) == Some(&v.as_str()))
-    }
-
     /// Recover a dead transport in place: reset → re-handshake → re-arm the
     /// liveness watcher. Returns the live [`McpService`].
     ///
@@ -4419,9 +4586,16 @@ impl McpClient {
             // variant write per non-Pending call (plus an `Arc::clone`
             // on the Ready path) — negligible.
             match std::mem::replace(&mut *guard, ClientState::Initializing) {
-                ClientState::Ready(service) => {
-                    *guard = ClientState::Ready(service.clone());
-                    return Ok(service);
+                ClientState::Ready {
+                    service,
+                    _connected,
+                } => {
+                    let ready = service.clone();
+                    *guard = ClientState::Ready {
+                        service,
+                        _connected,
+                    };
+                    return Ok(ready);
                 }
                 ClientState::Empty => {
                     *guard = ClientState::Empty;
@@ -4621,19 +4795,20 @@ impl McpClient {
                 config,
                 auth_manager,
             } => {
-                let mut headers = reqwest::header::HeaderMap::new();
-                for (key, value) in &config.headers {
-                    if key.eq_ignore_ascii_case("Authorization") {
-                        continue;
-                    }
-                    if let (Ok(n), Ok(v)) = (
-                        reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                        value.parse::<reqwest::header::HeaderValue>(),
-                    ) {
-                        headers.insert(n, v);
-                    }
-                }
-                ensure_figma_user_agent(&mut headers, name, &config.url);
+                // Authorization is injected per-request by `AuthClient`, never
+                // carried in `default_headers`.
+                let mut headers = parse_config_headers(
+                    name,
+                    "oauth-transport",
+                    config
+                        .headers
+                        .iter()
+                        .filter(|(key, _)| !key.eq_ignore_ascii_case("Authorization"))
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
+                apply_user_agent_policy(&mut headers, name, &config.url);
+                // reqwest 0.13; the policy chokepoint is typed for 0.12 and cannot wrap this builder.
+                #[allow(clippy::disallowed_methods)]
                 let http_client = with_extra_root_certificates(
                     reqwest::Client::builder().default_headers(headers),
                 )
@@ -4787,6 +4962,10 @@ impl McpClient {
         *self.notify_tx.lock() = tx;
     }
 
+    pub fn set_elicitation_tx(&self, tx: Option<crate::elicitation::ElicitationInbox>) {
+        *self.elicitation_tx.lock() = tx;
+    }
+
     /// Snapshot the current event sender, if any.
     ///
     /// Used by [`crate::liveness::spawn_transport_liveness`] (which
@@ -4873,21 +5052,17 @@ impl McpClient {
         StreamableHttpClientTransport<crate::mcp_http_client::McpHttpClient<reqwest::Client>>,
         McpError,
     > {
-        let mut headers = reqwest::header::HeaderMap::new();
-        for (key, value) in &config.headers {
-            match (
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                value.parse::<reqwest::header::HeaderValue>(),
-            ) {
-                (Ok(name), Ok(val)) => {
-                    headers.insert(name, val);
-                }
-                _ => {
-                    tracing::warn!("Skipping invalid MCP HTTP header: {key}");
-                }
-            }
-        }
-        ensure_figma_user_agent(&mut headers, server_name, &config.url);
+        let mut headers = parse_config_headers(
+            server_name,
+            "transport",
+            config
+                .headers
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        apply_user_agent_policy(&mut headers, server_name, &config.url);
+        // reqwest 0.13; the policy chokepoint is typed for 0.12 and cannot wrap this builder.
+        #[allow(clippy::disallowed_methods)]
         let client =
             with_extra_root_certificates(reqwest::Client::builder().default_headers(headers))
                 .build()
@@ -4929,7 +5104,7 @@ impl McpClient {
     pub async fn is_healthy(&self) -> bool {
         let guard = self.state.lock().await;
         match &*guard {
-            ClientState::Ready(service) => !service.is_transport_closed(),
+            ClientState::Ready { service, .. } => !service.is_transport_closed(),
             _ => false,
         }
     }
@@ -4945,7 +5120,7 @@ impl McpClient {
     pub async fn liveness_check(&self) -> LivenessCheck {
         let guard = self.state.lock().await;
         match &*guard {
-            ClientState::Ready(service) => {
+            ClientState::Ready { service, .. } => {
                 if service.is_transport_closed() {
                     LivenessCheck::TransportClosed
                 } else {
@@ -4968,7 +5143,7 @@ impl McpClient {
             ClientState::Empty => ClientStateKind::Empty,
             ClientState::Pending(_) => ClientStateKind::Pending,
             ClientState::Initializing => ClientStateKind::Initializing,
-            ClientState::Ready(_) => ClientStateKind::Ready,
+            ClientState::Ready { .. } => ClientStateKind::Ready,
         }
     }
 
@@ -5062,7 +5237,7 @@ impl McpClient {
     /// Returns `None` if the client isn't ready yet.
     pub async fn server_instructions(&self) -> Option<String> {
         let guard = self.state.lock().await;
-        if let ClientState::Ready(service) = &*guard {
+        if let ClientState::Ready { service, .. } = &*guard {
             service
                 .peer_info()?
                 .instructions
@@ -5080,7 +5255,7 @@ impl McpClient {
     pub async fn server_icons(&self) -> Vec<McpIcon> {
         let guard = self.state.lock().await;
         match &*guard {
-            ClientState::Ready(service) => service
+            ClientState::Ready { service, .. } => service
                 .peer_info()
                 .and_then(|info| info.server_info.clone())
                 .map(|server_info| McpIcon::from_rmcp_list(server_info.icons))
@@ -5464,6 +5639,57 @@ fn ensure_figma_user_agent(headers: &mut reqwest::header::HeaderMap, server_name
     );
 }
 
+static DEFAULT_USER_AGENT: LazyLock<reqwest::header::HeaderValue> = LazyLock::new(|| {
+    format!("grok-cli/{}", xai_grok_version::VERSION)
+        .parse()
+        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("grok-cli"))
+});
+
+fn ensure_default_user_agent(headers: &mut reqwest::header::HeaderMap) {
+    if headers.contains_key(reqwest::header::USER_AGENT) {
+        return;
+    }
+    headers.insert(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT.clone());
+}
+
+/// Figma keeps its pinned bare `grok-cli` attribution token; every other server
+/// gets the versioned default. A `User-Agent` already in the map always wins.
+fn apply_user_agent_policy(headers: &mut reqwest::header::HeaderMap, server_name: &str, url: &str) {
+    ensure_figma_user_agent(headers, server_name, url);
+    ensure_default_user_agent(headers);
+}
+
+/// Configured header pairs → `HeaderMap` for every MCP streamable-HTTP request
+/// path. Invalid pairs are warned and skipped; for duplicate names the last
+/// valid value wins (`HeaderMap::insert`). `stage` disambiguates the warning:
+/// one bad configured pair is reported by both the anonymous probe and the
+/// transport build on a single connection attempt.
+fn parse_config_headers<'a>(
+    server_name: &str,
+    stage: &'static str,
+    pairs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in pairs {
+        match (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            value.parse::<reqwest::header::HeaderValue>(),
+        ) {
+            (Ok(name), Ok(val)) => {
+                headers.insert(name, val);
+            }
+            _ => {
+                tracing::warn!(
+                    server = server_name,
+                    stage,
+                    "Skipping invalid MCP HTTP header: {key}"
+                );
+            }
+        }
+    }
+    headers
+}
+
 fn stdio_path_override(env: &[acp::EnvVariable]) -> Option<&str> {
     env.iter()
         .find(|e| e.name.eq_ignore_ascii_case("PATH"))
@@ -5550,6 +5776,7 @@ pub async fn start_mcp_server(
             cmd.kill_on_drop(true).args(&spawn_args);
             apply_stdio_env(&mut cmd, &env, ctx.session_id);
             xai_grok_tools::util::detach_command(&mut cmd);
+            xai_grok_sandbox::child_net::restrict_child_network(&mut cmd);
 
             let (transport, stderr_handle) = SafeTokioChildProcess::spawn(
                 cmd,
@@ -5557,6 +5784,7 @@ pub async fn start_mcp_server(
                 name.clone(),
                 ctx.event_writer.clone(),
             )
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to spawn MCP server '{}': {}", name, e);
                 xai_grok_telemetry::session_ctx::log_event(
@@ -5614,32 +5842,14 @@ pub async fn start_mcp_server(
                 );
                 HttpOauthPrep::NoOauthSupport
             } else {
-                let _auth_discovery_timer =
-                    xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
-                match tokio::time::timeout(
+                resolve_http_oauth_prep(
+                    &name,
+                    &url,
+                    &http_config.headers,
+                    ctx,
                     OAUTH_DISCOVERY_TIMEOUT,
-                    discover_and_prepare_auth(&name, &url, ctx.mode),
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            server = %name,
-                            url = %url,
-                            mode = ?ctx.mode,
-                            timeout_secs = OAUTH_DISCOVERY_TIMEOUT.as_secs(),
-                            "OAuth discovery timed out"
-                        );
-                        ctx.event_writer.emit(
-                            xai_grok_session_events::Event::McpOAuthDiscoveryTimeout {
-                                server_name: name.clone(),
-                                url: url.clone(),
-                            },
-                        );
-                        HttpOauthPrep::on_probe_failure(ctx.mode)
-                    }
-                }
             };
             match auth_prep {
                 HttpOauthPrep::ManagerReady(auth_mgr) => Ok(McpClient::new_http_auth(

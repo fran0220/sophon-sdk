@@ -1,4 +1,5 @@
 //! HTTP client for backend CRUD operations.
+use crate::auth::backend::{ActiveAuthBackend, AuthBackend};
 use crate::auth::{GrokAuth, GrokComConfig};
 use crate::session::export::{ExportedMessage, ExportedMetadata, ExportedSession};
 use indexmap::IndexMap;
@@ -53,8 +54,8 @@ async fn add_bundle_fetch_headers(
     url: &str,
 ) -> reqwest::RequestBuilder {
     let resolved_auth = match auth_manager {
-        Some(am) => am.auth().await.ok(),
-        None => None,
+        Some(am) if ActiveAuthBackend::default().is_xai_authority() => am.auth().await.ok(),
+        _ => None,
     };
     let mut credentials = crate::util::grok_auth_credentials::GrokAuthCredentials::new(
         resolved_auth.as_ref().map(|auth| auth.key.clone()),
@@ -290,12 +291,9 @@ impl Default for BackendClient {
 }
 impl BackendClient {
     fn build_default_client() -> reqwest::Client {
-        xai_grok_extra_ca::with_extra_root_certificates(
-                reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(DEFAULT_TIMEOUT),
-            )
-            .build()
+        xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.connect_timeout(Duration::from_secs(10)).timeout(DEFAULT_TIMEOUT)
+            })
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to build backend HTTP client; falling back to shared client");
                 crate::http::shared_client()
@@ -388,7 +386,7 @@ impl BackendClient {
         Ok(share_url(&share_response.permission_id))
     }
     /// Build auth + identity headers.
-    /// Must include X-XAI-Token-Auth so nginx auth subrequest routes to authenticate_xai_grok_cli_token.
+    /// Must include X-XAI-Token-Auth so nginx auth subrequest routes to OAuth.
     /// See: crates/codegen/xai-grok-shell/src/agent/app.rs:run_headless
     async fn auth_header_map(&self) -> Result<reqwest::header::HeaderMap, BackendError> {
         use reqwest::header::{HeaderMap, HeaderValue};
@@ -778,9 +776,11 @@ pub(crate) fn fetch_models_blocking(
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
         EndpointAuth::Session => {
-            let auth = auth.ok_or_else(|| {
-                BackendError::Auth("No auth credentials for cli-chat-proxy".into())
-            })?;
+            let auth = auth
+                .filter(|_| ActiveAuthBackend::default().is_xai_authority())
+                .ok_or_else(|| {
+                    BackendError::Auth("No auth credentials for cli-chat-proxy".into())
+                })?;
             request = request
                 .header("Authorization", format!("Bearer {}", &auth.key))
                 .header("X-XAI-Token-Auth", "xai-grok-cli")
@@ -907,6 +907,9 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| get_u64(obj, "inference_idle_timeout_secs")),
         max_retries: get_u64(obj, "maxRetries")
             .or_else(|| get_u64(obj, "max_retries"))
+            .and_then(|v| u32::try_from(v).ok()),
+        subagent_rate_limit_max_attempts: get_u64(obj, "subagentRateLimitMaxAttempts")
+            .or_else(|| get_u64(obj, "subagent_rate_limit_max_attempts"))
             .and_then(|v| u32::try_from(v).ok()),
         hidden: obj
             .get("hidden")

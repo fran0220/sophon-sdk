@@ -486,6 +486,15 @@ pub(crate) fn prepare_compaction_request(
     }
 }
 
+impl CompactOutput {
+    pub(crate) fn model_wait_ms(&self) -> Option<u64> {
+        match (self.ttft_ms, self.stream_ms) {
+            (None, None) => None,
+            (ttft, stream) => Some(ttft.unwrap_or(0).saturating_add(stream.unwrap_or(0))),
+        }
+    }
+}
+
 /// Structured compaction outcome. Converted to a stable string only at the
 /// tracing boundary (tracing can't record a custom type directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

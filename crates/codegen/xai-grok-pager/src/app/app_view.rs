@@ -390,6 +390,9 @@ pub struct SessionPickerEntry {
     /// Latest session recap (`lastRecap` on the session/list wire), shown on the
     /// expanded resume card whenever available. Distinct from `last_turn_summary`.
     pub last_recap: Option<String>,
+    /// `sessionKind` from the session/list wire (`"headless"`, `"fork"`,
+    /// `"worktree"`, …). Drives the picker's Headless page filter.
+    pub session_kind: Option<String>,
     /// Lazy-loaded detail for the expanded card view.
     pub card_detail: Option<CardDetail>,
 }
@@ -603,6 +606,15 @@ pub struct ScreenModeRelaunch {
     /// Active session to reopen via `--resume`.
     pub session_id: String,
 }
+/// A consented `/feedback` trace upload deferred until the coding-data
+/// sharing opt-in write claimed at `seq` resolves.
+#[derive(Debug, Clone)]
+pub struct PendingFeedbackTraceUpload {
+    /// The `coding_data_write_seq` generation this upload waits on.
+    pub seq: u64,
+    pub agent_id: AgentId,
+    pub session_id: acp::SessionId,
+}
 /// Root view component — owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -714,6 +726,10 @@ pub struct AppView {
     /// Whether the plugin marketplace CTA is enabled. Env `GROK_PLUGIN_CTA`
     /// overrides `RemoteSettings.plugin_cta` (remote settings); defaults to `false`.
     pub plugin_cta_enabled: bool,
+    /// Marketplace source name the plugin CTA draws candidates from, when
+    /// `[marketplace].plugin_cta_marketplace` is set in the effective config.
+    /// `None` keeps the default xAI Official source.
+    pub plugin_cta_marketplace: Option<String>,
     pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team
     /// and API-key auth. `/usage` itself stays available for session token/cost
@@ -755,6 +771,30 @@ pub struct AppView {
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
     /// Whether the dashboard is currently loading local sessions (non-leader mode).
     pub dashboard_sessions_loading: bool,
+    /// The single SQLite workspace connection owned by this pager process.
+    /// Opened lazily only after dashboard v2 is entered.
+    pub workspace_store: Option<xai_grok_dashboard_store::WorkspaceStore>,
+    /// Initial workspace view read from [`Self::workspace_store`].
+    pub workspace_snapshot: Option<xai_grok_dashboard_store::WorkspaceSnapshot>,
+    /// Prevents duplicate open/snapshot effects while the first read is pending.
+    pub workspace_store_loading: bool,
+    /// Agent metadata changed after workspace initialization and needs a scan.
+    pub workspace_sync_requested: bool,
+    /// The single store handle is currently owned by an async write effect.
+    pub workspace_write_in_flight: bool,
+    /// A newer read-only schema was opened; suppress writes but keep reads.
+    pub workspace_writes_disabled: bool,
+    /// Exact metadata payloads that have consumed their one automatic retry.
+    pub workspace_retry_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
+    /// Last metadata payloads that exhausted or cannot use their retry. An
+    /// identical payload stays suppressed until its agent metadata changes.
+    pub workspace_failed_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
     /// Server-authoritative shared prompt queues, keyed by `sessionId`
     /// Reconciled from `x.ai/queue/changed` broadcasts so
     /// every client renders the same ordered queue (including prompts queued
@@ -795,6 +835,16 @@ pub struct AppView {
     /// resolved by the shell and advertised on ACP initialize (`sessionRecap`).
     /// When false, the pager must not request recaps (zero `x.ai/recap` traffic).
     pub session_recap_available: bool,
+    /// Shell-advertised eligibility for the `/feedback` trace-upload offer,
+    /// exactly as received (initialize meta / auth-meta refreshes). Read it
+    /// through [`Self::feedback_trace_offer`], which subtracts the latch.
+    pub shell_feedback_trace_offer: bool,
+    /// A persisted card answer was made this session; keeps auth-meta
+    /// refreshes from re-offering before the async config write lands.
+    pub feedback_trace_choice_latched: bool,
+    /// Trace upload parked until the same card answer's sharing opt-in write
+    /// confirms (the storage proxy rejects uploads while opted out).
+    pub feedback_trace_upload_pending: Option<PendingFeedbackTraceUpload>,
     /// Stateful prompt widget rendered on the welcome screen (persists input across frames).
     pub welcome_prompt: PromptWidget,
     /// The single slash-command MRU/recency store. Owned here and injected
@@ -932,10 +982,10 @@ pub struct AppView {
     pub session_picker_deep_search_seq: u64,
     /// Monotonically increasing sequence number for session list fetches
     /// (`Effect::FetchSessionList`): only the seq-current response is
-    /// applied, so a stale completion can't clobber newer results. Bumped
-    /// only under chat mode (server-search supersede); in Build mode it
-    /// stays 0 so plain list responses keep their pre-existing
-    /// last-write-wins behavior.
+    /// applied, so stale completions and responses fetched under an obsolete
+    /// Headless policy cannot clobber newer results. Shared by the welcome
+    /// picker and the agent modal; per-incarnation generation additionally
+    /// prevents responses from crossing close/reopen or host boundaries.
     pub session_picker_list_seq: u64,
     /// Resolved compat-session cells used before checking resume-skill paths.
     pub(crate) foreign_session_compat: xai_grok_foreign_sessions::EnabledForeignSessionSources,
@@ -945,8 +995,24 @@ pub struct AppView {
     pub(crate) foreign_scan_coordinator: crate::app::ForeignScanCoordinator,
     /// Foreign lane completion and deferred native-lane notice.
     pub(crate) session_picker_lanes: crate::views::session_picker::SessionPickerLanes,
-    /// Invalidates detail reads when picker rows or filters change.
-    pub(crate) session_picker_detail_generation: u64,
+    /// Invalidates the welcome picker's in-flight card-detail reads when its
+    /// rows or filters change.
+    pub(crate) session_picker_detail_seq: u64,
+    /// Allocator for picker incarnation generations. Starts at 0; the first
+    /// allocation returns 1, so a freshly-constructed modal's 0 placeholder
+    /// can never collide with an allocated generation (no producer stamps a
+    /// request before the allocator runs).
+    pub(crate) picker_generation_counter: u64,
+    /// Generation of the welcome picker's current incarnation. Reallocated by
+    /// every browse fetch (the `Action::FetchSessionList` dispatcher) and
+    /// every picker dismissal, so results issued for a superseded incarnation
+    /// no longer match. Searches and debounce re-emissions read it and never
+    /// reallocate.
+    pub(crate) session_picker_generation: u64,
+    /// Dashboard session picker surface. `None` while unmounted; the
+    /// dashboard host constructs it on open and drops it on dismiss.
+    pub(crate) dashboard_session_picker:
+        Option<crate::views::session_picker_surface::SessionPickerSurface>,
     /// The search query `session_picker_entries` were server-fetched with
     /// (`None` = unfiltered fetch). Via
     /// [`crate::views::session_picker::effective_filter_query`], skips the
@@ -1197,8 +1263,11 @@ pub struct AppView {
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
-    /// Set from the resolved terminal state at startup.
+    /// Set from the resolved terminal state at startup; updated by the
+    /// in-process `/minimal` ⇄ `/fullscreen` switch (`mode_switch`).
     pub(crate) screen_mode: super::ScreenMode,
+    /// Pending in-process mode-switch target, consumed by the event loop.
+    pub(crate) pending_screen_mode_switch: Option<super::ScreenMode>,
     /// Onboarding tutorial overlay, if open. Top-level (not per-agent) so it
     /// works over both the welcome screen and an agent session. Opened by
     /// `/tutorial` (also in the command palette).
@@ -1270,6 +1339,13 @@ impl AppView {
             pending.abandon();
         }
     }
+    /// Next picker incarnation generation. One app-wide monotone counter, so
+    /// generations are unique across all picker hosts and a result can never
+    /// match a different host's live incarnation.
+    pub(crate) fn alloc_picker_generation(&mut self) -> u64 {
+        self.picker_generation_counter += 1;
+        self.picker_generation_counter
+    }
     pub fn is_zdr_blocked(&self) -> bool {
         self.is_zdr && !self.zdr_access_enabled
     }
@@ -1288,6 +1364,12 @@ impl AppView {
                 .team_role
                 .as_deref()
                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
+    }
+    /// Whether `/feedback` may offer the trace-consent card: the shell
+    /// advertised the offer and no card answer latched it off this session.
+    /// Derived so no code path can fabricate an offer the shell never made.
+    pub fn feedback_trace_offer(&self) -> bool {
+        self.shell_feedback_trace_offer && !self.feedback_trace_choice_latched
     }
     /// Why `coding_data_sharing` is locked for this user (`None` = editable).
     /// Mirrors the dispatch guards in `set_coding_data_sharing`.
@@ -1375,6 +1457,7 @@ impl AppView {
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
+        self.shell_feedback_trace_offer = meta.feedback_trace_offer;
         self.gate = meta.gate.clone();
         if was_gated && self.gate.is_none() {
             self.paywall_check_started = None;
@@ -1556,7 +1639,10 @@ impl AppView {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -1650,9 +1736,11 @@ impl AppView {
             import_claude_modal: None,
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
+            pending_screen_mode_switch: None,
             show_resolved_model: true,
             sharing_enabled: false,
             plugin_cta_enabled: false,
+            plugin_cta_marketplace: None,
             workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
@@ -1664,6 +1752,14 @@ impl AppView {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: std::collections::HashMap::new(),
+            workspace_failed_metadata: std::collections::HashMap::new(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -1671,6 +1767,9 @@ impl AppView {
             scheduler_background_loops_seed: true,
             cancel_rewind_enabled: true,
             session_recap_available: false,
+            shell_feedback_trace_offer: false,
+            feedback_trace_choice_latched: false,
+            feedback_trace_upload_pending: None,
             tutorial: None,
             dashboard: None,
             dashboard_return: None,
@@ -3796,7 +3895,7 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             if key!('w', CONTROL).matches(key) && ctx.cwd_has_git_ancestor {
                 return InputOutcome::Action(Action::OpenNewWorktreeDialog);
             }
-            if key!('s', CONTROL).matches(key) {
+            if key!(F(3)).matches(key) {
                 return InputOutcome::Action(Action::FetchSessionList);
             }
             if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
@@ -4471,13 +4570,9 @@ impl AppView {
         }
     }
     /// Render the current view to the terminal.
-    ///
-    /// Delegates to [`crate::render::draw::draw_frame`] which handles the
-    /// low-level terminal interaction (bypassing ratatui's `try_draw`,
-    /// synchronized output, cursor blink preservation). See that module's
-    /// docs for the full rationale.
     pub fn draw(&mut self, terminal: &mut PagerTerminal) {
         self.draw_inner(terminal);
+        xai_grok_telemetry::startup::record_first_frame();
         crate::memory_release::run_deferred_release();
     }
     fn draw_inner(&mut self, terminal: &mut PagerTerminal) {
@@ -5036,6 +5131,8 @@ impl AppView {
                                 registry,
                                 pending_hint,
                                 dashboard_roster,
+                                self.workspace_dashboard_enabled,
+                                self.workspace_snapshot.as_ref(),
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
                             );
@@ -5550,6 +5647,17 @@ impl AppView {
                     .iter()
                     .any(|c| c.name == "workflow")
                     || !agent.workflow_runs.is_empty(),
+            );
+            agent.prompt.slash_controller.set_workflow_runs(
+                agent
+                    .workflow_runs
+                    .iter()
+                    .map(|run| crate::slash::command::WorkflowRunChoice {
+                        name: run.name.clone(),
+                        status: run.status.clone(),
+                        builtin: run.builtin,
+                    })
+                    .collect(),
             );
             if agent.acp_synced_generation != agent.session.available_commands_generation {
                 agent.prompt.sync_acp_commands(

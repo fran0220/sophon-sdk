@@ -39,6 +39,7 @@ pub enum PendingKind {
     Question,
     /// `x.ai/exit_plan_mode` plan approval.
     PlanApproval,
+    McpElicitation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

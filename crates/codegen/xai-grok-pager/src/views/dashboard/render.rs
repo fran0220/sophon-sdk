@@ -8,7 +8,7 @@ use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
 
 use super::layout::{MIN_DASHBOARD_WIDTH, compute_layout};
-use super::row::{DashboardRow, RowBadge, build_rows_with_roster};
+use super::row::{DashboardRow, RowBadge, build_rows_with_roster, build_rows_with_workspace};
 use super::state::{
     DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RenameDraft,
     RowState, SectionKey,
@@ -108,6 +108,9 @@ pub fn render_dashboard(
     // Leader-mode session roster (FleetView). Empty in non-leader mode,
     // which naturally gates the appended roster-only rows.
     roster: &[crate::app::roster::RosterEntry],
+    // Dashboard v2 reads membership exclusively from `workspace_snapshot`.
+    workspace_dashboard_enabled: bool,
+    workspace_snapshot: Option<&xai_grok_dashboard_store::WorkspaceSnapshot>,
     // Whether the local on-disk session roster is still being fetched
     // (non-leader mode). When true and there's nothing to show yet, the
     // empty body reads "Loading sessions…" instead of the "no agents
@@ -143,23 +146,33 @@ pub fn render_dashboard(
     // comparators that want to know what view the user came from (None
     // in fresh dashboard renders).
     let active: Option<AgentId> = None;
-    let rows = build_rows_with_roster(
-        agents,
-        &state.pinned,
-        &state.reorder,
-        active,
-        state.grouping,
-        &state.filter,
-        home,
-        roster,
-    );
+    let rows = if workspace_dashboard_enabled {
+        workspace_snapshot
+            .map(|snapshot| build_rows_with_workspace(agents, snapshot, home))
+            .unwrap_or_default()
+    } else {
+        build_rows_with_roster(
+            agents,
+            &state.pinned,
+            &state.reorder,
+            active,
+            state.grouping,
+            &state.filter,
+            home,
+            roster,
+        )
+    };
     // Chat-conversation roster rows can't be deleted from the dashboard
     // yet — record them so the `[✗]` and Ctrl+X arm both skip them.
-    state.conversation_row_ids = roster
-        .iter()
-        .filter(|e| e.origin.kind == "conversation")
-        .map(|e| e.session_id.clone())
-        .collect();
+    state.conversation_row_ids = if workspace_dashboard_enabled {
+        Default::default()
+    } else {
+        roster
+            .iter()
+            .filter(|e| e.origin.kind == "conversation")
+            .map(|e| e.session_id.clone())
+            .collect()
+    };
     state.reanchor_selection(&rows);
 
     // DO NOT GC pinned/reorder at render time. The old
@@ -654,7 +667,7 @@ fn render_dashboard_banner(
         return;
     }
     if rows.is_empty() {
-        let hint = " No sessions yet — Esc to dispatch one. ";
+        let hint = " No sessions yet. Esc to dispatch one. ";
         let trunc = truncate_str(hint, inner.width as usize);
         buf.set_string(
             inner.x,
@@ -2305,6 +2318,7 @@ fn render_row(
     let armed_delete = state.armed_delete_row_ref();
     let show_delete = !row.is_more_placeholder
         && !row.id.is_subagent()
+        && !row.id.is_workspace()
         && row.state.allows_delete()
         && !state.row_is_conversation(&row.id)
         && (state.hovered_row.as_ref() == Some(&row.id) || armed_delete == Some(&row.id));
@@ -2664,6 +2678,7 @@ fn render_narrow_rows(
             let armed_here = state.armed_delete_row_ref() == Some(&row.id);
             let show_delete = !row.is_more_placeholder
                 && !row.id.is_subagent()
+                && !row.id.is_workspace()
                 && row.state.allows_delete()
                 && !state.row_is_conversation(&row.id)
                 && (hovered || armed_here);
@@ -2713,12 +2728,12 @@ fn render_no_match(buf: &mut Buffer, area: Rect, theme: &Theme, filter: &Filter)
     }
     let hint = match filter {
         Filter::None => "No matching rows.".to_string(),
-        Filter::Agent(n) => format!("No agents match `a:{n}` — press Esc to clear the filter."),
+        Filter::Agent(n) => format!("No agents match `a:{n}`. Press Esc to clear the filter."),
         Filter::State(s) => format!(
-            "No agents in state `{}` — press Esc to clear the filter.",
+            "No agents in state `{}`: press Esc to clear the filter.",
             s.group_label()
         ),
-        Filter::Substring(n) => format!("No rows match `{n}` — press Esc to clear the filter."),
+        Filter::Substring(n) => format!("No rows match `{n}`: press Esc to clear the filter."),
     };
     let truncated = truncate_str(&hint, area.width.saturating_sub(2) as usize);
     // Explicit offset to avoid `area.y + 1.min(...)`
@@ -2857,6 +2872,11 @@ fn paint_dispatch_config_badge(
         DashboardDispatchMode::Plan => flags.push(PromptFlag {
             text: "plan",
             color: Some(theme.accent_plan),
+            bold: false,
+        }),
+        DashboardDispatchMode::Auto => flags.push(PromptFlag {
+            text: "auto",
+            color: Some(theme.accent_system),
             bold: false,
         }),
         DashboardDispatchMode::AlwaysApprove => flags.push(PromptFlag {
@@ -3131,6 +3151,12 @@ fn dispatch_text_rows(state: &DashboardState, dispatch_width: u16, area_height: 
         .desired_height(content_w, &style, false, max_text_rows)
 }
 
+/// Top and bottom border rows of a dispatch dropdown panel.
+const DROPDOWN_CHROME_ROWS: u16 = 2;
+
+/// Smallest panel that still carries both borders and one item row.
+const MIN_DROPDOWN_PANEL_ROWS: u16 = DROPDOWN_CHROME_ROWS + 1;
+
 /// Render the `/command` completion dropdown above the dispatch box.
 /// Mirrors `agent_view`'s slash dropdown chrome. No-op (and clears the
 /// stored hit rect) when the dropdown is closed.
@@ -3156,19 +3182,17 @@ fn render_slash_dropdown(
     // Height in wrapped lines, not items (see `desired_item_rows`);
     // items render inset 1 col on each side.
     let item_rows = desired_item_rows(&snap.matches, dispatch_rect.width.saturating_sub(2));
-    let panel_h = item_rows.saturating_add(2);
-    let max_top = dispatch_rect.y.saturating_sub(1);
-    if max_top <= area.y || panel_h == 0 {
+    // The bottom is pinned to the input, so a panel taller than the space above it
+    // would start above `area` and paint off the buffer.
+    let panel_h = item_rows
+        .saturating_add(DROPDOWN_CHROME_ROWS)
+        .min(dispatch_rect.y.saturating_sub(area.y));
+    if panel_h < MIN_DROPDOWN_PANEL_ROWS {
         state.slash_dropdown_items_area = None;
         state.slash_dropdown_hit = Default::default();
         return;
     }
-    let top_y = max_top.saturating_sub(panel_h - 1);
-    if top_y < area.y {
-        state.slash_dropdown_items_area = None;
-        state.slash_dropdown_hit = Default::default();
-        return;
-    }
+    let top_y = dispatch_rect.y - panel_h;
     let panel_x = dispatch_rect.x;
     let panel_width = dispatch_rect.width;
     if panel_width < 4 {
@@ -3212,7 +3236,7 @@ fn render_slash_dropdown(
         x: items_x,
         y: top_y + 1,
         width: items_width,
-        height: item_rows,
+        height: panel_h - DROPDOWN_CHROME_ROWS,
     };
     state.slash_dropdown_hit = render_slash(
         buf,
@@ -3236,7 +3260,9 @@ fn peeked_agent_cwd(
     let id = match row {
         super::DashboardRowId::TopLevel(id) => *id,
         super::DashboardRowId::Subagent { parent, .. } => *parent,
-        super::DashboardRowId::Roster { .. } => return None,
+        super::DashboardRowId::Roster { .. } | super::DashboardRowId::Workspace { .. } => {
+            return None;
+        }
     };
     agents.get(&id).map(|a| a.session.cwd.clone())
 }
@@ -3471,9 +3497,13 @@ fn render_footer(
         return;
     }
 
-    let show_ctrl_x = selected_state.is_some_and(|s| {
-        matches!(s, RowState::Working | RowState::NeedsInput) || s.allows_delete()
-    });
+    let show_ctrl_x = !state
+        .selected
+        .as_ref()
+        .is_some_and(DashboardRowId::is_workspace)
+        && selected_state.is_some_and(|s| {
+            matches!(s, RowState::Working | RowState::NeedsInput) || s.allows_delete()
+        });
     let stop_label = if matches!(
         selected_state,
         Some(RowState::Working | RowState::NeedsInput)
@@ -3916,7 +3946,7 @@ pub fn popup_rect(view: Rect) -> Rect {
 ///
 /// When the popup area is too small for the bordered frame
 /// (`area.height < 5` or `area.width < 10`), paints a minimal
-/// fallback ("terminal too small — Esc to close") instead of leaving
+/// fallback ("terminal too small: Esc to close") instead of leaving
 /// the user staring at an empty box and
 /// returns `(None, None, false)`.
 pub fn render_popup_overlay(
@@ -3978,7 +4008,7 @@ pub fn render_popup_overlay(
         outline.render(area, buf);
         if area.height >= 3 && area.width >= 6 {
             let hint = truncate_str(
-                "(terminal too small — Esc to close)",
+                "(terminal too small: Esc to close)",
                 area.width.saturating_sub(2) as usize,
             );
             buf.set_string(

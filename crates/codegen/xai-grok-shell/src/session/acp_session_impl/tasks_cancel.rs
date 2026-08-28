@@ -94,24 +94,63 @@ pub(crate) struct TurnInputRequest {
     pub(crate) json_schema: Option<serde_json::Value>,
     pub(crate) persist_ack: Option<oneshot::Sender<()>>,
     pub(crate) parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
+    pub(crate) traceparent: Option<String>,
+}
+
+/// Completion-channel payload: prompt id, turn result, elapsed ms from `started_at`.
+/// `elapsed_ms` is `None` when no running task supplied a start time.
+pub(crate) struct TurnCompletionMsg {
+    pub(crate) prompt_id: String,
+    pub(crate) result: PromptTurnResult,
+    pub(crate) elapsed_ms: Option<u64>,
 }
 
 pub(crate) struct AgentTask {
     pub(crate) prompt_id: String,
     pub(crate) handle: tokio::task::AbortHandle,
+    /// Monotonic start of this running turn; complete and cancel both read it.
+    pub(crate) started_at: std::time::Instant,
+}
+
+/// Saturating `Instant` delta in ms. No panic on overflow.
+pub(crate) fn elapsed_ms_saturating(start: std::time::Instant, now: std::time::Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod elapsed_ms_tests {
+    use super::elapsed_ms_saturating;
+
+    #[test]
+    fn elapsed_ms_saturating_uses_injected_instants() {
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_millis(42);
+        assert_eq!(elapsed_ms_saturating(start, later), 42);
+        assert_eq!(elapsed_ms_saturating(later, start), 0);
+    }
 }
 
 impl AgentTask {
+    #[cfg(test)]
+    pub(crate) fn new(prompt_id: &str, handle: tokio::task::AbortHandle) -> Self {
+        Self {
+            prompt_id: prompt_id.to_string(),
+            handle,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
     pub(super) fn new_prompt(
         session: Arc<SessionActor>,
         request: TurnInputRequest,
-        completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+        completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
     ) -> Self {
-        let prompt_id = request.prompt_id.clone();
+        let started_at = std::time::Instant::now();
         Self {
-            prompt_id,
-            handle: tokio::task::spawn_local(run_task(session, request, completion_tx))
+            prompt_id: request.prompt_id.clone(),
+            handle: tokio::task::spawn_local(run_task(session, request, completion_tx, started_at))
                 .abort_handle(),
+            started_at,
         }
     }
 
@@ -171,11 +210,17 @@ fn front_is_rewind_poppable(front: Option<&InputItem>) -> bool {
 async fn run_task(
     session: Arc<SessionActor>,
     request: TurnInputRequest,
-    completion_tx: mpsc::UnboundedSender<(String, PromptTurnResult)>,
+    completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
+    started_at: std::time::Instant,
 ) {
     let prompt_id = request.prompt_id.clone();
     let result = session.handle_turn_input(request).await;
-    let _ = completion_tx.send((prompt_id, result));
+    let elapsed_ms = elapsed_ms_saturating(started_at, std::time::Instant::now());
+    let _ = completion_tx.send(TurnCompletionMsg {
+        prompt_id,
+        result,
+        elapsed_ms: Some(elapsed_ms),
+    });
 }
 
 impl SessionActor {
@@ -251,11 +296,8 @@ impl SessionActor {
         self.turn_report.release_aborted(epoch);
     }
 
-    /// Cancel the running turn for a send-now prompt: Ctrl+C parity (kills the
-    /// turn's foreground command; background tasks, subagents, and the queue
-    /// survive). Flushes the replay buffer before teardown so streamed chunks
-    /// persist; the caller's `maybe_start_running_task` then promotes the new
-    /// front (a flushed interjection fallback runs ahead of the send-now prompt).
+    /// The Ctrl+C teardown, except the running command moves to the background instead of being killed.
+    /// Background tasks, subagents, and the queue are untouched.
     pub(super) async fn cancel_turn_for_send_now(
         &self,
         replay_buffer: &mut crate::agent::update_chunk_merge::ReplayBuffer,
@@ -283,7 +325,17 @@ impl SessionActor {
         if let Some(gate) = &self.tool_context.task_wake_suppressed {
             gate.set(false);
         }
-        self.state.lock().await.notifications_suppressed = false;
+        {
+            let mut state = self.state.lock().await;
+            state.notifications_suppressed = false;
+            if state.take_hook_block_hold() {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.prompt.hook_block_hold_released",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({ "reason": "send_now" })),
+                );
+            }
+        }
         xai_grok_telemetry::unified_log::info(
             "shell.task_wake.gate_cleared",
             Some(self.session_info.id.0.as_ref()),
@@ -366,6 +418,7 @@ impl SessionActor {
         }
     }
 
+    #[tracing::instrument(name = "session.cancel", skip_all, fields(trigger = ?options.trigger.as_ref().map(crate::session::CancelTrigger::kind)))]
     pub(super) async fn cancel_running_task(
         &self,
         options: crate::session::CancelOptions,
@@ -504,16 +557,27 @@ impl SessionActor {
             );
         }
 
-        if cancel_subagents {
-            // Abort the producer first so it cannot enqueue more TaskTool work
-            // after the ParentSession sweep. Keep the task slot for prompt-id
-            // attribution below; cleanup will take+abort again (idempotent).
-            {
-                let state = self.state.lock().await;
+        // Sample before abort + teardown awaits so persisted cancel elapsed is
+        // turn runtime, not post-abort kill/token work. `None` when no running
+        // task supplies a start time (do not persist `Some(0)`).
+        let cancel_elapsed_ms = {
+            let state = self.state.lock().await;
+            let cancel_elapsed_ms = state
+                .running_task
+                .as_ref()
+                .map(|t| elapsed_ms_saturating(t.started_at, std::time::Instant::now()));
+            if cancel_subagents {
+                // Abort the producer first so it cannot enqueue more TaskTool work
+                // after the ParentSession sweep. Keep the task slot for prompt-id
+                // attribution below; cleanup will take+abort again (idempotent).
                 if let Some(task) = state.running_task.as_ref() {
                     self.abort_turn_task(task, self.turn_report.epoch());
                 }
             }
+            cancel_elapsed_ms
+        };
+
+        if cancel_subagents {
             // Then cancel every non-workflow session child (incl. prior turns)
             // and close spawn admission until the next turn opens it.
             self.cancel_all_session_subagents();
@@ -532,7 +596,10 @@ impl SessionActor {
             self.signals_handle().record_cancellation();
         }
 
-        // Kill all running foreground terminal processes before aborting the task.
+        // A send-now redirect is the user continuing, not stopping, so it never kills an in-flight command.
+        let send_now = matches!(trigger, Some(crate::session::CancelTrigger::SendNow));
+
+        // Kill all running foreground terminal processes before aborting the task. Send-now skips this and backgrounds them after the abort.
         // Each TerminalBackend implementation knows how to kill its own processes.
         // Background tasks are left alive for interactive sessions but killed
         // during subagent teardown (kill_background_tasks = true).
@@ -540,20 +607,8 @@ impl SessionActor {
         // Note: a narrow TOCTOU window exists — the running task could spawn a
         // new terminal between this call and the abort() below. In practice this
         // is negligible; abort() drops the future and any child handle it owns.
-        if self.startup_hints.is_subagent {
-            // Subagent: only kill foreground processes owned by this session,
-            // not the parent's or sibling's on the shared backend.
-            self.agent
-                .borrow()
-                .tool_bridge()
-                .kill_foreground_commands_by_owner(&self.session_info.id.0)
-                .await;
-        } else {
-            self.agent
-                .borrow()
-                .tool_bridge()
-                .kill_foreground_commands()
-                .await;
+        if !send_now {
+            self.kill_foreground_commands_for_cancel().await;
         }
 
         if kill_background_tasks {
@@ -811,7 +866,6 @@ impl SessionActor {
             // not aborting, so it must not arm the interrupt category or the
             // interrupt envelope for its own continuation turn
             // (mirrors the cancel-rate skip above).
-            let send_now = matches!(trigger, Some(crate::session::CancelTrigger::SendNow));
             if !send_now {
                 self.events.set_prior_interrupt_category(
                     crate::session::events::CancellationCategory::MidTurnAbort,
@@ -837,6 +891,11 @@ impl SessionActor {
                 } else {
                     crate::session::events::RedirectKind::CancelThenSend
                 });
+        }
+
+        // After the abort, so the turn no longer owns the commands it started.
+        if send_now {
+            self.background_foreground_commands_for_send_now().await;
         }
 
         if let Some(is_turn_active) = &self.tool_context.is_turn_active {
@@ -896,6 +955,8 @@ impl SessionActor {
                 Some(crate::session::commands::meta_category_str(
                     crate::session::events::CancellationCategory::MidTurnAbort,
                 )),
+                None,
+                cancel_elapsed_ms,
             )
             .await;
         }
@@ -961,6 +1022,57 @@ impl SessionActor {
                 WakeBarrier::Clear
             },
             turn_stopped,
+        }
+    }
+
+    /// The user sent a message mid-turn: move any running command to the background instead of killing it.
+    /// Each one's tool call gets an honest answer saying the command is still running.
+    async fn background_foreground_commands_for_send_now(&self) {
+        // This session and its subagents share one terminal, so move only this session's own commands.
+        // Replying to another session's command would put an answer in this session's history for a question it never asked.
+        let owner = Some(self.session_info.id.0.as_ref());
+        let backgrounded = {
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .background_foreground_commands(owner)
+                .await
+        };
+
+        // Empty can mean nothing was running, or that this backend cannot background at all. Kill, so the command does not outlive its turn.
+        // A kill does not report which commands it stopped, so `repair_dangling_tool_calls` answers the tool call before the next request.
+        if backgrounded.is_empty() {
+            self.kill_foreground_commands_for_cancel().await;
+        }
+
+        for bg in backgrounded {
+            // No command text: the model already has it in the tool call this answers.
+            let message = format!(
+                "Command was moved to the background because the user sent a new message. \
+                 The process is still running, not cancelled. Retrieve its output later \
+                 with {} (task_id: {}).",
+                self.tool_context.task_output_tool_name, bg.tool_call_id
+            );
+            self.chat_state_handle
+                .push_tool_result(ConversationItem::tool_result(bg.tool_call_id, message));
+        }
+    }
+
+    /// Kill the foreground commands this cancel owns. A subagent kills only its own, never the parent's or a sibling's on the shared backend.
+    #[tracing::instrument(name = "cancel.kill_foreground", skip_all)]
+    async fn kill_foreground_commands_for_cancel(&self) {
+        if self.startup_hints.is_subagent {
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .kill_foreground_commands_by_owner(&self.session_info.id.0)
+                .await;
+        } else {
+            self.agent
+                .borrow()
+                .tool_bridge()
+                .kill_foreground_commands()
+                .await;
         }
     }
 }

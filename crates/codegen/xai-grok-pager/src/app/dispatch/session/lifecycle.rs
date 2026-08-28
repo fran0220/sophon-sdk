@@ -8,6 +8,7 @@ use crate::app::actions::{Action, Effect, SwitchModelError};
 use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState, DeferredModelSwitch};
 use crate::app::agent_view::{ActivePane, AgentView, McpInitProgress};
 use crate::app::app_view::{ActiveView, AppView, TrustState};
+use crate::app::cancel_latency::TurnEnd;
 use crate::app::consent::ConsentState;
 use crate::app::dispatch::ctx::{
     SwitchCause, get_active_agent, reseed_tip_for_new_session, show_welcome, switch_to_agent,
@@ -322,7 +323,7 @@ fn apply_welcome_workspace_on_new_session(app: &mut AppView) -> Result<(), Vec<E
             app.welcome_local_workspace_ack_pending = true;
             app.session_picker_entries = None;
             app.session_picker_loading = false;
-            app.session_picker_list_seq = app.session_picker_list_seq.saturating_add(1);
+            super::foreign::next_picker_list_generation(app);
             Err(vec![])
         }
         Err(err) => {
@@ -393,6 +394,8 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -474,6 +477,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent_id,
         cwd: effective_cwd,
         model_id,
+        permission_mode_override: None,
         preferred_session_id,
         chat_kind,
     });
@@ -944,6 +948,8 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -1029,6 +1035,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         label,
         git_ref,
         model_id,
+        permission_mode_override: None,
         preferred_session_id,
         chat_kind,
     }];
@@ -1090,7 +1097,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
             && let Some(cmd) = switch_hint
         {
             agent.scrollback.push_block(RenderBlock::system(format!(
-                "Session {} \u{2014} use {cmd} to switch between sessions",
+                "Session {}, use {cmd} to switch between sessions",
                 session_id_clone.0,
             )));
         } else if agent_count > 1 {
@@ -1147,7 +1154,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
-            nonce: 0,
+            nonce: Default::default(),
         });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
@@ -1194,7 +1201,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.finish_command();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(TurnEnd::Aborted);
         let session_id_clone = session_id.clone();
         agent.bind_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
@@ -1255,7 +1262,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
-            nonce: 0,
+            nonce: Default::default(),
         });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
@@ -1365,7 +1372,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
         agent.mcp_init_progress = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(TurnEnd::Aborted);
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
         agent.show_toast(&msg);
@@ -1418,7 +1425,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
         agent.mcp_init_progress = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
-        agent.mark_turn_finished();
+        agent.mark_turn_finished(TurnEnd::Aborted);
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
         agent
