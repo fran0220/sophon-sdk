@@ -2194,13 +2194,34 @@ impl MvpAgent {
         &self,
     ) -> xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig {
         use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
-        let sampling_config = self.sampling_config.borrow();
-        let Some(ref api_key) = sampling_config.api_key else {
+        let cfg = self.cfg.borrow();
+        let (api_key, base_url, provider_headers, use_dynamic_api_key_provider) =
+            if let Some(provider) = &cfg.imagine_provider {
+                if provider.api_key.trim().is_empty() {
+                    return ImageGenConfig::Disabled;
+                }
+                (
+                    provider.api_key.clone(),
+                    provider.base_url.clone(),
+                    provider.extra_headers.clone(),
+                    false,
+                )
+            } else {
+                let sampling_config = self.sampling_config.borrow();
+                let Some(api_key) = sampling_config.api_key.clone() else {
+                    return ImageGenConfig::Disabled;
+                };
+                (
+                    api_key,
+                    cfg.endpoints.xai_api_base_url.clone(),
+                    indexmap::IndexMap::new(),
+                    true,
+                )
+            };
+        if base_url.trim().is_empty() {
             return ImageGenConfig::Disabled;
         };
         let tier_restricted = self.is_tier_restricted_capability();
-        let cfg = self.cfg.borrow();
-        let base_url = cfg.endpoints.xai_api_base_url.clone();
         let version = cfg
             .client_version
             .clone()
@@ -2214,10 +2235,12 @@ impl MvpAgent {
             alpha_test_key.as_deref(),
             &base_url,
         );
+        headers.extend(provider_headers);
         ImageGenConfig::Enabled {
-            api_key: api_key.clone(),
+            api_key,
             base_url,
             extra_headers: headers,
+            use_dynamic_api_key_provider,
             image_gen_enabled: cfg.resolve_image_gen().value,
             image_edit_enabled: cfg.resolve_image_edit().value,
             model_override: cfg.resolve_image_gen_model_override(),
@@ -2241,7 +2264,29 @@ impl MvpAgent {
         if !cfg.resolve_video_gen().value {
             return VideoGenConfig::Disabled;
         }
-        let Some(api_key) = self.sampling_config.borrow().api_key.clone() else {
+        let (api_key, base_url, provider_headers, use_dynamic_api_key_provider) =
+            if let Some(provider) = &cfg.imagine_provider {
+                if provider.api_key.trim().is_empty() {
+                    return VideoGenConfig::Disabled;
+                }
+                (
+                    provider.api_key.clone(),
+                    provider.base_url.clone(),
+                    provider.extra_headers.clone(),
+                    false,
+                )
+            } else {
+                let Some(api_key) = self.sampling_config.borrow().api_key.clone() else {
+                    return VideoGenConfig::Disabled;
+                };
+                (
+                    api_key,
+                    cfg.endpoints.xai_api_base_url.clone(),
+                    indexmap::IndexMap::new(),
+                    true,
+                )
+            };
+        if base_url.trim().is_empty() {
             return VideoGenConfig::Disabled;
         };
         let tier_restricted = self.is_tier_restricted_capability();
@@ -2255,7 +2300,6 @@ impl MvpAgent {
         if zdr_restricted {
             tracing::info!("video_gen zdr-restricted by tools.disable_zdr_incompatible_tools");
         }
-        let base_url = cfg.endpoints.xai_api_base_url.clone();
         let version = cfg
             .client_version
             .clone()
@@ -2269,10 +2313,12 @@ impl MvpAgent {
             alpha_test_key.as_deref(),
             &base_url,
         );
+        headers.extend(provider_headers);
         VideoGenConfig::Enabled {
             api_key,
             base_url,
             extra_headers: headers,
+            use_dynamic_api_key_provider,
             zdr_video_output_s3: zdr_video_output_s3.map(Box::new),
             tier_restricted,
             zdr_restricted,
@@ -2281,6 +2327,8 @@ impl MvpAgent {
     pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
+        let uses_model_owned_credential = config::find_model_by_id(&models, &model_id)
+            .is_some_and(|entry| entry.own_credential().is_some());
         let session = self.current_or_buffered_auth();
         let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
         let client_version = self.cfg.borrow().client_version.clone();
@@ -2299,6 +2347,15 @@ impl MvpAgent {
             alpha_test_key.as_deref(),
             &cfg.base_url,
         );
+        // Web search has its own HTTP client. Mark whether that client should
+        // follow the live session credential or retain the selected model's
+        // BYOK credential; otherwise switching the primary model can leak the
+        // wrong provider key into this independently routed request.
+        cfg.bearer_resolver = (!uses_model_owned_credential).then(|| {
+            crate::auth::credential_provider::WireValidBearerResolver::shared(
+                self.auth_manager.clone(),
+            )
+        });
         Some(cfg)
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at

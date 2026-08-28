@@ -496,6 +496,8 @@ pub(crate) async fn spawn_session_actor(
                 base_url: cfg.base_url,
                 model: cfg.model,
                 extra_headers: cfg.extra_headers,
+                query_params: cfg.query_params,
+                use_dynamic_api_key_provider: cfg.bearer_resolver.is_some(),
                 alpha_test_key: credentials.alpha_test_key.clone(),
                 allowed_domains: web_search_domains
                     .as_ref()

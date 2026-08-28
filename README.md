@@ -40,13 +40,31 @@ for the version of the code present in this tree.
 
 ## Thin SDK overlay
 
-This fork adds [`sophon-sdk`](crates/sophon-sdk), a thin compatibility crate
-that re-exports Grok Build's public Rust and ACP APIs without owning another
-runtime or protocol layer. The upstream tree is pinned by
+This fork adds [`sophon-sdk`](crates/sophon-sdk), a thin provider-aware
+embedding facade. Applications get stable `Agent`, `Session`, provider and
+event APIs; Grok Build still owns agent execution, tools, persistence, skills,
+plugins, MCP, subagents and model behavior. ACP is private implementation glue,
+and the pager/TUI is not part of the SDK dependency or public API. The upstream
+image/video tools can be routed to an independently credentialed media provider,
+while their implementation and request lifecycle remain upstream-owned. This
+provider-routing seam also keeps web search and prompt suggestions attached to
+their selected provider and is the one recorded upstream divergence. All other
+non-TUI agent operations remain reachable through typed lifecycle methods or a
+forward-compatible `x.ai/*` JSON extension seam, including search, titles,
+summaries, MCP, plugins, skills, hooks, tasks, subagents and worktrees. The
+upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
 `9684fa3cdbf2995e30ea8b9b637f1db008f144fc` (source metadata 1.0.10,
 `SOURCE_REV` `70ec060ec3d28e77b9c4593be43c2ab0128bcd21`). This is an independent
 redistribution, not an official xAI SDK.
+
+The synchronized source advances the previous 1.0.6-era public pin through the
+1.0.7–1.0.10 releases and later public source syncs. Highlights include faster
+concurrent subagents and follow-up delivery, MCP form/URL elicitation and
+non-blocking startup, workflow controls, improved tool-loop/rate-limit handling,
+and linked-worktree reuse for `grok clone`. TUI-only features remain available
+to the upstream application but are deliberately not mirrored by the SDK. See
+the [SDK boundary and usage guide](crates/sophon-sdk/README.md).
 
 ## Installing the released binary
 
@@ -106,7 +124,7 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 
 | Path | Contents |
 |------|----------|
-| `crates/sophon-sdk` | Thin re-export and source-provenance compatibility crate |
+| `crates/sophon-sdk` | Thin provider-aware Agent/Session embedding facade |
 | `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
 | `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
 | `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
@@ -130,6 +148,7 @@ cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
 cargo fmt --all               # rustfmt.toml at the repo root
 
 # verify the fork has not modified upstream-owned paths
+# outside the recorded media-provider patch
 crates/sophon-sdk/scripts/check-upstream-sync.sh
 ```
 

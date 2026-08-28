@@ -1,5 +1,9 @@
 use indexmap::IndexMap;
 
+fn dynamic_api_key_provider_by_default() -> bool {
+    true
+}
+
 /// Configuration for the web search tool.
 ///
 /// Use `Disabled` when no API key is available or web search should be turned off.
@@ -19,6 +23,13 @@ pub enum WebSearchConfig {
         model: String,
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         extra_headers: IndexMap<String, String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        query_params: IndexMap<String, String>,
+        /// Allow the host's live auth provider to replace `api_key` for each
+        /// request. Explicit BYOK routes disable this so another active model's
+        /// credential cannot escape into the search provider.
+        #[serde(default = "dynamic_api_key_provider_by_default")]
+        use_dynamic_api_key_provider: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha_test_key: Option<String>,
         /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
@@ -54,6 +65,8 @@ impl WebSearchConfig {
                 base_url,
                 model,
                 extra_headers,
+                query_params,
+                use_dynamic_api_key_provider,
                 allowed_domains,
                 excluded_domains,
                 ..
@@ -62,6 +75,8 @@ impl WebSearchConfig {
                 base_url: base_url.clone(),
                 model: model.clone(),
                 extra_headers: extra_headers.clone(),
+                query_params: query_params.clone(),
+                use_dynamic_api_key_provider: *use_dynamic_api_key_provider,
                 alpha_test_key: None,
                 allowed_domains: allowed_domains.clone(),
                 excluded_domains: excluded_domains.clone(),
@@ -87,6 +102,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -103,6 +120,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: headers,
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: Some("alpha-secret".to_string()),
             allowed_domains: Some(vec!["docs.x.ai".to_string()]),
             excluded_domains: None,
@@ -114,6 +133,8 @@ mod tests {
                 base_url,
                 model,
                 extra_headers,
+                query_params,
+                use_dynamic_api_key_provider,
                 alpha_test_key,
                 allowed_domains,
                 excluded_domains,
@@ -122,6 +143,8 @@ mod tests {
                 assert_eq!(base_url, "https://api.x.ai/v1");
                 assert_eq!(model, "test-web-search-model");
                 assert_eq!(extra_headers.get("X-Custom").unwrap(), "value");
+                assert!(query_params.is_empty());
+                assert!(use_dynamic_api_key_provider);
                 assert!(alpha_test_key.is_none());
                 // Domain filters survive redaction (not secrets).
                 assert_eq!(allowed_domains, Some(vec!["docs.x.ai".to_string()]));
@@ -138,6 +161,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-web-search-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,

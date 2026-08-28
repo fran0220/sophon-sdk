@@ -615,11 +615,31 @@ impl SessionActor {
             return None;
         };
 
-        let sampling_client = match self.prepare_chat_completion(false).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "prompt suggest: sampling client unavailable");
-                return None;
+        let (sampling_client, model) = if let Some(mut config) =
+            self.resolve_aux_sampler_config(&model).await
+        {
+            let active_session_config = self.reconstruct_full_config().await;
+            crate::agent::config::stamp_session_local_sampler_fields(
+                &mut config,
+                &active_session_config,
+                self.client_identifier.clone(),
+                Some(self.max_retries),
+            );
+            let model = config.model.clone();
+            match xai_grok_sampler::SamplingClient::new(config) {
+                Ok(client) => (client, model),
+                Err(error) => {
+                    tracing::debug!(%error, "prompt suggest: routed sampling client unavailable");
+                    return None;
+                }
+            }
+        } else {
+            match self.prepare_chat_completion(false).await {
+                Ok(client) => (client, model),
+                Err(error) => {
+                    tracing::debug!(%error, "prompt suggest: sampling client unavailable");
+                    return None;
+                }
             }
         };
 

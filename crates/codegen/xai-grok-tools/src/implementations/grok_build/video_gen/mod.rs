@@ -172,6 +172,7 @@ impl VideoGenClient {
             api_key,
             base_url,
             extra_headers,
+            use_dynamic_api_key_provider,
             zdr_video_output_s3,
             tier_restricted,
             zdr_restricted,
@@ -252,7 +253,9 @@ impl VideoGenClient {
                 .as_ref()
                 .map(|c| (**c).clone())
                 .filter(ZdrVideoOutputS3Config::is_valid),
-            api_key_provider,
+            api_key_provider: use_dynamic_api_key_provider
+                .then_some(api_key_provider)
+                .flatten(),
             attribution_callback: None,
             tier_restricted: *tier_restricted,
             zdr_restricted: *zdr_restricted,
@@ -740,6 +743,10 @@ pub enum VideoGenConfig {
         api_key: String,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
+        /// Allow the host's live auth provider to replace `api_key` for each
+        /// request. Embedders with an independent media provider set this to
+        /// `false` so model/session credential rotation cannot override it.
+        use_dynamic_api_key_provider: bool,
         zdr_video_output_s3: Option<Box<ZdrVideoOutputS3Config>>,
         /// `true` when the user is on a tier the Imagine server zero-limits
         /// (free / X Basic). The video tools stay advertised but short-circuit
@@ -1321,6 +1328,9 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::types::tool_metadata::test_ctx_with_call_id;
+
     // Mirrors image_gen's post_json pinning: every start/poll request must
     // route through request(), which attaches both bearer and session id.
     #[tokio::test]
@@ -1329,6 +1339,7 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             zdr_video_output_s3: None,
             tier_restricted: false,
             zdr_restricted: false,
@@ -1358,8 +1369,47 @@ mod tests {
         );
     }
 
-    use super::*;
-    use crate::types::tool_metadata::test_ctx_with_call_id;
+    #[tokio::test]
+    async fn independent_provider_uses_static_media_credential() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct ModelKey;
+        impl crate::types::ApiKeyProvider for ModelKey {
+            fn current_api_key(&self) -> Option<String> {
+                Some("model-key".into())
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/videos/generations"))
+            .and(header("Authorization", "Bearer media-key"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let cfg = VideoGenConfig::Enabled {
+            api_key: "media-key".into(),
+            base_url: server.uri(),
+            extra_headers: indexmap::IndexMap::new(),
+            use_dynamic_api_key_provider: false,
+            zdr_video_output_s3: None,
+            tier_restricted: false,
+            zdr_restricted: false,
+        };
+        let client = VideoGenClient::new(&cfg, Some(std::sync::Arc::new(ModelKey))).unwrap();
+        assert!(client.api_key_provider.is_none());
+        let response = client
+            .request(
+                reqwest::Method::POST,
+                &format!("{}/videos/generations", server.uri()),
+                None,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
 
     #[test]
     fn image_to_video_name_and_description() {

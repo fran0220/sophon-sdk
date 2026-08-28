@@ -3176,6 +3176,85 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
         "no resolved auth ⇒ fail open (tools not tier-restricted)"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_media_configs_keep_independent_provider_credentials() {
+    use crate::agent::config::ImagineProviderConfig;
+    use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
+    use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
+
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("model-key".to_string());
+    agent.cfg.borrow_mut().imagine_provider = Some(ImagineProviderConfig {
+        base_url: "https://media.example/v1".into(),
+        api_key: "media-key".into(),
+        extra_headers: indexmap::indexmap! {
+            "x-media-tenant".into() => "tenant".into(),
+        },
+    });
+
+    let ImageGenConfig::Enabled {
+        api_key,
+        base_url,
+        extra_headers,
+        use_dynamic_api_key_provider,
+        ..
+    } = agent.prepare_image_gen_config()
+    else {
+        panic!("expected image generation config");
+    };
+    assert_eq!(api_key, "media-key");
+    assert_eq!(base_url, "https://media.example/v1");
+    assert_eq!(extra_headers.get("x-media-tenant").map(String::as_str), Some("tenant"));
+    assert!(!use_dynamic_api_key_provider);
+
+    let VideoGenConfig::Enabled {
+        api_key,
+        base_url,
+        extra_headers,
+        use_dynamic_api_key_provider,
+        ..
+    } = agent.prepare_video_gen_config()
+    else {
+        panic!("expected video generation config");
+    };
+    assert_eq!(api_key, "media-key");
+    assert_eq!(base_url, "https://media.example/v1");
+    assert_eq!(extra_headers.get("x-media-tenant").map(String::as_str), Some("tenant"));
+    assert!(!use_dynamic_api_key_provider);
+}
+
+#[test]
+fn prepare_web_search_keeps_independent_model_routing() {
+    use crate::agent::config::ModelEntry;
+
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("search", &agent.cfg.borrow().endpoints);
+    entry.info.model = "search-wire-model".into();
+    entry.info.base_url = "https://search.example/v1".into();
+    entry.info.api_backend = xai_grok_sampler::ApiBackend::Responses;
+    entry.info.query_params = indexmap::indexmap! {
+        "tenant".into() => "search".into(),
+    };
+    entry.api_key = Some("search-key".into());
+    agent
+        .models_manager
+        .insert_test_entry("search", entry);
+    agent.cfg.borrow_mut().web_search_model = "search".into();
+
+    let config = agent
+        .prepare_web_search_sampling_config()
+        .expect("web search config");
+    assert_eq!(config.model, "search-wire-model");
+    assert_eq!(config.base_url, "https://search.example/v1");
+    assert_eq!(config.api_key.as_deref(), Some("search-key"));
+    assert_eq!(config.query_params.get("tenant").map(String::as_str), Some("search"));
+    assert!(
+        config.bearer_resolver.is_none(),
+        "active model credentials must not override the search provider"
+    );
+}
+
 /// The imagine tools bypass cli-chat-proxy (direct API calls), so the server
 /// can only scope the coding data-retention opt-out (`/privacy opt-out`) to
 /// Build traffic via the `x-grok-client-identifier` header. If this header is

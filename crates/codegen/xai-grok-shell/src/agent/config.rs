@@ -246,6 +246,32 @@ pub struct EndpointsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcs_service_account_key: Option<String>,
 }
+
+/// Runtime-only provider override for Grok Build's native Imagine tools.
+///
+/// Embedders use this when media requests must not share the active model or
+/// session credential. It is deliberately excluded from persisted Grok config;
+/// the embedding host remains the authority for provider secrets.
+#[derive(Clone, Default)]
+pub struct ImagineProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub extra_headers: IndexMap<String, String>,
+}
+
+impl std::fmt::Debug for ImagineProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImagineProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field(
+                "header_names",
+                &self.extra_headers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 /// A blank or whitespace-only override counts as unset. Single source of truth
 /// for the "empty value = not configured" rule shared by the endpoint resolvers.
 fn blank_as_unset(opt: &Option<String>) -> Option<String> {
@@ -1335,6 +1361,10 @@ pub struct Config {
     pub shell_environment_policy: ShellEnvironmentPolicyKnownKeys,
     #[serde(default)]
     pub endpoints: EndpointsConfig,
+    /// Host-owned image/video provider. Runtime-only so upstream config files
+    /// never become a second authority for embedding credentials.
+    #[serde(skip)]
+    pub imagine_provider: Option<ImagineProviderConfig>,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     /// Session behavior configuration.
@@ -1766,6 +1796,7 @@ impl Default for Config {
             toolset: ShellToolsetConfig::default(),
             shell_environment_policy: ShellEnvironmentPolicyKnownKeys::default(),
             endpoints,
+            imagine_provider: None,
             telemetry: TelemetryConfig::default(),
             session: SessionConfig::default(),
             agent: AgentSelectionConfig::default(),

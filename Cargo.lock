@@ -10084,8 +10084,19 @@ name = "sophon-sdk"
 version = "0.4.0"
 dependencies = [
  "agent-client-protocol",
+ "async-trait",
+ "http 1.4.0",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
  "xai-acp-lib",
+ "xai-grok-sampler",
  "xai-grok-shell",
+ "xai-grok-test-support",
 ]
 
 [[package]]

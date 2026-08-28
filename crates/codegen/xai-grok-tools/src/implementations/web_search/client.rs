@@ -10,6 +10,7 @@ pub struct WebSearchClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    query_params: indexmap::IndexMap<String, String>,
     /// Authoritative domain allowlist from `[toolset.web_search] allowed_domains`.
     /// When set it governs the search and the model's per-call `allowed_domains`
     /// is ignored (see [`Self::resolve_filters`]). Mutually exclusive with
@@ -38,6 +39,8 @@ impl WebSearchClient {
             base_url,
             model,
             extra_headers,
+            query_params,
+            use_dynamic_api_key_provider,
             alpha_test_key,
             allowed_domains,
             excluded_domains,
@@ -91,9 +94,12 @@ impl WebSearchClient {
             http,
             base_url: base_url.clone(),
             model: model.clone(),
+            query_params: query_params.clone(),
             default_allowed_domains: allowed_domains.clone(),
             default_excluded_domains: excluded_domains.clone(),
-            api_key_provider,
+            api_key_provider: use_dynamic_api_key_provider
+                .then_some(api_key_provider)
+                .flatten(),
             attribution_callback: None,
         })
     }
@@ -212,7 +218,11 @@ impl WebSearchClient {
         let request = self.build_request_json(query, allowed, excluded)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let sent_bearer = self.current_bearer().await;
-        let mut req = self.http.post(&url).json(&request);
+        let mut req = self
+            .http
+            .post(&url)
+            .query(&self.query_params)
+            .json(&request);
         if let Some(ref key) = sent_bearer {
             req = req.header(AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -413,6 +423,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: allowed,
             excluded_domains: excluded,
@@ -490,6 +502,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "custom-enterprise-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -522,6 +536,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -548,6 +564,8 @@ mod tests {
             base_url: "https://api.x.ai/v1".to_string(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -803,6 +821,8 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
@@ -815,6 +835,64 @@ mod tests {
             .expect("search must succeed with static key fallback");
         assert_eq!(content, "search result");
     }
+
+    #[tokio::test]
+    async fn independent_provider_keeps_its_key_and_query_parameters() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct UnrelatedModelProvider;
+        impl crate::types::ApiKeyProvider for UnrelatedModelProvider {
+            fn current_api_key(&self) -> Option<String> {
+                Some("unrelated-model-key".to_string())
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(query_param("tenant", "search"))
+            .and(header("Authorization", "Bearer search-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1234567890,
+                "status": "completed",
+                "model": "search-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "independent result",
+                        "annotations": []
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let config = WebSearchConfig::Enabled {
+            api_key: "search-key".to_string(),
+            base_url: server.uri(),
+            model: "search-model".to_string(),
+            extra_headers: IndexMap::new(),
+            query_params: indexmap::indexmap! { "tenant".into() => "search".into() },
+            use_dynamic_api_key_provider: false,
+            alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
+        };
+        let provider: SharedApiKeyProvider = std::sync::Arc::new(UnrelatedModelProvider);
+        let client = WebSearchClient::new(&config, Some(provider)).expect("client should build");
+        let (content, _citations) = client
+            .search("test query", None)
+            .await
+            .expect("independently routed search succeeds");
+        assert_eq!(content, "independent result");
+    }
+
     /// When the provider returns a fresh key, it overrides the static one.
     #[tokio::test]
     async fn provider_key_overrides_static_key() {
@@ -855,6 +933,8 @@ mod tests {
             base_url: server.uri(),
             model: "test-model".to_string(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            use_dynamic_api_key_provider: true,
             alpha_test_key: None,
             allowed_domains: None,
             excluded_domains: None,
