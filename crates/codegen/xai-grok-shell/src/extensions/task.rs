@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use xai_grok_tools::types::{KillOutcome, KillSource, TaskSnapshot};
 
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentCancelOutcome, SubagentInspection, SubagentProvenance, SubagentSnapshot,
-    SubagentSnapshotStatus,
+    ActiveAgentMessageOutcome, SubagentCancelOutcome, SubagentInspection, SubagentProvenance,
+    SubagentSnapshot, SubagentSnapshotStatus,
 };
 
 use crate::agent::MvpAgent;
@@ -128,6 +128,76 @@ pub struct CancelSubagentResponse {
     /// Typed outcome; `None` only from an older shell. This shell always sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<SubagentCancelOutcomeDto>,
+}
+
+/// Wire DTO for the `x.ai/subagent/send` request. The root session identity is
+/// required because the coordinator only admits messages to descendants owned
+/// by that session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendSubagentMessageRequest {
+    pub session_id: String,
+    pub subagent_id: String,
+    pub text: String,
+}
+
+/// Wire mirror of the coordinator's closed active-message outcome. In
+/// particular, callers can distinguish definite rejection from uncertain
+/// admission and avoid unsafe retries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SendSubagentMessageOutcomeDto {
+    Accepted {
+        message_id: String,
+    },
+    NotFoundOrNotOwned,
+    NotActiveOrFinalizing,
+    Saturated {
+        max_in_flight: usize,
+    },
+    AdmissionUncertain,
+    NotAcceptedBeforeDeadline,
+    Unsupported,
+    Limit {
+        max_bytes: usize,
+        observed_bytes: usize,
+    },
+    ChannelClosed,
+    /// Forward-compatible fallback. Never produced by this shell.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<ActiveAgentMessageOutcome> for SendSubagentMessageOutcomeDto {
+    fn from(outcome: ActiveAgentMessageOutcome) -> Self {
+        match outcome {
+            ActiveAgentMessageOutcome::Accepted { message_id } => Self::Accepted { message_id },
+            ActiveAgentMessageOutcome::NotFoundOrNotOwned => Self::NotFoundOrNotOwned,
+            ActiveAgentMessageOutcome::NotActiveOrFinalizing => Self::NotActiveOrFinalizing,
+            ActiveAgentMessageOutcome::Saturated { max_in_flight } => {
+                Self::Saturated { max_in_flight }
+            }
+            ActiveAgentMessageOutcome::AdmissionUncertain => Self::AdmissionUncertain,
+            ActiveAgentMessageOutcome::NotAcceptedBeforeDeadline => Self::NotAcceptedBeforeDeadline,
+            ActiveAgentMessageOutcome::Unsupported => Self::Unsupported,
+            ActiveAgentMessageOutcome::Limit {
+                max_bytes,
+                observed_bytes,
+            } => Self::Limit {
+                max_bytes,
+                observed_bytes,
+            },
+            ActiveAgentMessageOutcome::ChannelClosed => Self::ChannelClosed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SendSubagentMessageResponse {
+    pub subagent_id: String,
+    pub outcome: SendSubagentMessageOutcomeDto,
 }
 
 // ── Subagent list_running DTOs ────────────────────────────────────────────
@@ -631,6 +701,16 @@ pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -
 /// Handle `x.ai/subagent/*` extension methods.
 pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
+        "x.ai/subagent/send" => {
+            let req: SendSubagentMessageRequest = parse(args)?;
+            let outcome = agent
+                .send_subagent_message(&req.session_id, &req.subagent_id, req.text)
+                .await;
+            respond(Ok::<_, String>(SendSubagentMessageResponse {
+                subagent_id: req.subagent_id,
+                outcome: outcome.into(),
+            }))
+        }
         "x.ai/subagent/cancel" => {
             let req: CancelSubagentRequest = parse(args)?;
             tracing::info!(subagent_id = %req.subagent_id, "Cancelling subagent via ext method");
@@ -1141,5 +1221,35 @@ mod tests {
         assert_eq!(resp.subagent_id, "sa-1");
         assert!(resp.cancelled);
         assert!(resp.outcome.is_none());
+    }
+
+    #[test]
+    fn send_subagent_message_wire_preserves_delivery_certainty() {
+        let req: SendSubagentMessageRequest = serde_json::from_str(
+            r#"{"sessionId":"parent","subagentId":"child","text":"follow up"}"#,
+        )
+        .expect("parse send request");
+        assert_eq!(req.session_id, "parent");
+        assert_eq!(req.subagent_id, "child");
+        assert_eq!(req.text, "follow up");
+
+        let response = SendSubagentMessageResponse {
+            subagent_id: "child".into(),
+            outcome: ActiveAgentMessageOutcome::AdmissionUncertain.into(),
+        };
+        let json = serde_json::to_value(response).expect("serialize response");
+        assert_eq!(json["subagentId"], "child");
+        assert_eq!(json["outcome"]["kind"], "admission_uncertain");
+
+        let accepted: SendSubagentMessageOutcomeDto = ActiveAgentMessageOutcome::Accepted {
+            message_id: "msg-1".into(),
+        }
+        .into();
+        assert_eq!(
+            accepted,
+            SendSubagentMessageOutcomeDto::Accepted {
+                message_id: "msg-1".into()
+            }
+        );
     }
 }

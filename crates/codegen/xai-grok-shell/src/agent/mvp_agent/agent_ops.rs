@@ -3145,6 +3145,30 @@ impl MvpAgent {
             .cancel(subagent_id)
             .await
     }
+    /// Send one bounded follow-up message to an active descendant owned by the
+    /// supplied root session. The coordinator's typed result preserves whether
+    /// a timeout or channel failure leaves delivery uncertain.
+    pub(crate) async fn send_subagent_message(
+        &self,
+        parent_session_id: &str,
+        subagent_id: &str,
+        text: String,
+    ) -> xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOutcome {
+        use xai_grok_tools::implementations::grok_build::task::types::{
+            ActiveAgentMessageOutcome, ActiveAgentMessageRequest,
+        };
+
+        let request = match ActiveAgentMessageRequest::try_new(subagent_id, text) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_coordinator_session(
+            self.subagent_event_tx.clone(),
+            parent_session_id.to_owned(),
+        )
+        .send_active_message(request)
+        .await
+    }
     pub(crate) async fn list_running_subagents(
         &self,
         parent_session_id: &str,

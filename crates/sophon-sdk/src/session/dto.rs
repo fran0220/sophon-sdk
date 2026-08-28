@@ -153,6 +153,40 @@ pub struct SubagentCancelReceipt {
     pub outcome: Option<SubagentCancelOutcome>,
 }
 
+/// Result of admitting one follow-up message to an active subagent.
+///
+/// `AdmissionUncertain` does not prove non-delivery, so a caller must not
+/// automatically retry it with a non-idempotent message.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentMessageOutcome {
+    Accepted {
+        message_id: String,
+    },
+    NotFoundOrNotOwned,
+    NotActiveOrFinalizing,
+    Saturated {
+        max_in_flight: usize,
+    },
+    AdmissionUncertain,
+    NotAcceptedBeforeDeadline,
+    Unsupported,
+    Limit {
+        max_bytes: usize,
+        observed_bytes: usize,
+    },
+    ChannelClosed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentMessageReceipt {
+    pub subagent_id: String,
+    pub outcome: SubagentMessageOutcome,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct SessionId(pub(crate) String);
 

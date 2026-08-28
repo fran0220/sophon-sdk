@@ -442,6 +442,28 @@ impl Runtime {
             .map(parse_subagent_snapshot)
             .transpose()
     }
+    /// Sends one bounded follow-up message to a subagent that is still active
+    /// under `id`. The receipt preserves definite rejection versus uncertain
+    /// delivery; callers must not blindly retry uncertain outcomes.
+    pub async fn send_subagent_message(
+        &self,
+        id: &SessionId,
+        subagent_id: &str,
+        text: impl Into<String>,
+    ) -> Result<SubagentMessageReceipt, Error> {
+        serde_json::from_value(
+            self.typed_ext(
+                "x.ai/subagent/send",
+                serde_json::json!({
+                    "sessionId": id.as_str(),
+                    "subagentId": subagent_id,
+                    "text": text.into(),
+                }),
+            )
+            .await?,
+        )
+        .map_err(|e| Error::Operation(format!("invalid subagent/send response: {e}")))
+    }
     /// Cancels a subagent by its globally unique subagent id.
     pub async fn cancel_subagent(&self, subagent_id: &str) -> Result<SubagentCancelReceipt, Error> {
         serde_json::from_value(
