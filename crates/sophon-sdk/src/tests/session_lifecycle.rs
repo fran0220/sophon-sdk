@@ -59,12 +59,13 @@ async fn sdk_prompt_block_hook_cancels_before_inference() {
     .expect("prompt gate timeout")
     .expect("blocked prompt settles normally");
     assert_eq!(receipt.outcome, TurnOutcome::Cancelled);
-    let calls = hook.0.lock().expect("hook calls lock");
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].event, AgentHookEvent::UserPromptSubmit);
-    assert_eq!(calls[0].prompt_id.as_deref(), Some("blocked-turn"));
-    assert_eq!(calls[0].raw["prompt"], "deploy to prod");
-    drop(calls);
+    {
+        let calls = hook.0.lock().expect("hook calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].event, AgentHookEvent::UserPromptSubmit);
+        assert_eq!(calls[0].prompt_id.as_deref(), Some("blocked-turn"));
+        assert_eq!(calls[0].raw["prompt"], "deploy to prod");
+    }
 
     runtime
         .close_session(session)
