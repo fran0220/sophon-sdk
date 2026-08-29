@@ -8,9 +8,10 @@ official xAI SDK.
 
 Current source identity:
 
-- public Grok Build commit: `9684fa3cdbf2995e30ea8b9b637f1db008f144fc`
-- upstream source metadata: 1.0.10
-- embedded monorepo revision: `70ec060ec3d28e77b9c4593be43c2ab0128bcd21`
+- released product baseline: 1.0.13
+- public Grok Build commit: `bc7f02eddd3d84085849dc19ed216f11c23b0571`
+- public crate metadata: 1.0.12
+- embedded monorepo revision: `d5a0335a47221e8c9519936cb693e9b6450227ec`
 
 ## Use it
 
@@ -99,9 +100,9 @@ explicit `MediaProviderConfig::base_url`:
 | Image-to-video / reference-to-video | `POST {base_url}/videos/generations`, then `GET {base_url}/videos/{id}` |
 
 Image generation, image edit, and video generation can be enabled separately.
-The two image operations accept independent model overrides. Grok Build 1.0.10
-uses its fixed `grok-imagine-video-1.5` model for both video tools, so the SDK
-does not expose a video-model setting that upstream would ignore.
+The two image operations accept independent model overrides. This Grok Build
+baseline uses its fixed `grok-imagine-video-1.5` model for both video tools, so
+the SDK does not expose a video-model setting that upstream would ignore.
 
 `MediaProviderConfig` has its own API key and custom headers. Media requests use
 `Authorization: Bearer <media api_key>` and are not affected by model switching
@@ -189,13 +190,12 @@ non-TUI capability reachable from that agent has an SDK path:
 | New or uncommon standard/extension updates | `SessionUpdate::Other`, `Event::Extension`, and raw request/notification methods |
 
 One declared upstream feature is not part of this usable public-source
-baseline: Grok Build 1.0.10 declares Cargo feature `local-workspace`, but the
-public snapshot omits its `gateway_bridge` module and the feature does not
-compile. The SDK therefore does not claim the private Computer Hub
-own/attach path. Ordinary local repositories, git worktrees, session
-rehydration, tools, and all compiled `MvpAgent` extensions remain covered.
-Reimplementing that missing private service would violate the thin-wrapper
-boundary.
+baseline: Grok Build declares Cargo feature `local-workspace`, but the public
+snapshot omits its `gateway_bridge` module and the feature does not compile.
+The SDK therefore does not claim the private Computer Hub own/attach path.
+Ordinary local repositories, git worktrees, session rehydration, tools, and all
+compiled `MvpAgent` extensions remain covered. Reimplementing that missing
+private service would violate the thin-wrapper boundary.
 
 Image/video generation remains a native agent tool rather than a parallel
 imperative SDK API: the SDK supplies its provider and the upstream agent owns
@@ -235,19 +235,21 @@ SDK overlays only its explicit model/media routes and headless embedding mode.
 Set `GROK_HOME` before starting an Agent when an embedding needs an isolated
 upstream data directory.
 
-## What the 1.0.10 baseline contributes
+## What the 1.0.13 baseline contributes
 
-The full upstream source delta through the pinned 1.0.10 snapshot is retained.
-Agent-facing improvements inherited by the facade include faster concurrent
-subagents, immediate follow-up delivery while waiting on subagents/tasks, MCP
-form/URL elicitation and non-blocking connection startup, server-name-keyed MCP
-configuration, workflow agent-budget/reasoning controls, improved tool-loop and
-rate-limit handling, segmented/two-pass compaction work, and faster linked
-worktree reuse for `grok clone`.
+The full upstream source delta through the public snapshot underlying 1.0.13 is
+retained. Agent-facing improvements inherited by the facade include automatic
+continuation after length-truncated responses, execution of completed tool calls
+before continuation, transient sampler retries, faster subagent delivery, MCP
+form/URL elicitation and non-blocking startup, and detailed session-close timing
+spans. Configured command and HTTP `PreToolUse` hooks can now ask, defer, and add
+post-tool model context; the SDK continues to expose Grok Build's native hook
+configuration rather than mirroring that schema.
 
-TUI-only additions such as prompt stashing, modal/catalog changes, selection
-behavior, status-line rendering, and minimal/fullscreen switching remain in the
-upstream application source but are intentionally not SDK concepts.
+TUI-only additions such as the credit-limit Try Again action, iTerm2 pasted-image
+pixel previews, prompt stashing, modal/catalog changes, and selection behavior
+remain in the upstream application source but are intentionally not SDK
+concepts.
 
 ## Upstream sync policy
 

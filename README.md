@@ -54,17 +54,19 @@ forward-compatible `x.ai/*` JSON extension seam, including search, titles,
 summaries, MCP, plugins, skills, hooks, tasks, subagents and worktrees. The
 upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`9684fa3cdbf2995e30ea8b9b637f1db008f144fc` (source metadata 1.0.10,
-`SOURCE_REV` `70ec060ec3d28e77b9c4593be43c2ab0128bcd21`). This is an independent
+`bc7f02eddd3d84085849dc19ed216f11c23b0571` (the public source snapshot
+underlying release 1.0.13, crate metadata 1.0.12, `SOURCE_REV`
+`d5a0335a47221e8c9519936cb693e9b6450227ec`). This is an independent
 redistribution, not an official xAI SDK.
 
 The synchronized source advances the previous 1.0.6-era public pin through the
-1.0.7–1.0.10 releases and later public source syncs. Highlights include faster
-concurrent subagents and follow-up delivery, MCP form/URL elicitation and
-non-blocking startup, workflow controls, improved tool-loop/rate-limit handling,
-and linked-worktree reuse for `grok clone`. TUI-only features remain available
-to the upstream application but are deliberately not mirrored by the SDK. See
-the [SDK boundary and usage guide](crates/sophon-sdk/README.md).
+1.0.7–1.0.13 releases and later public source syncs. Highlights include
+automatic continuation after length truncation, hook ask/defer/context outcomes,
+transient turn retries, detailed session-close timing, MCP form/URL elicitation
+and non-blocking startup, and faster concurrent subagent delivery. TUI-only
+features remain available to the upstream application but are deliberately not
+mirrored by the SDK. See the
+[SDK boundary and usage guide](crates/sophon-sdk/README.md).
 
 ## Installing the released binary
 

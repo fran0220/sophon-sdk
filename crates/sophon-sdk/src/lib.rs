@@ -144,7 +144,7 @@ pub struct SourceProvenance {
 
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        upstream_release: "1.0.10",
+        upstream_release: "1.0.13",
         upstream_grok_build_commit: include_str!("../../../UPSTREAM_GROK_BUILD_COMMIT").trim(),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),
@@ -158,14 +158,14 @@ mod tests {
     #[test]
     fn provenance_matches_the_pinned_upstream_snapshot() {
         let provenance = source_provenance();
-        assert_eq!(provenance.upstream_release, "1.0.10");
+        assert_eq!(provenance.upstream_release, "1.0.13");
         assert_eq!(
             provenance.upstream_grok_build_commit,
-            "9684fa3cdbf2995e30ea8b9b637f1db008f144fc"
+            "bc7f02eddd3d84085849dc19ed216f11c23b0571"
         );
         assert_eq!(
             provenance.upstream_source_rev,
-            "70ec060ec3d28e77b9c4593be43c2ab0128bcd21"
+            "d5a0335a47221e8c9519936cb693e9b6450227ec"
         );
         assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
     }
