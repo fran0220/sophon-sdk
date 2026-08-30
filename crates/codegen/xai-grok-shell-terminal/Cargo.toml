@@ -12,7 +12,10 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 portable-pty = "0.9"
-process-wrap = { version = "9.0.0", features = ["tokio1", "job-object", "creation-flags"] }
+# Keep process-wrap's PROCESS_CREATION_FLAGS type aligned with workspace
+# windows 0.61: 9.1 moved to windows 0.62 and its CreationFlags no longer
+# accepts the constants this crate imports.
+process-wrap = { version = "=9.0.0", features = ["tokio1", "job-object", "creation-flags"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shlex = { workspace = true }
