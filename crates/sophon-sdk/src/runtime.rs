@@ -1683,6 +1683,13 @@ fn management_extension_event(
             session_id: string_field(payload, &["sessionId", "session_id"]).map(SessionId),
             snapshot_required: true,
         }),
+        "x.ai/scheduled_task_created"
+        | "x.ai/scheduled_task_fired"
+        | "x.ai/scheduled_task_deleted" => management_session_event(
+            &SessionId(string_field(payload, &["sessionId", "session_id"])?),
+            field(payload, &["update"])?,
+            field(payload, &["_meta"])?.as_object(),
+        ),
         _ => None,
     }
 }
@@ -2555,13 +2562,16 @@ mod tests {
             "x.ai/schedulerGeneration": "scheduler-generation",
             "x.ai/schedulerRevision": 11,
         });
-        let scheduler = management_session_event(
-            &SessionId("s1".into()),
+        let scheduler = management_extension_event(
+            "x.ai/scheduled_task_created",
             &serde_json::json!({
-                "sessionUpdate": "scheduled_task_created",
-                "taskId": "task-1",
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "scheduled_task_created",
+                    "taskId": "task-1",
+                },
+                "_meta": scheduler_metadata,
             }),
-            scheduler_metadata.as_object(),
         );
         assert!(matches!(
             scheduler,
