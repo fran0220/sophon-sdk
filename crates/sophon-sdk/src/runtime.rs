@@ -1629,7 +1629,8 @@ impl acp::Client for EmbeddedClient {
     ) -> acp::Result<()> {
         let session_id = SessionId(notification.session_id.0.to_string());
         if let Ok(raw_update) = serde_json::to_value(&notification.update)
-            && let Some(kind) = management_session_event(&session_id, &raw_update)
+            && let Some(kind) =
+                management_session_event(&session_id, &raw_update, notification.meta.as_ref())
         {
             self.management.send(kind);
         }
@@ -1689,20 +1690,21 @@ fn management_extension_event(
 fn management_session_event(
     session_id: &SessionId,
     update: &serde_json::Value,
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<mgmt::ManagementEventKind> {
     let kind = string_field(update, &["sessionUpdate", "session_update"])?;
     match kind.as_str() {
         "scheduled_task_created" => Some(mgmt::ManagementEventKind::Scheduler {
             session_id: session_id.clone(),
             task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
-            version: management_event_version(update)?,
+            version: management_event_version(metadata)?,
             occurrence: mgmt::ScheduledTaskEvent::Upserted,
             snapshot_required: true,
         }),
         "scheduled_task_fired" => Some(mgmt::ManagementEventKind::Scheduler {
             session_id: session_id.clone(),
             task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
-            version: management_event_version(update)?,
+            version: management_event_version(metadata)?,
             occurrence: mgmt::ScheduledTaskEvent::Fired {
                 subagent_id: string_field(update, &["subagentId", "subagent_id"])
                     .map(mgmt::SubagentId::new),
@@ -1712,7 +1714,7 @@ fn management_session_event(
         "scheduled_task_deleted" => Some(mgmt::ManagementEventKind::Scheduler {
             session_id: session_id.clone(),
             task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
-            version: management_event_version(update)?,
+            version: management_event_version(metadata)?,
             occurrence: mgmt::ScheduledTaskEvent::Removed {
                 reason: match string_field(update, &["reason"]).as_deref() {
                     Some("deleted") => mgmt::ScheduledTaskRemovalReason::Deleted,
@@ -1789,10 +1791,16 @@ fn string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
     field(value, names)?.as_str().map(str::to_owned)
 }
 
-fn management_event_version(value: &serde_json::Value) -> Option<mgmt::Version> {
+fn management_event_version(
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<mgmt::Version> {
+    let metadata = metadata?;
     Some(mgmt::Version {
-        generation: string_field(value, &["generation"])?,
-        revision: field(value, &["revision"])?.as_u64()?,
+        generation: metadata
+            .get("x.ai/schedulerGeneration")?
+            .as_str()?
+            .to_owned(),
+        revision: metadata.get("x.ai/schedulerRevision")?.as_u64()?,
     })
 }
 
@@ -2543,14 +2551,17 @@ mod tests {
             }) if session_id.as_str() == "s1"
         ));
 
+        let scheduler_metadata = serde_json::json!({
+            "x.ai/schedulerGeneration": "scheduler-generation",
+            "x.ai/schedulerRevision": 11,
+        });
         let scheduler = management_session_event(
             &SessionId("s1".into()),
             &serde_json::json!({
                 "sessionUpdate": "scheduled_task_created",
                 "taskId": "task-1",
-                "generation": "scheduler-generation",
-                "revision": 11,
             }),
+            scheduler_metadata.as_object(),
         );
         assert!(matches!(
             scheduler,
