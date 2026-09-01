@@ -1643,16 +1643,44 @@ impl acp::Client for EmbeddedClient {
     }
 
     async fn ext_notification(&self, notification: acp::ExtNotification) -> acp::Result<()> {
+        let method = notification.method.to_string();
         let payload = serde_json::from_str(notification.params.get()).unwrap_or_default();
-        if let Some(kind) = management_extension_event(notification.method.as_ref(), &payload) {
+        let mut terminal = None;
+        if method == "x.ai/session_notification" {
+            if let Some(session_id) =
+                string_field(&payload, &["sessionId", "session_id"]).map(SessionId)
+                && let Some(update) = field(&payload, &["update"])
+                && let Some(kind) = management_session_event(
+                    &session_id,
+                    update,
+                    field(&payload, &["_meta", "meta"]).and_then(serde_json::Value::as_object),
+                )
+            {
+                self.management.send(kind);
+            }
+            terminal = typed_xai_session_event(&payload);
+        }
+        if let Some(kind) = management_extension_event(&method, &payload) {
             self.management.send(kind);
         }
-        let _ = self.events.send(Event::Extension {
-            method: notification.method.to_string(),
-            payload,
-        });
+        let _ = self.events.send(Event::Extension { method, payload });
+        if let Some(terminal) = terminal {
+            let _ = self.events.send(terminal);
+        }
         Ok(())
     }
+}
+
+fn typed_xai_session_event(payload: &serde_json::Value) -> Option<Event> {
+    let update = other_session_update(field(payload, &["update"])?.clone());
+    if !matches!(update, SessionUpdate::TurnCompleted(_)) {
+        return None;
+    }
+    Some(Event::Session {
+        session_id: SessionId(string_field(payload, &["sessionId", "session_id"])?),
+        update,
+        metadata: field(payload, &["_meta", "meta"]).cloned(),
+    })
 }
 
 fn management_extension_event(
@@ -2625,28 +2653,47 @@ mod tests {
 
     #[test]
     fn durable_turn_terminal_is_projected_without_raw_json_downstream() {
-        let update = other_session_update(serde_json::json!({
-            "sessionUpdate": "turn_completed",
-            "prompt_id": "scheduler-fired-occurrence-1",
-            "stop_reason": "error",
-            "agent_result": "connection reset",
-            "error_kind": "provider_error",
-            "elapsed_ms": 1234,
-            "usage": {
-                "inputTokens": 10,
-                "outputTokens": 4,
-                "totalTokens": 14,
-                "cachedReadTokens": 3,
-                "cacheCreationTokens": 2,
-                "reasoningTokens": 1,
-                "modelCalls": 2,
-                "apiDurationMs": 900,
-                "costUsdTicks": 42,
-                "costIsPartial": true,
-                "numTurns": 2,
-                "usageIsIncomplete": true
-            }
-        }));
+        let payload = serde_json::json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "turn_completed",
+                "prompt_id": "scheduler-fired-occurrence-1",
+                "stop_reason": "error",
+                "agent_result": "connection reset",
+                "error_kind": "provider_error",
+                "elapsed_ms": 1234,
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 4,
+                    "totalTokens": 14,
+                    "cachedReadTokens": 3,
+                    "cacheCreationTokens": 2,
+                    "reasoningTokens": 1,
+                    "modelCalls": 2,
+                    "apiDurationMs": 900,
+                    "costUsdTicks": 42,
+                    "costIsPartial": true,
+                    "numTurns": 2,
+                    "usageIsIncomplete": true
+                }
+            },
+            "_meta": { "eventId": "s1-17" },
+        });
+        let Event::Session {
+            session_id,
+            update,
+            metadata,
+        } = typed_xai_session_event(&payload).expect("typed xAI Session terminal")
+        else {
+            unreachable!("terminal decoder always returns a Session event")
+        };
+        assert_eq!(session_id.as_str(), "s1");
+        assert_eq!(
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("eventId")),
+            Some(&serde_json::json!("s1-17"))
+        );
 
         assert!(matches!(
             update,
