@@ -161,11 +161,11 @@ mod tests {
         assert_eq!(provenance.upstream_release, "1.0.13");
         assert_eq!(
             provenance.upstream_grok_build_commit,
-            "bc7f02eddd3d84085849dc19ed216f11c23b0571"
+            "bb7f39d5858cbf5e00de639367f59debbdcb0138"
         );
         assert_eq!(
             provenance.upstream_source_rev,
-            "d5a0335a47221e8c9519936cb693e9b6450227ec"
+            "d761e8ba538084df023de79d26892eaf73ed7411"
         );
         assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
     }

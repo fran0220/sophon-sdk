@@ -8,10 +8,10 @@ official xAI SDK.
 
 Current source identity:
 
-- released product baseline: 1.0.13
-- public Grok Build commit: `bc7f02eddd3d84085849dc19ed216f11c23b0571`
-- public crate metadata: 1.0.12
-- embedded monorepo revision: `d5a0335a47221e8c9519936cb693e9b6450227ec`
+- released product baseline: 1.0.13 plus the subsequent public source sync
+- public Grok Build commit: `bb7f39d5858cbf5e00de639367f59debbdcb0138`
+- public crate metadata: 1.0.13
+- embedded monorepo revision: `d761e8ba538084df023de79d26892eaf73ed7411`
 
 ## Use it
 
@@ -106,8 +106,8 @@ the SDK does not expose a video-model setting that upstream would ignore.
 
 `MediaProviderConfig` has its own API key and custom headers. Media requests use
 `Authorization: Bearer <media api_key>` and are not affected by model switching
-or session credential refresh. This is the fork's one intentional Grok Build
-provider-routing divergence: native image/video clients can opt out of the
+or session credential refresh. The provider-routing divergence lets native
+image/video clients opt out of the
 active session key provider when an embedding supplies an independent media
 provider. The same narrow patch keeps web-search credentials/query parameters
 and prompt-suggestion routes attached to their selected model provider. The
@@ -240,16 +240,17 @@ The SDK then overlays only its explicit model/media routes and headless embeddin
 mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
 upstream data directory rather than the default `~/.grok`.
 
-## What the 1.0.13 baseline contributes
+## What the post-1.0.13 source sync contributes
 
-The full upstream source delta through the public snapshot underlying 1.0.13 is
-retained. Agent-facing improvements inherited by the facade include automatic
-continuation after length-truncated responses, execution of completed tool calls
-before continuation, transient sampler retries, faster subagent delivery, MCP
-form/URL elicitation and non-blocking startup, and detailed session-close timing
-spans. Configured command and HTTP `PreToolUse` hooks can now ask, defer, and add
-post-tool model context; the SDK continues to expose Grok Build's native hook
-configuration rather than mirroring that schema.
+The public commit retains version 1.0.13 metadata but advances the embedded
+monorepo revision. Agent-facing improvements inherited by the facade include
+length-limit salvage and completed-tool delivery before continuation,
+replacement/context delivery from `PostToolUse` hooks, model effort variants,
+configurable prompt-suggestion reasoning and telemetry, persisted usage data,
+managed-config supervision, safer linked-worktree cleanup, and sampler/subagent
+reliability improvements. The SDK continues to expose these through Grok
+Build's native behavior and forward-compatible event/extension seams rather
+than mirroring their internal schemas.
 
 TUI-only additions such as the credit-limit Try Again action, iTerm2 pasted-image
 pixel previews, prompt stashing, modal/catalog changes, and selection behavior
@@ -259,12 +260,13 @@ concepts.
 ## Upstream sync policy
 
 Upstream-owned directories remain byte-for-byte equal to the commit in
-`UPSTREAM_GROK_BUILD_COMMIT`, except for the provider-routing patch recorded
-under [`upstream-patches/`](upstream-patches/). The sync check validates both
-the untouched tree and the exact approved patch. An upgrade imports the
-complete public snapshot, updates the provenance files, reconciles that one
-patch, then adapts only this small facade for public API changes. Do not fork
-other upstream agent behavior into `sophon-sdk`.
+`UPSTREAM_GROK_BUILD_COMMIT`, except for the separately digested provider
+routing, hermetic embedded discovery, and Windows portability groups documented
+in [`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md), plus a one-line public
+snapshot test-import repair. The sync check validates the untouched tree and
+each approved patch independently. An upgrade imports the complete public
+snapshot, updates provenance, reconciles those boundaries, then adapts only
+this small facade for public API changes.
 
 ```sh
 crates/sophon-sdk/scripts/check-upstream-sync.sh

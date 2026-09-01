@@ -48,24 +48,26 @@ and the pager/TUI is not part of the SDK dependency or public API. The upstream
 image/video tools can be routed to an independently credentialed media provider,
 while their implementation and request lifecycle remain upstream-owned. This
 provider-routing seam also keeps web search and prompt suggestions attached to
-their selected provider and is the one recorded upstream divergence. All other
-non-TUI agent operations remain reachable through typed lifecycle methods or a
+their selected provider. Separately digested hermetic-discovery and Windows
+portability patches protect the embedding boundary and supported build hosts;
+a fourth digest records one stale public-test import repair. All other non-TUI
+agent operations remain reachable through typed lifecycle methods or a
 forward-compatible `x.ai/*` JSON extension seam, including search, titles,
 summaries, MCP, plugins, skills, hooks, tasks, subagents and worktrees. The
 upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`bc7f02eddd3d84085849dc19ed216f11c23b0571` (the public source snapshot
-underlying release 1.0.13, crate metadata 1.0.12, `SOURCE_REV`
-`d5a0335a47221e8c9519936cb693e9b6450227ec`). This is an independent
+`bb7f39d5858cbf5e00de639367f59debbdcb0138` (a post-1.0.13 public source sync,
+crate metadata 1.0.13, `SOURCE_REV`
+`d761e8ba538084df023de79d26892eaf73ed7411`). This is an independent
 redistribution, not an official xAI SDK.
 
 The synchronized source advances the previous 1.0.6-era public pin through the
-1.0.7–1.0.13 releases and later public source syncs. Highlights include
-automatic continuation after length truncation, hook ask/defer/context outcomes,
-transient turn retries, detailed session-close timing, MCP form/URL elicitation
-and non-blocking startup, and faster concurrent subagent delivery. TUI-only
-features remain available to the upstream application but are deliberately not
-mirrored by the SDK. See the
+1.0.7–1.0.13 releases and the latest public source sync. Highlights include
+length-limit salvage, complete pre/post-tool hook context delivery, effort-based
+model variants, configurable prompt suggestions, persisted usage, managed-config
+supervision, safer worktree cleanup, and sampler/subagent reliability work.
+TUI-only features remain available to the upstream application but are
+deliberately not mirrored by the SDK. See the
 [SDK boundary and usage guide](crates/sophon-sdk/README.md).
 
 ## Installing the released binary
@@ -149,8 +151,7 @@ cargo test -p xai-grok-config # per-crate tests
 cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
 cargo fmt --all               # rustfmt.toml at the repo root
 
-# verify the fork has not modified upstream-owned paths
-# outside the recorded media-provider patch
+# verify untouched upstream paths and each declared divergence digest
 crates/sophon-sdk/scripts/check-upstream-sync.sh
 ```
 
