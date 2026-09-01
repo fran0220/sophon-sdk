@@ -191,7 +191,9 @@ async fn read_agents_config_with_roots(
 
     let mut home_roots = Vec::new();
     add_discovery_root(&mut home_roots, grok_home, true, HOME_RULES_DIRS);
-    if let Some(home) = home_dir {
+    if !compat.hermetic
+        && let Some(home) = home_dir
+    {
         if compat.claude.agents || compat.claude.rules {
             add_discovery_root(
                 &mut home_roots,
@@ -591,6 +593,45 @@ mod tests {
             !has_ghost,
             "Without optional workspace user dir, ghost AGENTS.md should not be found"
         );
+    }
+
+    #[tokio::test]
+    async fn hermetic_agents_config_keeps_owned_rules_and_project_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grok_home = tmp.path().join("grok-home");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        for dir in [
+            grok_home.join("rules"),
+            home.join(".claude/rules"),
+            repo.join(".grok/rules"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        init_git_repo(&repo);
+        fs::write(grok_home.join("rules/owned.md"), "owned-rule").unwrap();
+        fs::write(home.join(".claude/rules/ambient.md"), "home-rule").unwrap();
+        fs::write(repo.join(".grok/rules/ambient.md"), "project-rule").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "vendor-instructions").unwrap();
+        fs::write(repo.join("AGENTS.md"), "project-instructions").unwrap();
+
+        let configs = read_agents_config_with_roots(
+            repo.to_str().unwrap(),
+            None,
+            CompatConfig {
+                hermetic: true,
+                ..Default::default()
+            },
+            grok_home,
+            Some(home),
+        )
+        .await;
+        let contents: Vec<_> = configs
+            .iter()
+            .map(|config| config.content.as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["owned-rule", "project-instructions"]);
     }
 
     /// Regression: running outside a git repo must not panic.

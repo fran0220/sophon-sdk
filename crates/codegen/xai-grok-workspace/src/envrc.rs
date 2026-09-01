@@ -134,6 +134,9 @@ watch_file() { :; }
 "#;
 
 pub fn load_envrc(dir: &Path) -> Option<HashMap<String, String>> {
+    if xai_grok_config::hermetic_discovery() {
+        return None;
+    }
     load_envrc_with_timeout(dir, effective_timeout())
 }
 

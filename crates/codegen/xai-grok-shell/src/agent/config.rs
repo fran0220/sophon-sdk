@@ -806,6 +806,7 @@ fn resolve_compat_config(
             .value,
         );
     }
+    resolved.hermetic = xai_grok_config::hermetic_discovery();
     resolved
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,7 +944,11 @@ impl PluginsConfig {
     /// Native `.grok/config.toml` entries already present take precedence:
     /// a name is only added if it isn't already in the opposite list.
     pub(crate) fn merge_claude_enabled_plugins(&mut self, _cwd: Option<&std::path::Path>) {
-        if crate::claude_import::is_claude_import_marked_with_log("merge_claude_enabled_plugins") {
+        if xai_grok_config::hermetic_discovery()
+            || crate::claude_import::is_claude_import_marked_with_log(
+                "merge_claude_enabled_plugins",
+            )
+        {
             return;
         }
         let mut paths = Vec::new();

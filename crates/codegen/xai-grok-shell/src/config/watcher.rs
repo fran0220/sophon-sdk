@@ -593,6 +593,9 @@ pub(crate) struct ProjectDiscoveryWatcher {
 
 impl ProjectDiscoveryWatcher {
     pub(crate) fn start(cwd: &Path) -> Option<(Self, mpsc::UnboundedReceiver<DiscoveryChange>)> {
+        if xai_grok_config::hermetic_discovery() {
+            return None;
+        }
         let project_root = crate::session::workflow::registry::project_root(cwd);
         let project_grok = project_root.join(".grok");
         let (tx, rx) = mpsc::unbounded_channel();
@@ -680,19 +683,30 @@ impl SkillsFileWatcher {
         config_paths: &[String],
     ) -> Option<(Self, mpsc::UnboundedReceiver<DiscoveryChange>)> {
         let grok_home = xai_grok_tools::util::grok_home::grok_home();
-        // Watch the full superset of vendor dirs (all-on compat). This watcher
-        // is leader-global (no per-session compat resolved here); the actual
-        // per-session discovery gating happens downstream, so watching a
-        // currently-disabled vendor dir is harmless (a change just re-runs the
-        // gated discovery) and avoids ever missing a watch if a toggle flips.
+        let hermetic = xai_grok_config::hermetic_discovery();
+        // Outside hermetic mode, watch the full superset of vendor dirs (all-on
+        // compat). This watcher is leader-global (no per-session compat
+        // resolved here); the actual per-session discovery gating happens
+        // downstream, so watching a currently-disabled vendor dir is harmless
+        // (a change just re-runs the gated discovery) and avoids ever missing a
+        // watch if a toggle flips. Hermetic mode keeps only owned and explicit
+        // roots.
+        let compat = xai_grok_tools::types::compat::CompatConfig {
+            hermetic,
+            ..Default::default()
+        };
         let dirs_to_watch = xai_grok_agent::prompt::skills::collect_skill_config_dirs(
             cwd,
             monorepo_user_dir,
             &grok_home,
             config_paths,
-            xai_grok_tools::types::compat::CompatConfig::default(),
+            compat,
         );
-        let project_root = cwd.map(crate::session::workflow::registry::project_root);
+        let project_root = if hermetic {
+            None
+        } else {
+            cwd.map(crate::session::workflow::registry::project_root)
+        };
         Self::start_with_dirs(&dirs_to_watch, &grok_home, project_root.as_deref())
     }
 

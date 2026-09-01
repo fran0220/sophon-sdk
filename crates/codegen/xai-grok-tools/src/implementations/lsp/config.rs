@@ -31,7 +31,8 @@ pub fn load_servers_with_plugins_sourced(
     );
 
     let user_path = crate::util::grok_home::grok_home().join("lsp.json");
-    let project_path = cwd.join(".grok").join("lsp.json");
+    let project_path =
+        (!xai_grok_config::hermetic_discovery()).then(|| cwd.join(".grok").join("lsp.json"));
 
     // User-level servers
     let mut servers: BTreeMap<String, (LspServerConfig, ConfigSource)> = load_file(&user_path)
@@ -50,16 +51,18 @@ pub fn load_servers_with_plugins_sourced(
         .collect();
 
     // Project-level overrides
-    for (name, cfg) in load_file(&project_path) {
-        servers.insert(
-            name,
-            (
-                cfg,
-                ConfigSource::Project {
-                    path: project_path.clone(),
-                },
-            ),
-        );
+    if let Some(project_path) = project_path {
+        for (name, cfg) in load_file(&project_path) {
+            servers.insert(
+                name,
+                (
+                    cfg,
+                    ConfigSource::Project {
+                        path: project_path.clone(),
+                    },
+                ),
+            );
+        }
     }
 
     // Plugin file-based configs
@@ -138,7 +141,11 @@ pub fn load_servers(cwd: &Path) -> BTreeMap<String, LspServerConfig> {
     let project_path = cwd.join(".grok").join("lsp.json");
 
     let mut merged = load_file(&user_path);
-    let project = load_file(&project_path);
+    let project = if xai_grok_config::hermetic_discovery() {
+        BTreeMap::new()
+    } else {
+        load_file(&project_path)
+    };
 
     if !merged.is_empty() {
         tracing::info!(

@@ -36,6 +36,13 @@ pub fn project_agent_dirs(cwd: Option<&Path>) -> (Vec<PathBuf>, Option<PathBuf>)
 /// never drift from discovery (adding a third project-agent dir updates both at
 /// once).
 pub fn project_agent_dirs_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    project_agent_dirs_in_mode(chain_dirs, xai_grok_config::hermetic_discovery())
+}
+
+fn project_agent_dirs_in_mode(chain_dirs: &[PathBuf], hermetic: bool) -> Vec<PathBuf> {
+    if hermetic {
+        return Vec::new();
+    }
     crate::repo::existing_subdirs_along(chain_dirs, PROJECT_AGENT_SUBDIRS)
 }
 
@@ -202,10 +209,20 @@ pub(crate) fn user_agent_dirs(
     home: Option<&Path>,
     grok_home: Option<&Path>,
 ) -> Vec<(std::path::PathBuf, AgentScope)> {
+    user_agent_dirs_in_mode(home, grok_home, xai_grok_config::hermetic_discovery())
+}
+
+fn user_agent_dirs_in_mode(
+    home: Option<&Path>,
+    grok_home: Option<&Path>,
+    hermetic: bool,
+) -> Vec<(std::path::PathBuf, AgentScope)> {
     // Legacy literal ~/.grok, included only when it differs from grok_home
     // (i.e. GROK_HOME points elsewhere) so agents left in the old location are
     // still discovered and stay consistent with scope_from_path classification.
+    // Hermetic discovery drops literal-home dirs entirely.
     let legacy_grok = home
+        .filter(|_| !hermetic)
         .map(|h| h.join(".grok"))
         .filter(|legacy| grok_home != Some(legacy.as_path()));
 
@@ -216,7 +233,7 @@ pub(crate) fn user_agent_dirs(
     if let Some(l) = &legacy_grok {
         dirs.push((l.join("agents"), AgentScope::User));
     }
-    if let Some(h) = home {
+    if !hermetic && let Some(h) = home {
         dirs.push((h.join(".claude").join("agents"), AgentScope::User));
     }
     if let Some(g) = grok_home {
@@ -820,6 +837,36 @@ mod tests {
             count, 1,
             "no duplicate ~/.grok/agents when grok_home == ~/.grok"
         );
+    }
+
+    #[test]
+    fn hermetic_agent_dirs_keep_only_grok_home_sources() {
+        let home = Path::new("/home/u");
+        let grok = Path::new("/application/grok-home");
+        let paths: Vec<_> = user_agent_dirs_in_mode(Some(home), Some(grok), true)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        assert_eq!(
+            paths,
+            vec![grok.join("agents"), grok.join("bundled/agents")]
+        );
+    }
+
+    #[test]
+    fn hermetic_agent_dirs_hide_project_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        let project_agents = project.join(".grok/agents");
+        fs::create_dir_all(&project_agents).unwrap();
+        let chain = vec![project];
+
+        assert_eq!(
+            project_agent_dirs_in_mode(&chain, false),
+            vec![project_agents]
+        );
+        assert!(project_agent_dirs_in_mode(&chain, true).is_empty());
     }
 
     #[test]

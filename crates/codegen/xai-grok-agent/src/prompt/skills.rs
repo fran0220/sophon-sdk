@@ -172,30 +172,34 @@ pub fn collect_skill_config_dirs(
     // this list equals the historical `[".grok", ".agents", ".claude", ".cursor"]`.
     let config_dir_names = compat.skill_config_dirs();
 
-    // Priority 1 & 2: Walk from cwd up to the git root.
-    if let Some(cwd) = cwd {
-        if let Some(ref root) = git_root {
-            let mut current = Some(cwd.to_path_buf());
-            while let Some(dir) = current {
+    // Hermetic discovery: the working directory and literal home directory
+    // contribute nothing. `$GROK_HOME`, injected dirs and explicit paths remain.
+    if !compat.hermetic {
+        // Priority 1 & 2: Walk from cwd up to the git root.
+        if let Some(cwd) = cwd {
+            if let Some(ref root) = git_root {
+                let mut current = Some(cwd.to_path_buf());
+                while let Some(dir) = current {
+                    for name in &config_dir_names {
+                        try_add(dir.join(name));
+                    }
+                    if dir == *root {
+                        break;
+                    }
+                    current = dir.parent().map(|p| p.to_path_buf());
+                }
+            } else {
                 for name in &config_dir_names {
-                    try_add(dir.join(name));
+                    try_add(cwd.join(name));
                 }
-                if dir == *root {
-                    break;
-                }
-                current = dir.parent().map(|p| p.to_path_buf());
-            }
-        } else {
-            for name in &config_dir_names {
-                try_add(cwd.join(name));
             }
         }
-    }
 
-    // Priority 2.5: Optional workspace user dir.
-    if let Some(user_dir) = workspace_user_dir {
-        for name in &config_dir_names {
-            try_add(user_dir.join(name));
+        // Priority 2.5: Optional workspace user dir.
+        if let Some(user_dir) = workspace_user_dir {
+            for name in &config_dir_names {
+                try_add(user_dir.join(name));
+            }
         }
     }
 
@@ -203,7 +207,9 @@ pub fn collect_skill_config_dirs(
     // be overridden), so it's handled separately; `.agents` is always added,
     // while `.claude`/`.cursor` are gated by the skills compat cells.
     try_add(grok_home);
-    if let Some(home) = xai_dirs::home_dir() {
+    if !compat.hermetic
+        && let Some(home) = xai_dirs::home_dir()
+    {
         try_add(home.join(".agents"));
         if compat.claude.skills {
             try_add(home.join(".claude"));
@@ -2459,6 +2465,38 @@ mod tests {
         );
         assert!(ends_with(&dirs, ".claude"), "claude must remain: {dirs:?}");
         assert!(ends_with(&dirs, ".grok"), "grok must remain: {dirs:?}");
+    }
+
+    #[test]
+    fn collect_skill_config_dirs_hermetic_keeps_only_owned_and_explicit_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("workspace");
+        let workspace_user = tmp.path().join("workspace-user");
+        let grok_home = tmp.path().join("application-grok-home");
+        let explicit = tmp.path().join("explicit-skills");
+        for dir in [
+            cwd.join(".grok"),
+            cwd.join(".agents"),
+            workspace_user.join(".grok"),
+            grok_home.clone(),
+            explicit.clone(),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+
+        let compat = CompatConfig {
+            hermetic: true,
+            ..Default::default()
+        };
+        let dirs = collect_skill_config_dirs(
+            Some(&cwd),
+            Some(&workspace_user),
+            &grok_home,
+            &[explicit.to_string_lossy().into_owned()],
+            compat,
+        );
+
+        assert_eq!(dirs, vec![grok_home, explicit]);
     }
 
     // ── Same-scope frontmatter-name collisions (copied skill dirs) ──────

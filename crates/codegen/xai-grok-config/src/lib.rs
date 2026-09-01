@@ -19,6 +19,7 @@ pub mod config_override;
 mod env_overlay;
 pub mod fs_atomic;
 pub mod global_hook_sources;
+mod hermetic;
 mod loader;
 mod macos_managed;
 mod managed_cache;
@@ -41,6 +42,7 @@ pub use global_hook_sources::{
     path_has_symlink_component, resolve_global_hook_sources, resolve_trust_boundary_sources,
     unique_ancestors_rootward,
 };
+pub use hermetic::{HERMETIC_DISCOVERY_ENV, hermetic_discovery, set_hermetic_discovery};
 
 pub use config_layers::{
     CampaignsState, ConfigLayers, campaigns_application_disabled, campaigns_state_path,

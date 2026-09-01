@@ -230,10 +230,15 @@ normal `sophon-sdk` dependency closure.
 At startup the SDK loads and resolves Grok Build's effective configuration; it
 does not replace it with defaults. Persisted sessions, web fetch, tools, skills,
 plugins, hooks, MCP, subagents, workflows, compaction, worktrees, feature gates,
-and other ordinary settings therefore continue to come from `GROK_HOME`. The
-SDK overlays only its explicit model/media routes and headless embedding mode.
-Set `GROK_HOME` before starting an Agent when an embedding needs an isolated
-upstream data directory.
+and other ordinary settings therefore continue to come from `GROK_HOME`. Before
+that first load, the SDK fixes capability discovery to hermetic mode: the
+resolved Grok home plus explicit or injected paths remain, while project config,
+vendor home directories, rules, MCP/LSP servers, hooks, plugins, workflows and
+subprocess-environment overlays are not discovered from the ambient workspace.
+Ordinary workspace files and project `AGENTS.md` instructions remain visible.
+The SDK then overlays only its explicit model/media routes and headless embedding
+mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
+upstream data directory rather than the default `~/.grok`.
 
 ## What the 1.0.13 baseline contributes
 

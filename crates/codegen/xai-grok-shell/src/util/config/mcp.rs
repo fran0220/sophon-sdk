@@ -1342,8 +1342,8 @@ pub(crate) fn load_claude_json_mcp_servers(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> Vec<acp::McpServer> {
-    // Compat gate: skip ~/.claude.json MCP loading when disabled.
-    if !compat.claude.mcps {
+    // Hermetic discovery excludes vendor files regardless of compat cells.
+    if compat.hermetic || !compat.claude.mcps {
         return vec![];
     }
     // Phase 2 cutoff: if the user has imported, skip reading ~/.claude.json.
@@ -1377,8 +1377,8 @@ pub(crate) fn load_claude_json_mcp_servers_as_configs(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> IndexMap<String, McpServerConfig> {
-    // Compat gate: skip ~/.claude.json MCP loading when disabled.
-    if !compat.claude.mcps {
+    // Hermetic discovery excludes vendor files regardless of compat cells.
+    if compat.hermetic || !compat.claude.mcps {
         return IndexMap::new();
     }
     // Phase 2 cutoff: if the user has imported, skip reading ~/.claude.json.
@@ -1469,8 +1469,8 @@ pub(crate) fn load_cursor_mcp_servers(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> Vec<acp::McpServer> {
-    // Compat gate: skip Cursor MCP loading when disabled.
-    if !compat.cursor.mcps {
+    // Hermetic discovery excludes vendor files regardless of compat cells.
+    if compat.hermetic || !compat.cursor.mcps {
         return vec![];
     }
     let mut result = Vec::new();
@@ -1518,8 +1518,8 @@ pub(crate) fn load_cursor_mcp_servers_as_configs(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> IndexMap<String, McpServerConfig> {
-    // Compat gate: skip Cursor MCP loading when disabled.
-    if !compat.cursor.mcps {
+    // Hermetic discovery excludes vendor files regardless of compat cells.
+    if compat.hermetic || !compat.cursor.mcps {
         return IndexMap::new();
     }
     let mut result = IndexMap::new();
@@ -2545,6 +2545,32 @@ expose_image_base64 = true
         let config = read_mcp_json(&mcp_json_path).expect("should parse cursor mcp.json");
         assert_eq!(config.mcp_servers.len(), 1);
         assert!(config.mcp_servers.contains_key("test_server"));
+    }
+
+    #[test]
+    fn hermetic_mode_skips_project_cursor_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "ambient": { "command": "ambient-server" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let regular = load_cursor_mcp_servers_as_configs(dir.path(), &CompatConfig::default());
+        assert!(regular.contains_key("ambient"));
+
+        let hermetic = CompatConfig {
+            hermetic: true,
+            ..Default::default()
+        };
+        assert!(load_cursor_mcp_servers_as_configs(dir.path(), &hermetic).is_empty());
+        assert!(load_cursor_mcp_servers(dir.path(), &hermetic).is_empty());
     }
 
     /// Path-based loader used by kill-switch attribution (no mcps/import gates).

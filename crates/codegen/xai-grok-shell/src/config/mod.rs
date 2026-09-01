@@ -195,6 +195,9 @@ impl SubagentsConfig {
     /// Each file defines a single `SubagentPersona`. The file stem becomes
     /// the persona name. Inline config takes precedence.
     pub(crate) fn discover_personas(&mut self, cwd: &std::path::Path) {
+        if xai_grok_config::hermetic_discovery() {
+            return;
+        }
         let dir = cwd.join(".grok").join("personas");
         self.discover_personas_in_dir(&dir);
     }
@@ -238,6 +241,9 @@ impl SubagentsConfig {
     ///
     /// Precedence: inline config roles override file-based roles with the same name.
     pub(crate) fn discover_roles(&mut self, cwd: &std::path::Path) {
+        if xai_grok_config::hermetic_discovery() {
+            return;
+        }
         let roles_dir = cwd.join(".grok").join("roles");
         self.discover_roles_in_dir(&roles_dir);
     }

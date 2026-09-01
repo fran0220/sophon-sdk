@@ -261,6 +261,9 @@ pub fn project_plugin_dirs(cwd: Option<&Path>) -> (Vec<PathBuf>, Option<PathBuf>
 /// ([`crate::repo::RepoDirChain`]). The folder-trust gate reuses its one shared
 /// chain here so detection and discovery can never drift.
 pub fn project_plugin_dirs_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    if xai_grok_config::hermetic_discovery() {
+        return Vec::new();
+    }
     crate::repo::existing_subdirs_along(chain_dirs, &[".grok/plugins", ".claude/plugins"])
 }
 
@@ -278,6 +281,7 @@ pub fn discover_plugins(
     project_trusted: bool,
 ) -> Vec<DiscoveredPlugin> {
     let _plugin_discovery_timer = crate::timing::timer("plugin_discovery");
+    let hermetic = xai_grok_config::hermetic_discovery();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     let mut candidates: Vec<DiscoveredPlugin> = Vec::new();
 
@@ -301,7 +305,7 @@ pub fn discover_plugins(
     // 2-3. Project plugins (.grok/plugins/, .claude/plugins/) — scan the SAME
     // dirs the folder-trust gate detects, via the shared `project_plugin_dirs`
     // walk (cwd→git root), so discovery and gating can never drift.
-    if let Some(cwd) = cwd {
+    if !hermetic && let Some(cwd) = cwd {
         let (project_dirs, git_root) = project_plugin_dirs(Some(cwd));
         for plugins_dir in project_dirs {
             let origin = project_plugins_dir_origin(&plugins_dir);
@@ -341,7 +345,8 @@ pub fn discover_plugins(
     // Gate the grok plugins dir on user_grok_home() so a project's .grok/plugins
     // is never scanned as user-global when no home resolves.
     let grok = xai_grok_config::user_grok_home();
-    let plugin_dirs = user_plugin_dirs(xai_dirs::home_dir().as_deref(), grok.as_deref());
+    let home = xai_dirs::home_dir().filter(|_| !hermetic);
+    let plugin_dirs = user_plugin_dirs(home.as_deref(), grok.as_deref());
     for (plugins_dir, origin) in plugin_dirs {
         if plugins_dir.is_dir() {
             scan_plugin_dir(
@@ -360,19 +365,21 @@ pub fn discover_plugins(
     // Marketplace repos are cloned locally and registered here.
     // Tracks marketplace installs in installed_plugins.json with explicit
     // Each marketplace has a plugins/ (and optionally external_plugins/) subdirectory.
-    for marketplace in &super::marketplace::resolve_known_marketplaces() {
-        for dir in &marketplace.plugin_dirs {
-            collect_plugin(
-                dir,
-                PluginScope::User,
-                PluginOrigin::ClaudeMarketplace {
-                    marketplace: marketplace.name.clone(),
-                },
-                trust_store,
-                project_trusted,
-                &mut seen_paths,
-                &mut candidates,
-            );
+    if !hermetic {
+        for marketplace in &super::marketplace::resolve_known_marketplaces() {
+            for dir in &marketplace.plugin_dirs {
+                collect_plugin(
+                    dir,
+                    PluginScope::User,
+                    PluginOrigin::ClaudeMarketplace {
+                        marketplace: marketplace.name.clone(),
+                    },
+                    trust_store,
+                    project_trusted,
+                    &mut seen_paths,
+                    &mut candidates,
+                );
+            }
         }
     }
 
@@ -397,7 +404,7 @@ pub fn discover_plugins(
     // scope wins. Within same scope, first-found (alphabetical by canonical
     // with explicit installPath entries (nested under cache/<marketplace>/<plugin>/<version>/).
     // The plugin name is extracted from the JSON key ("name@marketplace").
-    if let Some(home) = xai_dirs::home_dir() {
+    if !hermetic && let Some(home) = xai_dirs::home_dir() {
         let installed_json = home
             .join(".claude")
             .join("plugins")

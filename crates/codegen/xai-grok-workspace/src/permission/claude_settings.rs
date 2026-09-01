@@ -362,6 +362,9 @@ pub fn has_claude_compat(cwd: &Path) -> bool {
 /// for conflicts as documented below).
 /// `defaultMode` uses scope precedence: the most specific file that sets it wins.
 pub fn find_claude_settings_paths(cwd: &Path) -> Vec<PathBuf> {
+    if xai_grok_config::hermetic_discovery() {
+        return Vec::new();
+    }
     let mut paths = global_claude_settings_paths();
 
     // Project paths (higher priority — closer to cwd wins)
@@ -399,6 +402,9 @@ fn global_claude_settings_paths() -> Vec<PathBuf> {
 /// — the single choke point for env injection and permission resolution so
 /// the two cannot drift on which files an untrusted clone may contribute.
 pub(crate) fn claude_settings_paths_for_trust(cwd: &Path, project_trusted: bool) -> Vec<PathBuf> {
+    if xai_grok_config::hermetic_discovery() {
+        return Vec::new();
+    }
     if project_trusted {
         find_claude_settings_paths(cwd)
     } else {
@@ -413,6 +419,9 @@ pub(crate) fn claude_settings_paths_for_trust(cwd: &Path, project_trusted: bool)
 /// `env` is injected into every spawned subprocess — must flip the folder
 /// untrusted, not just one at the git root.
 pub fn project_claude_settings_present(cwd: &Path) -> bool {
+    if xai_grok_config::hermetic_discovery() {
+        return false;
+    }
     collect_project_claude_paths(cwd)
         .iter()
         .any(|p| p.is_file())

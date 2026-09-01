@@ -77,6 +77,7 @@ pub struct Agent {
 
 impl Agent {
     pub async fn start(config: AgentConfig) -> Result<Self, Error> {
+        require_hermetic_discovery()?;
         config.validate()?;
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(1024);
@@ -515,7 +516,21 @@ async fn command_loop(agent: Rc<MvpAgent>, mut commands: mpsc::UnboundedReceiver
     }
 }
 
+fn require_hermetic_discovery() -> Result<(), Error> {
+    if xai_grok_config::set_hermetic_discovery(true) {
+        Ok(())
+    } else {
+        Err(Error::Start(
+            "Grok discovery mode was resolved before sophon-sdk startup".into(),
+        ))
+    }
+}
+
 fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, ModelEntry>), Error> {
+    // An embedding application owns its whole configuration surface, so the
+    // facade fixes hermetic discovery before the first config load. Fail
+    // closed if another caller already resolved this process to ambient mode.
+    require_hermetic_discovery()?;
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|error| Error::Start(format!("failed to load Grok config: {error}")))?;
     let mut grok = GrokConfig::new_from_toml_cfg(&raw_config).map_err(Error::Start)?;
@@ -1137,6 +1152,7 @@ mod tests {
     #[test]
     fn media_tools_are_disabled_without_an_explicit_provider() {
         let (grok, _) = grok_config(&config()).expect("Grok config");
+        assert!(grok.compat_resolved.hermetic);
         assert_eq!(grok.requirements.image_gen.pinned(), Some(false));
         assert_eq!(grok.requirements.image_edit.pinned(), Some(false));
         assert_eq!(grok.requirements.video_gen.pinned(), Some(false));

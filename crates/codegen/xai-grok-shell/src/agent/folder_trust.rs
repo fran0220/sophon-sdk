@@ -401,6 +401,9 @@ fn compute_from_inputs(
 /// `~/.grok/config.toml` is dropped when untrusted. This is intended — untrusted
 /// project content must not influence the command spawned for a shared name.
 pub(crate) fn project_scoped_mcp_names(cwd: &Path) -> HashSet<String> {
+    if xai_grok_config::hermetic_discovery() {
+        return HashSet::new();
+    }
     let mut names = HashSet::new();
 
     // `.grok/config.toml [mcp_servers]` entries tagged project (the loader's key

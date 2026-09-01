@@ -10048,6 +10048,7 @@ dependencies = [
  "tokio",
  "url",
  "xai-acp-lib",
+ "xai-grok-config",
  "xai-grok-sampler",
  "xai-grok-shell",
  "xai-grok-test-support",

@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 url = { workspace = true }
 xai-acp-lib = { workspace = true }
+xai-grok-config = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-shell = { workspace = true }
 

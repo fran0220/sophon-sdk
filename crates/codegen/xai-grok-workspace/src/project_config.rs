@@ -14,6 +14,9 @@ pub const MCP_JSON_FILENAME: &str = ".mcp.json";
 /// Candidate `.mcp.json` paths from repo root to `cwd`, whether or not they exist.
 /// Useful for file watching so newly created files are detected after startup.
 pub fn mcp_json_candidate_paths(cwd: &Path) -> Vec<PathBuf> {
+    if xai_grok_config::hermetic_discovery() {
+        return Vec::new();
+    }
     mcp_json_candidate_paths_in(&RepoDirChain::resolve(cwd).dirs)
 }
 
@@ -35,6 +38,13 @@ pub fn find_mcp_json_files(cwd: &Path) -> Vec<PathBuf> {
 /// [`find_mcp_json_files`] over a precomputed dir chain. See [`RepoDirChain`].
 /// `pub(crate)` — the gate (`repo_configs_present`) reaches it within this crate.
 pub(crate) fn find_mcp_json_files_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    find_mcp_json_files_in_mode(chain_dirs, xai_grok_config::hermetic_discovery())
+}
+
+fn find_mcp_json_files_in_mode(chain_dirs: &[PathBuf], hermetic: bool) -> Vec<PathBuf> {
+    if hermetic {
+        return Vec::new();
+    }
     mcp_json_candidate_paths_in(chain_dirs)
         .into_iter()
         .filter(|path| path.is_file())
@@ -73,6 +83,13 @@ pub fn find_project_configs(cwd: &Path) -> Vec<PathBuf> {
 /// `cwd == $HOME` does not treat `~/.grok/config.toml` as a project overlay.
 /// `pub(crate)` — the gate (`repo_configs_present`) reaches it within this crate.
 pub(crate) fn find_project_configs_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    find_project_configs_in_mode(chain_dirs, xai_grok_config::hermetic_discovery())
+}
+
+fn find_project_configs_in_mode(chain_dirs: &[PathBuf], hermetic: bool) -> Vec<PathBuf> {
+    if hermetic {
+        return Vec::new();
+    }
     // `dirs` is cwd-first; reverse so repo root comes first (lowest priority)
     // and cwd last (highest), matching skills/AGENTS.md discovery order.
     chain_dirs
@@ -110,5 +127,20 @@ mod tests {
         let found = find_project_configs(&project);
         assert_eq!(found.len(), 1);
         assert!(!is_user_grok_config_file(&found[0]));
+    }
+
+    #[test]
+    fn hermetic_mode_hides_project_config_and_mcp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".grok")).unwrap();
+        std::fs::write(project.join(".grok/config.toml"), "# project\n").unwrap();
+        std::fs::write(project.join(".mcp.json"), "{}\n").unwrap();
+        let chain = vec![project];
+
+        assert_eq!(find_project_configs_in_mode(&chain, false).len(), 1);
+        assert_eq!(find_mcp_json_files_in_mode(&chain, false).len(), 1);
+        assert!(find_project_configs_in_mode(&chain, true).is_empty());
+        assert!(find_mcp_json_files_in_mode(&chain, true).is_empty());
     }
 }

@@ -329,6 +329,9 @@ fn directory_present_or_uncertain(path: &Path) -> bool {
 /// `first_only` it returns immediately after the first marker (the gate's
 /// historical short-circuit); otherwise it collects every distinct kind.
 fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> {
+    if xai_grok_config::hermetic_discovery() {
+        return Vec::new();
+    }
     // Resolve the git root + cwd→root dir chain ONCE and reuse it across the
     // git2-based marker checks below: this gate does 1 git2 discover + 1 git2
     // walk (+ the settings-compat path's own cheap `.git`-existence walk, intentionally separate —
@@ -469,6 +472,9 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
 /// [`claude_project_mcp_present`] (existence) and the shell's
 /// `project_scoped_mcp_names` (the names) derive from, so the two never drift.
 pub fn claude_project_mcp_names(cwd: &Path) -> Option<Vec<String>> {
+    if xai_grok_config::hermetic_discovery() {
+        return None;
+    }
     let home = xai_dirs::home_dir()?;
     let content = std::fs::read_to_string(home.join(".claude.json")).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;

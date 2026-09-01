@@ -338,6 +338,12 @@ pub struct CompatConfig {
     pub cursor: VendorCompat,
     pub claude: VendorCompat,
     pub codex: VendorCompat,
+    /// Hermetic capability discovery. When true, skills, commands, agents,
+    /// rules, MCP servers, hooks, plugins, workflows and LSP servers come only
+    /// from `$GROK_HOME` and explicitly configured or injected paths. Ambient
+    /// working-tree, literal-home and vendor discovery is disabled regardless
+    /// of the per-vendor cells. Ordinary project `AGENTS.md` discovery remains.
+    pub hermetic: bool,
 }
 
 impl CompatConfig {
@@ -382,6 +388,9 @@ impl CompatConfig {
     /// Replaces the hard-coded `RULES_DIRS` constant. When all cells are on,
     /// the returned list is identical.
     pub fn rules_dirs(&self) -> Vec<&'static str> {
+        if self.hermetic {
+            return Vec::new();
+        }
         let mut dirs = vec![".grok/rules"];
         if self.claude.rules {
             dirs.push(".claude/rules");
@@ -399,6 +408,9 @@ impl CompatConfig {
     /// Replaces the hard-coded `AGENT_FILENAMES` constant. When `claude.agents`
     /// is on, the returned list is identical (same order).
     pub fn agent_filenames(&self) -> Vec<&'static str> {
+        if self.hermetic {
+            return vec!["Agents.md", "AGENT.md", "AGENTS.md"];
+        }
         let mut names = vec![
             "Agents.md",
             "Claude.md",
@@ -421,6 +433,9 @@ impl CompatConfig {
     /// Replaces the hard-coded `[".claude", ".cursor"]` home scan. When both
     /// cells are on, the returned list is identical (same order).
     pub fn agents_home_dirs(&self) -> Vec<&'static str> {
+        if self.hermetic {
+            return Vec::new();
+        }
         let mut dirs = Vec::new();
         if self.claude.agents {
             dirs.push(".claude");
@@ -601,6 +616,21 @@ mod tests {
         c.claude.agents = false;
         assert_eq!(c.agents_home_dirs(), vec![".cursor"]);
         c.cursor.agents = false;
+        assert!(c.agents_home_dirs().is_empty());
+    }
+
+    #[test]
+    fn hermetic_instructions_keep_only_ordinary_project_agent_files() {
+        let c = CompatConfig {
+            hermetic: true,
+            ..Default::default()
+        };
+
+        assert!(c.rules_dirs().is_empty());
+        assert_eq!(
+            c.agent_filenames(),
+            vec!["Agents.md", "AGENT.md", "AGENTS.md"]
+        );
         assert!(c.agents_home_dirs().is_empty());
     }
 

@@ -941,7 +941,7 @@ pub async fn run_leader(
     shared_models_manager.spawn_background_refresh();
     let models_manager_for_agent = shared_models_manager.clone();
     let models_manager_for_config = shared_models_manager;
-    let recursive_config_watch_enabled = {
+    let recursive_config_watch_enabled = !xai_grok_config::hermetic_discovery() && {
         let user_cfg = crate::config::load_from_disk().ok();
         let requirements = crate::agent::config::read_requirements_toml();
         crate::util::config::resolve_mcp_recursive_config_watch(
@@ -1121,7 +1121,9 @@ pub async fn run_leader(
             let mut watch_paths = crate::config::find_project_configs(&cwd_for_watcher);
             watch_paths
                 .extend(crate::util::config::mcp_json_candidate_paths(&cwd_for_watcher));
-            if let Some(home) = xai_dirs::home_dir() {
+            if !xai_grok_config::hermetic_discovery()
+                && let Some(home) = xai_dirs::home_dir()
+            {
                 watch_paths.push(home.join(".claude.json"));
             }
             let auth_scope = agent_config.grok_com_config.auth_scope();

@@ -137,6 +137,7 @@ impl WorkflowRegistry {
 
         let mut dirs = Vec::new();
         if let Some(cwd) = session_cwd
+            && !xai_grok_config::hermetic_discovery()
             && crate::agent::folder_trust::project_scope_allowed(cwd)
         {
             dirs.push((project_root(cwd).join(".grok").join("workflows"), "project"));

@@ -52,9 +52,11 @@ pub(crate) fn discover_hook_source_paths(
     compat: &xai_grok_tools::types::compat::CompatConfig,
 ) -> HookSourcePaths {
     let grok = xai_grok_config::user_grok_home();
-    let home = xai_dirs::home_dir();
-    let include_claude = include_claude_hooks(compat);
-    let include_cursor = include_cursor_hooks(compat);
+    // Hermetic discovery keeps only `$GROK_HOME` sources. Vendor globals and
+    // every project hook source are ambient configuration.
+    let home = xai_dirs::home_dir().filter(|_| !compat.hermetic);
+    let include_claude = !compat.hermetic && include_claude_hooks(compat);
+    let include_cursor = !compat.hermetic && include_cursor_hooks(compat);
 
     // Soft hooks-paths I/O keeps fixed slots; hard resolve omits Grok globals.
     let mut global: Vec<PathBuf> =
@@ -91,7 +93,9 @@ pub(crate) fn discover_hook_source_paths(
     }
 
     let mut project = Vec::new();
-    if let Some(root) = git_root {
+    if !compat.hermetic
+        && let Some(root) = git_root
+    {
         if include_claude {
             project.push(root.join(".claude").join("settings.json"));
             project.push(root.join(".claude").join("settings.local.json"));
@@ -153,6 +157,27 @@ mod tests {
     use super::*;
     use xai_grok_hooks::config::HookProvenance;
     use xai_grok_hooks::event::HookEventName;
+
+    #[test]
+    fn hermetic_hook_sources_exclude_project_and_vendor_files() {
+        let project = Path::new("/workspace/project");
+        let compat = xai_grok_tools::types::compat::CompatConfig {
+            hermetic: true,
+            ..Default::default()
+        };
+
+        let sources = discover_hook_source_paths(Some(project), &compat);
+        assert!(sources.project.is_empty());
+        if let Some(home) = xai_dirs::home_dir() {
+            for ambient in [
+                home.join(".claude/settings.json"),
+                home.join(".claude/settings.local.json"),
+                home.join(".cursor/hooks.json"),
+            ] {
+                assert!(!sources.global.contains(&ambient));
+            }
+        }
+    }
 
     /// Write `content` as `<dir>/requirements.toml`.
     fn write_requirements(dir: &Path, content: &str) {

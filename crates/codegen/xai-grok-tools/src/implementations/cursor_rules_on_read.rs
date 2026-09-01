@@ -87,7 +87,7 @@ pub async fn append_cursor_rules_for_read(
     content: &mut String,
     content_concise: &mut Option<String>,
 ) {
-    if !enabled {
+    if !enabled || xai_grok_config::hermetic_discovery() {
         return;
     }
     let Some(reminder) =

@@ -849,6 +849,12 @@ pub fn discover_skills_for_paths(
     already_checked: &mut HashSet<PathBuf>,
     compat: CompatConfig,
 ) -> Vec<SkillInfo> {
+    // Mid-session upward walks are ambient tree discovery. In hermetic mode,
+    // startup roots under `$GROK_HOME` and explicit paths are the only sources.
+    if compat.hermetic {
+        return Vec::new();
+    }
+
     // `.grok` and `.agents` are always scanned; `.claude` is gated on the
     // claude-vendor skills cell. (`.cursor` is excluded here by design — see fn docs.)
     let mut config_dir_names: Vec<&str> = vec![".grok", ".agents"];
@@ -1568,6 +1574,37 @@ model: test-model
         assert!(
             !names_off.contains(&"claude-dyn"),
             "claude-dyn must be gated off: {names_off:?}"
+        );
+    }
+
+    #[test]
+    fn discover_skills_for_paths_skips_ambient_tree_in_hermetic_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(tmp.path()).unwrap();
+        let sub = repo.join("sub");
+        let skill = sub.join(".grok/skills/ambient");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: ambient\n---\n").unwrap();
+        let file = sub.join("file.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let compat = CompatConfig {
+            hermetic: true,
+            ..Default::default()
+        };
+        let mut checked = HashSet::new();
+        let skills = discover_skills_for_paths(
+            &[file.as_path()],
+            &repo,
+            Some(repo.as_path()),
+            &mut checked,
+            compat,
+        );
+
+        assert!(skills.is_empty());
+        assert!(
+            checked.is_empty(),
+            "hermetic discovery must not walk the tree"
         );
     }
 
