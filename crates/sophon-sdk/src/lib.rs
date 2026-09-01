@@ -42,7 +42,7 @@ pub enum Error {
         admission_source: management::AdmissionSource,
     },
     #[error("agent quiesce timed out before all accepted work drained")]
-    QuiesceTimedOut(management::QuiesceReport),
+    QuiesceTimedOut(Box<management::QuiesceReport>),
     #[error("the embedding does not handle Grok Build client request: {0}")]
     UnsupportedClientRequest(String),
     #[error("Grok Build runtime stopped")]

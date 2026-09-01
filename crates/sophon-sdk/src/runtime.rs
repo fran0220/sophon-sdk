@@ -1018,7 +1018,7 @@ async fn command_loop(
                 );
                 let report = mgmt::quiesce_report(agent.quiesce(Duration::from_secs(30)).await);
                 if !report.drained() {
-                    let _ = reply.send(Err(Error::QuiesceTimedOut(report)));
+                    let _ = reply.send(Err(Error::QuiesceTimedOut(Box::new(report))));
                     continue;
                 }
                 update_runtime_health(
