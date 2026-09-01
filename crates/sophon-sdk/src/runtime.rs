@@ -306,7 +306,7 @@ async fn start_worker(
             auth_manager,
             Some(models),
         )
-        .map_err(Error::Start)?,
+        .map_err(|error| Error::Start(error.to_string()))?,
     );
     let client = EmbeddedClient {
         events,
@@ -1180,7 +1180,9 @@ mod tests {
                     "https://search.example/v1",
                     "search-key",
                     "search-model",
-                ),
+                )
+                .header("x-search-tenant", "tenant")
+                .query_param("tenant", "search"),
             ))
             .web_search_model("search")
             .session_summary_model("search")
@@ -1195,6 +1197,24 @@ mod tests {
             PromptSuggestModelPin::Pinned("search".into())
         );
         assert_eq!(models["search"].info.base_url, "https://search.example/v1");
+        assert_eq!(models["search"].info.model, "search-model");
+        assert_eq!(models["search"].api_key.as_deref(), Some("search-key"));
+        assert_eq!(
+            models["search"]
+                .info
+                .extra_headers
+                .get("x-search-tenant")
+                .map(String::as_str),
+            Some("tenant")
+        );
+        assert_eq!(
+            models["search"]
+                .info
+                .query_params
+                .get("tenant")
+                .map(String::as_str),
+            Some("search")
+        );
     }
 
     #[test]
