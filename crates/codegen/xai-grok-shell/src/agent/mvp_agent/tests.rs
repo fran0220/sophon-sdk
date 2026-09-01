@@ -3149,8 +3149,8 @@ async fn prepare_media_configs_keep_independent_provider_credentials() {
     assert!(!use_dynamic_api_key_provider);
 }
 
-#[test]
-fn prepare_web_search_keeps_independent_model_routing() {
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_web_search_keeps_independent_model_routing() {
     use crate::agent::config::ModelEntry;
 
     let agent = build_minimal_agent_for_tests();
@@ -3178,6 +3178,35 @@ fn prepare_web_search_keeps_independent_model_routing() {
         config.bearer_resolver.is_none(),
         "active model credentials must not override the search provider"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn summary_fallback_keeps_the_active_provider_model() {
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("summary", &agent.cfg.borrow().endpoints);
+    entry.auth_provider = Some(crate::auth::AuthProviderRef::new(
+        "cold-summary-provider".into(),
+        crate::auth::AuthProviderConfig {
+            command: "printf unused".into(),
+            args: None,
+            token_ttl_secs: Some(3600),
+            timeout_secs: None,
+            cwd: None,
+        },
+    ));
+    agent.models_manager.insert_test_entry("summary", entry);
+    agent.cfg.borrow_mut().session_summary_model = Some("summary".into());
+    let primary = xai_grok_sampler::SamplerConfig {
+        model: "active-wire-model".into(),
+        base_url: "https://active.example/v1".into(),
+        api_key: Some("active-key".into()),
+        ..Default::default()
+    };
+
+    let (_, model) = agent
+        .build_summary_client(&primary)
+        .expect("active provider should remain a valid fallback");
+    assert_eq!(model, "active-wire-model");
 }
 
 /// The imagine tools bypass cli-chat-proxy (direct API calls).

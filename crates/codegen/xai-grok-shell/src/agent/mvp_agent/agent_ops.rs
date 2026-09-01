@@ -124,11 +124,10 @@ impl MvpAgent {
                 );
                 cfg
             }
-            None => {
-                let mut fallback = primary.clone();
-                fallback.model = slug;
-                fallback
-            }
+            // Keep the active wire model together with its endpoint and
+            // credential. Sending an unresolved helper slug to the active
+            // provider can select a nonexistent model or cross providers.
+            None => primary.clone(),
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;

@@ -838,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_provider_keeps_its_key_and_query_parameters() {
-        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::matchers::{body_partial_json, header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         struct UnrelatedModelProvider;
@@ -853,6 +853,10 @@ mod tests {
             .and(path("/responses"))
             .and(query_param("tenant", "search"))
             .and(header("Authorization", "Bearer search-key"))
+            .and(header("x-search-tenant", "tenant"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "search-model"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "resp_test",
                 "object": "response",
@@ -877,7 +881,9 @@ mod tests {
             api_key: "search-key".to_string(),
             base_url: server.uri(),
             model: "search-model".to_string(),
-            extra_headers: IndexMap::new(),
+            extra_headers: indexmap::indexmap! {
+                "x-search-tenant".into() => "tenant".into(),
+            },
             query_params: indexmap::indexmap! { "tenant".into() => "search".into() },
             use_dynamic_api_key_provider: false,
             alpha_test_key: None,

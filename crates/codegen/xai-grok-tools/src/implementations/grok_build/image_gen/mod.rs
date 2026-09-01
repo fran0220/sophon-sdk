@@ -631,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_provider_uses_static_media_credential() {
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         struct ModelKey;
@@ -645,17 +645,23 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .and(header("Authorization", "Bearer media-key"))
+            .and(header("x-media-tenant", "tenant"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "media-wire-model"
+            })))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
         let cfg = ImageGenConfig::Enabled {
             api_key: "media-key".into(),
             base_url: server.uri(),
-            extra_headers: indexmap::IndexMap::new(),
+            extra_headers: indexmap::indexmap! {
+                "x-media-tenant".into() => "tenant".into(),
+            },
             use_dynamic_api_key_provider: false,
             image_gen_enabled: true,
             image_edit_enabled: true,
-            model_override: None,
+            model_override: Some("media-wire-model".into()),
             edit_model_override: None,
             tier_restricted: false,
         };
@@ -664,7 +670,7 @@ mod tests {
         let response = client
             .post_json(
                 &format!("{}/images/generations", server.uri()),
-                &serde_json::json!({}),
+                &serde_json::json!({ "model": client.model }),
                 None,
             )
             .send()

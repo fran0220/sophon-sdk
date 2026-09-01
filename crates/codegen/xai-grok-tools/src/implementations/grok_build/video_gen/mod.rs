@@ -1385,13 +1385,16 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/videos/generations"))
             .and(header("Authorization", "Bearer media-key"))
+            .and(header("x-media-tenant", "tenant"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
         let cfg = VideoGenConfig::Enabled {
             api_key: "media-key".into(),
             base_url: server.uri(),
-            extra_headers: indexmap::IndexMap::new(),
+            extra_headers: indexmap::indexmap! {
+                "x-media-tenant".into() => "tenant".into(),
+            },
             use_dynamic_api_key_provider: false,
             zdr_video_output_s3: None,
             tier_restricted: false,

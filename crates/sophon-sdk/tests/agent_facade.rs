@@ -67,7 +67,9 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                             suggestion_server.url(),
                             "suggestion-secret",
                             "suggestion-wire-model",
-                        ),
+                        )
+                        .header("x-suggestion-tenant", "tenant")
+                        .query_param("tenant", "suggestion"),
                     ))
                     .prompt_suggestion_model("suggestion-model"),
             )
@@ -148,6 +150,10 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             assert_eq!(
                 suggestion_request.header("authorization"),
                 Some("Bearer suggestion-secret")
+            );
+            assert_eq!(
+                suggestion_request.header("x-suggestion-tenant"),
+                Some("tenant")
             );
             assert_eq!(
                 suggestion_request

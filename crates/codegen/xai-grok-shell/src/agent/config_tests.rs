@@ -409,16 +409,22 @@ fn finalize_image_describe_sampler_some_stamps_session_fields() {
 fn resolve_aux_model_honors_grok_build_override() {
     let endpoints = EndpointsConfig::default();
     let mut catalog = IndexMap::new();
-    catalog.insert(
-        "grok-build".to_string(),
-        test_model_entry(
-            "v9m-rl-learnability-tp8",
-            "https://vendor.example/v1",
-            Some("vendor-key"),
-            None,
-            None,
-        ),
+    let mut entry = test_model_entry(
+        "v9m-rl-learnability-tp8",
+        "https://vendor.example/v1",
+        Some("vendor-key"),
+        None,
+        None,
     );
+    entry
+        .info
+        .extra_headers
+        .insert("x-vendor-tenant".into(), "tenant".into());
+    entry
+        .info
+        .query_params
+        .insert("api-version".into(), "2026-08-31".into());
+    catalog.insert("grok-build".to_string(), entry);
     let resolved = resolve_aux_model_sampling_config(
         "grok-build",
         &catalog,
@@ -432,6 +438,17 @@ fn resolve_aux_model_honors_grok_build_override() {
     assert_eq!(resolved.model, "v9m-rl-learnability-tp8");
     assert_eq!(resolved.base_url, "https://vendor.example/v1");
     assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
+    assert_eq!(
+        resolved
+            .extra_headers
+            .get("x-vendor-tenant")
+            .map(String::as_str),
+        Some("tenant")
+    );
+    assert_eq!(
+        resolved.query_params.get("api-version").map(String::as_str),
+        Some("2026-08-31")
+    );
 }
 /// Cold cache falls back to the session model, never the xAI proxy; warm cache serves the provider token at the provider endpoint.
 #[tokio::test]
