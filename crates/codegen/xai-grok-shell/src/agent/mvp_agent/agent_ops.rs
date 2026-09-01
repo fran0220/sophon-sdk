@@ -433,6 +433,23 @@ impl MvpAgent {
     pub async fn flush_all_sessions(&self, grace: std::time::Duration) {
         self.activity.flush_all_sessions(grace).await;
     }
+    /// Atomically close Agent-wide prompt admission and drain all work that
+    /// was accepted before the fence.
+    pub async fn quiesce(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::agent::activity::QuiesceReport {
+        self.activity.quiesce(timeout).await
+    }
+    /// Typed embedding-management access to one resident session actor.
+    /// The returned handle sends directly to the actor that owns FIFO,
+    /// scheduler, rewind, tasks, hooks and MCP state.
+    pub fn management_session_handle(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::session::SessionHandle> {
+        self.resident_handle(&agent_client_protocol::SessionId::new(session_id))
+    }
     /// Install the channel that fans new session cwds into the leader's `ConfigFileWatcher::watch_path`.
     /// Called once after the watcher is constructed in `agent/app.rs`.
     /// In simple / non-leader mode the channel is never wired and `notify_session_cwd_for_watch` is a no-op.
@@ -2818,7 +2835,7 @@ impl MvpAgent {
         }
     }
     /// Routes through the session's tool bridge to the TerminalBackend.
-    pub(crate) async fn kill_background_task(
+    pub async fn kill_background_task(
         &self,
         session_id: &str,
         task_id: &str,
@@ -2845,7 +2862,7 @@ impl MvpAgent {
     }
     /// Cancel a subagent by id, returning a typed outcome that backs the pager's `x.ai/subagent/cancel`.
     /// Active/pending becomes cancelled (a finish follows); already-finished returns its terminal status; an unknown id returns `NotFound`.
-    pub(crate) async fn cancel_subagent(
+    pub async fn cancel_subagent(
         &self,
         subagent_id: &str,
     ) -> xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome {
@@ -2855,7 +2872,7 @@ impl MvpAgent {
             .cancel(subagent_id)
             .await
     }
-    pub(crate) async fn list_running_subagents(
+    pub async fn list_running_subagents(
         &self,
         parent_session_id: &str,
     ) -> Vec<
@@ -2879,7 +2896,7 @@ impl MvpAgent {
         }
         backend.list_running(parent_session_id).await
     }
-    pub(crate) async fn inspect_subagent(
+    pub async fn inspect_subagent(
         &self,
         subagent_id: &str,
     ) -> Option<
@@ -2891,7 +2908,7 @@ impl MvpAgent {
             .inspect(subagent_id)
             .await
     }
-    pub(crate) async fn query_subagent(
+    pub async fn query_subagent(
         &self,
         subagent_id: &str,
         block: bool,
@@ -4222,6 +4239,7 @@ impl MvpAgent {
                 session_env,
             )
             .with_hunk_tracking_enabled(hunk_tracking_enabled);
+        tool_ctx.admission = self.activity.admission_controller();
         tool_ctx.process_scope = Some(ProcessScope::new());
         let workspace_ops = self
             .resolve_workspace_ops()

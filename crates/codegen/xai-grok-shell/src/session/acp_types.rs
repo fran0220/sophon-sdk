@@ -258,6 +258,44 @@ pub(crate) struct CommentDeleteResponse {
 
 // ── Rewind ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindVersion {
+    pub generation: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindAuthority(pub(crate) std::sync::Arc<tokio::sync::Mutex<RewindVersion>>);
+
+impl Default for RewindAuthority {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(
+            RewindVersion {
+                generation: uuid::Uuid::now_v7().to_string(),
+                revision: 0,
+            },
+        )))
+    }
+}
+
+impl RewindAuthority {
+    pub async fn version(&self) -> RewindVersion {
+        self.0.lock().await.clone()
+    }
+}
+
+impl RewindVersion {
+    pub(crate) fn bump(&mut self) {
+        if let Some(revision) = self.revision.checked_add(1) {
+            self.revision = revision;
+        } else {
+            self.generation = uuid::Uuid::now_v7().to_string();
+            self.revision = 1;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RewindMode {
@@ -320,6 +358,26 @@ pub struct RewindPointsRequest {}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RewindPointsResponse {
     pub rewind_points: Vec<RewindPointInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindSnapshot {
+    pub version: RewindVersion,
+    pub rewind_points: Vec<RewindPointInfo>,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum RewindExecutionResult {
+    Committed {
+        version: RewindVersion,
+        response: RewindResponse,
+        used_compaction_replay: bool,
+    },
+    Conflict {
+        expected: RewindVersion,
+        snapshot: RewindSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -594,6 +652,22 @@ impl StartupHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rewind_authority_is_monotonic_and_rolls_generation_on_overflow() {
+        let authority = RewindAuthority::default();
+        let initial = authority.version().await;
+        {
+            let mut version = authority.0.lock().await;
+            version.bump();
+            assert_eq!(version.generation, initial.generation);
+            assert_eq!(version.revision, 1);
+            version.revision = u64::MAX;
+            version.bump();
+            assert_ne!(version.generation, initial.generation);
+            assert_eq!(version.revision, 1);
+        }
+    }
 
     #[test]
     fn desktop_client_type_deserializes_and_round_trips() {

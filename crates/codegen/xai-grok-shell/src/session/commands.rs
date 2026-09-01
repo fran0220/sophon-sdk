@@ -119,6 +119,127 @@ pub struct PromptTurnOk {
     pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
 }
 pub(crate) type PromptTurnResult = Result<PromptTurnOk, acp::Error>;
+
+/// Actor-authoritative work counters used by Agent quiesce. These are read in
+/// the session mailbox, so the snapshot is ordered after every prompt command
+/// previously accepted by that actor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionDrainSnapshot {
+    pub session_id: String,
+    pub queued_prompts: usize,
+    pub running_prompt: bool,
+    pub pending_interactions: usize,
+    pub outstanding_background_tasks: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOverrideFacts {
+    pub x_search_from_date: Option<String>,
+    pub x_search_to_date: Option<String>,
+    pub web_allowed_domains: Vec<String>,
+    pub web_excluded_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveRouteFacts {
+    pub base_url: String,
+    pub model: String,
+    pub api_backend: String,
+    pub context_window: u64,
+    pub reasoning_effort: Option<String>,
+    pub header_names: Vec<String>,
+    pub query_parameter_names: Vec<String>,
+    pub environment_header_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEffectiveConfigSnapshot {
+    pub session_id: String,
+    pub version: xai_prompt_queue::QueueVersion,
+    pub route: EffectiveRouteFacts,
+    pub backend_search_active: bool,
+    /// Configuration already attached to the active FIFO batch.
+    pub active_batch_search: SearchOverrideFacts,
+    /// Configuration after every already-admitted FIFO row has drained.
+    pub next_empty_fifo_search: SearchOverrideFacts,
+    /// Queue rows that carry a deferred configuration patch.
+    pub pending_config_prompt_ids: Vec<String>,
+}
+
+impl SessionDrainSnapshot {
+    pub fn is_idle(&self) -> bool {
+        self.queued_prompts == 0
+            && !self.running_prompt
+            && self.pending_interactions == 0
+            && self.outstanding_background_tasks == 0
+    }
+}
+
+/// One atomic mutation of the session actor's authoritative native FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QueueMutation {
+    Remove {
+        id: String,
+        expected_entry_version: u64,
+        owner: Option<String>,
+    },
+    Reorder {
+        ordered_ids: Vec<String>,
+    },
+    Clear {
+        owner: Option<String>,
+    },
+    Edit {
+        id: String,
+        expected_entry_version: u64,
+        new_text: String,
+        editor: Option<String>,
+    },
+    Interject {
+        id: String,
+        expected_entry_version: u64,
+        owner: Option<String>,
+        new_text: Option<String>,
+    },
+    Hold {
+        id: String,
+    },
+    Release {
+        id: String,
+    },
+}
+
+/// Compare-and-swap request. `operation_id` makes retries idempotent for the
+/// lifetime of the authoritative session actor.
+#[derive(Debug)]
+pub struct QueueMutationRequest {
+    pub operation_id: String,
+    pub expected: xai_prompt_queue::QueueVersion,
+    pub mutation: QueueMutation,
+}
+
+/// Structured outcome of an atomic FIFO mutation.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum QueueMutationResult {
+    Committed {
+        operation_id: String,
+        applied: bool,
+        replayed: bool,
+        committed_version: xai_prompt_queue::QueueVersion,
+        snapshot: xai_prompt_queue::QueueChanged,
+    },
+    Conflict {
+        operation_id: String,
+        expected: xai_prompt_queue::QueueVersion,
+        actual: xai_prompt_queue::QueueVersion,
+        snapshot: xai_prompt_queue::QueueChanged,
+    },
+    OperationIdReused {
+        operation_id: String,
+    },
+}
 pub(crate) fn ok_end_turn(tokens: u64, snapshot: Option<TurnDeltaSnapshot>) -> PromptTurnResult {
     Ok(PromptTurnOk {
         stop_reason: acp::StopReason::EndTurn,
@@ -303,6 +424,10 @@ pub enum SessionCommand {
         send_now: bool,
         /// Actor-authoritative admission and deferred fallback for terminal task wakes.
         admission: Option<TaskWakeAdmission>,
+        /// Permit acquired by an upstream authority (currently the scheduler).
+        /// Ordinary human prompts leave this empty and linearize admission in
+        /// the session actor itself.
+        agent_admission: Option<xai_grok_tools::management::admission::AdmissionPermit>,
         tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
         respond_to: oneshot::Sender<PromptTurnResult>,
         /// Optional initial-child readiness signal.
@@ -436,6 +561,14 @@ pub enum SessionCommand {
     },
     GetRewindPoints {
         respond_to: oneshot::Sender<RewindPointsResponse>,
+    },
+    GetRewindSnapshot {
+        respond_to: oneshot::Sender<RewindSnapshot>,
+    },
+    ExecuteRewindVersioned {
+        expected: RewindVersion,
+        request: RewindRequest,
+        respond_to: oneshot::Sender<anyhow::Result<RewindExecutionResult>>,
     },
     /// Local file-snapshot counts keyed by `prompt_index`, read straight from the file-state tracker.
     /// The tracker is independent of the chat-state prompt index, which is empty in bridge mode.
@@ -619,6 +752,22 @@ pub enum SessionCommand {
     /// Used by the leader's idle-unload decision on client disconnect to avoid unloading a session that still has pending work.
     IsBusy {
         respond_to: oneshot::Sender<bool>,
+    },
+    /// Ordered, authoritative drain state for Agent-level quiesce.
+    GetDrainSnapshot {
+        respond_to: oneshot::Sender<SessionDrainSnapshot>,
+    },
+    /// Authoritative FIFO recovery snapshot; does not advance its revision.
+    GetQueueSnapshot {
+        respond_to: oneshot::Sender<xai_prompt_queue::QueueChanged>,
+    },
+    GetEffectiveConfigSnapshot {
+        respond_to: oneshot::Sender<Result<SessionEffectiveConfigSnapshot, String>>,
+    },
+    /// Atomic, idempotent compare-and-swap FIFO mutation.
+    MutateQueue {
+        request: QueueMutationRequest,
+        respond_to: oneshot::Sender<QueueMutationResult>,
     },
     GetHooksList {
         respond_to: oneshot::Sender<xai_hooks_plugins_types::HooksListResponse>,

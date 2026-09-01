@@ -1,6 +1,6 @@
 # Maintained Grok Build divergences
 
-Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for four
+Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for five
 explicitly reviewed patch groups. Each group has its own file list and SHA-256
 digest under `upstream-patches/`; `scripts/check-upstream-sync.sh` rejects both
 changes outside these lists and drift within a listed group.
@@ -102,13 +102,90 @@ Approved file (digest: `public-snapshot-repairs.sha256`):
 
 - `crates/codegen/xai-grok-shell/src/upload/memory_tests.rs`
 
+## Typed management authority
+
+The embedded SDK has a stable provider-aware management plane without copying
+Grok Build state or requiring downstream JSON extension DTOs. Grok Build's
+actors remain authoritative:
+
+- one Agent-owned admission controller linearizes human, peer, scheduler and
+  old-session prompt admission with quiesce, then actor snapshots prove FIFO,
+  interactions, background tasks, subagents and completion presentation drain;
+- native FIFO and scheduler actors expose generation/revision CAS, bounded
+  incarnation-local idempotency receipts, structured conflicts and versioned
+  notifications;
+- rewind CAS is serialized with prompt acceptance, compaction and rewind, and
+  reports cross-compaction replay;
+- actor snapshots expose credential-free effective configuration, including
+  active FIFO batch versus next empty-FIFO overrides;
+- existing terminal-task and subagent authorities expose typed list/inspect/
+  cancel/kill paths without a second store.
+
+The SDK projection, public DTOs, and JSON parsing of fixed legacy extension
+routes remain under `crates/sophon-sdk` and are excluded from upstream-path
+validation. Approved upstream files (digest: `typed-management.sha256`):
+
+- `crates/codegen/xai-grok-agent/src/builder.rs`
+- `crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs`
+- `crates/codegen/xai-grok-pager/src/app/app_view.rs`
+- `crates/codegen/xai-grok-shell/src/agent/activity.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/subagent_spawn.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/attempt_runner.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/spawn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/parent_message.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_queue.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/rewind.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_types.rs`
+- `crates/codegen/xai-grok-shell/src/session/agent_rebuild.rs`
+- `crates/codegen/xai-grok-shell/src/session/commands.rs`
+- `crates/codegen/xai-grok-shell/src/session/compaction.rs`
+- `crates/codegen/xai-grok-shell/src/session/handle.rs`
+- `crates/codegen/xai-grok-shell/src/session/message_delivery.rs`
+- `crates/codegen/xai-grok-shell/src/session/prompt_queue.rs`
+- `crates/codegen/xai-grok-shell/src/test_support/lsp_runtime.rs`
+- `crates/codegen/xai-grok-shell/src/tools/notification_bridge.rs`
+- `crates/codegen/xai-grok-shell/src/tools/notification_bridge_tests.rs`
+- `crates/codegen/xai-grok-shell/src/tools/tool_context.rs`
+- `crates/codegen/xai-grok-subagent-resolution/src/overrides.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`
+- `crates/codegen/xai-grok-tools/src/lib.rs`
+- `crates/codegen/xai-grok-tools/src/management/admission.rs`
+- `crates/codegen/xai-grok-tools/src/management/mod.rs`
+- `crates/codegen/xai-grok-tools/src/management/scheduler_ingress.rs`
+- `crates/codegen/xai-grok-tools/src/notification/types.rs`
+- `crates/codegen/xai-grok-tools/src/registry/types.rs`
+- `crates/codegen/xai-grok-workspace/src/session/tool_config.rs`
+- `crates/codegen/xai-prompt-queue/Cargo.toml`
+- `crates/codegen/xai-prompt-queue/src/lib.rs`
+- `crates/codegen/xai-prompt-queue/src/types.rs`
+
+`builder.rs`, `agent_ops.rs`, session spawn/rebuild paths and `tool_config.rs`
+intentionally overlap earlier groups. Each digest covers the complete pinned
+diff for its exact file set, so either boundary detects drift.
+
 ## Updating upstream
 
 1. Import the complete public snapshot and update
    `UPSTREAM_GROK_BUILD_COMMIT` and `SOURCE_REV`.
-2. Reconcile only the four groups above with the new upstream paths.
-3. Run the focused provider, hermetic-discovery, Windows compile, and SDK
-   checks.
+2. Reconcile only the five groups above with the new upstream paths.
+3. Run the focused provider, hermetic-discovery, Windows compile, actor
+   management, and SDK checks.
 4. Regenerate each digest independently using the corresponding exact array
    and `git diff` command in `scripts/check-upstream-sync.sh`.
 

@@ -1,4 +1,104 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+/// Generation/revision of one session's authoritative native FIFO.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueVersion {
+    pub generation: String,
+    pub revision: u64,
+}
+
+/// Shared clock cloned into a session actor and its handle. A generation is
+/// unique per actor incarnation; revision is monotonic within it.
+#[derive(Clone, Debug)]
+pub struct QueueClock(Arc<Mutex<QueueClockInner>>);
+
+#[derive(Debug)]
+struct QueueClockInner {
+    version: QueueVersion,
+    receipt_order: VecDeque<String>,
+    receipts: HashMap<String, QueueMutationReceipt>,
+}
+
+/// Small idempotency receipt retained by the authoritative session actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueMutationReceipt {
+    pub version: QueueVersion,
+    pub applied: bool,
+    pub request_fingerprint: String,
+}
+
+const MAX_MUTATION_RECEIPTS: usize = 256;
+
+impl Default for QueueClock {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(QueueClockInner {
+            version: QueueVersion {
+                generation: uuid::Uuid::now_v7().to_string(),
+                revision: 0,
+            },
+            receipt_order: VecDeque::new(),
+            receipts: HashMap::new(),
+        })))
+    }
+}
+
+impl QueueClock {
+    pub fn snapshot(&self) -> QueueVersion {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .version
+            .clone()
+    }
+
+    pub fn bump(&self) -> QueueVersion {
+        let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(next) = inner.version.revision.checked_add(1) {
+            inner.version.revision = next;
+        } else {
+            inner.version.generation = uuid::Uuid::now_v7().to_string();
+            inner.version.revision = 1;
+        }
+        inner.version.clone()
+    }
+
+    pub fn receipt(&self, operation_id: &str) -> Option<QueueMutationReceipt> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .receipts
+            .get(operation_id)
+            .cloned()
+    }
+
+    pub fn record_receipt(
+        &self,
+        operation_id: String,
+        request_fingerprint: String,
+        applied: bool,
+    ) -> QueueMutationReceipt {
+        let mut inner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(receipt) = inner.receipts.get(&operation_id) {
+            return receipt.clone();
+        }
+        let receipt = QueueMutationReceipt {
+            version: inner.version.clone(),
+            applied,
+            request_fingerprint,
+        };
+        inner.receipt_order.push_back(operation_id.clone());
+        inner.receipts.insert(operation_id, receipt.clone());
+        while inner.receipt_order.len() > MAX_MUTATION_RECEIPTS {
+            if let Some(expired) = inner.receipt_order.pop_front() {
+                inner.receipts.remove(&expired);
+            }
+        }
+        receipt
+    }
+}
 
 /// Content-block `_meta` key for per-prompt display texts when several
 /// follow-ups were combined (length ≥ 2). Empty / absent = not combined.
@@ -56,6 +156,12 @@ pub struct QueueEntryWire {
 pub struct QueueChanged {
     /// The session this queue belongs to; drives per-session fan-out routing.
     pub session_id: String,
+    /// Actor-incarnation generation. Empty only when decoding a legacy event.
+    #[serde(default)]
+    pub generation: String,
+    /// Monotonic revision within `generation`.
+    #[serde(default)]
+    pub revision: u64,
     #[serde(default)]
     pub entries: Vec<QueueEntryWire>,
     /// The prompt the actor is currently draining, `None` when no turn runs. The correlation
@@ -80,9 +186,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queue_clock_versions_and_receipts_support_cas_recovery() {
+        let clock = QueueClock::default();
+        let initial = clock.snapshot();
+        assert!(!initial.generation.is_empty());
+        assert_eq!(initial.revision, 0);
+
+        let current = clock.bump();
+        assert_eq!(current.generation, initial.generation);
+        assert_eq!(current.revision, 1);
+        assert_ne!(initial, current, "the initial version is now stale");
+
+        let receipt = clock.record_receipt("op-1".into(), "edit:p1:v0:new".into(), true);
+        assert_eq!(receipt.version, current);
+        assert_eq!(receipt.request_fingerprint, "edit:p1:v0:new");
+        assert_eq!(clock.receipt("op-1"), Some(receipt));
+    }
+
+    #[test]
     fn queue_changed_full_round_trip() {
         let original = QueueChanged {
             session_id: "sess-42".into(),
+            generation: "queue-gen".into(),
+            revision: 7,
             entries: vec![
                 QueueEntryWire {
                     id: "p1".into(),
@@ -113,6 +239,8 @@ mod tests {
         };
         let json = serde_json::to_value(&original).unwrap();
         assert_eq!(json["sessionId"], "sess-42");
+        assert_eq!(json["generation"], "queue-gen");
+        assert_eq!(json["revision"], 7);
         assert_eq!(json["entries"][0]["lastEditor"], "bob");
         assert_eq!(json["runningPromptId"], "p0");
         assert!(json["entries"][1].get("owner").is_none());
@@ -126,6 +254,8 @@ mod tests {
     fn queue_changed_golden_wire_json() {
         let payload = QueueChanged {
             session_id: "s1".into(),
+            generation: "queue-gen".into(),
+            revision: 4,
             entries: vec![QueueEntryWire {
                 id: "p1".into(),
                 version: 2,
@@ -144,6 +274,8 @@ mod tests {
         };
         let expected = serde_json::json!({
             "sessionId": "s1",
+            "generation": "queue-gen",
+            "revision": 4,
             "entries": [{
                 "id": "p1",
                 "version": 2,
@@ -196,6 +328,8 @@ mod tests {
     fn running_combined_texts_round_trip() {
         let original = QueueChanged {
             session_id: "s1".into(),
+            generation: "queue-gen".into(),
+            revision: 9,
             entries: vec![],
             running_prompt_id: Some("p0".into()),
             running_text: Some("a\n\nb".into()),

@@ -4,17 +4,29 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SchedulerVersion {
+pub struct SchedulerVersion {
     generation: uuid::Uuid,
     revision: u64,
 }
 
 impl SchedulerVersion {
-    pub(super) fn generation(self) -> String {
+    pub fn parse(generation: &str, revision: u64) -> Result<Self, SchedulerError> {
+        let generation = uuid::Uuid::parse_str(generation).map_err(|_| {
+            SchedulerError::InvalidVersion(format!(
+                "scheduler generation is not a UUID: {generation}"
+            ))
+        })?;
+        Ok(Self {
+            generation,
+            revision,
+        })
+    }
+
+    pub fn generation(self) -> String {
         self.generation.to_string()
     }
 
-    pub(super) fn revision(self) -> u64 {
+    pub fn revision(self) -> u64 {
         self.revision
     }
 
@@ -157,6 +169,9 @@ impl Default for SchedulerClock {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SchedulerError {
+    #[error("invalid scheduler version: {0}")]
+    InvalidVersion(String),
+
     #[error("invalid interval: {0}")]
     InvalidInterval(String),
 
@@ -183,11 +198,15 @@ pub enum SchedulerError {
 
     #[error("scheduler removal timed out")]
     Timeout,
+
+    #[error("scheduler operation id {0} was already used for a different operation")]
+    OperationIdReused(String),
 }
 
 pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolError {
     let code = match &error {
-        SchedulerError::InvalidInterval(_)
+        SchedulerError::InvalidVersion(_)
+        | SchedulerError::InvalidInterval(_)
         | SchedulerError::TaskLimitReached(_)
         | SchedulerError::TaskNotFound(_) => "scheduler_invalid_request",
         SchedulerError::Persistence(_) => "scheduler_persistence",
@@ -196,6 +215,7 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
         SchedulerError::RemovalPending(_) => "scheduler_removal_pending",
         SchedulerError::Cancelled => "scheduler_cancelled",
         SchedulerError::Timeout => "scheduler_timeout",
+        SchedulerError::OperationIdReused(_) => "scheduler_operation_id_reused",
     };
     xai_tool_runtime::ToolError::custom(code, error.to_string())
 }
@@ -330,10 +350,25 @@ crate::register_resource!("grok_build", "Scheduler", SchedulerState);
 
 #[derive(Debug, Clone)]
 pub struct SchedulerSnapshot {
-    // Consumed by the authoritative scheduler snapshot layer in the next migration PR.
-    #[allow(dead_code)]
-    pub(crate) version: SchedulerVersion,
+    pub version: SchedulerVersion,
     pub tasks: Vec<ScheduledTask>,
+}
+
+/// Result of a compare-and-swap scheduler write.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SchedulerMutationResult<T> {
+    Committed {
+        operation_id: String,
+        value: T,
+        version: SchedulerVersion,
+        replayed: bool,
+    },
+    Conflict {
+        operation_id: String,
+        expected: SchedulerVersion,
+        snapshot: SchedulerSnapshot,
+    },
 }
 
 /// Handle for tools to communicate with the SchedulerActor.
@@ -359,6 +394,103 @@ pub enum SchedulerCommand {
     List {
         reply: oneshot::Sender<SchedulerSnapshot>,
     },
+    CreateManaged {
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        task: ScheduledTask,
+        reply: oneshot::Sender<Result<SchedulerMutationResult<ScheduledTask>, SchedulerError>>,
+    },
+    UpdateManaged {
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        id: String,
+        prompt: Option<String>,
+        interval_secs: Option<u64>,
+        reply: oneshot::Sender<Result<SchedulerMutationResult<ScheduledTask>, SchedulerError>>,
+    },
+    DeleteManaged {
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        id: String,
+        reply: oneshot::Sender<Result<SchedulerMutationResult<bool>, SchedulerError>>,
+    },
+}
+
+impl SchedulerHandle {
+    pub async fn snapshot(&self) -> Result<SchedulerSnapshot, SchedulerError> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(SchedulerCommand::List { reply })
+            .map_err(|_| SchedulerError::Cancelled)?;
+        response.await.map_err(|_| SchedulerError::Cancelled)
+    }
+
+    pub async fn create(
+        &self,
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        task: ScheduledTask,
+    ) -> Result<SchedulerMutationResult<ScheduledTask>, SchedulerError> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(SchedulerCommand::CreateManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                task,
+                reply,
+            })
+            .map_err(|_| SchedulerError::Cancelled)?;
+        response.await.map_err(|_| SchedulerError::Cancelled)?
+    }
+
+    pub async fn update(
+        &self,
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        id: String,
+        prompt: Option<String>,
+        interval_secs: Option<u64>,
+    ) -> Result<SchedulerMutationResult<ScheduledTask>, SchedulerError> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(SchedulerCommand::UpdateManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                id,
+                prompt,
+                interval_secs,
+                reply,
+            })
+            .map_err(|_| SchedulerError::Cancelled)?;
+        response.await.map_err(|_| SchedulerError::Cancelled)?
+    }
+
+    pub async fn delete(
+        &self,
+        operation_id: String,
+        request_fingerprint: String,
+        expected: SchedulerVersion,
+        id: String,
+    ) -> Result<SchedulerMutationResult<bool>, SchedulerError> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(SchedulerCommand::DeleteManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                id,
+                reply,
+            })
+            .map_err(|_| SchedulerError::Cancelled)?;
+        response.await.map_err(|_| SchedulerError::Cancelled)?
+    }
 }
 
 #[cfg(test)]

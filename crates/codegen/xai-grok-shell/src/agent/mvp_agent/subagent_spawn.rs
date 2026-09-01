@@ -211,6 +211,7 @@ impl MvpAgent {
             .as_ref()
             .and_then(|ps| ps.resolved_tool_overrides.load_full().map(|o| (*o).clone()));
         let mut ctx = crate::agent::subagent::SubagentSpawnContext {
+            admission: parent_handle.as_ref()?.tool_context.admission.clone(),
             lsp: parent_lsp,
             process_scope: parent_process_scope,
             client_hooks: Default::default(),

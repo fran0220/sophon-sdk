@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
 use indexmap::IndexMap;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use xai_acp_lib::{AcpGatewayReceiver, AcpGatewaySender};
 use xai_grok_sampler::AuthScheme;
 use xai_grok_shell::agent::config::{
@@ -18,6 +19,7 @@ use xai_grok_shell::sampling::ApiBackend;
 
 use crate::config::{AgentConfig, PermissionPolicy, ProviderProtocol};
 use crate::event::{Event, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate};
+use crate::management as mgmt;
 use crate::{
     ClientHandler, Error, PermissionDecision, PermissionOption, PermissionOptionKind,
     PermissionRequest, PromptBlock, PromptResult, Session, SessionConfig, SessionId, SessionInfo,
@@ -25,6 +27,7 @@ use crate::{
 };
 
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
+type ManagementReply<T> = oneshot::Sender<Result<T, mgmt::ManagementError>>;
 
 enum Command {
     CreateSession(SessionConfig, Reply<(SessionId, serde_json::Value)>),
@@ -52,14 +55,85 @@ enum Command {
         Reply<()>,
     ),
     Close(SessionId, Reply<()>),
+    Quiesce(Duration, ManagementReply<mgmt::QuiesceReport>),
+    QueueSnapshot(SessionId, ManagementReply<mgmt::QueueSnapshot>),
+    MutateQueue(
+        SessionId,
+        mgmt::QueueMutationRequest,
+        ManagementReply<mgmt::QueueMutationResult>,
+    ),
+    SchedulerSnapshot(SessionId, ManagementReply<mgmt::SchedulerSnapshot>),
+    SchedulerCreate(
+        SessionId,
+        mgmt::OperationId,
+        mgmt::Version,
+        mgmt::ScheduledTaskCreate,
+        ManagementReply<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>>,
+    ),
+    SchedulerUpdate(
+        SessionId,
+        mgmt::OperationId,
+        mgmt::Version,
+        mgmt::ScheduledTaskUpdate,
+        ManagementReply<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>>,
+    ),
+    SchedulerDelete(
+        SessionId,
+        mgmt::OperationId,
+        mgmt::Version,
+        mgmt::ScheduledTaskId,
+        ManagementReply<mgmt::SchedulerMutationResult<bool>>,
+    ),
+    RewindSnapshot(SessionId, ManagementReply<mgmt::RewindSnapshot>),
+    Rewind(
+        SessionId,
+        mgmt::RewindRequest,
+        ManagementReply<mgmt::RewindExecutionResult>,
+    ),
+    EffectiveConfig(
+        SessionId,
+        ManagementReply<mgmt::SessionEffectiveConfigSnapshot>,
+    ),
+    BackgroundTasks(SessionId, ManagementReply<Vec<mgmt::BackgroundTask>>),
+    KillBackgroundTask(
+        SessionId,
+        mgmt::BackgroundTaskId,
+        mgmt::BackgroundTaskKillSource,
+        ManagementReply<mgmt::BackgroundTaskKillOutcome>,
+    ),
+    RunningSubagents(SessionId, ManagementReply<Vec<mgmt::RunningSubagent>>),
+    Subagent(
+        mgmt::SubagentId,
+        ManagementReply<Option<mgmt::SubagentSnapshot>>,
+    ),
+    CancelSubagent(
+        mgmt::SubagentId,
+        ManagementReply<mgmt::SubagentCancelOutcome>,
+    ),
     Shutdown(Reply<()>),
 }
 
 struct AgentInner {
     commands: mpsc::UnboundedSender<Command>,
     events: broadcast::Sender<Event>,
+    management_events: broadcast::Sender<mgmt::ManagementEvent>,
+    runtime_health: watch::Receiver<mgmt::RuntimeHealth>,
+    effective_config: mgmt::AgentEffectiveConfigSnapshot,
     initialization_response: serde_json::Value,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+struct ManagementEmitter {
+    events: broadcast::Sender<mgmt::ManagementEvent>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl ManagementEmitter {
+    fn send(&self, kind: mgmt::ManagementEventKind) {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.events.send(mgmt::ManagementEvent { sequence, kind });
+    }
 }
 
 impl Drop for AgentInner {
@@ -79,13 +153,34 @@ impl Agent {
     pub async fn start(config: AgentConfig) -> Result<Self, Error> {
         require_hermetic_discovery()?;
         config.validate()?;
+        let effective_config = mgmt::agent_config_snapshot(&config);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(1024);
+        let (management_events, _) = broadcast::channel(256);
+        let management = ManagementEmitter {
+            events: management_events.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+        };
+        let (runtime_health_tx, runtime_health) = watch::channel(mgmt::RuntimeHealth {
+            generation: 0,
+            state: mgmt::RuntimeState::Starting,
+            failure: None,
+        });
         let (ready_tx, ready_rx) = oneshot::channel();
         let worker_events = events.clone();
+        let worker_management = management.clone();
         let worker = std::thread::Builder::new()
             .name("sophon-grok-build".into())
-            .spawn(move || run_worker(config, command_rx, worker_events, ready_tx))
+            .spawn(move || {
+                run_worker(
+                    config,
+                    command_rx,
+                    worker_events,
+                    worker_management,
+                    runtime_health_tx,
+                    ready_tx,
+                )
+            })
             .map_err(|error| Error::Start(error.to_string()))?;
 
         match ready_rx.await {
@@ -93,6 +188,9 @@ impl Agent {
                 inner: Arc::new(AgentInner {
                     commands,
                     events,
+                    management_events,
+                    runtime_health,
+                    effective_config,
                     initialization_response,
                     worker: Mutex::new(Some(worker)),
                 }),
@@ -110,6 +208,36 @@ impl Agent {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribe to typed management events. If `recv()` returns `Lagged` or
+    /// event sequences jump, recover with the authoritative domain snapshot.
+    pub fn subscribe_management(&self) -> broadcast::Receiver<mgmt::ManagementEvent> {
+        self.inner.management_events.subscribe()
+    }
+
+    pub fn runtime_health(&self) -> mgmt::RuntimeHealth {
+        self.inner.runtime_health.borrow().clone()
+    }
+
+    pub fn subscribe_runtime_health(&self) -> watch::Receiver<mgmt::RuntimeHealth> {
+        self.inner.runtime_health.clone()
+    }
+
+    /// Credential-free effective provider and auxiliary-route facts fixed at
+    /// Agent startup.
+    pub fn effective_config_snapshot(&self) -> mgmt::AgentEffectiveConfigSnapshot {
+        self.inner.effective_config.clone()
+    }
+
+    /// Atomically fence Agent-wide prompt admission and wait for all work
+    /// accepted before the fence to settle.
+    pub async fn quiesce(
+        &self,
+        timeout: Duration,
+    ) -> Result<mgmt::QuiesceReport, mgmt::ManagementError> {
+        self.management_request(|reply| Command::Quiesce(timeout, reply))
+            .await
     }
 
     /// Complete upstream initialization response as forward-compatible JSON.
@@ -163,6 +291,106 @@ impl Agent {
             Command::ListSessions(cwd.map(Path::to_path_buf), cursor.map(str::to_owned), reply)
         })
         .await
+    }
+
+    /// Authoritative skill inventory for `cwd`.
+    pub async fn skills(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<mgmt::SkillsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/list",
+                serde_json::json!({ "cwd": management_path(cwd.as_ref())? }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_snapshot(response)
+    }
+
+    /// Configured skill paths, ignore paths, and effective skill inventory.
+    pub async fn skills_config(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<mgmt::SkillsConfigSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/config",
+                serde_json::json!({ "cwd": management_path(cwd.as_ref())? }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_config_snapshot(response)
+    }
+
+    pub async fn add_skill_path(
+        &self,
+        cwd: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+    ) -> Result<mgmt::SkillsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/add",
+                serde_json::json!({
+                    "cwd": management_path(cwd.as_ref())?,
+                    "path": management_path(path.as_ref())?,
+                }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_snapshot(response)
+    }
+
+    pub async fn remove_skill_path(
+        &self,
+        cwd: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+    ) -> Result<mgmt::SkillsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/remove",
+                serde_json::json!({
+                    "cwd": management_path(cwd.as_ref())?,
+                    "path": management_path(path.as_ref())?,
+                }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_snapshot(response)
+    }
+
+    pub async fn reset_skill_paths(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<mgmt::SkillsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/reset",
+                serde_json::json!({ "cwd": management_path(cwd.as_ref())? }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_snapshot(response)
+    }
+
+    pub async fn set_skill_enabled(
+        &self,
+        cwd: impl AsRef<Path>,
+        name: impl Into<String>,
+        enabled: bool,
+    ) -> Result<mgmt::SkillsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension(
+                "x.ai/skills/toggle",
+                serde_json::json!({
+                    "cwd": management_path(cwd.as_ref())?,
+                    "name": name.into(),
+                    "enabled": enabled,
+                }),
+            )
+            .await
+            .map_err(|error| management_extension_error(error, None))?;
+        mgmt::skills_snapshot(response)
     }
 
     /// Invoke any Grok Build `x.ai/*` extension without exposing ACP types.
@@ -251,12 +479,33 @@ impl Agent {
             .map_err(|_| Error::RuntimeStopped)?;
         response.await.map_err(|_| Error::RuntimeStopped)?
     }
+
+    async fn management_request<T>(
+        &self,
+        command: impl FnOnce(ManagementReply<T>) -> Command,
+    ) -> Result<T, mgmt::ManagementError> {
+        let (reply, response) = oneshot::channel();
+        self.inner.commands.send(command(reply)).map_err(|_| {
+            mgmt::ManagementError::new(
+                mgmt::ManagementErrorKind::RuntimeStopped,
+                "Grok Build runtime stopped",
+            )
+        })?;
+        response.await.map_err(|_| {
+            mgmt::ManagementError::new(
+                mgmt::ManagementErrorKind::RuntimeStopped,
+                "Grok Build runtime stopped",
+            )
+        })?
+    }
 }
 
 fn run_worker(
     config: AgentConfig,
     commands: mpsc::UnboundedReceiver<Command>,
     events: broadcast::Sender<Event>,
+    management: ManagementEmitter,
+    runtime_health: watch::Sender<mgmt::RuntimeHealth>,
     ready: oneshot::Sender<Result<serde_json::Value, Error>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -265,19 +514,49 @@ fn run_worker(
     {
         Ok(runtime) => runtime,
         Err(error) => {
+            update_runtime_health(
+                &runtime_health,
+                &management,
+                mgmt::RuntimeState::Failed,
+                Some(mgmt::RuntimeFailure {
+                    code: "runtime_build".into(),
+                    message: error.to_string(),
+                }),
+            );
             let _ = ready.send(Err(Error::Start(error.to_string())));
             return;
         }
     };
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(async move {
-        let result = start_worker(config, commands, events).await;
+        let result = start_worker(config, commands, events, management.clone()).await;
         match result {
             Ok((agent, commands, initialization_response)) => {
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Ready,
+                    None,
+                );
                 let _ = ready.send(Ok(initialization_response));
-                command_loop(agent, commands).await;
+                command_loop(agent, commands, management.clone(), runtime_health.clone()).await;
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Stopped,
+                    None,
+                );
             }
             Err(error) => {
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Failed,
+                    Some(mgmt::RuntimeFailure {
+                        code: "startup".into(),
+                        message: error.to_string(),
+                    }),
+                );
                 let _ = ready.send(Err(error));
             }
         }
@@ -288,6 +567,7 @@ async fn start_worker(
     config: AgentConfig,
     commands: mpsc::UnboundedReceiver<Command>,
     events: broadcast::Sender<Event>,
+    management: ManagementEmitter,
 ) -> Result<
     (
         Rc<MvpAgent>,
@@ -310,6 +590,7 @@ async fn start_worker(
     );
     let client = EmbeddedClient {
         events,
+        management,
         permission_policy: config.permission_policy,
         handler: config.client_handler,
     };
@@ -349,7 +630,12 @@ async fn start_worker(
     Ok((agent, commands, initialization_response))
 }
 
-async fn command_loop(agent: Rc<MvpAgent>, mut commands: mpsc::UnboundedReceiver<Command>) {
+async fn command_loop(
+    agent: Rc<MvpAgent>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    management: ManagementEmitter,
+    runtime_health: watch::Sender<mgmt::RuntimeHealth>,
+) {
     while let Some(command) = commands.recv().await {
         match command {
             Command::CreateSession(config, reply) => {
@@ -507,13 +793,440 @@ async fn command_loop(agent: Rc<MvpAgent>, mut commands: mpsc::UnboundedReceiver
                     .map_err(acp_error);
                 let _ = reply.send(result);
             }
+            Command::Quiesce(timeout, reply) => {
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Quiescing,
+                    None,
+                );
+                let report = mgmt::quiesce_report(agent.quiesce(timeout).await);
+                if report.drained() {
+                    update_runtime_health(
+                        &runtime_health,
+                        &management,
+                        mgmt::RuntimeState::Quiesced,
+                        None,
+                    );
+                }
+                let _ = reply.send(Ok(report));
+            }
+            Command::QueueSnapshot(id, reply) => {
+                let result = match management_session(&agent, &id) {
+                    Ok(handle) => handle
+                        .queue_snapshot()
+                        .await
+                        .map(mgmt::queue_snapshot)
+                        .ok_or_else(|| {
+                            management_error(
+                                mgmt::ManagementErrorKind::AuthorityUnavailable,
+                                "session FIFO actor stopped",
+                                &id,
+                            )
+                        }),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::MutateQueue(id, request, reply) => {
+                let operation_id = request.operation_id.clone();
+                let result = match management_session(&agent, &id) {
+                    Ok(handle) => handle
+                        .mutate_queue(mgmt::queue_mutation(request))
+                        .await
+                        .map(mgmt::queue_mutation_result)
+                        .map_err(|message| {
+                            management_error(
+                                mgmt::ManagementErrorKind::AuthorityUnavailable,
+                                message,
+                                &id,
+                            )
+                            .operation(operation_id)
+                        }),
+                    Err(error) => Err(error.operation(operation_id)),
+                };
+                let _ = reply.send(result);
+            }
+            Command::SchedulerSnapshot(id, reply) => {
+                let result = match scheduler_handle(&agent, &id) {
+                    Ok(handle) => handle
+                        .snapshot()
+                        .await
+                        .map(mgmt::scheduler_snapshot)
+                        .map_err(|error| scheduler_error(error, &id, None)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::SchedulerCreate(id, operation_id, expected, create, reply) => {
+                let result = scheduler_create(&agent, &id, operation_id, expected, create).await;
+                let _ = reply.send(result);
+            }
+            Command::SchedulerUpdate(id, operation_id, expected, update, reply) => {
+                let result = scheduler_update(&agent, &id, operation_id, expected, update).await;
+                let _ = reply.send(result);
+            }
+            Command::SchedulerDelete(id, operation_id, expected, task_id, reply) => {
+                let result = scheduler_delete(&agent, &id, operation_id, expected, task_id).await;
+                let _ = reply.send(result);
+            }
+            Command::RewindSnapshot(id, reply) => {
+                let result = match management_session(&agent, &id) {
+                    Ok(handle) => handle
+                        .rewind_snapshot()
+                        .await
+                        .map(mgmt::rewind_snapshot)
+                        .ok_or_else(|| {
+                            management_error(
+                                mgmt::ManagementErrorKind::AuthorityUnavailable,
+                                "session rewind actor stopped",
+                                &id,
+                            )
+                        }),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::Rewind(id, request, reply) => {
+                let result = match management_session(&agent, &id) {
+                    Ok(handle) => {
+                        let expected = xai_grok_shell::session::RewindVersion {
+                            generation: request.expected.generation,
+                            revision: request.expected.revision,
+                        };
+                        let upstream = xai_grok_shell::session::RewindRequest {
+                            target_prompt_index: request.target_prompt_index,
+                            force: request.force,
+                            mode: mgmt::rewind_mode(request.mode),
+                        };
+                        handle
+                            .rewind(expected, upstream)
+                            .await
+                            .map(mgmt::rewind_execution_result)
+                            .map_err(|error| {
+                                management_error(
+                                    mgmt::ManagementErrorKind::Upstream,
+                                    error.to_string(),
+                                    &id,
+                                )
+                            })
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::EffectiveConfig(id, reply) => {
+                let result = match management_session(&agent, &id) {
+                    Ok(handle) => handle
+                        .effective_config_snapshot()
+                        .await
+                        .map(mgmt::effective_config_snapshot)
+                        .map_err(|message| {
+                            management_error(
+                                mgmt::ManagementErrorKind::AuthorityUnavailable,
+                                message,
+                                &id,
+                            )
+                        }),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::BackgroundTasks(id, reply) => {
+                let result = agent
+                    .list_tasks(&id.0)
+                    .await
+                    .map(|tasks| tasks.into_iter().map(mgmt::background_task).collect())
+                    .ok_or_else(|| {
+                        management_error(
+                            mgmt::ManagementErrorKind::NotFound,
+                            "session not found or has no terminal authority",
+                            &id,
+                        )
+                    });
+                let _ = reply.send(result);
+            }
+            Command::KillBackgroundTask(id, task_id, source, reply) => {
+                let source = match source {
+                    mgmt::BackgroundTaskKillSource::Client => {
+                        xai_grok_tools::types::KillSource::ClientUi
+                    }
+                    mgmt::BackgroundTaskKillSource::Teardown => {
+                        xai_grok_tools::types::KillSource::Teardown
+                    }
+                };
+                let result = agent
+                    .kill_background_task(&id.0, task_id.as_str(), source)
+                    .await
+                    .map(|outcome| match outcome {
+                        xai_grok_tools::types::KillOutcome::Killed => {
+                            mgmt::BackgroundTaskKillOutcome::Killed
+                        }
+                        xai_grok_tools::types::KillOutcome::AlreadyExited => {
+                            mgmt::BackgroundTaskKillOutcome::AlreadyExited
+                        }
+                        xai_grok_tools::types::KillOutcome::NotFound => {
+                            mgmt::BackgroundTaskKillOutcome::NotFound
+                        }
+                    })
+                    .map_err(|message| {
+                        management_error(mgmt::ManagementErrorKind::Upstream, message, &id)
+                    });
+                let _ = reply.send(result);
+            }
+            Command::RunningSubagents(id, reply) => {
+                if management_session(&agent, &id).is_err() {
+                    let _ = reply.send(Err(management_error(
+                        mgmt::ManagementErrorKind::NotFound,
+                        "session not found",
+                        &id,
+                    )));
+                    continue;
+                }
+                let result = agent
+                    .list_running_subagents(&id.0)
+                    .await
+                    .into_iter()
+                    .map(mgmt::running_subagent)
+                    .collect();
+                let _ = reply.send(Ok(result));
+            }
+            Command::Subagent(id, reply) => {
+                let result = agent
+                    .inspect_subagent(id.as_str())
+                    .await
+                    .map(mgmt::subagent_snapshot);
+                let _ = reply.send(Ok(result));
+            }
+            Command::CancelSubagent(id, reply) => {
+                use xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome as Upstream;
+                let result = match agent.cancel_subagent(id.as_str()).await {
+                    Upstream::Cancelled => mgmt::SubagentCancelOutcome::Cancelled,
+                    Upstream::AlreadyFinished { status } => {
+                        mgmt::SubagentCancelOutcome::AlreadyFinished { status }
+                    }
+                    Upstream::NotFound => mgmt::SubagentCancelOutcome::NotFound,
+                };
+                let _ = reply.send(Ok(result));
+            }
             Command::Shutdown(reply) => {
-                agent.flush_all_sessions(Duration::from_secs(5)).await;
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Quiescing,
+                    None,
+                );
+                let report = mgmt::quiesce_report(agent.quiesce(Duration::from_secs(30)).await);
+                if !report.drained() {
+                    let _ = reply.send(Err(Error::QuiesceTimedOut(report)));
+                    continue;
+                }
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Quiesced,
+                    None,
+                );
+                agent.flush_all_sessions(Duration::from_secs(10)).await;
                 let _ = reply.send(Ok(()));
                 break;
             }
         }
     }
+}
+
+fn update_runtime_health(
+    sender: &watch::Sender<mgmt::RuntimeHealth>,
+    management: &ManagementEmitter,
+    state: mgmt::RuntimeState,
+    failure: Option<mgmt::RuntimeFailure>,
+) {
+    let health = mgmt::RuntimeHealth {
+        generation: sender.borrow().generation.saturating_add(1),
+        state,
+        failure,
+    };
+    sender.send_replace(health.clone());
+    management.send(mgmt::ManagementEventKind::Runtime(health));
+}
+
+fn management_session(
+    agent: &MvpAgent,
+    id: &SessionId,
+) -> Result<xai_grok_shell::session::SessionHandle, mgmt::ManagementError> {
+    agent.management_session_handle(&id.0).ok_or_else(|| {
+        management_error(
+            mgmt::ManagementErrorKind::NotFound,
+            "session is not resident",
+            id,
+        )
+    })
+}
+
+fn scheduler_handle(
+    agent: &MvpAgent,
+    id: &SessionId,
+) -> Result<
+    xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle,
+    mgmt::ManagementError,
+> {
+    management_session(agent, id)?
+        .scheduler_handle
+        .ok_or_else(|| {
+            management_error(
+                mgmt::ManagementErrorKind::AuthorityUnavailable,
+                "session has no scheduler authority",
+                id,
+            )
+        })
+}
+
+fn management_error(
+    kind: mgmt::ManagementErrorKind,
+    message: impl Into<String>,
+    session_id: &SessionId,
+) -> mgmt::ManagementError {
+    mgmt::ManagementError::new(kind, message).session(session_id.clone())
+}
+
+fn scheduler_error(
+    error: xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError,
+    session_id: &SessionId,
+    operation_id: Option<mgmt::OperationId>,
+) -> mgmt::ManagementError {
+    use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError;
+    let kind = match error {
+        SchedulerError::InvalidVersion(_)
+        | SchedulerError::InvalidInterval(_)
+        | SchedulerError::TaskLimitReached(_) => mgmt::ManagementErrorKind::InvalidRequest,
+        SchedulerError::TaskNotFound(_) => mgmt::ManagementErrorKind::NotFound,
+        SchedulerError::Cancelled => mgmt::ManagementErrorKind::AuthorityUnavailable,
+        SchedulerError::Timeout => mgmt::ManagementErrorKind::Timeout,
+        SchedulerError::OperationIdReused(_) => mgmt::ManagementErrorKind::OperationIdReused,
+        SchedulerError::Persistence(_)
+        | SchedulerError::Notification(_)
+        | SchedulerError::NoDurableNotificationConsumer
+        | SchedulerError::RemovalPending(_) => mgmt::ManagementErrorKind::Upstream,
+    };
+    let mut result = management_error(kind, error.to_string(), session_id);
+    if let Some(operation_id) = operation_id {
+        result = result.operation(operation_id);
+    }
+    result
+}
+
+fn scheduler_version(
+    version: mgmt::Version,
+) -> Result<
+    xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerVersion,
+    xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError,
+> {
+    xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerVersion::parse(
+        &version.generation,
+        version.revision,
+    )
+}
+
+async fn scheduler_create(
+    agent: &MvpAgent,
+    session_id: &SessionId,
+    operation_id: mgmt::OperationId,
+    expected: mgmt::Version,
+    create: mgmt::ScheduledTaskCreate,
+) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
+    use xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask;
+    let request_fingerprint = format!("create:{create:?}");
+    if create.interval_secs == 0 {
+        return Err(management_error(
+            mgmt::ManagementErrorKind::InvalidRequest,
+            "scheduled-task interval must be greater than zero",
+            session_id,
+        )
+        .operation(operation_id));
+    }
+    let expected = scheduler_version(expected)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
+    let handle = scheduler_handle(agent, session_id)
+        .map_err(|error| error.operation(operation_id.clone()))?;
+    let mut task = ScheduledTask::with_fire_immediately(
+        create.interval_secs.max(60),
+        create.prompt,
+        true,
+        create.durable,
+        create.fire_immediately,
+    );
+    task.foreground = create.foreground;
+    handle
+        .create(operation_id.0.clone(), request_fingerprint, expected, task)
+        .await
+        .map(mgmt::scheduler_task_result)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id)))
+}
+
+async fn scheduler_update(
+    agent: &MvpAgent,
+    session_id: &SessionId,
+    operation_id: mgmt::OperationId,
+    expected: mgmt::Version,
+    update: mgmt::ScheduledTaskUpdate,
+) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
+    let request_fingerprint = format!("update:{update:?}");
+    if update.prompt.is_none() && update.interval_secs.is_none() {
+        return Err(management_error(
+            mgmt::ManagementErrorKind::InvalidRequest,
+            "scheduled-task update must change prompt and/or interval",
+            session_id,
+        )
+        .operation(operation_id));
+    }
+    if update.interval_secs == Some(0) {
+        return Err(management_error(
+            mgmt::ManagementErrorKind::InvalidRequest,
+            "scheduled-task interval must be greater than zero",
+            session_id,
+        )
+        .operation(operation_id));
+    }
+    let expected = scheduler_version(expected)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
+    let handle = scheduler_handle(agent, session_id)
+        .map_err(|error| error.operation(operation_id.clone()))?;
+    handle
+        .update(
+            operation_id.0.clone(),
+            request_fingerprint,
+            expected,
+            update.id.0,
+            update.prompt,
+            update.interval_secs.map(|seconds| seconds.max(60)),
+        )
+        .await
+        .map(mgmt::scheduler_task_result)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id)))
+}
+
+async fn scheduler_delete(
+    agent: &MvpAgent,
+    session_id: &SessionId,
+    operation_id: mgmt::OperationId,
+    expected: mgmt::Version,
+    task_id: mgmt::ScheduledTaskId,
+) -> Result<mgmt::SchedulerMutationResult<bool>, mgmt::ManagementError> {
+    let request_fingerprint = format!("delete:{task_id:?}");
+    let expected = scheduler_version(expected)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
+    let handle = scheduler_handle(agent, session_id)
+        .map_err(|error| error.operation(operation_id.clone()))?;
+    handle
+        .delete(
+            operation_id.0.clone(),
+            request_fingerprint,
+            expected,
+            task_id.0,
+        )
+        .await
+        .map(mgmt::scheduler_bool_result)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id)))
 }
 
 fn require_hermetic_discovery() -> Result<(), Error> {
@@ -766,7 +1479,55 @@ fn stop_reason(reason: acp::StopReason) -> StopReason {
 }
 
 fn acp_error(error: acp::Error) -> Error {
+    if error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_admission_closed")
+    {
+        let data = error.data.as_ref().expect("checked above");
+        let state = match data.get("state").and_then(serde_json::Value::as_str) {
+            Some("quiescing") => mgmt::AdmissionState::Quiescing,
+            Some("quiesced") => mgmt::AdmissionState::Quiesced,
+            _ => mgmt::AdmissionState::Open,
+        };
+        let source = match data.get("source").and_then(serde_json::Value::as_str) {
+            Some("peer") => mgmt::AdmissionSource::Peer,
+            Some("scheduler") => mgmt::AdmissionSource::Scheduler,
+            _ => mgmt::AdmissionSource::Human,
+        };
+        return Error::AdmissionRejected {
+            generation: data
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            state,
+            admission_source: source,
+        };
+    }
     Error::Operation(error.to_string())
+}
+
+fn management_extension_error(
+    error: Error,
+    session_id: Option<&SessionId>,
+) -> mgmt::ManagementError {
+    let mut result =
+        mgmt::ManagementError::new(mgmt::ManagementErrorKind::Upstream, error.to_string());
+    if let Some(session_id) = session_id {
+        result = result.session(session_id.clone());
+    }
+    result
+}
+
+fn management_path(path: &Path) -> Result<&str, mgmt::ManagementError> {
+    path.to_str().ok_or_else(|| {
+        mgmt::ManagementError::new(
+            mgmt::ManagementErrorKind::InvalidRequest,
+            "management paths must be valid UTF-8",
+        )
+    })
 }
 
 fn raw_response(response: &impl serde::Serialize) -> Result<serde_json::Value, Error> {
@@ -775,6 +1536,7 @@ fn raw_response(response: &impl serde::Serialize) -> Result<serde_json::Value, E
 
 struct EmbeddedClient {
     events: broadcast::Sender<Event>,
+    management: ManagementEmitter,
     permission_policy: PermissionPolicy,
     handler: Option<Arc<dyn ClientHandler>>,
 }
@@ -865,8 +1627,14 @@ impl acp::Client for EmbeddedClient {
         &self,
         notification: acp::SessionNotification,
     ) -> acp::Result<()> {
+        let session_id = SessionId(notification.session_id.0.to_string());
+        if let Ok(raw_update) = serde_json::to_value(&notification.update)
+            && let Some(kind) = management_session_event(&session_id, &raw_update)
+        {
+            self.management.send(kind);
+        }
         let _ = self.events.send(Event::Session {
-            session_id: SessionId(notification.session_id.0.to_string()),
+            session_id,
             update: session_update(notification.update),
             metadata: notification.meta.map(serde_json::Value::Object),
         });
@@ -875,12 +1643,157 @@ impl acp::Client for EmbeddedClient {
 
     async fn ext_notification(&self, notification: acp::ExtNotification) -> acp::Result<()> {
         let payload = serde_json::from_str(notification.params.get()).unwrap_or_default();
+        if let Some(kind) = management_extension_event(notification.method.as_ref(), &payload) {
+            self.management.send(kind);
+        }
         let _ = self.events.send(Event::Extension {
             method: notification.method.to_string(),
             payload,
         });
         Ok(())
     }
+}
+
+fn management_extension_event(
+    method: &str,
+    payload: &serde_json::Value,
+) -> Option<mgmt::ManagementEventKind> {
+    match method {
+        "x.ai/queue/changed" => {
+            serde_json::from_value::<xai_prompt_queue::QueueChanged>(payload.clone())
+                .ok()
+                .map(mgmt::queue_snapshot)
+                .map(mgmt::ManagementEventKind::Queue)
+        }
+        "x.ai/config/effective_changed" => {
+            Some(mgmt::ManagementEventKind::EffectiveConfigChanged {
+                session_id: SessionId(string_field(payload, &["sessionId", "session_id"])?),
+                version: mgmt::Version {
+                    generation: string_field(payload, &["generation"])?,
+                    revision: field(payload, &["revision"])?.as_u64()?,
+                },
+                snapshot_required: true,
+            })
+        }
+        "x.ai/mcp/servers_updated"
+        | "x.ai/mcp/tools_changed"
+        | "x.ai/mcp/server_status"
+        | "x.ai/mcp/init_progress" => Some(mgmt::ManagementEventKind::McpChanged {
+            session_id: string_field(payload, &["sessionId", "session_id"]).map(SessionId),
+            snapshot_required: true,
+        }),
+        _ => None,
+    }
+}
+
+fn management_session_event(
+    session_id: &SessionId,
+    update: &serde_json::Value,
+) -> Option<mgmt::ManagementEventKind> {
+    let kind = string_field(update, &["sessionUpdate", "session_update"])?;
+    match kind.as_str() {
+        "scheduled_task_created" => Some(mgmt::ManagementEventKind::Scheduler {
+            session_id: session_id.clone(),
+            task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
+            version: management_event_version(update)?,
+            occurrence: mgmt::ScheduledTaskEvent::Upserted,
+            snapshot_required: true,
+        }),
+        "scheduled_task_fired" => Some(mgmt::ManagementEventKind::Scheduler {
+            session_id: session_id.clone(),
+            task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
+            version: management_event_version(update)?,
+            occurrence: mgmt::ScheduledTaskEvent::Fired {
+                subagent_id: string_field(update, &["subagentId", "subagent_id"])
+                    .map(mgmt::SubagentId::new),
+            },
+            snapshot_required: true,
+        }),
+        "scheduled_task_deleted" => Some(mgmt::ManagementEventKind::Scheduler {
+            session_id: session_id.clone(),
+            task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
+            version: management_event_version(update)?,
+            occurrence: mgmt::ScheduledTaskEvent::Removed {
+                reason: match string_field(update, &["reason"]).as_deref() {
+                    Some("deleted") => mgmt::ScheduledTaskRemovalReason::Deleted,
+                    Some("expired") => mgmt::ScheduledTaskRemovalReason::Expired,
+                    Some("completed") => mgmt::ScheduledTaskRemovalReason::Completed,
+                    Some("rejected_by_admission_fence") => {
+                        mgmt::ScheduledTaskRemovalReason::RejectedByAdmissionFence
+                    }
+                    _ => mgmt::ScheduledTaskRemovalReason::Unknown,
+                },
+            },
+            snapshot_required: true,
+        }),
+        "task_backgrounded" => Some(mgmt::ManagementEventKind::BackgroundTask {
+            session_id: session_id.clone(),
+            task_id: mgmt::BackgroundTaskId::new(string_field(update, &["taskId", "task_id"])?),
+            occurrence: mgmt::BackgroundTaskEvent::Started,
+            snapshot_required: true,
+        }),
+        "task_completed" => {
+            let snapshot = field(update, &["taskSnapshot", "task_snapshot"])?;
+            Some(mgmt::ManagementEventKind::BackgroundTask {
+                session_id: session_id.clone(),
+                task_id: mgmt::BackgroundTaskId::new(string_field(
+                    snapshot,
+                    &["taskId", "task_id"],
+                )?),
+                occurrence: mgmt::BackgroundTaskEvent::Completed,
+                snapshot_required: true,
+            })
+        }
+        "subagent_spawned" => Some(mgmt::ManagementEventKind::Subagent {
+            session_id: session_id.clone(),
+            subagent_id: mgmt::SubagentId::new(string_field(
+                update,
+                &["subagentId", "subagent_id"],
+            )?),
+            occurrence: mgmt::SubagentEvent::Spawned,
+            snapshot_required: true,
+        }),
+        "subagent_progress" => Some(mgmt::ManagementEventKind::Subagent {
+            session_id: session_id.clone(),
+            subagent_id: mgmt::SubagentId::new(string_field(
+                update,
+                &["subagentId", "subagent_id"],
+            )?),
+            occurrence: mgmt::SubagentEvent::Progress,
+            snapshot_required: true,
+        }),
+        "subagent_finished" => Some(mgmt::ManagementEventKind::Subagent {
+            session_id: session_id.clone(),
+            subagent_id: mgmt::SubagentId::new(string_field(
+                update,
+                &["subagentId", "subagent_id"],
+            )?),
+            occurrence: mgmt::SubagentEvent::Finished {
+                status: string_field(update, &["status"]).unwrap_or_else(|| "unknown".into()),
+            },
+            snapshot_required: true,
+        }),
+        "hooks_changed" => Some(mgmt::ManagementEventKind::HooksChanged {
+            session_id: session_id.clone(),
+            snapshot_required: true,
+        }),
+        _ => None,
+    }
+}
+
+fn field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a serde_json::Value> {
+    names.iter().find_map(|name| value.get(*name))
+}
+
+fn string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
+    field(value, names)?.as_str().map(str::to_owned)
+}
+
+fn management_event_version(value: &serde_json::Value) -> Option<mgmt::Version> {
+    Some(mgmt::Version {
+        generation: string_field(value, &["generation"])?,
+        revision: field(value, &["revision"])?.as_u64()?,
+    })
 }
 
 fn permission_option_kind(kind: acp::PermissionOptionKind) -> PermissionOptionKind {
@@ -1102,6 +2015,219 @@ impl Session {
         self.agent.cancel(self.id.clone(), metadata).await
     }
 
+    pub async fn queue_snapshot(&self) -> Result<mgmt::QueueSnapshot, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::QueueSnapshot(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn mutate_queue(
+        &self,
+        request: mgmt::QueueMutationRequest,
+    ) -> Result<mgmt::QueueMutationResult, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::MutateQueue(self.id.clone(), request, reply))
+            .await
+    }
+
+    pub async fn scheduler_snapshot(
+        &self,
+    ) -> Result<mgmt::SchedulerSnapshot, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::SchedulerSnapshot(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn create_scheduled_task(
+        &self,
+        operation_id: mgmt::OperationId,
+        expected: mgmt::Version,
+        create: mgmt::ScheduledTaskCreate,
+    ) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| {
+                Command::SchedulerCreate(self.id.clone(), operation_id, expected, create, reply)
+            })
+            .await
+    }
+
+    pub async fn update_scheduled_task(
+        &self,
+        operation_id: mgmt::OperationId,
+        expected: mgmt::Version,
+        update: mgmt::ScheduledTaskUpdate,
+    ) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| {
+                Command::SchedulerUpdate(self.id.clone(), operation_id, expected, update, reply)
+            })
+            .await
+    }
+
+    pub async fn delete_scheduled_task(
+        &self,
+        operation_id: mgmt::OperationId,
+        expected: mgmt::Version,
+        task_id: mgmt::ScheduledTaskId,
+    ) -> Result<mgmt::SchedulerMutationResult<bool>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| {
+                Command::SchedulerDelete(self.id.clone(), operation_id, expected, task_id, reply)
+            })
+            .await
+    }
+
+    pub async fn rewind_snapshot(&self) -> Result<mgmt::RewindSnapshot, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::RewindSnapshot(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn rewind(
+        &self,
+        request: mgmt::RewindRequest,
+    ) -> Result<mgmt::RewindExecutionResult, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::Rewind(self.id.clone(), request, reply))
+            .await
+    }
+
+    /// Credential-free current-session route and FIFO configuration facts.
+    pub async fn effective_config_snapshot(
+        &self,
+    ) -> Result<mgmt::SessionEffectiveConfigSnapshot, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::EffectiveConfig(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn background_tasks(
+        &self,
+    ) -> Result<Vec<mgmt::BackgroundTask>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::BackgroundTasks(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn kill_background_task(
+        &self,
+        task_id: mgmt::BackgroundTaskId,
+        source: mgmt::BackgroundTaskKillSource,
+    ) -> Result<mgmt::BackgroundTaskKillOutcome, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| {
+                Command::KillBackgroundTask(self.id.clone(), task_id, source, reply)
+            })
+            .await
+    }
+
+    pub async fn running_subagents(
+        &self,
+    ) -> Result<Vec<mgmt::RunningSubagent>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::RunningSubagents(self.id.clone(), reply))
+            .await
+    }
+
+    pub async fn subagent(
+        &self,
+        id: mgmt::SubagentId,
+    ) -> Result<Option<mgmt::SubagentSnapshot>, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::Subagent(id, reply))
+            .await
+    }
+
+    pub async fn cancel_subagent(
+        &self,
+        id: mgmt::SubagentId,
+    ) -> Result<mgmt::SubagentCancelOutcome, mgmt::ManagementError> {
+        self.agent
+            .management_request(|reply| Command::CancelSubagent(id, reply))
+            .await
+    }
+
+    pub async fn usage(&self) -> Result<mgmt::SessionUsage, mgmt::ManagementError> {
+        let response = self
+            .extension("x.ai/session/usage", serde_json::json!({}))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::session_usage(response).map_err(|error| error.session(self.id.clone()))
+    }
+
+    pub async fn info(&self) -> Result<mgmt::LiveSessionInfo, mgmt::ManagementError> {
+        let response = self
+            .extension("x.ai/session/info", serde_json::json!({}))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::live_session_info(response).map_err(|error| error.session(self.id.clone()))
+    }
+
+    pub async fn hooks(&self) -> Result<mgmt::HooksSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension("x.ai/hooks/list", serde_json::json!({}))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::hooks_snapshot(response).map_err(|error| error.session(self.id.clone()))
+    }
+
+    pub async fn apply_hook_action(
+        &self,
+        action: mgmt::HookAction,
+    ) -> Result<mgmt::ActionOutcome, mgmt::ManagementError> {
+        let action = match action {
+            mgmt::HookAction::Reload => serde_json::json!({ "type": "reload" }),
+            mgmt::HookAction::TrustProject => serde_json::json!({ "type": "trust" }),
+            mgmt::HookAction::UntrustProject => serde_json::json!({ "type": "untrust" }),
+            mgmt::HookAction::AddPath(path) => {
+                serde_json::json!({ "type": "add", "path": management_path(&path)? })
+            }
+            mgmt::HookAction::RemovePath(path) => {
+                serde_json::json!({ "type": "remove", "path": management_path(&path)? })
+            }
+            mgmt::HookAction::Enable(hook_name) => {
+                serde_json::json!({ "type": "enable", "hook_name": hook_name })
+            }
+            mgmt::HookAction::Disable(hook_name) => {
+                serde_json::json!({ "type": "disable", "hook_name": hook_name })
+            }
+            mgmt::HookAction::ToggleSource {
+                hook_names,
+                disable,
+            } => serde_json::json!({
+                "type": "toggle_source",
+                "hook_names": hook_names,
+                "disable": disable,
+            }),
+        };
+        let response = self
+            .extension("x.ai/hooks/action", serde_json::json!({ "action": action }))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::action_outcome(response).map_err(|error| error.session(self.id.clone()))
+    }
+
+    pub async fn workflows(&self) -> Result<mgmt::WorkflowsSnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension("x.ai/workflows/list", serde_json::json!({}))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::workflows_snapshot(response).map_err(|error| error.session(self.id.clone()))
+    }
+
+    /// Current MCP inventory/status. Configuration values and setup secrets
+    /// are deliberately omitted from the typed snapshot.
+    pub async fn mcp_inventory(
+        &self,
+        cache: bool,
+    ) -> Result<mgmt::McpInventorySnapshot, mgmt::ManagementError> {
+        let response = self
+            .extension("x.ai/mcp/list", serde_json::json!({ "cache": cache }))
+            .await
+            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
+        mgmt::mcp_inventory_snapshot(response).map_err(|error| error.session(self.id.clone()))
+    }
+
     pub async fn close(&self) -> Result<(), Error> {
         self.agent.close(self.id.clone()).await
     }
@@ -1249,5 +2375,129 @@ mod tests {
             grok.features.image_edit_model_override.as_deref(),
             Some("edit-model")
         );
+    }
+
+    #[test]
+    fn effective_config_snapshot_exposes_names_but_never_credentials_or_values() {
+        let config = AgentConfig::new(ModelConfig::new(
+            "default",
+            ProviderConfig::openai_responses("https://model.example/v1", "sdk-secret-key", "model")
+                .header("x-tenant", "secret-header-value")
+                .query_param("tenant", "secret-query-value"),
+        ))
+        .media(MediaConfig::new(
+            MediaProviderConfig::new("https://media.example/v1", "media-secret-key")
+                .header("x-media-tenant", "secret-media-header"),
+        ));
+
+        let snapshot = mgmt::agent_config_snapshot(&config);
+        let debug = format!("{snapshot:?}");
+        for secret in [
+            "sdk-secret-key",
+            "secret-header-value",
+            "secret-query-value",
+            "media-secret-key",
+            "secret-media-header",
+        ] {
+            assert!(!debug.contains(secret), "snapshot leaked {secret}");
+        }
+        assert_eq!(snapshot.routes[0].header_names, ["x-tenant"]);
+        assert_eq!(snapshot.routes[0].query_parameter_names, ["tenant"]);
+        assert_eq!(
+            snapshot.media.as_ref().unwrap().header_names,
+            ["x-media-tenant"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_management_events_recover_from_authoritative_queue_snapshot() {
+        let (events, _) = broadcast::channel(2);
+        let emitter = ManagementEmitter {
+            events: events.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+        };
+        let mut subscriber = events.subscribe();
+        for revision in 1..=3 {
+            emitter.send(mgmt::ManagementEventKind::Queue(mgmt::QueueSnapshot {
+                session_id: SessionId("s1".into()),
+                version: mgmt::Version {
+                    generation: "queue-generation".into(),
+                    revision,
+                },
+                running: None,
+                pending: Vec::new(),
+            }));
+        }
+
+        assert!(matches!(
+            subscriber.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        let recovered = mgmt::queue_snapshot(xai_prompt_queue::QueueChanged {
+            session_id: "s1".into(),
+            generation: "queue-generation".into(),
+            revision: 3,
+            ..Default::default()
+        });
+        assert_eq!(recovered.version.revision, 3);
+        assert_eq!(recovered.version.generation, "queue-generation");
+    }
+
+    #[test]
+    fn admission_error_data_is_projected_structurally() {
+        let error = acp::Error::new(-32099, "closed").data(serde_json::json!({
+            "code": "agent_admission_closed",
+            "generation": 7,
+            "state": "quiescing",
+            "source": "scheduler",
+        }));
+        assert!(matches!(
+            acp_error(error),
+            Error::AdmissionRejected {
+                generation: 7,
+                state: mgmt::AdmissionState::Quiescing,
+                admission_source: mgmt::AdmissionSource::Scheduler,
+            }
+        ));
+    }
+
+    #[test]
+    fn management_invalidations_preserve_native_versions() {
+        let config = management_extension_event(
+            "x.ai/config/effective_changed",
+            &serde_json::json!({
+                "sessionId": "s1",
+                "generation": "config-generation",
+                "revision": 7,
+            }),
+        );
+        assert!(matches!(
+            config,
+            Some(mgmt::ManagementEventKind::EffectiveConfigChanged {
+                session_id,
+                version: mgmt::Version { revision: 7, .. },
+                snapshot_required: true,
+            }) if session_id.as_str() == "s1"
+        ));
+
+        let scheduler = management_session_event(
+            &SessionId("s1".into()),
+            &serde_json::json!({
+                "sessionUpdate": "scheduled_task_created",
+                "taskId": "task-1",
+                "generation": "scheduler-generation",
+                "revision": 11,
+            }),
+        );
+        assert!(matches!(
+            scheduler,
+            Some(mgmt::ManagementEventKind::Scheduler {
+                task_id,
+                version: mgmt::Version { revision: 11, .. },
+                occurrence: mgmt::ScheduledTaskEvent::Upserted,
+                snapshot_required: true,
+                ..
+            }) if task_id.as_str() == "task-1"
+        ));
     }
 }

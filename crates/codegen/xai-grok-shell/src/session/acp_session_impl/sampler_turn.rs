@@ -386,6 +386,8 @@ impl SessionActor {
     /// Set the per-turn override and emit it before any turn runs, so a subagent spawned this turn inherits it.
     pub(crate) fn set_tool_overrides(&self, overrides: xai_grok_sampling_types::ToolOverrides) {
         *self.tool_overrides.borrow_mut() = Some(overrides);
+        let config_version = self.tool_context.config_clock.bump();
+        self.broadcast_effective_config_changed(config_version);
         self.emit_resolved_tool_overrides();
     }
 
@@ -399,6 +401,8 @@ impl SessionActor {
             let mut slot = self.tool_overrides.borrow_mut();
             *slot = update.apply(slot.take());
         }
+        let config_version = self.tool_context.config_clock.bump();
+        self.broadcast_effective_config_changed(config_version);
         self.emit_resolved_tool_overrides();
     }
 

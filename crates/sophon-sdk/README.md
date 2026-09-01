@@ -120,17 +120,96 @@ or ambient environment flags. The SDK only routes existing upstream tools; it
 does not add parallel `generate_image` / `generate_video` APIs or own polling
 state.
 
+## Stable typed management
+
+`management` is the stable embedded control plane. It does not expose ACP or
+`serde_json::Value`: IDs are newtypes, extensible enums are non-exhaustive,
+mutations carry actor generations/revisions, and failures are structured.
+
+```rust
+use std::time::Duration;
+use sophon_sdk::management::{
+    OperationId, QueueMutation, QueueMutationRequest, QueueMutationResult,
+};
+
+# async fn manage(agent: &sophon_sdk::Agent, session: &sophon_sdk::Session)
+#     -> Result<(), Box<dyn std::error::Error>> {
+let mut management_events = agent.subscribe_management();
+let queue = session.queue_snapshot().await?;
+if let Some(entry) = queue.pending.first() {
+    let result = session
+        .mutate_queue(QueueMutationRequest {
+            operation_id: OperationId::new("host-remove-42"),
+            expected: queue.version.clone(),
+            mutation: QueueMutation::Remove {
+                id: entry.id.clone(),
+                expected_entry_version: entry.version,
+                owner: None,
+            },
+        })
+        .await?;
+    match result {
+        QueueMutationResult::Committed { snapshot, .. } => {
+            println!("queue revision {}", snapshot.version.revision);
+        }
+        QueueMutationResult::Conflict { snapshot, .. } => {
+            // Rebase the intended edit on this authoritative snapshot.
+            println!("queue changed to revision {}", snapshot.version.revision);
+        }
+        QueueMutationResult::OperationIdReused { .. } => {
+            // The same idempotency key was reused for a different request.
+        }
+        _ => {}
+    }
+}
+
+// A lag or sequence gap is explicit. Subscribe first, then take the domain
+// snapshot; refetch that snapshot after RecvError::Lagged or snapshot_required.
+let _ = management_events.try_recv();
+
+let report = agent.quiesce(Duration::from_secs(30)).await?;
+assert!(report.drained());
+# Ok(())
+# }
+```
+
+The management invariants are:
+
+- **One authority.** FIFO, scheduler, rewind, terminal tasks, subagents, hooks,
+  MCP, and effective session state are read or mutated through their Grok Build
+  actors. The SDK stores no second queue, task database, or runtime mirror.
+- **Linearizable admission.** Human prompts, peer messages, internal scheduler
+  fires, and old `Session` handles acquire from one Agent-owned fence. Closing
+  it and admitting work share one lock. Quiesce then waits for all accepted
+  permits, native FIFO/running prompts, interactions, background tasks,
+  subagents, and completion presentations. Shutdown refuses to proceed after a
+  timed-out drain.
+- **CAS plus idempotency.** Queue and scheduler writes require the exact actor
+  generation/revision and a caller operation ID. Conflicts return the current
+  snapshot. Successful operation receipts are replayable within that actor
+  incarnation; reusing an ID for a different request is rejected.
+- **Recoverable observation.** Management events have an Agent-global monotonic
+  sequence. Queue events carry full versioned snapshots; scheduler and
+  effective-config events carry native versions; other event domains explicitly
+  set `snapshot_required`. Tokio broadcast lag is never hidden—refetch the
+  authoritative typed snapshot.
+- **No credentials.** Effective configuration reports routing/model/protocol,
+  context, media/auxiliary choices, and header/query *names*. API keys, bearer
+  values, header/query values, credential files, and browser state are absent.
+  Session snapshots distinguish the overrides mounted on the active FIFO batch
+  from those that will apply after all currently pending rows drain.
+
 ## Public API
 
 - `AgentConfig`, `ModelConfig`, `ProviderConfig`, and `ProviderProtocol` define
   an explicit fixed model catalog. One Agent may route models to different
   providers. Optional `MediaConfig` routes upstream image/video tools without
   reimplementing them.
-- `Agent::start`, `subscribe`, `create_session`, `load_session`,
-  `resume_session`, `list_sessions`, and `shutdown` own the embedding
-  lifecycle. Session listing preserves Grok Build's cursor pagination. Raw
-  initialization and attach responses retain advertised capabilities, model
-  and mode state, commands, MCP state, and future fields.
+- `Agent::start`, `subscribe`, `subscribe_management`, `runtime_health`,
+  `subscribe_runtime_health`, `quiesce`, session creation/attachment/listing,
+  and `shutdown` own the embedding lifecycle. Raw initialization and attach
+  responses remain available for forward-compatible capability discovery, but
+  are not the lifecycle or management contract.
 - `SessionConfig` accepts raw upstream metadata and MCP server definitions.
   This preserves agent profiles, plugin directories, tool overrides,
   reasoning settings, SDK-provided MCP servers, and future additions without
@@ -141,10 +220,14 @@ state.
   upstream operations. Prompt results and session events retain their opaque
   upstream metadata; cancellation metadata exposes subagent cancellation and
   optional rewind controls.
-- `Agent::extension`, `Agent::notify_extension`, and the session-scoped
-  `Session::extension` expose the complete Grok Build `x.ai/*` request and
-  notification surface as JSON. This deliberately replaces hundreds of
-  one-line SDK wrappers with one forward-compatible seam.
+- `management` and typed `Agent` / `Session` methods cover the stable embedded
+  management surface: native FIFO, scheduler, rewind, effective configuration,
+  usage/info, hooks, skills/workflows, MCP inventory/status, background tasks,
+  and subagents.
+- `Agent::extension`, `Agent::notify_extension`, and `Session::extension`
+  retain the complete Grok Build `x.ai/*` JSON seam for new, experimental, or
+  uncommon capabilities. Stable consumers do not need to spell the typed
+  management method names or parse their responses.
 - `Event` projects common user/assistant/thought, tool-call, and plan updates.
   Unmirrored standard updates remain available as JSON through
   `SessionUpdate::Other`; xAI extension notifications remain available through
@@ -156,15 +239,20 @@ state.
   hooks, and SDK MCP calls. Grok Build remains responsible for tool execution.
 - `source_provenance()` reports the exact public and embedded source commits.
 
-For example, the same raw seam covers current methods and future additions:
+For example, the raw seam remains available for deliberately untyped areas:
 
 ```rust
 let models = agent.extension("x.ai/models/list", serde_json::json!({})).await?;
 let session_matches = agent
     .extension("x.ai/session/search", serde_json::json!({ "query": "provider" }))
     .await?;
-let mcp = session.extension("x.ai/mcp/list", serde_json::json!({})).await?;
-# let _ = (models, session_matches, mcp);
+let resource = session
+    .extension("x.ai/mcp/read_resource", serde_json::json!({
+        "server": "docs",
+        "uri": "docs://experimental"
+    }))
+    .await?;
+# let _ = (models, session_matches, resource);
 # Ok::<(), sophon_sdk::Error>(())
 ```
 
@@ -178,16 +266,42 @@ non-TUI capability reachable from that agent has an SDK path:
 | Prompt loop; text/image/audio/resource input; image understanding | typed `Session` prompt methods plus raw blocks/metadata |
 | Native repository, terminal, web-fetch, web-search, image and video tools | executed by the upstream agent; configured through `GROK_HOME` and provider routes |
 | Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; raw summary/compaction extensions |
-| Session list/info/search/state/history/import/fork/repair/usage/rename/delete/rewind | typed lifecycle/list/rename where useful; otherwise `x.ai/session/*`, `x.ai/sessions/*`, and `x.ai/rewind/*` |
+| Runtime lifecycle and lossless Agent replacement | typed health watch, Agent-wide admission fence, `quiesce`, and loss-refusing `shutdown` |
+| Native prompt FIFO | typed running/pending snapshot; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
+| Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events |
+| Background terminal tasks | typed records/list and kill outcomes; snapshot-required start/completion events |
+| Subagents | typed running list, inspect, cancel, status/results, and snapshot-required lifecycle events |
+| Rewind | typed points, generation/revision CAS, modes, file conflicts, result, and cross-compaction replay reporting |
+| Session info and usage | typed live identity/context and persisted usage/model totals |
+| Effective configuration | credential-free Agent and Session snapshots plus versioned invalidation; active batch versus next empty-FIFO state |
+| Hooks, skills and workflows | typed inventories/config/action outcomes and skill mutations; hook invalidation events |
+| MCP | typed credential-free inventory, transport facts, tool/status/auth/setup state, and snapshot-required status events |
+| Session search/state/history/import/fork/repair/delete | raw `x.ai/session/*` / `x.ai/sessions/*`; content and persistence workflows are not runtime authority |
 | Models, modes, commands, workspaces, prompt history | typed model/mode switching plus `x.ai/models/*`, `x.ai/commands/*`, `x.ai/workspaces/*` |
 | Local file/content/code search, filesystem and terminal/PTY control | `x.ai/search/*`, `x.ai/code/*`, `x.ai/fs/*`, `x.ai/terminal/*` |
-| MCP tools/resources/auth/setup/toggles/config | `SessionConfig::mcp_server`, `x.ai/mcp/*`, events, and reverse `ClientHandler` calls |
-| Skills, workflows, plugins, marketplaces and hooks | effective upstream config plus `x.ai/skills/*`, `x.ai/workflows/*`, `x.ai/plugins/*`, `x.ai/marketplace/*`, `x.ai/hooks/*` |
-| Tasks, scheduler and subagents | agent tools plus `x.ai/task/*`, `x.ai/scheduler/*`, `x.ai/subagent/*` and events |
+| MCP tools/resources/auth/setup/toggles/config | typed inventory/status; raw mutation/auth/setup/resource calls and reverse `ClientHandler` calls |
+| Skills, workflows, plugins, marketplaces and hooks | typed skills/workflows/hooks; raw plugins and marketplaces |
+| Tasks, scheduler and subagents | typed records, supported mutations/results, snapshots, and events |
 | Git, diffs/staging/commits and linked worktrees | upstream tools plus `x.ai/git/*` and `x.ai/git/worktree/*` |
 | Memory, manual/automatic compaction, recap and suggestions | `x.ai/memory/*`, `x.ai/compact_conversation*`, `x.ai/recap`, `x.ai/suggest*` |
 | Permissions, ask-user, folder trust, plan exit, client hooks and SDK MCP | `PermissionPolicy::Delegate` and `ClientHandler` |
 | New or uncommon standard/extension updates | `SessionUpdate::Other`, `Event::Extension`, and raw request/notification methods |
+
+### Raw extension audit
+
+The following remain raw by design. This is an explicit stability decision,
+not an unimplemented management DTO:
+
+| Raw route family | Reason |
+|---|---|
+| `x.ai/fs/*`, `search/*`, `code/*`, `terminal/*`, `git/*`, worktree and hunk operations | Imperative workspace/tool and UI plumbing; the agent's normal tool loop owns execution. |
+| account, auth, billing/credits, privacy/consent, feedback, sharing/cloud and rollout/survey routes | First-party control-plane or product-specific contracts, often identity-bearing. |
+| `plugins/*` and `marketplace/*` install/reload/action routes | Experimental product catalog and executable installation lifecycle. |
+| session content/search/import/fork/repair/history/state/delete, memory, compact, recap and suggest routes | Content/persistence workflows rather than runtime lifecycle authority; shapes evolve with upstream storage. |
+| MCP call/read-resource, mutation, auth, setup, toggle/upsert/delete routes | Provider interaction and credential/setup flows; typed inventory/status is stable and secret-free. |
+| models, commands, workspaces and prompt-history catalogs | Discovery/UI catalogs not required for lifecycle correctness; model switching itself is typed. |
+| debug/internal/telemetry notifications | Diagnostic and explicitly unstable implementation details. |
+| raw queue/scheduler/rewind/task/subagent routes | Compatibility only. The typed native actor methods are the stable path and preserve CAS, idempotency, and recovery semantics. |
 
 One declared upstream feature is not part of this usable public-source
 baseline: Grok Build declares Cargo feature `local-workspace`, but the public
@@ -213,9 +327,9 @@ receiver falls behind the bounded buffer.
 | Owned by this SDK | Kept in Grok Build | Deliberately not copied into this SDK |
 |---|---|---|
 | Model and independently credentialed media routing | Agent and model loop | ACP request/transport types |
-| `Agent` / `Session` lifecycle facade | Built-in tools and terminal execution | Pager/TUI APIs or dependencies |
+| Stable typed `Agent` / `Session` lifecycle and management facade | FIFO, scheduler, rewind, task/subagent and hook/MCP actors | Pager/TUI APIs or dependencies |
 | Prompt block conversion | Session persistence and replay | A second session store or journal |
-| Common event projection + raw JSON fallback | Skills, plugins, hooks, MCP discovery | Typed mirrors of every extension schema |
+| Typed recoverable management events + raw fallback | Skills, plugins, hooks, MCP discovery | Product/control-plane and experimental extension schemas |
 | Provider routing + host callback boundary | Subagents, tasks, scheduler, workflows, compaction, worktrees | Kernels, harnesses, artifact or workflow platforms |
 
 ACP is used only as a private in-process adapter because the pinned
@@ -261,16 +375,19 @@ concepts.
 
 Upstream-owned directories remain byte-for-byte equal to the commit in
 `UPSTREAM_GROK_BUILD_COMMIT`, except for the separately digested provider
-routing, hermetic embedded discovery, and Windows portability groups documented
-in [`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md), plus a one-line public
-snapshot test-import repair. The sync check validates the untouched tree and
-each approved patch independently. An upgrade imports the complete public
-snapshot, updates provenance, reconciles those boundaries, then adapts only
-this small facade for public API changes.
+routing, hermetic embedded discovery, Windows portability, public snapshot
+repair, and typed-management authority groups documented in
+[`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md). The sync check validates the
+untouched tree and each approved patch independently. An upgrade imports the
+complete public snapshot, updates provenance, reconciles those boundaries,
+then adapts only this facade for public API changes.
 
 ```sh
 crates/sophon-sdk/scripts/check-upstream-sync.sh
-CARGO_INCREMENTAL=0 cargo check --locked -p sophon-sdk --all-targets
+CARGO_INCREMENTAL=0 cargo clippy --locked -p xai-prompt-queue -p xai-grok-tools -p xai-grok-shell -p sophon-sdk --all-targets -- -D warnings
+CARGO_INCREMENTAL=0 cargo test --locked -p xai-prompt-queue
+CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-tools
+CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-shell
 CARGO_INCREMENTAL=0 cargo test --locked -p sophon-sdk
 ```
 

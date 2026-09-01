@@ -401,6 +401,8 @@
         // Serializing the payload as the shell emits it pins the wire shape the handler consumes, not cross-crate compat
         let shell_payload = xai_grok_shell::session::prompt_queue::QueueChanged {
             session_id: "sess-1".to_string(),
+            generation: "queue-gen".to_string(),
+            revision: 1,
             entries: Vec::new(),
             running_prompt_id: Some("prompt-running".to_string()),
             running_text: None,
@@ -1496,6 +1498,8 @@
         // Shell and pager share the xai-prompt-queue type; pin kind through a serde cycle.
         let shell = xai_grok_shell::session::prompt_queue::QueueChanged {
             session_id: "sess-1".to_string(),
+            generation: "queue-gen".to_string(),
+            revision: 1,
             entries: vec![xai_grok_shell::session::prompt_queue::QueueEntryWire {
                 id: "b1".to_string(),
                 version: 0,

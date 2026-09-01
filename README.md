@@ -49,12 +49,13 @@ image/video tools can be routed to an independently credentialed media provider,
 while their implementation and request lifecycle remain upstream-owned. This
 provider-routing seam also keeps web search and prompt suggestions attached to
 their selected provider. Separately digested hermetic-discovery and Windows
-portability patches protect the embedding boundary and supported build hosts;
-a fourth digest records one stale public-test import repair. All other non-TUI
-agent operations remain reachable through typed lifecycle methods or a
-forward-compatible `x.ai/*` JSON extension seam, including search, titles,
-summaries, MCP, plugins, skills, hooks, tasks, subagents and worktrees. The
-upstream tree is pinned by
+portability patches protect the embedding boundary and supported build hosts; a
+fourth digest records one stale public-test import repair. A fifth reviewed
+patch adds actor-authoritative typed management: native FIFO CAS, Agent-wide
+admission/quiesce, scheduler/tasks, rewind, health, credential-free effective
+configuration, hooks/MCP and subagent observation. Stable management no longer
+requires downstream `x.ai/*` JSON; the raw extension seam remains for new,
+experimental and uncommon operations. The upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
 `bb7f39d5858cbf5e00de639367f59debbdcb0138` (a post-1.0.13 public source sync,
 crate metadata 1.0.13, `SOURCE_REV`

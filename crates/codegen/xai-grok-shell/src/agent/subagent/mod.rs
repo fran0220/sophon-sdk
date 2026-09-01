@@ -109,6 +109,8 @@ impl AutoCompactThresholdTiers {
 /// Avoids passing `&MvpAgent` (which would require the coordinator to know about the full agent struct).
 /// Built by `MvpAgent::build_subagent_spawn_context()`.
 pub(crate) struct SubagentSpawnContext {
+    /// Same Agent-wide admission authority as the root session.
+    pub admission: xai_grok_tools::management::admission::AdmissionController,
     /// Parent's LSP runtime, inherited via ToolContext, same as fs/terminal.
     pub lsp: Option<std::sync::Arc<dyn xai_grok_tools::implementations::lsp::LspBackend>>,
     /// Root session's process scope, inherited so the subagent's own child processes are reaped when the parent session closes.

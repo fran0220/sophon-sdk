@@ -61,6 +61,8 @@ impl SessionActor {
                 reasoning_effort: sampling_config.reasoning_effort,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
             });
+        let config_version = self.tool_context.config_clock.bump();
+        self.broadcast_effective_config_changed(config_version);
         let existing = self.chat_state_handle.get_credentials().await;
         let session_key = self
             .auth_manager

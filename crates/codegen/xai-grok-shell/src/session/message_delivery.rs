@@ -59,6 +59,7 @@ impl HumanPromptContent {
             json_schema: self.json_schema,
             send_now: false,
             admission: None,
+            agent_admission: None,
             tool_overrides_update: self.tool_overrides_update,
             respond_to: self.respond_to,
             prompt_admitted: None,

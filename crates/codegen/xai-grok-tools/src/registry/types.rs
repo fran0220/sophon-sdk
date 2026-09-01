@@ -247,6 +247,12 @@ pub struct SessionContext {
     /// subagent exit.
     pub parent_scheduler_handle:
         Option<crate::implementations::grok_build::scheduler::types::SchedulerHandle>,
+    /// Agent-wide admission authority for scheduler fires.
+    pub admission: Option<crate::management::admission::AdmissionController>,
+    /// Direct actor-backed foreground prompt ingress. Hosts that do not
+    /// provide it retain the legacy notification path.
+    pub scheduler_prompt_ingress:
+        Option<crate::management::scheduler_ingress::SchedulerPromptIngress>,
     /// Available skills for the Skill tool and description templates.
     pub skills: Vec<SkillInfo>,
     /// File path for persisting Resources state across restarts.
@@ -1006,6 +1012,12 @@ impl ToolRegistryBuilder {
         resources.insert(crate::types::resources::SessionEnv(ctx.session_env));
         if let Some(owner_session_id) = ctx.owner_session_id.clone() {
             resources.insert(crate::types::resources::OwnerSessionId(owner_session_id));
+        }
+        if let Some(admission) = ctx.admission {
+            resources.insert(admission);
+        }
+        if let Some(ingress) = ctx.scheduler_prompt_ingress {
+            resources.insert(ingress);
         }
         if let Some(subagent) = ctx.subagent {
             resources.insert(subagent.backend);
@@ -2220,6 +2232,8 @@ mod tests {
             owner_session_id: None,
             subagent: None,
             parent_scheduler_handle: None,
+            admission: None,
+            scheduler_prompt_ingress: None,
             skills: vec![],
             state_path: tmp.path().join("state.json"),
             memory_backend: None,

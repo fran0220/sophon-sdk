@@ -1291,6 +1291,7 @@ impl acp::Agent for MvpAgent {
                     json_schema,
                     send_now: true,
                     admission: None,
+                    agent_admission: None,
                     tool_overrides_update,
                     respond_to: tx,
                     prompt_admitted: None,

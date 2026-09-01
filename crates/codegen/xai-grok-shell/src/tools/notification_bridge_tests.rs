@@ -1157,6 +1157,7 @@ async fn scheduled_task_fired_is_not_persisted() {
             human_schedule: "every 5 minutes".into(),
             next_fire_at: Some("2026-01-01T00:00:00Z".into()),
             subagent_id: Some("subagent-1".into()),
+            prompt_enqueued: false,
             generation: "generation-a".into(),
             revision: 3,
         },

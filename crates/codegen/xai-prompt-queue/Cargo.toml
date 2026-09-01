@@ -8,6 +8,7 @@ description = "Shared prompt-queue wire types for xai-grok-shell and xai-grok-pa
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 
 [lints]
 workspace = true

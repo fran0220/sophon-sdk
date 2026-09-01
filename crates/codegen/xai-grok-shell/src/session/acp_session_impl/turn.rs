@@ -756,17 +756,24 @@ impl SessionActor {
                 let _ = ack.send(());
             }
         } else {
-            self.chat_state_handle.increment_prompt_index();
-            *self.tool_context.prompt_index.lock().await = current_prompt_index;
-            self.tool_context
-                .active_message_parent_prompt_index
-                .store(current_prompt_index, std::sync::atomic::Ordering::Release);
-            self.file_state_tracker
-                .begin_prompt(current_prompt_index)
-                .await;
             let trimmed = text.trim().to_string();
-            if !trimmed.is_empty() {
-                self.chat_state_handle.cache_prompt_text(trimmed);
+            {
+                // Rewind CAS and every mutation of its execution basis share
+                // this lock. Once the revision advances, a snapshot command
+                // ordered through chat-state observes the new prompt index.
+                let mut rewind_version = self.tool_context.rewind_authority.0.lock().await;
+                self.chat_state_handle.increment_prompt_index();
+                *self.tool_context.prompt_index.lock().await = current_prompt_index;
+                self.tool_context
+                    .active_message_parent_prompt_index
+                    .store(current_prompt_index, std::sync::atomic::Ordering::Release);
+                self.file_state_tracker
+                    .begin_prompt(current_prompt_index)
+                    .await;
+                if !trimmed.is_empty() {
+                    self.chat_state_handle.cache_prompt_text(trimmed);
+                }
+                rewind_version.bump();
             }
             let echo_mode = user_echo_mode(prompt_id, &input_origin);
             for block in prompt_blocks.iter() {

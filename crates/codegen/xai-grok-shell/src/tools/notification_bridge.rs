@@ -425,6 +425,7 @@ async fn handle_notification(
                         json_schema: None,
                         send_now: false,
                         tool_overrides_update: None,
+                        agent_admission: None,
                         admission: Some(crate::session::commands::TaskWakeAdmission {
                             respond_to: admission_tx,
                             fallback: crate::session::commands::TaskWakeFallback {
@@ -672,7 +673,7 @@ async fn handle_notification(
                 subagent_id = fired.subagent_id.as_deref().unwrap_or(""),
                 "Scheduled task fired"
             );
-            if fired.subagent_id.is_none() {
+            if fired.subagent_id.is_none() && !fired.prompt_enqueued {
                 let inject_payload = serde_json::json!({
                     "sessionId": config.session_id,
                     "taskId": &fired.task_id,

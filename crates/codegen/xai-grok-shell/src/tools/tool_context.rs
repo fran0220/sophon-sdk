@@ -187,6 +187,16 @@ pub(crate) fn subagent_foreground_wait(
 pub struct ToolContext {
     pub gateway: Option<GatewaySender>,
     pub session_id: Option<acp::SessionId>,
+    /// Agent-wide authority for admitting human, peer, and scheduler prompts.
+    /// Root sessions receive the controller owned by `AgentActivity`; child
+    /// sessions inherit that exact handle from their parent.
+    pub admission: xai_grok_tools::management::admission::AdmissionController,
+    /// Version clock for this session actor's native FIFO snapshots/events.
+    pub queue_clock: xai_prompt_queue::QueueClock,
+    /// Generation clock and serialization gate for this session's timeline.
+    pub rewind_authority: crate::session::RewindAuthority,
+    /// Version clock for credential-free effective configuration snapshots.
+    pub config_clock: xai_prompt_queue::QueueClock,
     pub fs: AsyncFsWrapper,
     pub terminal: Arc<dyn AsyncTerminalRunner>,
     pub cwd: AbsPathBuf,
@@ -320,6 +330,10 @@ impl ToolContext {
         Self {
             gateway,
             session_id,
+            admission: Default::default(),
+            queue_clock: Default::default(),
+            rewind_authority: Default::default(),
+            config_clock: Default::default(),
             fs: AsyncFsWrapper::new(fs),
             terminal,
             cwd,
@@ -413,6 +427,10 @@ mod tests {
             Self {
                 gateway: None,
                 session_id: None,
+                admission: Default::default(),
+                queue_clock: Default::default(),
+                rewind_authority: Default::default(),
+                config_clock: Default::default(),
                 fs: AsyncFsWrapper::new(fs),
                 terminal,
                 cwd,

@@ -1065,6 +1065,8 @@ async fn file_toolset_override_e2e_to_finalized_toolset() {
         owner_session_id: None,
         subagent: None,
         parent_scheduler_handle: None,
+        admission: None,
+        scheduler_prompt_ingress: None,
         skills: vec![],
         state_path: tmp.path().join("state.json"),
         memory_backend: None,

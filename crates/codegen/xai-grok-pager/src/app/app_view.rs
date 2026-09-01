@@ -2108,6 +2108,8 @@ impl AppView {
     ) -> Vec<(String, String)> {
         let crate::app::prompt_queue::QueueChanged {
             session_id,
+            generation: _,
+            revision: _,
             mut entries,
             running_prompt_id,
             running_text: _,

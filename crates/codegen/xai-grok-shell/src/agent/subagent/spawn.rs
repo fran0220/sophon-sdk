@@ -203,6 +203,10 @@ impl coordinator::ChildRunner for ShellChildRunner {
     }
     fn on_completed(&self, completion: coordinator::ChildCompletion<Self::CompletionData>) {
         let gateway = self.agent_ref.get().gateway.clone();
+        // The coordinator publishes running=0 immediately before this call.
+        // Hold a separate activity guard until completion presentation has
+        // synchronously enqueued any related parent-session wake.
+        let presentation_guard = self.agent_ref.get().activity.begin_presentation();
         let will_wake = will_wake_for(&completion);
         let reservations = completion
             .completion_data
@@ -213,6 +217,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
         }
         let subagent_id = completion.request.id.clone();
         let present = move || {
+            let _presentation_guard = presentation_guard;
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 present_child_completion(completion, &gateway, will_wake)
             }))
@@ -471,6 +476,7 @@ pub(crate) fn inject_subagent_completed_prompt(params: InjectParams) {
             json_schema: None,
             send_now: false,
             admission: None,
+            agent_admission: None,
             tool_overrides_update: None,
             respond_to,
             prompt_admitted: None,

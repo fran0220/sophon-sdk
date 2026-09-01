@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -21,7 +21,8 @@ use crate::types::resources::{SharedResources, State};
 use super::interval::interval_to_human;
 use super::types::{
     LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerClock,
-    SchedulerCommand, SchedulerError, SchedulerSnapshot, SchedulerState, SchedulerVersion,
+    SchedulerCommand, SchedulerError, SchedulerMutationResult, SchedulerSnapshot, SchedulerState,
+    SchedulerVersion,
 };
 
 const MAX_SCHEDULED_TASKS: usize = 50;
@@ -38,6 +39,28 @@ enum ExpiryPersistenceOutcome {
     NotCommitted(std::io::Error),
     Unknown(SchedulerError),
 }
+
+#[derive(Debug, Clone)]
+enum SchedulerReceiptValue {
+    Created(ScheduledTask),
+    Updated(ScheduledTask),
+    Deleted(bool),
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerReceipt {
+    request_fingerprint: String,
+    version: SchedulerVersion,
+    value: SchedulerReceiptValue,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerReceiptLedger {
+    order: VecDeque<String>,
+    receipts: HashMap<String, SchedulerReceipt>,
+}
+
+const MAX_MANAGEMENT_RECEIPTS: usize = 256;
 
 pub(crate) struct PendingDurableRemoval {
     task_id: String,
@@ -268,6 +291,14 @@ impl SchedulerActor {
 
     async fn compute_next_fire_delay(&self) -> Duration {
         let res = self.resources.lock().await;
+        if res
+            .get::<crate::management::admission::AdmissionController>()
+            .is_some_and(|controller| {
+                controller.snapshot().state != crate::management::admission::AdmissionState::Open
+            })
+        {
+            return Duration::MAX;
+        }
         let scheduler_state = res.get::<State<SchedulerState>>();
         scheduler_state
             .map(|s| {
@@ -293,6 +324,17 @@ impl SchedulerActor {
         debug_assert!(self.pending_removal.is_none());
         let now = Utc::now();
         let mut res = self.resources.lock().await;
+        let admission = res
+            .get::<crate::management::admission::AdmissionController>()
+            .cloned();
+        let prompt_ingress = res
+            .get::<crate::management::scheduler_ingress::SchedulerPromptIngress>()
+            .cloned();
+        let background_enabled = res
+            .get::<crate::types::resources::SchedulerBackgroundLoops>()
+            .is_none_or(|v| v.0);
+        let subagent_events = res.get::<SubagentEventSender>().cloned();
+        let owner_session = res.get::<SessionIdResource>().map(|s| s.0.clone());
         let state = res.get_or_default::<State<SchedulerState>>();
         let idx = state.tasks.iter().position(|task| {
             task.next_wake_at() <= now && !self.blocked_expiries.contains(&task.id)
@@ -411,6 +453,47 @@ impl SchedulerActor {
             return;
         }
 
+        let mut agent_permit = match admission {
+            Some(controller) => match controller
+                .try_admit(crate::management::admission::AdmissionSource::Scheduler)
+            {
+                Ok(permit) => Some(permit),
+                Err(rejection) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        generation = rejection.generation,
+                        state = ?rejection.state,
+                        "Scheduled fire rejected by agent admission fence"
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let spawn_deps = if foreground || should_remove || !background_enabled {
+            None
+        } else {
+            subagent_events.zip(owner_session)
+        };
+        let mut prompt_enqueued = false;
+        if spawn_deps.is_none()
+            && let (Some(ingress), Some(permit)) = (prompt_ingress.as_ref(), agent_permit.take())
+        {
+            if let Err(error) = ingress.enqueue(
+                crate::management::scheduler_ingress::SchedulerPrompt {
+                    task_id: task_id.clone(),
+                    prompt: prompt.clone(),
+                    human_schedule: human_schedule.clone(),
+                },
+                permit,
+            ) {
+                tracing::warn!(%task_id, %error, "Scheduled foreground prompt ingress failed");
+                return;
+            }
+            prompt_enqueued = true;
+        }
+
         let mut reservation = self.clock.prepare_transition(transition_count);
 
         if is_expired {
@@ -447,17 +530,6 @@ impl SchedulerActor {
             state.tasks.remove(idx);
         }
 
-        let background_enabled = res
-            .get::<crate::types::resources::SchedulerBackgroundLoops>()
-            .is_none_or(|v| v.0);
-        let spawn_deps = if foreground || should_remove || !background_enabled {
-            None
-        } else {
-            let events = res.get::<SubagentEventSender>().cloned();
-            let session = res.get::<SessionIdResource>().map(|s| s.0.clone());
-            events.zip(session)
-        };
-
         drop(res);
 
         tracing::info!(
@@ -480,6 +552,7 @@ impl SchedulerActor {
                     last_subagent_id,
                     iterations_since_fresh,
                     chain_reset_pending,
+                    agent_permit.clone(),
                 )
                 .await
             }
@@ -504,6 +577,23 @@ impl SchedulerActor {
         match outcome {
             LoopFireOutcome::Skipped => unreachable!("skipped outcome returned above"),
             LoopFireOutcome::Foreground => {
+                if !prompt_enqueued
+                    && let (Some(ingress), Some(permit)) =
+                        (prompt_ingress.as_ref(), agent_permit.take())
+                {
+                    if let Err(error) = ingress.enqueue(
+                        crate::management::scheduler_ingress::SchedulerPrompt {
+                            task_id: task_id.clone(),
+                            prompt: prompt.clone(),
+                            human_schedule: human_schedule.clone(),
+                        },
+                        permit,
+                    ) {
+                        tracing::warn!(%task_id, %error, "Scheduled fallback prompt ingress failed");
+                    } else {
+                        prompt_enqueued = true;
+                    }
+                }
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover(transition, Some(&task_id), commit.rollover);
                 let fire_version = commit.version;
@@ -514,6 +604,7 @@ impl SchedulerActor {
                         human_schedule,
                         next_fire_at,
                         subagent_id: None,
+                        prompt_enqueued,
                         generation: fire_version.generation(),
                         revision: fire_version.revision(),
                     });
@@ -529,6 +620,7 @@ impl SchedulerActor {
                         human_schedule,
                         next_fire_at,
                         subagent_id: Some(id),
+                        prompt_enqueued: false,
                         generation: fire_version.generation(),
                         revision: fire_version.revision(),
                     });
@@ -558,6 +650,7 @@ impl SchedulerActor {
         last_subagent_id: Option<String>,
         iterations_since_fresh: u32,
         chain_reset_pending: bool,
+        agent_admission: Option<crate::management::admission::AdmissionPermit>,
     ) -> LoopFireOutcome {
         let prev_snapshot = match &last_subagent_id {
             Some(prev_id) => {
@@ -705,6 +798,7 @@ impl SchedulerActor {
             resume_from,
             cwd: None,
             runtime_overrides: SubagentRuntimeOverrides {
+                agent_admission,
                 completion_output_cap: Some(LOOP_COMPLETION_OUTPUT_CAP),
                 spawn_depth: Some(0),
                 loop_task_id: Some(task_id.to_string()),
@@ -808,27 +902,152 @@ impl SchedulerActor {
         }
     }
 
+    async fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        let res = self.resources.lock().await;
+        let tasks = res
+            .get::<State<SchedulerState>>()
+            .map(|state| state.tasks.clone())
+            .unwrap_or_default();
+        SchedulerSnapshot {
+            version: self.clock.snapshot(),
+            tasks,
+        }
+    }
+
+    async fn create_task(
+        &mut self,
+        task: ScheduledTask,
+    ) -> Result<(ScheduledTask, SchedulerVersion), SchedulerError> {
+        if let Some(pending) = &self.pending_removal {
+            return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
+        }
+        let mut res = self.resources.lock().await;
+        let state = res.get_or_default::<State<SchedulerState>>();
+        if state.tasks.len() >= MAX_SCHEDULED_TASKS {
+            return Err(SchedulerError::TaskLimitReached(MAX_SCHEDULED_TASKS));
+        }
+        let mut reservation = self.clock.prepare_transition(1);
+        state.tasks.push(task.clone());
+        let commit = reservation.commit_next(&mut self.clock);
+        log_rollover("create", Some(&task.id), commit.rollover);
+        self.notification_handle
+            .send_scheduled_task_created(task_created_payload(&task, commit.version));
+        Ok((task, commit.version))
+    }
+
+    async fn update_task(
+        &mut self,
+        id: String,
+        prompt: Option<String>,
+        interval_secs: Option<u64>,
+    ) -> Result<(ScheduledTask, SchedulerVersion), SchedulerError> {
+        if let Some(pending) = &self.pending_removal {
+            return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
+        }
+        let mut res = self.resources.lock().await;
+        let state = res.get_or_default::<State<SchedulerState>>();
+        let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
+            return Err(SchedulerError::TaskNotFound(id));
+        };
+        let mut reservation = self.clock.prepare_transition(1);
+        let task = &mut state.tasks[index];
+        if let Some(prompt) = prompt {
+            if prompt != task.prompt {
+                task.chain_reset_pending = true;
+                task.iterations_since_fresh = 0;
+            }
+            task.prompt = prompt;
+        }
+        if let Some(interval_secs) = interval_secs {
+            task.interval_secs = interval_secs;
+            if task.next_fire_at() <= Utc::now() {
+                task.last_fired_at = Some(Utc::now());
+            }
+        }
+        let updated = task.clone();
+        drop(res);
+
+        let commit = reservation.commit_next(&mut self.clock);
+        log_rollover("update", Some(&id), commit.rollover);
+        self.notification_handle
+            .send_scheduled_task_created(task_created_payload(&updated, commit.version));
+        Ok((updated, commit.version))
+    }
+
+    async fn delete_task(
+        &mut self,
+        id: String,
+    ) -> Result<(bool, SchedulerVersion), SchedulerError> {
+        if self
+            .pending_removal
+            .as_ref()
+            .is_some_and(|pending| pending.task_id == id)
+        {
+            let deleted = self.complete_pending_removal().await?;
+            return Ok((deleted, self.clock.snapshot()));
+        }
+        if let Some(pending) = &self.pending_removal {
+            return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
+        }
+
+        let mut res = self.resources.lock().await;
+        let state = res.get_or_default::<State<SchedulerState>>();
+        let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
+            return Ok((false, self.clock.snapshot()));
+        };
+        if self.notification_handle.durable_targets() == DurableNotificationTargets::None {
+            return Err(SchedulerError::NoDurableNotificationConsumer);
+        }
+        state.tasks.remove(index);
+        drop(res);
+        self.pending_removal = Some(PendingDurableRemoval {
+            task_id: id,
+            reservation: self.clock.prepare_transition(1),
+        });
+        let deleted = self.complete_pending_removal().await?;
+        Ok((deleted, self.clock.snapshot()))
+    }
+
+    async fn receipt(&self, operation_id: &str) -> Option<SchedulerReceipt> {
+        self.resources
+            .lock()
+            .await
+            .get::<SchedulerReceiptLedger>()
+            .and_then(|ledger| ledger.receipts.get(operation_id).cloned())
+    }
+
+    async fn record_receipt(
+        &self,
+        operation_id: String,
+        request_fingerprint: String,
+        version: SchedulerVersion,
+        value: SchedulerReceiptValue,
+    ) {
+        let mut resources = self.resources.lock().await;
+        let ledger = resources.get_or_default::<SchedulerReceiptLedger>();
+        if ledger.receipts.contains_key(&operation_id) {
+            return;
+        }
+        ledger.order.push_back(operation_id.clone());
+        ledger.receipts.insert(
+            operation_id,
+            SchedulerReceipt {
+                request_fingerprint,
+                version,
+                value,
+            },
+        );
+        while ledger.order.len() > MAX_MANAGEMENT_RECEIPTS {
+            if let Some(expired) = ledger.order.pop_front() {
+                ledger.receipts.remove(&expired);
+            }
+        }
+    }
+
     async fn handle_command(&mut self, cmd: SchedulerCommand) {
         match cmd {
             SchedulerCommand::Create { task, reply } => {
-                if let Some(pending) = &self.pending_removal {
-                    let _ =
-                        reply.send(Err(SchedulerError::RemovalPending(pending.task_id.clone())));
-                    return;
-                }
-                let mut res = self.resources.lock().await;
-                let state = res.get_or_default::<State<SchedulerState>>();
-                if state.tasks.len() >= MAX_SCHEDULED_TASKS {
-                    let _ = reply.send(Err(SchedulerError::TaskLimitReached(MAX_SCHEDULED_TASKS)));
-                    return;
-                }
-                let mut reservation = self.clock.prepare_transition(1);
-                state.tasks.push(task.clone());
-                let commit = reservation.commit_next(&mut self.clock);
-                log_rollover("create", Some(&task.id), commit.rollover);
-                self.notification_handle
-                    .send_scheduled_task_created(task_created_payload(&task, commit.version));
-                let _ = reply.send(Ok(task));
+                let _ = reply.send(self.create_task(task).await.map(|(task, _)| task));
             }
             SchedulerCommand::Update {
                 id,
@@ -836,89 +1055,181 @@ impl SchedulerActor {
                 interval_secs,
                 reply,
             } => {
-                if let Some(pending) = &self.pending_removal {
-                    let _ =
-                        reply.send(Err(SchedulerError::RemovalPending(pending.task_id.clone())));
-                    return;
-                }
-                let mut res = self.resources.lock().await;
-                let state = res.get_or_default::<State<SchedulerState>>();
-                let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
-                    let _ = reply.send(Err(SchedulerError::TaskNotFound(id)));
-                    return;
-                };
-                let mut reservation = self.clock.prepare_transition(1);
-                let task = &mut state.tasks[index];
-                if let Some(prompt) = prompt {
-                    // A new prompt is a new job: the next fire starts a fresh
-                    // transcript. The anchor is kept (not cleared) so the
-                    // in-flight guard still sees a running old iteration —
-                    // clearing it here would let the next fire double-spawn.
-                    if prompt != task.prompt {
-                        task.chain_reset_pending = true;
-                        task.iterations_since_fresh = 0;
-                    }
-                    task.prompt = prompt;
-                }
-                if let Some(interval_secs) = interval_secs {
-                    task.interval_secs = interval_secs;
-                    if task.next_fire_at() <= Utc::now() {
-                        task.last_fired_at = Some(Utc::now());
-                    }
-                }
-                let updated = task.clone();
-                drop(res);
-
-                let commit = reservation.commit_next(&mut self.clock);
-                log_rollover("update", Some(&id), commit.rollover);
-                self.notification_handle
-                    .send_scheduled_task_created(task_created_payload(&updated, commit.version));
-                let _ = reply.send(Ok(updated));
+                let _ = reply.send(
+                    self.update_task(id, prompt, interval_secs)
+                        .await
+                        .map(|(task, _)| task),
+                );
             }
             SchedulerCommand::Delete { id, reply } => {
-                if self
-                    .pending_removal
-                    .as_ref()
-                    .is_some_and(|pending| pending.task_id == id)
-                {
-                    let _ = reply.send(self.complete_pending_removal().await);
-                    return;
-                }
-                if let Some(pending) = &self.pending_removal {
-                    let _ =
-                        reply.send(Err(SchedulerError::RemovalPending(pending.task_id.clone())));
-                    return;
-                }
-
-                let mut res = self.resources.lock().await;
-                let state = res.get_or_default::<State<SchedulerState>>();
-                let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
-                    let _ = reply.send(Ok(false));
-                    return;
-                };
-                // A replay create may exist even for a currently non-durable task.
-                if self.notification_handle.durable_targets() == DurableNotificationTargets::None {
-                    let _ = reply.send(Err(SchedulerError::NoDurableNotificationConsumer));
-                    return;
-                }
-                state.tasks.remove(index);
-                drop(res);
-                self.pending_removal = Some(PendingDurableRemoval {
-                    task_id: id,
-                    reservation: self.clock.prepare_transition(1),
-                });
-                let _ = reply.send(self.complete_pending_removal().await);
+                let _ = reply.send(self.delete_task(id).await.map(|(deleted, _)| deleted));
             }
             SchedulerCommand::List { reply } => {
-                let res = self.resources.lock().await;
-                let tasks = res
-                    .get::<State<SchedulerState>>()
-                    .map(|state| state.tasks.clone())
-                    .unwrap_or_default();
-                let _ = reply.send(SchedulerSnapshot {
-                    version: self.clock.snapshot(),
-                    tasks,
-                });
+                let _ = reply.send(self.scheduler_snapshot().await);
+            }
+            SchedulerCommand::CreateManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                task,
+                reply,
+            } => {
+                if let Some(receipt) = self.receipt(&operation_id).await {
+                    let result = if receipt.request_fingerprint != request_fingerprint {
+                        Err(SchedulerError::OperationIdReused(operation_id))
+                    } else {
+                        match receipt.value {
+                            SchedulerReceiptValue::Created(value) => {
+                                Ok(SchedulerMutationResult::Committed {
+                                    operation_id,
+                                    value,
+                                    version: receipt.version,
+                                    replayed: true,
+                                })
+                            }
+                            _ => Err(SchedulerError::OperationIdReused(operation_id)),
+                        }
+                    };
+                    let _ = reply.send(result);
+                } else if expected != self.clock.snapshot() {
+                    let snapshot = self.scheduler_snapshot().await;
+                    let _ = reply.send(Ok(SchedulerMutationResult::Conflict {
+                        operation_id,
+                        expected,
+                        snapshot,
+                    }));
+                } else {
+                    match self.create_task(task).await {
+                        Ok((value, version)) => {
+                            self.record_receipt(
+                                operation_id.clone(),
+                                request_fingerprint,
+                                version,
+                                SchedulerReceiptValue::Created(value.clone()),
+                            )
+                            .await;
+                            let _ = reply.send(Ok(SchedulerMutationResult::Committed {
+                                operation_id,
+                                value,
+                                version,
+                                replayed: false,
+                            }));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+            }
+            SchedulerCommand::UpdateManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                id,
+                prompt,
+                interval_secs,
+                reply,
+            } => {
+                if let Some(receipt) = self.receipt(&operation_id).await {
+                    let result = if receipt.request_fingerprint != request_fingerprint {
+                        Err(SchedulerError::OperationIdReused(operation_id))
+                    } else {
+                        match receipt.value {
+                            SchedulerReceiptValue::Updated(value) => {
+                                Ok(SchedulerMutationResult::Committed {
+                                    operation_id,
+                                    value,
+                                    version: receipt.version,
+                                    replayed: true,
+                                })
+                            }
+                            _ => Err(SchedulerError::OperationIdReused(operation_id)),
+                        }
+                    };
+                    let _ = reply.send(result);
+                } else if expected != self.clock.snapshot() {
+                    let snapshot = self.scheduler_snapshot().await;
+                    let _ = reply.send(Ok(SchedulerMutationResult::Conflict {
+                        operation_id,
+                        expected,
+                        snapshot,
+                    }));
+                } else {
+                    match self.update_task(id, prompt, interval_secs).await {
+                        Ok((value, version)) => {
+                            self.record_receipt(
+                                operation_id.clone(),
+                                request_fingerprint,
+                                version,
+                                SchedulerReceiptValue::Updated(value.clone()),
+                            )
+                            .await;
+                            let _ = reply.send(Ok(SchedulerMutationResult::Committed {
+                                operation_id,
+                                value,
+                                version,
+                                replayed: false,
+                            }));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+            }
+            SchedulerCommand::DeleteManaged {
+                operation_id,
+                request_fingerprint,
+                expected,
+                id,
+                reply,
+            } => {
+                if let Some(receipt) = self.receipt(&operation_id).await {
+                    let result = if receipt.request_fingerprint != request_fingerprint {
+                        Err(SchedulerError::OperationIdReused(operation_id))
+                    } else {
+                        match receipt.value {
+                            SchedulerReceiptValue::Deleted(value) => {
+                                Ok(SchedulerMutationResult::Committed {
+                                    operation_id,
+                                    value,
+                                    version: receipt.version,
+                                    replayed: true,
+                                })
+                            }
+                            _ => Err(SchedulerError::OperationIdReused(operation_id)),
+                        }
+                    };
+                    let _ = reply.send(result);
+                } else if expected != self.clock.snapshot() {
+                    let snapshot = self.scheduler_snapshot().await;
+                    let _ = reply.send(Ok(SchedulerMutationResult::Conflict {
+                        operation_id,
+                        expected,
+                        snapshot,
+                    }));
+                } else {
+                    match self.delete_task(id).await {
+                        Ok((value, version)) => {
+                            self.record_receipt(
+                                operation_id.clone(),
+                                request_fingerprint,
+                                version,
+                                SchedulerReceiptValue::Deleted(value),
+                            )
+                            .await;
+                            let _ = reply.send(Ok(SchedulerMutationResult::Committed {
+                                operation_id,
+                                value,
+                                version,
+                                replayed: false,
+                            }));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1113,6 +1424,110 @@ mod tests {
         assert_eq!(snapshot.tasks[0].prompt, "check deploy");
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn managed_create_is_cas_idempotent_and_rejects_operation_id_reuse() {
+        let (handle, cancel, _notif_rx) = make_test_actor();
+        let expected = handle.snapshot().await.unwrap().version;
+        let task = ScheduledTask::new(300, "check deploy".into(), true, false);
+
+        let first = handle
+            .create(
+                "create-1".into(),
+                "create:300:check deploy".into(),
+                expected,
+                task.clone(),
+            )
+            .await
+            .unwrap();
+        let SchedulerMutationResult::Committed {
+            version,
+            replayed,
+            value,
+            ..
+        } = first
+        else {
+            panic!("first create must commit");
+        };
+        assert!(!replayed);
+        assert_eq!(version.revision(), 1);
+
+        let replay = handle
+            .create(
+                "create-1".into(),
+                "create:300:check deploy".into(),
+                expected,
+                task.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay,
+            SchedulerMutationResult::Committed {
+                replayed: true,
+                value: replayed_value,
+                ..
+            } if replayed_value.id == value.id
+        ));
+
+        let reused = handle
+            .create(
+                "create-1".into(),
+                "create:600:different".into(),
+                expected,
+                task,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(reused, SchedulerError::OperationIdReused(_)));
+
+        let conflict = handle
+            .create(
+                "create-2".into(),
+                "create:300:second".into(),
+                expected,
+                ScheduledTask::new(300, "second".into(), true, false),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            conflict,
+            SchedulerMutationResult::Conflict { snapshot, .. }
+                if snapshot.version == version && snapshot.tasks.len() == 1
+        ));
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn agent_fence_rejects_internal_scheduler_ingress_without_advancing_cadence() {
+        let mut task = due_one_shot("fenced-fire");
+        task.foreground = true;
+        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
+        let controller = crate::management::admission::AdmissionController::default();
+        let enqueued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ingress_count = enqueued.clone();
+        {
+            let mut resources = actor.resources.lock().await;
+            resources.insert(controller.clone());
+            resources.insert(
+                crate::management::scheduler_ingress::SchedulerPromptIngress::new(
+                    move |_prompt, _permit| {
+                        ingress_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    },
+                ),
+            );
+        }
+        controller.begin_quiesce();
+
+        actor.fire_next_task().await;
+
+        assert_eq!(enqueued.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(actor.clock.snapshot().revision(), 0);
+        assert_eq!(actor.scheduler_snapshot().await.tasks.len(), 1);
+        assert_eq!(controller.snapshot().rejected, 1);
     }
 
     #[tokio::test]

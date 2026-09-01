@@ -1677,6 +1677,10 @@ impl SessionActor {
         let segments_queued = u32::from(
             self.persist_compaction_segment(&segment_messages, &generate_session_compact),
         );
+        // A compaction changes whether every subsequent rewind must replay
+        // persisted updates. Serialize that basis change with typed rewind
+        // CAS so a pre-compaction snapshot cannot execute afterward.
+        let mut rewind_version = self.tool_context.rewind_authority.0.lock().await;
         self.chat_state_handle
             .record_compaction_at(prompt_index_at_compaction);
         self.persist_compaction_checkpoint(
@@ -1708,6 +1712,8 @@ impl SessionActor {
         let new_len = compacted_history.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(compacted_history);
+        rewind_version.bump();
+        drop(rewind_version);
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(

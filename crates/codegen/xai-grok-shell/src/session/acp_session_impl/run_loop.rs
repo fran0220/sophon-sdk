@@ -570,8 +570,35 @@ pub(super) async fn run_session(
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, agent_admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
+                            let source = match &origin {
+                                super::PromptOrigin::User if !session.startup_hints.is_subagent => {
+                                    Some(xai_grok_tools::management::admission::AdmissionSource::Human)
+                                }
+                                super::PromptOrigin::SchedulerFired => {
+                                    Some(xai_grok_tools::management::admission::AdmissionSource::Scheduler)
+                                }
+                                _ => None,
+                            };
+                            let _agent_admission = match (agent_admission, source) {
+                                (Some(permit), _) => Some(permit),
+                                (None, Some(source)) => match session.tool_context.admission.try_admit(source) {
+                                    Ok(permit) => Some(permit),
+                                    Err(rejection) => {
+                                        let _ = respond_to.send(Err(
+                                            acp::Error::new(-32099, "agent admission is closed").data(serde_json::json!({
+                                                "code": "agent_admission_closed",
+                                                "generation": rejection.generation,
+                                                "state": format!("{:?}", rejection.state).to_ascii_lowercase(),
+                                                "source": format!("{:?}", rejection.admission_source).to_ascii_lowercase(),
+                                            })),
+                                        ));
+                                        continue;
+                                    }
+                                },
+                                (None, None) => None,
+                            };
                             let (actor_admitted, task_wake_fallback) = match admission {
                                 Some(admission) => {
                                     let fallback = session
@@ -953,12 +980,12 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::HoldEdit { id } => {
                             // insert (not entry/or_insert): re-entering edit after a dropped release must refresh the TTL stamp
-                            session.handle_hold_edit(id).await;
+                            let _ = session.handle_hold_edit(id).await;
                         }
                         SessionCommand::ReleaseEdit { id } => {
                             // No hook-hold release: ReleaseEdit also fires on a cancelled editor, and a peek is not re-engagement
                             // The save path (EditQueuedPrompt) releases.
-                            session.handle_release_edit(&id).await;
+                            let _ = session.handle_release_edit(&id).await;
                             // Unblocks an editable front that was parked under edit hold.
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
@@ -1139,6 +1166,19 @@ pub(super) async fn run_session(
                             let response = session.get_rewind_points().await;
                             let _ = respond_to.send(response);
                         }
+                        SessionCommand::GetRewindSnapshot { respond_to } => {
+                            let _ = respond_to.send(session.rewind_snapshot().await);
+                        }
+                        SessionCommand::ExecuteRewindVersioned {
+                            expected,
+                            request,
+                            respond_to,
+                        } => {
+                            let result = session
+                                .handle_rewind_versioned(expected, request)
+                                .await;
+                            let _ = respond_to.send(result);
+                        }
                         SessionCommand::GetRewindFileCounts { respond_to } => {
                             let _ = respond_to.send(session.rewind_file_counts().await);
                         }
@@ -1246,6 +1286,206 @@ pub(super) async fn run_session(
                                 state_is_busy(&state)
                             };
                             let _ = respond_to.send(busy);
+                        }
+                        SessionCommand::GetDrainSnapshot { respond_to } => {
+                            let (queued_prompts, running_prompt, pending_interactions) = {
+                                let state = session.state.lock().await;
+                                (
+                                    state.pending_inputs.len().saturating_sub(
+                                        usize::from(state.running_task.is_some()),
+                                    ),
+                                    state.running_task.is_some()
+                                        || state.finalization_gate.is_active(),
+                                    session
+                                        .pending_interactions
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .len(),
+                                )
+                            };
+                            let owner = session.session_info.id.0.as_ref();
+                            let outstanding_background_tasks = session
+                                .agent
+                                .borrow()
+                                .tool_bridge()
+                                .list_tasks()
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|task| {
+                                    task.is_outstanding()
+                                        && task.owner_session_id.as_deref().is_none_or(|id| id == owner)
+                                })
+                                .count();
+                            let _ = respond_to.send(
+                                crate::session::commands::SessionDrainSnapshot {
+                                    session_id: owner.to_string(),
+                                    queued_prompts,
+                                    running_prompt,
+                                    pending_interactions,
+                                    outstanding_background_tasks,
+                                },
+                            );
+                        }
+                        SessionCommand::GetQueueSnapshot { respond_to } => {
+                            let _ = respond_to.send(session.queue_snapshot().await);
+                        }
+                        SessionCommand::GetEffectiveConfigSnapshot { respond_to } => {
+                            let _ = respond_to.send(session.effective_config_snapshot().await);
+                        }
+                        SessionCommand::MutateQueue { request, respond_to } => {
+                            let crate::session::commands::QueueMutationRequest {
+                                operation_id,
+                                expected,
+                                mutation,
+                            } = request;
+                            let request_fingerprint = format!("{mutation:?}");
+                            if let Some(receipt) =
+                                session.tool_context.queue_clock.receipt(&operation_id)
+                            {
+                                if receipt.request_fingerprint != request_fingerprint {
+                                    let _ = respond_to.send(
+                                        crate::session::commands::QueueMutationResult::OperationIdReused {
+                                            operation_id,
+                                        },
+                                    );
+                                    continue;
+                                }
+                                let snapshot = session.queue_snapshot().await;
+                                let _ = respond_to.send(
+                                    crate::session::commands::QueueMutationResult::Committed {
+                                        operation_id,
+                                        applied: receipt.applied,
+                                        replayed: true,
+                                        committed_version: receipt.version,
+                                        snapshot,
+                                    },
+                                );
+                                continue;
+                            }
+
+                            let actual = session.tool_context.queue_clock.snapshot();
+                            if expected != actual {
+                                let snapshot = session.queue_snapshot().await;
+                                let _ = respond_to.send(
+                                    crate::session::commands::QueueMutationResult::Conflict {
+                                        operation_id,
+                                        expected,
+                                        actual,
+                                        snapshot,
+                                    },
+                                );
+                                continue;
+                            }
+
+                            let mut reengages = false;
+                            let (applied, cancel_running_turn) = match mutation {
+                                crate::session::commands::QueueMutation::Remove {
+                                    id,
+                                    expected_entry_version,
+                                    owner,
+                                } => {
+                                    let applied = session
+                                        .handle_remove_queued_prompt(
+                                            &id,
+                                            expected_entry_version,
+                                            owner.as_deref(),
+                                        )
+                                        .await;
+                                    reengages = applied;
+                                    (applied, false)
+                                }
+                                crate::session::commands::QueueMutation::Reorder {
+                                    ordered_ids,
+                                } => {
+                                    let applied = session.handle_reorder_queue(&ordered_ids).await;
+                                    reengages = applied;
+                                    (applied, false)
+                                }
+                                crate::session::commands::QueueMutation::Clear { owner } => {
+                                    let applied =
+                                        session.handle_clear_queue(owner.as_deref()).await;
+                                    reengages = applied;
+                                    (applied, false)
+                                }
+                                crate::session::commands::QueueMutation::Edit {
+                                    id,
+                                    expected_entry_version,
+                                    new_text,
+                                    editor,
+                                } => {
+                                    let applied = session
+                                        .handle_edit_queued_prompt_versioned(
+                                            &id,
+                                            Some(expected_entry_version),
+                                            new_text,
+                                            editor.as_deref(),
+                                        )
+                                        .await;
+                                    reengages = applied;
+                                    (applied, false)
+                                }
+                                crate::session::commands::QueueMutation::Interject {
+                                    id,
+                                    expected_entry_version,
+                                    owner,
+                                    new_text,
+                                } => {
+                                    let outcome = session
+                                        .handle_interject_queued_prompt(
+                                            &id,
+                                            expected_entry_version,
+                                            owner.as_deref(),
+                                            new_text.as_deref(),
+                                        )
+                                        .await;
+                                    reengages = outcome.mutated;
+                                    (outcome.mutated, outcome.cancel_running_turn)
+                                }
+                                crate::session::commands::QueueMutation::Hold { id } => {
+                                    (session.handle_hold_edit(id).await, false)
+                                }
+                                crate::session::commands::QueueMutation::Release { id } => {
+                                    (session.handle_release_edit(&id).await, false)
+                                }
+                            };
+
+                            let settled = if cancel_running_turn {
+                                session
+                                    .cancel_turn_for_send_now(&mut replay_buffer)
+                                    .await
+                                    .settled
+                            } else {
+                                true
+                            };
+                            if settled && reengages {
+                                session.release_hook_block_hold("typed_queue_mutation").await;
+                            }
+                            if settled {
+                                SessionActor::maybe_start_running_task(
+                                    session.clone(),
+                                    completion_tx.clone(),
+                                )
+                                .await;
+                            }
+                            let receipt = session
+                                .tool_context
+                                .queue_clock
+                                .record_receipt(
+                                    operation_id.clone(),
+                                    request_fingerprint,
+                                    applied,
+                                );
+                            let snapshot = session.queue_snapshot().await;
+                            let _ = respond_to.send(
+                                crate::session::commands::QueueMutationResult::Committed {
+                                    operation_id,
+                                    applied,
+                                    replayed: false,
+                                    committed_version: receipt.version,
+                                    snapshot,
+                                },
+                            );
                         }
                         SessionCommand::FlushComplete { respond_to } => {
                             // Flush the actor-owned replay buffer inline

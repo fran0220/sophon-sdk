@@ -132,6 +132,9 @@ pub(crate) struct AgentRebuildSpec {
     pub owner_session_id: Option<String>,
     pub parent_scheduler_handle:
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
+    pub admission: xai_grok_tools::management::admission::AdmissionController,
+    pub scheduler_prompt_ingress:
+        xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress,
 }
 impl AgentRebuildSpec {
     /// This is the canonical construction path; see module docs for the invariant.
@@ -223,6 +226,8 @@ impl AgentRebuildSpec {
             system_prompt_label,
             owner_session_id,
             parent_scheduler_handle,
+            admission,
+            scheduler_prompt_ingress,
         } = self.as_ref();
         let _ = mcp_state;
         #[allow(unused_variables)]
@@ -290,6 +295,8 @@ impl AgentRebuildSpec {
         if let Some(handle) = parent_scheduler_handle.clone() {
             builder = builder.with_parent_scheduler_handle(handle);
         }
+        builder =
+            builder.with_management_ingress(admission.clone(), scheduler_prompt_ingress.clone());
         if let Some(memory_backend) = memory_backend.clone() {
             builder = builder.with_memory_backend(memory_backend);
         }
@@ -472,6 +479,11 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         system_prompt_label: xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         owner_session_id: Some("test-session".to_string()),
         parent_scheduler_handle: None,
+        admission: Default::default(),
+        scheduler_prompt_ingress:
+            xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress::new(
+                |_prompt, _permit| Ok(()),
+            ),
     })
 }
 #[cfg(test)]

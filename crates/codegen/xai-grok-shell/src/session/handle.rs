@@ -238,6 +238,59 @@ impl SessionHandle {
         }
         rx.await.unwrap_or(true)
     }
+    /// Authoritative native FIFO snapshot for initial load or event-gap recovery.
+    pub async fn queue_snapshot(&self) -> Option<xai_prompt_queue::QueueChanged> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::GetQueueSnapshot { respond_to: tx })
+            .ok()?;
+        rx.await.ok()
+    }
+    /// Atomically mutate the native FIFO under generation/revision compare-and-swap.
+    pub async fn mutate_queue(
+        &self,
+        request: crate::session::commands::QueueMutationRequest,
+    ) -> Result<crate::session::commands::QueueMutationResult, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::MutateQueue {
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await.map_err(|_| "session closed".to_string())
+    }
+    pub async fn rewind_snapshot(&self) -> Option<crate::session::RewindSnapshot> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::GetRewindSnapshot { respond_to: tx })
+            .ok()?;
+        rx.await.ok()
+    }
+    pub async fn effective_config_snapshot(
+        &self,
+    ) -> Result<crate::session::commands::SessionEffectiveConfigSnapshot, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::GetEffectiveConfigSnapshot { respond_to: tx })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await.map_err(|_| "session closed".to_string())?
+    }
+    pub async fn rewind(
+        &self,
+        expected: crate::session::RewindVersion,
+        request: crate::session::RewindRequest,
+    ) -> anyhow::Result<crate::session::RewindExecutionResult> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::ExecuteRewindVersioned {
+                expected,
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| anyhow::anyhow!("session closed"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("session closed"))?
+    }
     /// List all background tasks.
     /// Routes through the session actor to the ToolBridge's TerminalBackend.
     pub async fn list_tasks(&self) -> Option<Vec<xai_grok_tools::types::TaskSnapshot>> {

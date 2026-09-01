@@ -477,6 +477,100 @@ impl SessionActor {
         self.broadcast_queue_changed_inner(state, Some(running));
     }
 
+    /// Read the current authoritative queue without advancing its version.
+    /// This is the recovery snapshot for subscribers that lagged events.
+    pub(super) async fn queue_snapshot(&self) -> crate::session::prompt_queue::QueueChanged {
+        let state = self.state.lock().await;
+        let running = state.running_prompt_id().and_then(|pid| {
+            state
+                .pending_inputs
+                .iter()
+                .find(|i| i.prompt_id == pid)
+                .map(Self::running_display_from_item)
+        });
+        self.build_queue_snapshot(&state, running, self.tool_context.queue_clock.snapshot())
+    }
+
+    pub(super) async fn effective_config_snapshot(
+        &self,
+    ) -> Result<crate::session::commands::SessionEffectiveConfigSnapshot, String> {
+        let sampling = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .ok_or_else(|| "chat state unavailable".to_string())?;
+        let current = self.tool_overrides.borrow().clone();
+        let (next_empty, pending_config_prompt_ids) = {
+            let state = self.state.lock().await;
+            let running_id = state.running_prompt_id();
+            let mut next = current.clone();
+            let mut ids = Vec::new();
+            for item in &state.pending_inputs {
+                if running_id == Some(item.prompt_id.as_str()) {
+                    continue;
+                }
+                if let Some(update) = item.tool_overrides_update.clone() {
+                    ids.push(item.prompt_id.clone());
+                    next = update.apply(next);
+                }
+            }
+            (next, ids)
+        };
+        let mut header_names = sampling.extra_headers.keys().cloned().collect::<Vec<_>>();
+        header_names.extend(sampling.env_http_headers.keys().cloned());
+        header_names.sort();
+        header_names.dedup();
+        let mut query_parameter_names = sampling.query_params.keys().cloned().collect::<Vec<_>>();
+        query_parameter_names.sort();
+        let mut environment_header_names = sampling
+            .env_http_headers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        environment_header_names.sort();
+        Ok(crate::session::commands::SessionEffectiveConfigSnapshot {
+            session_id: self.session_info.id.0.to_string(),
+            version: self.tool_context.config_clock.snapshot(),
+            route: crate::session::commands::EffectiveRouteFacts {
+                base_url: sampling.base_url,
+                model: sampling.model,
+                api_backend: format!("{:?}", sampling.api_backend),
+                context_window: sampling.context_window.get(),
+                reasoning_effort: sampling.reasoning_effort.map(|value| format!("{value:?}")),
+                header_names,
+                query_parameter_names,
+                environment_header_names,
+            },
+            backend_search_active: self.backend_search_active(),
+            active_batch_search: search_override_facts(current.as_ref()),
+            next_empty_fifo_search: search_override_facts(next_empty.as_ref()),
+            pending_config_prompt_ids,
+        })
+    }
+
+    /// Invalidate credential-free effective-config snapshots after the actor
+    /// applies a route or FIFO-batch override change. The version is the
+    /// authoritative recovery token; values remain available only through the
+    /// actor snapshot command.
+    pub(super) fn broadcast_effective_config_changed(
+        &self,
+        version: crate::session::prompt_queue::QueueVersion,
+    ) {
+        let payload = serde_json::json!({
+            "sessionId": self.session_info.id.0.as_ref(),
+            "generation": version.generation,
+            "revision": version.revision,
+        });
+        if let Ok(params) = serde_json::value::to_raw_value(&payload) {
+            self.notifications
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/config/effective_changed",
+                    params.into(),
+                ));
+        }
+    }
+
     pub(super) fn running_display_from_item(item: &InputItem) -> RunningPromptDisplay {
         let meta = item.queue_meta.as_ref();
         RunningPromptDisplay {
@@ -493,7 +587,12 @@ impl SessionActor {
         }
     }
 
-    fn broadcast_queue_changed_inner(&self, state: &State, running: Option<RunningPromptDisplay>) {
+    fn build_queue_snapshot(
+        &self,
+        state: &State,
+        running: Option<RunningPromptDisplay>,
+        version: crate::session::prompt_queue::QueueVersion,
+    ) -> crate::session::prompt_queue::QueueChanged {
         let running_id = running.as_ref().map(|r| r.id.clone());
         // Exclude the running/promoting row from `entries` (same as when `running_task` is set)
         let mut entries = self.build_queue_wire(state);
@@ -507,14 +606,26 @@ impl SessionActor {
             Some(r) => (Some(r.text), Some(r.kind), r.combined_texts),
             None => (None, None, None),
         };
-        let payload = crate::session::prompt_queue::QueueChanged {
+        crate::session::prompt_queue::QueueChanged {
             session_id: self.session_info.id.0.to_string(),
+            generation: version.generation,
+            revision: version.revision,
             entries,
             running_prompt_id: running_id,
             running_text,
             running_kind,
             running_combined_texts,
-        };
+        }
+    }
+
+    fn broadcast_queue_changed_inner(&self, state: &State, running: Option<RunningPromptDisplay>) {
+        let version = self.tool_context.queue_clock.bump();
+        let payload = self.build_queue_snapshot(state, running, version);
+        // Pending FIFO membership/order determines the configuration that
+        // will become effective once the queue empties. Advance its own
+        // recovery token alongside every authoritative queue transition.
+        let config_version = self.tool_context.config_clock.bump();
+        self.broadcast_effective_config_changed(config_version);
         tracing::debug!(
             target: "qtrace",
             pid = std::process::id(),
@@ -1022,6 +1133,17 @@ impl SessionActor {
         new_text: String,
         editor: Option<&str>,
     ) -> bool {
+        self.handle_edit_queued_prompt_versioned(id, None, new_text, editor)
+            .await
+    }
+
+    pub(super) async fn handle_edit_queued_prompt_versioned(
+        &self,
+        id: &str,
+        expected_version: Option<u64>,
+        new_text: String,
+        editor: Option<&str>,
+    ) -> bool {
         let mut state = self.state.lock().await;
         let mut should_broadcast = false;
         if new_text.trim().is_empty() {
@@ -1032,11 +1154,15 @@ impl SessionActor {
                 queued_id = %id,
                 "queue edit no-op: id names the running turn"
             );
-        } else if let Some(pos) = state
-            .pending_inputs
-            .iter()
-            .position(|item| item.is_queue_editable() && item.has_queue_id(id))
-        {
+        } else if let Some(pos) = state.pending_inputs.iter().position(|item| {
+            item.is_queue_editable()
+                && item.has_queue_id(id)
+                && expected_version.is_none_or(|version| {
+                    item.queue_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.version == version)
+                })
+        }) {
             if let Some(item) = state.pending_inputs.get_mut(pos) {
                 Self::apply_queued_prompt_edit(item, new_text, editor);
             }
@@ -1058,17 +1184,24 @@ impl SessionActor {
 
     /// Stamp (or re-stamp) a queue-edit hold.
     /// `insert` refreshes the TTL, so re-entering edit after a dropped release does not inherit the old hold's age.
-    pub(crate) async fn handle_hold_edit(&self, id: String) {
+    pub(crate) async fn handle_hold_edit(&self, id: String) -> bool {
         let mut state = self.state.lock().await;
         if Self::has_editable_row(&state, &id) {
             state.edit_holds.insert(id, std::time::Instant::now());
+            self.broadcast_queue_changed(&state);
+            true
+        } else {
+            false
         }
     }
 
-    pub(crate) async fn handle_release_edit(&self, id: &str) {
+    pub(crate) async fn handle_release_edit(&self, id: &str) -> bool {
         let mut state = self.state.lock().await;
-        if Self::has_editable_row(&state, id) {
-            state.edit_holds.remove(id);
+        if Self::has_editable_row(&state, id) && state.edit_holds.remove(id).is_some() {
+            self.broadcast_queue_changed(&state);
+            true
+        } else {
+            false
         }
     }
 
@@ -1296,4 +1429,21 @@ impl SessionActor {
             meta.last_editor = editor.map(str::to_string);
         }
     }
+}
+
+fn search_override_facts(
+    overrides: Option<&xai_grok_sampling_types::ToolOverrides>,
+) -> crate::session::commands::SearchOverrideFacts {
+    let mut facts = crate::session::commands::SearchOverrideFacts::default();
+    if let Some(x_search) = overrides.and_then(|value| value.x_search.as_ref())
+        && let Some(bound) = x_search.date_bound.as_ref()
+    {
+        facts.x_search_from_date = bound.from_date().map(str::to_string);
+        facts.x_search_to_date = bound.to_date().map(str::to_string);
+    }
+    if let Some(web_search) = overrides.and_then(|value| value.web_search.as_ref()) {
+        facts.web_allowed_domains = web_search.allowed_domains.clone().unwrap_or_default();
+        facts.web_excluded_domains = web_search.excluded_domains.clone().unwrap_or_default();
+    }
+    facts
 }

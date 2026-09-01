@@ -41,6 +41,20 @@ impl SessionActor {
         completion_tx: mpsc::UnboundedSender<super::turn_task::TurnCompletionMsg>,
         commit: impl FnOnce(&Self, &mut State, PreparedDelivery) -> bool,
     ) {
+        // Peer messages are new root admissions, not continuations hidden
+        // behind the SDK command channel. Acquire from the same authority as
+        // human and scheduler intake before any async preparation.
+        let _agent_admission = match self
+            .tool_context
+            .admission
+            .try_admit(xai_grok_tools::management::admission::AdmissionSource::Peer)
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = respond_to.send(ActiveMessageAdmission::Rejected);
+                return;
+            }
+        };
         let receipt_permit = match receipt_sink.reserve_owned().await {
             Ok(permit) => permit,
             Err(_) => {

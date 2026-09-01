@@ -312,6 +312,10 @@ pub struct ScheduledTaskFired {
     /// RFC3339 timestamp of next fire (for live countdown viz).
     pub next_fire_at: Option<String>,
     pub subagent_id: Option<String>,
+    /// True when the scheduler used typed direct session ingress; clients
+    /// must not bounce the prompt back through the legacy JSON notification.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub prompt_enqueued: bool,
     #[cfg_attr(feature = "serde", serde(default))]
     pub generation: String,
     #[cfg_attr(feature = "serde", serde(default))]

@@ -79,6 +79,15 @@ impl SessionActor {
         RewindPointsResponse { rewind_points }
     }
 
+    pub(super) async fn rewind_snapshot(&self) -> RewindSnapshot {
+        let version = self.tool_context.rewind_authority.0.lock().await;
+        let rewind_points = self.get_rewind_points().await.rewind_points;
+        RewindSnapshot {
+            version: version.clone(),
+            rewind_points,
+        }
+    }
+
     /// Load user prompts from `updates.jsonl` in chronological order.
     ///
     /// Each `UserMessageChunk` sequence is merged into a single prompt string.
@@ -145,6 +154,52 @@ impl SessionActor {
         &self,
         request: RewindRequest,
     ) -> anyhow::Result<RewindResponse> {
+        let mut version = self.tool_context.rewind_authority.0.lock().await;
+        let response = self.handle_rewind_inner(request).await?;
+        if response.success {
+            version.bump();
+        }
+        Ok(response)
+    }
+
+    pub(super) async fn handle_rewind_versioned(
+        &self,
+        expected: RewindVersion,
+        request: RewindRequest,
+    ) -> anyhow::Result<RewindExecutionResult> {
+        let mut version = self.tool_context.rewind_authority.0.lock().await;
+        if *version != expected {
+            let rewind_points = self.get_rewind_points().await.rewind_points;
+            return Ok(RewindExecutionResult::Conflict {
+                expected,
+                snapshot: RewindSnapshot {
+                    version: version.clone(),
+                    rewind_points,
+                },
+            });
+        }
+        let wants_conversation =
+            matches!(request.mode, RewindMode::All | RewindMode::ConversationOnly);
+        let used_compaction_replay = request.force
+            && wants_conversation
+            && self
+                .chat_state_handle
+                .snapshot()
+                .await
+                .and_then(|snapshot| snapshot.last_compaction_prompt_index)
+                .is_some();
+        let response = self.handle_rewind_inner(request).await?;
+        if response.success {
+            version.bump();
+        }
+        Ok(RewindExecutionResult::Committed {
+            version: version.clone(),
+            response,
+            used_compaction_replay,
+        })
+    }
+
+    async fn handle_rewind_inner(&self, request: RewindRequest) -> anyhow::Result<RewindResponse> {
         self.signals_handle().mark_reverted();
 
         let target_index = request.target_prompt_index;

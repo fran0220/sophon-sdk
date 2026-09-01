@@ -115,6 +115,7 @@ pub(super) async fn run_one_turn_attempt(
         json_schema: input.request.runtime_overrides.output_schema.clone(),
         send_now: false,
         admission: None,
+        agent_admission: None,
         tool_overrides_update: None,
         respond_to: prompt_tx,
         prompt_admitted: Some(input.prompt_admitted),

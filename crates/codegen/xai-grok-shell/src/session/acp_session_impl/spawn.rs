@@ -946,6 +946,38 @@ pub(crate) async fn spawn_session_actor(
         }
         Arc::new(TokioMutex::new(state))
     };
+    let scheduler_prompt_tx = cmd_tx.clone();
+    let scheduler_prompt_ingress =
+        xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress::new(
+            move |scheduled, permit| {
+                let (respond_to, _completion) = oneshot::channel();
+                scheduler_prompt_tx
+                    .send(SessionCommand::Prompt {
+                        prompt_id: format!("scheduler-fired-{}", uuid::Uuid::now_v7()),
+                        prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            scheduled.prompt,
+                        ))],
+                        prompt_mode: PromptMode::Agent,
+                        artifact_upload_ctx: None,
+                        client_identifier: None,
+                        screen_mode: None,
+                        verbatim: true,
+                        traceparent: None,
+                        json_schema: None,
+                        send_now: false,
+                        admission: None,
+                        agent_admission: Some(permit),
+                        tool_overrides_update: None,
+                        respond_to,
+                        prompt_admitted: None,
+                        persist_ack: None,
+                        parsed_prompt_tx: None,
+                    })
+                    .map_err(|_| {
+                        xai_grok_tools::management::scheduler_ingress::SchedulerIngressError::SessionUnavailable
+                    })
+            },
+        );
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         terminal_backend: terminal_backend.clone(),
@@ -1012,6 +1044,8 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         },
+        admission: tool_context.admission.clone(),
+        scheduler_prompt_ingress,
     });
     use xai_grok_telemetry::subagent_spawn::SubagentSpawnPhase;
     let builder_started_at = std::time::Instant::now();

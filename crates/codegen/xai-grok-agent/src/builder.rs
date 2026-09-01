@@ -54,6 +54,9 @@ pub struct AgentBuilder {
     owner_session_id: Option<String>,
     parent_scheduler_handle:
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
+    admission: Option<xai_grok_tools::management::admission::AdmissionController>,
+    scheduler_prompt_ingress:
+        Option<xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress>,
     /// The agent definition, set via from_definition() or built up via individual with_*() calls.
     definition: Option<AgentDefinition>,
     /// Pre-rendered persona IO summaries for the task tool description.
@@ -195,6 +198,8 @@ impl AgentBuilder {
             notification_handle,
             owner_session_id: None,
             parent_scheduler_handle: None,
+            admission: None,
+            scheduler_prompt_ingress: None,
             definition: None,
             persona_summaries: Vec::new(),
             prompt_audience: crate::prompt::context::PromptAudience::Primary,
@@ -404,6 +409,15 @@ impl AgentBuilder {
         handle: xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle,
     ) -> Self {
         self.parent_scheduler_handle = Some(handle);
+        self
+    }
+    pub fn with_management_ingress(
+        mut self,
+        admission: xai_grok_tools::management::admission::AdmissionController,
+        ingress: xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress,
+    ) -> Self {
+        self.admission = Some(admission);
+        self.scheduler_prompt_ingress = Some(ingress);
         self
     }
     /// Set the web search configuration.
@@ -1034,6 +1048,8 @@ impl AgentBuilder {
                 owner_session_id: self.owner_session_id.clone(),
                 subagent: None,
                 parent_scheduler_handle: self.parent_scheduler_handle.take(),
+                admission: self.admission.take(),
+                scheduler_prompt_ingress: self.scheduler_prompt_ingress.take(),
                 skills: skill_info.clone(),
                 state_path,
                 memory_backend: self.memory_backend,

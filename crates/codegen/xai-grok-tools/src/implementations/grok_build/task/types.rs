@@ -164,6 +164,10 @@ pub enum ModelOverrideProvenance {
 
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
+    /// Agent-level admission retained by scheduler-originated work while it
+    /// is queued or running in the shared subagent coordinator. Never set by
+    /// model-facing task input.
+    pub agent_admission: Option<crate::management::admission::AdmissionPermit>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.

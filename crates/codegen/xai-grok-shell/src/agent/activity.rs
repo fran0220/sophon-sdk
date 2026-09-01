@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use xai_grok_telemetry::session_end::{self, Phase};
 
 use crate::session::pending_interaction::PendingInteractions;
@@ -37,6 +38,64 @@ const FLUSH_POLL: Duration = Duration::from_millis(50);
 /// Known gap: a `SessionEnd` hook configured with a longer `timeout` than this is still cut off at the grace.
 /// Aligning the two needs the hook registry's configured timeouts at flush time, which this layer does not see.
 pub const SESSION_FLUSH_GRACE: Duration = Duration::from_secs(10);
+
+/// Authoritative Agent-wide drain state. Session rows are actor round-trips;
+/// subagent/presentation counts are the coordinator's shared gauges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentDrainSnapshot {
+    pub sessions: Vec<crate::session::commands::SessionDrainSnapshot>,
+    pub subagents: usize,
+    pub presentations: usize,
+    pub unreachable_sessions: Vec<String>,
+}
+
+impl AgentDrainSnapshot {
+    pub fn queued_prompts(&self) -> usize {
+        self.sessions.iter().map(|s| s.queued_prompts).sum()
+    }
+
+    pub fn running_prompts(&self) -> usize {
+        self.sessions.iter().filter(|s| s.running_prompt).count()
+    }
+
+    pub fn outstanding_background_tasks(&self) -> usize {
+        self.sessions
+            .iter()
+            .map(|s| s.outstanding_background_tasks)
+            .sum()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.unreachable_sessions.is_empty()
+            && self.subagents == 0
+            && self.presentations == 0
+            && self.sessions.iter().all(|session| session.is_idle())
+    }
+}
+
+/// Result of fencing and draining an Agent. A timed-out report retains the
+/// exact last authoritative snapshot so replacement/shutdown code can refuse
+/// a lossy transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuiesceReport {
+    pub fence: xai_grok_tools::management::admission::AdmissionSnapshot,
+    pub admission: xai_grok_tools::management::admission::AdmissionSnapshot,
+    pub initial: AgentDrainSnapshot,
+    pub final_snapshot: AgentDrainSnapshot,
+    pub polls: u64,
+    pub elapsed: Duration,
+    pub timed_out: bool,
+}
+
+impl QuiesceReport {
+    pub fn drained(&self) -> bool {
+        !self.timed_out && self.admission.active == 0 && self.final_snapshot.is_idle()
+    }
+
+    pub fn rejected_during_quiesce(&self) -> u64 {
+        self.admission.rejected.saturating_sub(self.fence.rejected)
+    }
+}
 
 /// Per-session slice of state shared with the session actor (the same `Arc`s the actor mutates; see the matching `SessionHandle` fields).
 struct SessionActivityEntry {
@@ -74,6 +133,13 @@ struct ActivityInner {
     sessions: Mutex<Vec<SessionActivityEntry>>,
     /// Subagents currently initializing or running; kept in sync by the shared coordinator's `running_count_changed` callback.
     subagents: Arc<AtomicUsize>,
+    /// Completion presentation can enqueue a related synthetic prompt after
+    /// the coordinator's running count reaches zero. This gauge closes that
+    /// drain-observation window.
+    presentations: AtomicUsize,
+    /// The one admission authority shared by every session and scheduler
+    /// belonging to this agent.
+    admission: xai_grok_tools::management::admission::AdmissionController,
 }
 
 /// Cheap-to-clone, `Send + Sync` handle. See module docs.
@@ -83,6 +149,12 @@ pub struct AgentActivity {
 }
 
 impl AgentActivity {
+    pub(crate) fn admission_controller(
+        &self,
+    ) -> xai_grok_tools::management::admission::AdmissionController {
+        self.inner.admission.clone()
+    }
+
     /// Register a session's shared state at handle-creation time.
     /// No unregister exists; the entry expires when the actor exits.
     pub(crate) fn register_session(&self, id: &str, handle: &SessionHandle) {
@@ -99,6 +171,13 @@ impl AgentActivity {
         self.inner.subagents.clone()
     }
 
+    pub(crate) fn begin_presentation(&self) -> PresentationGuard {
+        self.inner.presentations.fetch_add(1, Ordering::AcqRel);
+        PresentationGuard {
+            activity: self.clone(),
+        }
+    }
+
     /// Whether the agent has live work: a running turn, a parked blocking interaction, or an initializing/running subagent.
     ///
     /// Known gap: prompts queued but not yet started (`pending_inputs` in the actor) are not mirrored here.
@@ -107,12 +186,111 @@ impl AgentActivity {
     /// The flush's quiesce loop re-snapshots and still ends such an actor via its Shutdown arm.
     pub fn is_busy(&self) -> bool {
         self.inner.subagents.load(Ordering::Relaxed) > 0
+            || self.inner.presentations.load(Ordering::Acquire) > 0
             || self.lock_live_sessions().iter().any(|e| e.is_busy())
     }
 
     /// Number of live registered sessions (diagnostics/tests).
     pub fn session_count(&self) -> usize {
         self.lock_live_sessions().len()
+    }
+
+    /// Fence all new Agent prompt admissions and wait for every unit accepted
+    /// before the fence, its FIFO turn, related session actor work, background
+    /// process, subagent, and completion presentation to settle.
+    pub async fn quiesce(&self, timeout: Duration) -> QuiesceReport {
+        const POLL: Duration = Duration::from_millis(25);
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        let fence = self.inner.admission.begin_quiesce();
+        let _ = self.inner.admission.wait_for_zero(deadline).await;
+        let initial = self.drain_snapshot(deadline).await;
+        let mut final_snapshot = initial.clone();
+        let mut polls = 1u64;
+
+        loop {
+            let admission = self.inner.admission.snapshot();
+            if admission.active == 0 && final_snapshot.is_idle() {
+                // Completion presenters enqueue their related session command
+                // before dropping the presentation gauge. A short quiet
+                // barrier followed by another actor round-trip proves that no
+                // such command was left behind the first snapshot.
+                if tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(POLL).await;
+                    final_snapshot = self.drain_snapshot(deadline).await;
+                    polls = polls.saturating_add(1);
+                }
+                let admission = self.inner.admission.snapshot();
+                if admission.active == 0 && final_snapshot.is_idle() {
+                    let admission = self.inner.admission.mark_quiesced();
+                    return QuiesceReport {
+                        fence,
+                        admission,
+                        initial,
+                        final_snapshot,
+                        polls,
+                        elapsed: started.elapsed(),
+                        timed_out: false,
+                    };
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return QuiesceReport {
+                    fence,
+                    admission: self.inner.admission.snapshot(),
+                    initial,
+                    final_snapshot,
+                    polls,
+                    elapsed: started.elapsed(),
+                    timed_out: true,
+                };
+            }
+            tokio::time::sleep(POLL).await;
+            final_snapshot = self.drain_snapshot(deadline).await;
+            polls = polls.saturating_add(1);
+        }
+    }
+
+    async fn drain_snapshot(&self, deadline: tokio::time::Instant) -> AgentDrainSnapshot {
+        let entries: Vec<_> = self
+            .lock_live_sessions()
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.cmd_tx.clone()))
+            .collect();
+        let mut pending = FuturesUnordered::new();
+        for (id, cmd_tx) in entries {
+            pending.push(async move {
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                if cmd_tx
+                    .send(SessionCommand::GetDrainSnapshot { respond_to })
+                    .is_err()
+                {
+                    return (id, None);
+                }
+                let snapshot = tokio::time::timeout_at(deadline, response)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                (id, snapshot)
+            });
+        }
+        let mut sessions = Vec::new();
+        let mut unreachable_sessions = Vec::new();
+        while let Some((id, snapshot)) = pending.next().await {
+            match snapshot {
+                Some(snapshot) => sessions.push(snapshot),
+                None => unreachable_sessions.push(id),
+            }
+        }
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        unreachable_sessions.sort();
+        AgentDrainSnapshot {
+            sessions,
+            subagents: self.inner.subagents.load(Ordering::Acquire),
+            presentations: self.inner.presentations.load(Ordering::Acquire),
+            unreachable_sessions,
+        }
     }
 
     /// Send [`SessionCommand::Shutdown`] to every live session actor and wait up to `grace` for them to exit, observed via `cmd_tx.is_closed()`.
@@ -206,6 +384,19 @@ impl AgentActivity {
     }
 }
 
+pub(crate) struct PresentationGuard {
+    activity: AgentActivity,
+}
+
+impl Drop for PresentationGuard {
+    fn drop(&mut self) {
+        self.activity
+            .inner
+            .presentations
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +426,24 @@ mod tests {
                 }
             }
             false
+        })
+    }
+
+    fn spawn_drain_actor(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+        snapshots: Vec<crate::session::commands::SessionDrainSnapshot>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut snapshots = std::collections::VecDeque::from(snapshots);
+            let mut last = crate::session::commands::SessionDrainSnapshot::default();
+            while let Some(command) = rx.recv().await {
+                if let SessionCommand::GetDrainSnapshot { respond_to } = command {
+                    if let Some(snapshot) = snapshots.pop_front() {
+                        last = snapshot;
+                    }
+                    let _ = respond_to.send(last.clone());
+                }
+            }
         })
     }
 
@@ -395,5 +604,44 @@ mod tests {
     async fn flush_with_no_sessions_is_noop() {
         let activity = AgentActivity::default();
         activity.flush_all_sessions(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn quiesce_reports_actor_fifo_drain_and_rejects_old_session_authority() {
+        let activity = AgentActivity::default();
+        let old_session_admission = activity.admission_controller();
+        let (rx, _prompt_id, _pending) = register_raw(&activity, "s1");
+        let actor = spawn_drain_actor(
+            rx,
+            vec![
+                crate::session::commands::SessionDrainSnapshot {
+                    session_id: "s1".into(),
+                    queued_prompts: 2,
+                    running_prompt: true,
+                    pending_interactions: 0,
+                    outstanding_background_tasks: 1,
+                },
+                crate::session::commands::SessionDrainSnapshot {
+                    session_id: "s1".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let report = activity.quiesce(Duration::from_secs(1)).await;
+
+        assert!(report.drained());
+        assert_eq!(report.initial.queued_prompts(), 2);
+        assert_eq!(report.initial.running_prompts(), 1);
+        assert_eq!(report.initial.outstanding_background_tasks(), 1);
+        assert!(report.final_snapshot.is_idle());
+        let rejection = old_session_admission
+            .try_admit(xai_grok_tools::management::admission::AdmissionSource::Human)
+            .expect_err("a pre-fence session authority must reject after quiesce");
+        assert_eq!(
+            rejection.state,
+            xai_grok_tools::management::admission::AdmissionState::Quiesced
+        );
+        actor.abort();
     }
 }

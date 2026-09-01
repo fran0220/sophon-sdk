@@ -5,7 +5,8 @@
 
 pub use xai_prompt_queue::{
     COMBINED_DISPLAY_TEXTS_META, CombineGate, QueueChanged, QueueEntryMeta, QueueEntryWire,
-    TEXT_SEPARATOR, combine_prefix_len, is_combined, join_texts, stamp_combined_display_texts,
+    QueueVersion, TEXT_SEPARATOR, combine_prefix_len, is_combined, join_texts,
+    stamp_combined_display_texts,
 };
 
 // Outbound method for broadcast_queue_changed. This is an ACP routing concern, not a queue concern.
@@ -19,6 +20,8 @@ mod tests {
     fn queue_changed_serializes_camel_case_with_session_id() {
         let payload = QueueChanged {
             session_id: "sess-1".to_string(),
+            generation: "queue-gen".to_string(),
+            revision: 1,
             entries: vec![QueueEntryWire {
                 id: "p1".to_string(),
                 version: 0,
@@ -49,6 +52,8 @@ mod tests {
     fn queue_changed_round_trips_running_prompt_id() {
         let payload = QueueChanged {
             session_id: "sess-1".to_string(),
+            generation: "queue-gen".to_string(),
+            revision: 2,
             entries: Vec::new(),
             running_prompt_id: Some("prompt-running".to_string()),
 

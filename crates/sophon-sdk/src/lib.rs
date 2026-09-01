@@ -3,13 +3,15 @@
 
 //! Thin provider-aware embedding facade over the pinned Grok Build source.
 //!
-//! Provider routing and an async Agent/Session API are SDK-owned. Agent
-//! execution, tools, persistence, skills, plugins, MCP, and model behavior stay
-//! upstream-owned. ACP is a private adapter and the TUI is not part of this API.
+//! Provider routing and the typed async Agent/Session management facade are
+//! SDK-owned. Agent execution, FIFO/task state, tools, persistence, skills,
+//! plugins, MCP, and model behavior stay upstream-owned. ACP is a private
+//! adapter and the TUI is not part of this API.
 
 mod client;
 mod config;
 mod event;
+pub mod management;
 mod runtime;
 
 use std::fmt;
@@ -33,6 +35,14 @@ pub enum Error {
     Start(String),
     #[error("Grok Build operation failed: {0}")]
     Operation(String),
+    #[error("agent {admission_source:?} admission is closed at generation {generation}")]
+    AdmissionRejected {
+        generation: u64,
+        state: management::AdmissionState,
+        admission_source: management::AdmissionSource,
+    },
+    #[error("agent quiesce timed out before all accepted work drained")]
+    QuiesceTimedOut(management::QuiesceReport),
     #[error("the embedding does not handle Grok Build client request: {0}")]
     UnsupportedClientRequest(String),
     #[error("Grok Build runtime stopped")]
