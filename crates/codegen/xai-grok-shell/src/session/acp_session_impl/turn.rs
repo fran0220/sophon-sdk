@@ -1833,42 +1833,39 @@ impl SessionActor {
         let completion_req = match agent_ref.completion_requirement() {
             Some(req) => req,
             None => {
-                return self
-                    .process_conversation_turn(
-                        req_id,
-                        trace_gcs_config,
-                        artifact_tracker.as_ref(),
-                        json_schema,
-                        &mut *salvage,
-                    )
-                    .await;
+                return Box::pin(self.process_conversation_turn(
+                    req_id,
+                    trace_gcs_config,
+                    artifact_tracker.as_ref(),
+                    json_schema,
+                    &mut *salvage,
+                ))
+                .await;
             }
         };
         let recovery = match &completion_req.recovery {
             Some(r) => r.clone(),
             None => {
-                return self
-                    .process_conversation_turn(
-                        req_id,
-                        trace_gcs_config,
-                        artifact_tracker.as_ref(),
-                        json_schema,
-                        &mut *salvage,
-                    )
-                    .await;
+                return Box::pin(self.process_conversation_turn(
+                    req_id,
+                    trace_gcs_config,
+                    artifact_tracker.as_ref(),
+                    json_schema,
+                    &mut *salvage,
+                ))
+                .await;
             }
         };
         let required_tool = completion_req.tool.clone();
         let recovery_prompt = completion_req.reminder.clone();
-        let mut result = self
-            .process_conversation_turn(
-                req_id,
-                trace_gcs_config.clone(),
-                artifact_tracker.as_ref(),
-                json_schema.clone(),
-                &mut *salvage,
-            )
-            .await;
+        let mut result = Box::pin(self.process_conversation_turn(
+            req_id,
+            trace_gcs_config.clone(),
+            artifact_tracker.as_ref(),
+            json_schema.clone(),
+            &mut *salvage,
+        ))
+        .await;
         if matches!(
             result,
             Ok(TurnOutcome::MaxTurnsReached { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
@@ -1929,15 +1926,14 @@ impl SessionActor {
             salvage.round_boundary();
             let recovery_message = ConversationItem::auto_recovery(recovery_prompt.clone());
             self.chat_state_handle.push_user_message(recovery_message);
-            result = self
-                .process_conversation_turn(
-                    req_id,
-                    trace_gcs_config.clone(),
-                    artifact_tracker.as_ref(),
-                    None,
-                    &mut *salvage,
-                )
-                .await;
+            result = Box::pin(self.process_conversation_turn(
+                req_id,
+                trace_gcs_config.clone(),
+                artifact_tracker.as_ref(),
+                None,
+                &mut *salvage,
+            ))
+            .await;
             if matches!(
                 result,
                 Ok(TurnOutcome::MaxTurnsReached { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
