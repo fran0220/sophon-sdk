@@ -192,7 +192,10 @@ The management invariants are:
   sequence. Queue events carry full versioned snapshots; scheduler and
   effective-config events carry native versions; other event domains explicitly
   set `snapshot_required`. Tokio broadcast lag is never hidden—refetch the
-  authoritative typed snapshot.
+  authoritative typed snapshot. Queue rows expose their typed human, scheduler,
+  or internal origin, and scheduler-owned prompts emit a typed durable
+  `SessionUpdate::TurnCompleted` terminal, so an embedding never parses native
+  prompt IDs or terminal JSON to adopt autonomous work.
 - **No credentials.** Effective configuration reports routing/model/protocol,
   context, media/auxiliary choices, and header/query *names*. API keys, bearer
   values, header/query values, credential files, and browser state are absent.
@@ -228,11 +231,11 @@ The management invariants are:
   retain the complete Grok Build `x.ai/*` JSON seam for new, experimental, or
   uncommon capabilities. Stable consumers do not need to spell the typed
   management method names or parse their responses.
-- `Event` projects common user/assistant/thought, tool-call, and plan updates.
-  Unmirrored standard updates remain available as JSON through
-  `SessionUpdate::Other`; xAI extension notifications remain available through
-  `Event::Extension`. This is the forward-compatible escape hatch for upstream
-  additions, not a second protocol model.
+- `Event` projects common user/assistant/thought, tool-call, plan, and durable
+  turn-terminal updates. Unmirrored standard updates remain available as JSON
+  through `SessionUpdate::Other`; xAI extension notifications remain available
+  through `Event::Extension`. This is the forward-compatible escape hatch for
+  upstream additions, not a second protocol model.
 - `PermissionPolicy` supports fail-closed `DenyAll` (the default), `AllowAll`,
   or host-delegated decisions. `ClientHandler` also receives blocking
   agent-to-host extension calls such as ask-user, folder trust, plan exit,
@@ -267,8 +270,8 @@ non-TUI capability reachable from that agent has an SDK path:
 | Native repository, terminal, web-fetch, web-search, image and video tools | executed by the upstream agent; configured through `GROK_HOME` and provider routes |
 | Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; raw summary/compaction extensions |
 | Runtime lifecycle and lossless Agent replacement | typed health watch, Agent-wide admission fence, `quiesce`, and loss-refusing `shutdown` |
-| Native prompt FIFO | typed running/pending snapshot; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
-| Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events |
+| Native prompt FIFO | typed running/pending snapshot with prompt origin; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
+| Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events; typed durable terminal for directly admitted foreground occurrences |
 | Background terminal tasks | typed records/list and kill outcomes; snapshot-required start/completion events |
 | Subagents | typed running list, inspect, cancel, status/results, and snapshot-required lifecycle events |
 | Rewind | typed points, generation/revision CAS, modes, file conflicts, result, and cross-compaction replay reporting |

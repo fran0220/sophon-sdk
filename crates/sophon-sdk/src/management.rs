@@ -229,6 +229,7 @@ impl QuiesceReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueEntry {
     pub id: QueueEntryId,
+    pub source: QueueEntrySource,
     pub version: u64,
     pub owner: Option<String>,
     pub last_editor: Option<String>,
@@ -241,9 +242,18 @@ pub struct QueueEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunningQueueEntry {
     pub id: QueueEntryId,
+    pub source: QueueEntrySource,
     pub kind: Option<String>,
     pub text: Option<String>,
     pub combined_texts: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QueueEntrySource {
+    Human,
+    Scheduler,
+    Internal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1019,6 +1029,7 @@ pub enum SubagentEvent {
 
 pub(crate) fn queue_snapshot(snapshot: xai_prompt_queue::QueueChanged) -> QueueSnapshot {
     let running = snapshot.running_prompt_id.map(|id| RunningQueueEntry {
+        source: queue_entry_source(&id),
         id: QueueEntryId::new(id),
         kind: snapshot.running_kind,
         text: snapshot.running_text,
@@ -1035,6 +1046,7 @@ pub(crate) fn queue_snapshot(snapshot: xai_prompt_queue::QueueChanged) -> QueueS
             .entries
             .into_iter()
             .map(|entry| QueueEntry {
+                source: queue_entry_source(&entry.id),
                 id: QueueEntryId::new(entry.id),
                 version: entry.version,
                 owner: entry.owner,
@@ -1045,6 +1057,23 @@ pub(crate) fn queue_snapshot(snapshot: xai_prompt_queue::QueueChanged) -> QueueS
                 position: entry.position,
             })
             .collect(),
+    }
+}
+
+fn queue_entry_source(id: &str) -> QueueEntrySource {
+    use xai_grok_shell::session::PromptOrigin;
+
+    match PromptOrigin::from_prompt_id(id) {
+        PromptOrigin::User => QueueEntrySource::Human,
+        PromptOrigin::SchedulerFired => QueueEntrySource::Scheduler,
+        PromptOrigin::TaskCompleted { .. }
+        | PromptOrigin::SubagentCompleted { .. }
+        | PromptOrigin::ParentAgentMessage { .. }
+        | PromptOrigin::WorkflowCompleted { .. }
+        | PromptOrigin::NotificationDrain
+        | PromptOrigin::GoalSummary
+        | PromptOrigin::GoalClassifierNudge
+        | PromptOrigin::PlanResume => QueueEntrySource::Internal,
     }
 }
 

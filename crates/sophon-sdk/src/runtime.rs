@@ -1849,8 +1849,71 @@ fn session_update(update: acp::SessionUpdate) -> SessionUpdate {
                 })
                 .collect(),
         ),
-        other => SessionUpdate::Other(serde_json::to_value(other).unwrap_or_default()),
+        other => other_session_update(serde_json::to_value(other).unwrap_or_default()),
     }
+}
+
+fn other_session_update(value: serde_json::Value) -> SessionUpdate {
+    if value
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+        == Some("turn_completed")
+        && let Some(completion) = turn_completion(&value)
+    {
+        return SessionUpdate::TurnCompleted(completion);
+    }
+    SessionUpdate::Other(value)
+}
+
+fn turn_completion(value: &serde_json::Value) -> Option<crate::TurnCompletion> {
+    let usage = value.get("usage").map(|usage| crate::TurnUsage {
+        input_tokens: unsigned_field(usage, &["inputTokens", "input_tokens"]),
+        output_tokens: unsigned_field(usage, &["outputTokens", "output_tokens"]),
+        total_tokens: unsigned_field(usage, &["totalTokens", "total_tokens"]),
+        cached_read_tokens: unsigned_field(usage, &["cachedReadTokens", "cached_read_tokens"]),
+        cache_creation_tokens: unsigned_field(
+            usage,
+            &["cacheCreationTokens", "cache_creation_tokens"],
+        ),
+        reasoning_tokens: unsigned_field(usage, &["reasoningTokens", "reasoning_tokens"]),
+        model_calls: unsigned_field(usage, &["modelCalls", "model_calls"]),
+        api_duration_ms: unsigned_field(usage, &["apiDurationMs", "api_duration_ms"]),
+        cost_usd_ticks: field(usage, &["costUsdTicks", "cost_usd_ticks"])
+            .and_then(serde_json::Value::as_i64),
+        cost_is_partial: field(usage, &["costIsPartial", "cost_is_partial"])
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        turns: unsigned_field(usage, &["numTurns", "num_turns"]),
+        incomplete: field(usage, &["usageIsIncomplete", "usage_is_incomplete"])
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    });
+    Some(crate::TurnCompletion {
+        prompt_id: string_field(value, &["promptId", "prompt_id"])?,
+        stop_reason: completion_stop_reason(&string_field(value, &["stopReason", "stop_reason"])?),
+        agent_result: string_field(value, &["agentResult", "agent_result"]),
+        error_kind: string_field(value, &["errorKind", "error_kind"]),
+        usage,
+        elapsed_ms: field(value, &["elapsedMs", "elapsed_ms"]).and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn completion_stop_reason(value: &str) -> crate::StopReason {
+    match value {
+        "end_turn" => crate::StopReason::EndTurn,
+        "max_tokens" => crate::StopReason::MaxTokens,
+        "max_turn_requests" => crate::StopReason::MaxTurnRequests,
+        "refusal" => crate::StopReason::Refusal,
+        "cancelled" => crate::StopReason::Cancelled,
+        "error" => crate::StopReason::Error,
+        _ => crate::StopReason::Other,
+    }
+}
+
+fn unsigned_field(value: &serde_json::Value, names: &[&str]) -> u64 {
+    field(value, names)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
 }
 
 fn text_update(
@@ -2498,6 +2561,97 @@ mod tests {
                 snapshot_required: true,
                 ..
             }) if task_id.as_str() == "task-1"
+        ));
+    }
+
+    #[test]
+    fn queue_snapshot_exposes_actor_prompt_origins_without_id_parsing_downstream() {
+        let snapshot = mgmt::queue_snapshot(xai_prompt_queue::QueueChanged {
+            session_id: "s1".into(),
+            generation: "queue-generation".into(),
+            revision: 3,
+            entries: vec![xai_prompt_queue::QueueEntryWire {
+                id: "task-completed-task-1".into(),
+                version: 1,
+                owner: None,
+                last_editor: None,
+                kind: "prompt".into(),
+                text: "task terminal".into(),
+                combined_texts: None,
+                position: 0,
+            }],
+            running_prompt_id: Some("scheduler-fired-occurrence-1".into()),
+            running_text: Some("scheduled prompt".into()),
+            running_kind: Some("prompt".into()),
+            running_combined_texts: None,
+        });
+
+        assert!(matches!(
+            snapshot.running,
+            Some(mgmt::RunningQueueEntry {
+                source: mgmt::QueueEntrySource::Scheduler,
+                ..
+            })
+        ));
+        assert!(matches!(
+            snapshot.pending.as_slice(),
+            [mgmt::QueueEntry {
+                source: mgmt::QueueEntrySource::Internal,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn durable_turn_terminal_is_projected_without_raw_json_downstream() {
+        let update = other_session_update(serde_json::json!({
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "scheduler-fired-occurrence-1",
+            "stop_reason": "error",
+            "agent_result": "connection reset",
+            "error_kind": "provider_error",
+            "elapsed_ms": 1234,
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 4,
+                "totalTokens": 14,
+                "cachedReadTokens": 3,
+                "cacheCreationTokens": 2,
+                "reasoningTokens": 1,
+                "modelCalls": 2,
+                "apiDurationMs": 900,
+                "costUsdTicks": 42,
+                "costIsPartial": true,
+                "numTurns": 2,
+                "usageIsIncomplete": true
+            }
+        }));
+
+        assert!(matches!(
+            update,
+            SessionUpdate::TurnCompleted(crate::TurnCompletion {
+                prompt_id,
+                stop_reason: crate::StopReason::Error,
+                agent_result: Some(agent_result),
+                error_kind: Some(error_kind),
+                elapsed_ms: Some(1234),
+                usage: Some(crate::TurnUsage {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    total_tokens: 14,
+                    cached_read_tokens: 3,
+                    cache_creation_tokens: 2,
+                    reasoning_tokens: 1,
+                    model_calls: 2,
+                    api_duration_ms: 900,
+                    cost_usd_ticks: Some(42),
+                    cost_is_partial: true,
+                    turns: 2,
+                    incomplete: true,
+                }),
+            }) if prompt_id == "scheduler-fired-occurrence-1"
+                && agent_result == "connection reset"
+                && error_kind == "provider_error"
         ));
     }
 }

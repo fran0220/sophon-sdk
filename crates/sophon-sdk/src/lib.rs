@@ -24,7 +24,9 @@ pub use config::{
     AgentConfig, MediaConfig, MediaProviderConfig, ModelConfig, PermissionPolicy, ProviderConfig,
     ProviderProtocol,
 };
-pub use event::{Event, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate};
+pub use event::{
+    Event, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate, TurnCompletion, TurnUsage,
+};
 pub use runtime::Agent;
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +135,7 @@ pub enum StopReason {
     MaxTurnRequests,
     Refusal,
     Cancelled,
+    Error,
     Other,
 }
 

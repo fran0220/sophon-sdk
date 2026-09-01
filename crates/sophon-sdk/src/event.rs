@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::SessionId;
+use crate::{SessionId, StopReason};
 
 /// Streaming output emitted by the embedded Grok Build agent.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,7 +29,36 @@ pub enum SessionUpdate {
     ToolCall(Box<ToolCall>),
     ToolCallUpdate(Box<ToolCallUpdate>),
     Plan(Vec<PlanEntry>),
+    /// Durable terminal for a prompt admitted without a [`crate::Session`]
+    /// prompt future, such as a scheduler-owned foreground occurrence.
+    TurnCompleted(TurnCompletion),
     Other(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnCompletion {
+    pub prompt_id: String,
+    pub stop_reason: StopReason,
+    pub agent_result: Option<String>,
+    pub error_kind: Option<String>,
+    pub usage: Option<TurnUsage>,
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub model_calls: u64,
+    pub api_duration_ms: u64,
+    pub cost_usd_ticks: Option<i64>,
+    pub cost_is_partial: bool,
+    pub turns: u64,
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
