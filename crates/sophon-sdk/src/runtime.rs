@@ -126,13 +126,16 @@ struct AgentInner {
 #[derive(Clone)]
 struct ManagementEmitter {
     events: broadcast::Sender<mgmt::ManagementEvent>,
+    ordered_events: broadcast::Sender<Event>,
     sequence: Arc<AtomicU64>,
 }
 
 impl ManagementEmitter {
     fn send(&self, kind: mgmt::ManagementEventKind) {
         let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = self.events.send(mgmt::ManagementEvent { sequence, kind });
+        let event = mgmt::ManagementEvent { sequence, kind };
+        let _ = self.events.send(event.clone());
+        let _ = self.ordered_events.send(Event::Management(event));
     }
 }
 
@@ -159,6 +162,7 @@ impl Agent {
         let (management_events, _) = broadcast::channel(256);
         let management = ManagementEmitter {
             events: management_events.clone(),
+            ordered_events: events.clone(),
             sequence: Arc::new(AtomicU64::new(0)),
         };
         let (runtime_health_tx, runtime_health) = watch::channel(mgmt::RuntimeHealth {
@@ -206,12 +210,17 @@ impl Agent {
         }
     }
 
+    /// Subscribes to the one causally ordered stream of typed management and
+    /// raw Session/extension events. A lag error means this event history is
+    /// incomplete and cannot be repaired from a current management snapshot.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
     }
 
-    /// Subscribe to typed management events. If `recv()` returns `Lagged` or
+    /// Subscribes to management events only. If `recv()` returns `Lagged` or
     /// event sequences jump, recover with the authoritative domain snapshot.
+    /// Consumers correlating management with Session content must instead use
+    /// the causally ordered [`Self::subscribe`] stream.
     pub fn subscribe_management(&self) -> broadcast::Receiver<mgmt::ManagementEvent> {
         self.inner.management_events.subscribe()
     }
@@ -2518,11 +2527,14 @@ mod tests {
     #[tokio::test]
     async fn lagged_management_events_recover_from_authoritative_queue_snapshot() {
         let (events, _) = broadcast::channel(2);
+        let (ordered_events, _) = broadcast::channel(4);
         let emitter = ManagementEmitter {
             events: events.clone(),
+            ordered_events: ordered_events.clone(),
             sequence: Arc::new(AtomicU64::new(0)),
         };
         let mut subscriber = events.subscribe();
+        let mut ordered_subscriber = ordered_events.subscribe();
         for revision in 1..=3 {
             emitter.send(mgmt::ManagementEventKind::Queue(mgmt::QueueSnapshot {
                 session_id: SessionId("s1".into()),
@@ -2547,6 +2559,21 @@ mod tests {
         });
         assert_eq!(recovered.version.revision, 3);
         assert_eq!(recovered.version.generation, "queue-generation");
+
+        for expected_revision in 1..=3 {
+            let Event::Management(mgmt::ManagementEvent {
+                sequence,
+                kind: mgmt::ManagementEventKind::Queue(snapshot),
+            }) = ordered_subscriber
+                .recv()
+                .await
+                .expect("ordered management event")
+            else {
+                panic!("management event missing from causally ordered stream");
+            };
+            assert_eq!(sequence, expected_revision);
+            assert_eq!(snapshot.version.revision, expected_revision);
+        }
     }
 
     #[test]

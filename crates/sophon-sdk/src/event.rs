@@ -6,6 +6,9 @@ use crate::{SessionId, StopReason};
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
+    /// Stable typed management state published in causal order with the raw
+    /// Session or extension notification that produced it.
+    Management(crate::management::ManagementEvent),
     Session {
         session_id: SessionId,
         update: SessionUpdate,

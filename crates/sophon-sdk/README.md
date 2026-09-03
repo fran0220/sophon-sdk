@@ -54,8 +54,12 @@ let session = agent
 let result = session.prompt("Inspect this repository and summarize it").await?;
 assert_eq!(result.stop_reason, StopReason::EndTurn);
 
-while let Ok(Event::Session { update, .. }) = events.try_recv() {
-    if let SessionUpdate::AssistantText(text) = update {
+while let Ok(event) = events.try_recv() {
+    if let Event::Session {
+        update: SessionUpdate::AssistantText(text),
+        ..
+    } = event
+    {
         print!("{text}");
     }
 }
@@ -188,14 +192,18 @@ The management invariants are:
   generation/revision and a caller operation ID. Conflicts return the current
   snapshot. Successful operation receipts are replayable within that actor
   incarnation; reusing an ID for a different request is rejected.
-- **Recoverable observation.** Management events have an Agent-global monotonic
-  sequence. Queue events carry full versioned snapshots; scheduler and
-  effective-config events carry native versions; other event domains explicitly
-  set `snapshot_required`. Tokio broadcast lag is never hidden—refetch the
-  authoritative typed snapshot. Queue rows expose their typed human, scheduler,
-  or internal origin, and scheduler-owned prompts emit a typed durable
-  `SessionUpdate::TurnCompleted` terminal, so an embedding never parses native
-  prompt IDs or terminal JSON to adopt autonomous work.
+- **Ordered observation.** `Agent::subscribe` publishes typed management and
+  raw Session/extension events in one causal order. In particular, the prior
+  prompt's terminal state precedes successor promotion, and promotion precedes
+  successor content. A lag in that stream is unrecoverable event-history loss.
+  The management-only stream has an Agent-global monotonic sequence; queue
+  events carry full versioned snapshots, scheduler and effective-config events
+  carry native versions, and other domains explicitly set `snapshot_required`.
+  A management-only lag is recovered from the authoritative typed snapshot.
+  Queue rows expose their typed human, scheduler, or internal origin, and
+  scheduler-owned prompts emit a typed durable `SessionUpdate::TurnCompleted`
+  terminal, so an embedding never parses native prompt IDs or terminal JSON to
+  adopt autonomous work.
 - **No credentials.** Effective configuration reports routing/model/protocol,
   context, media/auxiliary choices, and header/query *names*. API keys, bearer
   values, header/query values, credential files, and browser state are absent.
@@ -231,11 +239,12 @@ The management invariants are:
   retain the complete Grok Build `x.ai/*` JSON seam for new, experimental, or
   uncommon capabilities. Stable consumers do not need to spell the typed
   management method names or parse their responses.
-- `Event` projects common user/assistant/thought, tool-call, plan, and durable
-  turn-terminal updates. Unmirrored standard updates remain available as JSON
-  through `SessionUpdate::Other`; xAI extension notifications remain available
-  through `Event::Extension`. This is the forward-compatible escape hatch for
-  upstream additions, not a second protocol model.
+- `Event` carries typed management plus common user/assistant/thought,
+  tool-call, plan, and durable turn-terminal updates in one causal stream.
+  Unmirrored standard updates remain available as JSON through
+  `SessionUpdate::Other`; xAI extension notifications remain available through
+  `Event::Extension`. This is the forward-compatible escape hatch for upstream
+  additions, not a second protocol model.
 - `PermissionPolicy` supports fail-closed `DenyAll` (the default), `AllowAll`,
   or host-delegated decisions. `ClientHandler` also receives blocking
   agent-to-host extension calls such as ask-user, folder trust, plan exit,
