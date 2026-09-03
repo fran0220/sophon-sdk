@@ -58,6 +58,13 @@ public_snapshot_repairs=(
   crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
 )
 
+goal_reliability=(
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal_support.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_tests/goal/goal_planner_e2e_tests.rs
+)
+
 typed_management=(
   crates/codegen/xai-grok-agent/src/builder.rs
   crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs
@@ -117,6 +124,7 @@ all_approved=(
   "${hermetic_discovery[@]}"
   "${windows_portability[@]}"
   "${public_snapshot_repairs[@]}"
+  "${goal_reliability[@]}"
   "${typed_management[@]}"
 )
 exclusions=(
@@ -168,6 +176,10 @@ verify_digest \
   public-snapshot-repairs \
   "$digest_dir/public-snapshot-repairs.sha256" \
   "${public_snapshot_repairs[@]}"
+verify_digest \
+  goal-reliability \
+  "$digest_dir/goal-reliability.sha256" \
+  "${goal_reliability[@]}"
 verify_digest \
   typed-management \
   "$digest_dir/typed-management.sha256" \

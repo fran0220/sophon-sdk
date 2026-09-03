@@ -784,7 +784,11 @@ impl SessionActor {
         )
     }
 
-    pub(super) async fn setup_goal(&self, objective: &str, token_budget: Option<i64>) -> String {
+    pub(super) async fn setup_goal(
+        &self,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> GoalSetupOutcome {
         let goal_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
         let token_baseline = self.chat_state_handle.get_total_tokens().await as i64;
@@ -818,6 +822,16 @@ impl SessionActor {
 
         self.maybe_run_goal_planner(objective).await;
 
+        if let Some(message) = self.goal_tracker.lock().snapshot().and_then(|goal| {
+            goal.status.is_paused().then(|| {
+                goal.pause_message
+                    .clone()
+                    .unwrap_or_else(planner_failure_pause_message)
+            })
+        }) {
+            return GoalSetupOutcome::Message(message);
+        }
+
         let names = self.resolve_goal_tool_names().await;
         let planner_enabled = self.goal_planner_enabled;
         let body = {
@@ -850,7 +864,9 @@ impl SessionActor {
                 )
             }
         };
-        format!("<system-reminder>\n{body}\nStart now.\n</system-reminder>\n\n")
+        GoalSetupOutcome::Inference(format!(
+            "<system-reminder>\n{body}\nStart now.\n</system-reminder>\n\n"
+        ))
     }
 
     pub(super) async fn resume_goal(&self) -> GoalResumeOutcome {

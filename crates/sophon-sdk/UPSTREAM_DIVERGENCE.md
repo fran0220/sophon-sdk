@@ -1,6 +1,6 @@
 # Maintained Grok Build divergences
 
-Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for five
+Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for six
 explicitly reviewed patch groups. Each group has its own file list and SHA-256
 digest under `upstream-patches/`; `scripts/check-upstream-sync.sh` rejects both
 changes outside these lists and drift within a listed group.
@@ -102,6 +102,30 @@ Approved file (digest: `public-snapshot-repairs.sha256`):
 
 - `crates/codegen/xai-grok-shell/src/upload/memory_tests.rs`
 
+## Goal reliability
+
+Goal planning keeps its fail-closed contract on every host:
+
+- publishing a staged plan and its immutable baseline uses Windows
+  extended-length paths, so a valid plan is not discarded merely because the
+  embedding's Session directory exceeds legacy `MAX_PATH`;
+- publication errors retain their source, destination and operating-system
+  detail in logs instead of collapsing into an unexplained pause;
+- when initial planning does fail, `/goal <objective>` ends that Turn with the
+  canonical paused message instead of running ordinary inference under a Goal
+  that is no longer active, matching the existing `/goal resume` behavior.
+
+Approved files (digest: `goal-reliability.sha256`):
+
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal_support.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/goal/goal_planner_e2e_tests.rs`
+
+`turn.rs` intentionally overlaps typed management because both Goal slash
+control flow and typed prompt admission share that boundary. Both digests
+therefore detect changes to it.
+
 ## Typed management authority
 
 The embedded SDK has a stable provider-aware management plane without copying
@@ -183,7 +207,7 @@ diff for its exact file set, so either boundary detects drift.
 
 1. Import the complete public snapshot and update
    `UPSTREAM_GROK_BUILD_COMMIT` and `SOURCE_REV`.
-2. Reconcile only the five groups above with the new upstream paths.
+2. Reconcile only the six groups above with the new upstream paths.
 3. Run the focused provider, hermetic-discovery, Windows compile, actor
    management, and SDK checks.
 4. Regenerate each digest independently using the corresponding exact array

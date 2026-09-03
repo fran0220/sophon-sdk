@@ -536,8 +536,15 @@ impl SessionActor {
                         token_budget,
                     } => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);
-                        let reminder = self.setup_goal(&objective, token_budget).await;
-                        vec![text_block(reminder)]
+                        match self.setup_goal(&objective, token_budget).await {
+                            GoalSetupOutcome::Inference(reminder) => vec![text_block(reminder)],
+                            GoalSetupOutcome::Message(msg) => {
+                                self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.mark_front_message_committed().await;
+                                self.send_host_turn_slash_command_output(&msg).await;
+                                return ok_end_turn(0, None);
+                            }
+                        }
                     }
                     BuiltinAction::GoalResume => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);

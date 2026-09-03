@@ -173,6 +173,14 @@ pub(super) enum GoalResumeOutcome {
     Message(String),
 }
 
+/// Result of [`SessionActor::setup_goal()`] (`/goal <objective>`).
+pub(super) enum GoalSetupOutcome {
+    /// Planning left the goal active: run an inference turn seeded with this reminder.
+    Inference(String),
+    /// Planning paused the goal: print this message and end the turn.
+    Message(String),
+}
+
 /// Goal-only `<task_completion_discipline>` (Rules 1-4); `{TODO_TOOL}` from [`GoalToolNames`].
 /// Template must end with `\n` so `{DISCIPLINE_BLOCK}TRACKING:` glues correctly.
 pub(super) fn render_goal_task_discipline(names: &GoalToolNames) -> String {
@@ -831,6 +839,73 @@ mod fold_tokens_by_model_tests {
     }
 }
 
+#[cfg(windows)]
+fn extended_length_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let path = std::path::absolute(path)?;
+    let path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if path.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        || path.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        return Ok(OsString::from_wide(&path).into());
+    }
+    let mut extended = if path.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        r"\\?\UNC\".encode_utf16().collect::<Vec<_>>()
+    } else {
+        r"\\?\".encode_utf16().collect::<Vec<_>>()
+    };
+    extended.extend_from_slice(if path.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        &path[2..]
+    } else {
+        &path
+    });
+    Ok(OsString::from_wide(&extended).into())
+}
+
+#[cfg(not(windows))]
+fn extended_length_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+#[cfg(all(test, windows))]
+mod extended_length_path_tests {
+    use super::extended_length_path;
+
+    #[test]
+    fn temp_path_persists_beyond_legacy_max_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut directory = temp.path().to_path_buf();
+        while directory.as_os_str().len() < 300 {
+            directory.push("long-goal-session-component");
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        let staged = directory.join("plan-attempt.md");
+        let canonical = directory.join("plan.md");
+        std::fs::write(&staged, "# Plan\n").unwrap();
+
+        tempfile::TempPath::try_from_path(extended_length_path(&staged).unwrap())
+            .unwrap()
+            .persist(extended_length_path(&canonical).unwrap())
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(canonical).unwrap(), "# Plan\n");
+    }
+
+    #[test]
+    fn relative_mixed_path_is_absolute_and_normalized_before_prefixing() {
+        let path = extended_length_path(std::path::Path::new(
+            r"relative/goal-component\..\goal-component/plan.md",
+        ))
+        .unwrap();
+        let rendered = path.to_string_lossy();
+        assert!(rendered.starts_with(r"\\?\"), "{rendered}");
+        assert!(!rendered.contains('/'), "{rendered}");
+        assert!(!rendered.contains(r"\..\"), "{rendered}");
+    }
+}
+
 /// Resolved per-role `/goal` model selection, cached on the actor.
 ///
 /// `Default` (every role `InheritCurrent`, empty skeptic pool) reproduces today's behavior.
@@ -1071,7 +1146,17 @@ impl SessionActor {
                     // Turn the "planning…" badge off NOW, before the plan/baseline I/O below, instead of only at the very end
                     // That way the UI never advertises "planning" while it can no longer replan
                     self.clear_goal_planning_latch(run_goal_id.as_deref()).await;
-                    if attempt_file.persist(&plan_file).is_err() {
+                    let staged_plan_file = attempt_file.to_path_buf();
+                    let publish = extended_length_path(&plan_file).and_then(|destination| {
+                        attempt_file.persist(destination).map_err(Into::into)
+                    });
+                    if let Err(error) = publish {
+                        tracing::warn!(
+                            error = %error,
+                            source = %staged_plan_file.display(),
+                            destination = %plan_file.display(),
+                            "goal planner: failed to publish staged plan",
+                        );
                         let still_same_goal =
                             self.goal_tracker.lock().snapshot().is_some_and(|goal| {
                                 same_active_goal(goal) && goal.plan_file.is_none()
@@ -1106,18 +1191,25 @@ impl SessionActor {
                     if let Some((src, dst)) = baseline_target {
                         let tmp = dst
                             .with_file_name(format!("plan-baseline-{}.md", uuid::Uuid::now_v7()));
-                        let baseline_file = match tempfile::TempPath::try_from_path(tmp.clone()) {
+                        let baseline_file = match extended_length_path(&tmp)
+                            .and_then(tempfile::TempPath::try_from_path)
+                        {
                             Ok(guard) => guard,
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
                                     "goal planner: could not stage plan baseline path; \
-                                     PLAN_CHANGES will render (none)"
+                                         PLAN_CHANGES will render (none)"
                                 );
                                 break;
                             }
                         };
-                        match tokio::fs::copy(&src, &tmp).await {
+                        let baseline_copy =
+                            match (extended_length_path(&src), extended_length_path(&tmp)) {
+                                (Ok(src), Ok(tmp)) => tokio::fs::copy(src, tmp).await,
+                                (Err(error), _) | (_, Err(error)) => Err(error),
+                            };
+                        match baseline_copy {
                             Ok(_) => {
                                 let mut tracker = self.goal_tracker.lock();
                                 let can_publish = tracker.snapshot().is_some_and(|goal| {
@@ -1125,11 +1217,25 @@ impl SessionActor {
                                         && goal.plan_file.as_deref() == Some(src.as_path())
                                         && goal.plan_baseline_file.is_none()
                                 });
-                                if can_publish
-                                    && baseline_file.persist(&dst).is_ok()
-                                    && let Some(goal) = tracker.snapshot_mut()
-                                {
-                                    goal.plan_baseline_file = Some(dst);
+                                if can_publish {
+                                    let staged_baseline = baseline_file.to_path_buf();
+                                    let publish =
+                                        extended_length_path(&dst).and_then(|destination| {
+                                            baseline_file.persist(destination).map_err(Into::into)
+                                        });
+                                    match publish {
+                                        Ok(()) => {
+                                            if let Some(goal) = tracker.snapshot_mut() {
+                                                goal.plan_baseline_file = Some(dst);
+                                            }
+                                        }
+                                        Err(error) => tracing::warn!(
+                                            error = %error,
+                                            source = %staged_baseline.display(),
+                                            destination = %dst.display(),
+                                            "goal planner: failed to publish plan baseline",
+                                        ),
+                                    }
                                 }
                             }
                             Err(err) => tracing::warn!(
@@ -1228,13 +1334,23 @@ impl SessionActor {
             }
         };
         // `TempPath` deletes on drop and persists by rename, so any early exit cleans up the staged file and a failed rename can't leave it behind
-        let attempt_file = match tempfile::TempPath::try_from_path(attempt_plan_file.clone()) {
+        let attempt_file = match extended_length_path(&attempt_plan_file)
+            .and_then(tempfile::TempPath::try_from_path)
+        {
             Ok(guard) => guard,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "goal planner: could not stage attempt plan path; skipping planner"
+                    path = %attempt_plan_file.display(),
+                    "goal planner: could not stage attempt plan path; pausing goal"
                 );
+                let _ = self
+                    .auto_pause_goal_if_matches_with_message(
+                        &goal_id,
+                        crate::session::goal_tracker::GoalPauseReason::User,
+                        planner_failure_pause_message(),
+                    )
+                    .await;
                 return PlannerAttemptStep::Stop;
             }
         };

@@ -1046,7 +1046,7 @@ async fn planner_subagent_tokens_fold_into_goal_total() {
         .await;
 }
 
-/// Lifecycle regression guard: the planner fails, the goal pauses with the canonical message, and `GoalResume` re-fires the planner.
+/// Lifecycle regression guard: the planner fails, initial setup ends without inference, and `GoalResume` re-fires the planner.
 /// The second attempt succeeds and the goal goes Active with `plan_file` set.
 /// This pins the retry-on-resume contract; without it, the pause message ("resume with /goal to retry") would be a lie.
 #[tokio::test(flavor = "current_thread")]
@@ -1102,8 +1102,11 @@ async fn lifecycle_fail_pause_resume_retry_success() {
 
             let (actor, _tmp) = make_planner_actor(Some(tx), true).await;
             create_test_goal(&actor);
-
-            actor.maybe_run_goal_planner("do X").await;
+            let outcome = actor.setup_goal("do X", None).await;
+            assert!(
+                matches!(outcome, GoalSetupOutcome::Message(ref message) if message == &planner_failure_pause_message()),
+                "a failed initial plan must end the turn instead of starting ordinary inference",
+            );
             {
                 let snap = actor.goal_tracker.lock().snapshot().cloned().unwrap();
                 assert!(snap.plan_file.is_none());
@@ -1237,7 +1240,10 @@ async fn setup_goal_reminder_is_plan_aware_when_planner_enabled() {
             let (actor, _tmp) = make_planner_actor(Some(tx), true).await;
             let plan_path = actor.goal_tracker.lock().plan_path();
 
-            let reminder = actor.setup_goal("ship it", None).await;
+            let GoalSetupOutcome::Inference(reminder) = actor.setup_goal("ship it", None).await
+            else {
+                panic!("successful planning must proceed to inference");
+            };
 
             let snap = actor.goal_tracker.lock().snapshot().cloned().unwrap();
             assert_eq!(snap.plan_file.as_deref(), Some(plan_path.as_path()));
@@ -1260,7 +1266,10 @@ async fn setup_goal_reminder_is_no_plan_when_planner_disabled() {
         .run_until(async {
             let (actor, _tmp) = make_planner_actor(None, false).await;
 
-            let reminder = actor.setup_goal("ship it", None).await;
+            let GoalSetupOutcome::Inference(reminder) = actor.setup_goal("ship it", None).await
+            else {
+                panic!("planner-disabled setup must proceed to inference");
+            };
 
             let snap = actor.goal_tracker.lock().snapshot().cloned().unwrap();
             assert!(snap.plan_file.is_none(), "planner off writes no plan");
