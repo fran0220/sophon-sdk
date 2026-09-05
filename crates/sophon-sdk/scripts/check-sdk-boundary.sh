@@ -31,6 +31,7 @@ class Signatures(HTMLParser):
         super().__init__()
         self.depth = 0
         self.signature = None
+        self.blanket = None
         self.count = 0
         self.leaks = []
 
@@ -38,6 +39,12 @@ class Signatures(HTMLParser):
         attrs = dict(attrs)
         if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr", "source", "area", "base", "embed", "param", "track", "col"}:
             self.depth += 1
+        # External `impl<T> Trait for T` is not an SDK declaration. Such traits
+        # apply even to std types and cannot be removed by hiding SDK imports.
+        if attrs.get("id") == "blanket-implementations-list":
+            self.blanket = self.depth
+        if self.blanket is not None:
+            return
         if ({"item-decl", "code-header"} & set(attrs.get("class", "").split())
                 or attrs.get("id", "").startswith("reexport.")):
             self.signature = self.depth
@@ -50,6 +57,8 @@ class Signatures(HTMLParser):
     def handle_endtag(self, tag):
         if self.signature == self.depth:
             self.signature = None
+        if self.blanket == self.depth:
+            self.blanket = None
         self.depth -= 1
 
 
@@ -63,6 +72,9 @@ assert probe.count == 1 and len(probe.leaks) == 1
 probe = Signatures()
 probe.feed('<div class="docblock"><a href="../agent_client_protocol/index.html">internal docs</a></div>')
 assert not probe.leaks
+probe = Signatures()
+probe.feed('<div id="blanket-implementations-list"><h3 class="code-header"><a href="../agent_client_protocol_schema/trait.IntoOption.html">blanket</a></h3></div><h3 class="code-header"><a href="../agent_client_protocol/trait.Client.html">explicit impl</a></h3>')
+assert probe.count == 1 and len(probe.leaks) == 1
 
 count = 0
 leaks = []
@@ -75,5 +87,5 @@ if not count:
     raise SystemExit("No rustdoc signatures found; boundary check cannot validate this rustdoc format")
 if leaks:
     raise SystemExit("Forbidden public signature links: " + repr(leaks))
-print(f"PASS: no TUI dependencies; {count} public rustdoc signatures contain no ACP/TUI type links")
+print(f"PASS: no TUI dependencies; {count} SDK-declared public rustdoc signatures contain no ACP/TUI type links (dependency blanket impls excluded)")
 PY

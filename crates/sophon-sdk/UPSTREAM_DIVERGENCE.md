@@ -296,3 +296,40 @@ maintaining a duplicate implementation.
   SDK's normal dependency closure, as do `ratatui` and `crossterm`.
 - Windows/macOS execution and live external-provider credentials were not
   exercised in this Linux orb; portability patches are retained.
+
+## SDK 0.4.1 correctness validation (Linux x86_64)
+
+The complete repair plan was assessed with Oracle, then implementation was
+checked against the native callers. Reserved synthetic IDs are rejected only
+at SDK ingress so pager scheduler prompts keep working. Gateway permission
+cancellation and ordered notification handling are opt-in; native TUI/stdio
+defaults are unchanged. Checked native actor flushing reports timeout to the
+SDK instead of claiming a successful stop.
+
+Executed with `env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0`:
+
+- `cargo test --locked -p sophon-sdk -p xai-acp-lib`: SDK 20 unit tests,
+  both facade/lifecycle integration tests, and ACP 20 unit tests pass.
+- `cargo test --locked -p xai-grok-shell --lib <filter> -- --test-threads=1`:
+  `sdk_041` 4, `prompt_queue_actor_tests` 94, `cancel_running_task_tests` 26,
+  and `agent::activity::tests` 14 pass. Counts overlap across filters.
+  A new revision-invariance assertion initially exposed a rejected Remove
+  still broadcasting a version bump; the implementation was repaired, and
+  the unchanged assertion now passes alongside valid-edit hold release.
+- `cargo clippy --locked -p sophon-sdk -p xai-grok-shell -p xai-acp-lib
+  -p xai-prompt-queue --lib -- -D warnings`: passes.
+- `cargo clippy --locked -p sophon-sdk -p xai-acp-lib --all-targets
+  -- -D warnings`: passes, including the new integration and gateway tests.
+- `scripts/check-sdk-boundary.sh`: checks all upstream digests, absence of
+  pager/ratatui/crossterm in normal dependencies, and resolved SDK-declared
+  public signatures/reexports. Real temporary rustdoc negative fixtures
+  confirmed detection of ACP type aliases, reexports and function arguments.
+  Dependency-wide blanket impls are not SDK declarations; the check excludes
+  that rustdoc section, not explicit trait implementations. ACP remains an
+  internal dependency. Its existing stdin-reader private-doc-link warning is
+  unrelated to this change.
+
+The broader upstream full-suite/all-target lint limitations recorded above
+were not suppressed or represented as fixed. This release uses targeted
+native regression coverage; it does not claim exhaustive raw-route, live
+provider, Windows or macOS verification.

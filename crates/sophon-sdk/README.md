@@ -356,8 +356,7 @@ receiver falls behind the bounded buffer.
   and an ordered in-process notification barrier (2-second budget). The barrier
   and actor flush are checked: failure stops the worker with `Failed` health
   and an error, never a successful replacement claim.
-  The barrier
-  proves earlier notifications reached the broadcast streams, not that slow
+  The barrier proves earlier notifications reached the broadcast streams, not that slow
   subscribers consumed them or that lagged history can be recovered. Retained
   Agent/Session handles retain senders: stop consumers on terminal runtime
   health, not by waiting indefinitely for broadcast channel closure.
@@ -382,7 +381,8 @@ receiver falls behind the bounded buffer.
 
 ACP is used only as a private in-process adapter because the pinned
 `MvpAgent`'s complete session lifecycle is implemented on that trait. No ACP
-type appears in the public API, downstream crates do not add an ACP dependency,
+type appears in SDK-declared public signatures or reexports; downstream crates
+do not need to add an ACP dependency,
 and no stdio transport or sidecar process is started. The internal compile
 closure still contains `agent-client-protocol` and `xai-acp-lib`; removing them
 would require feature-gating/refactoring the upstream agent rather than a thin
@@ -392,7 +392,11 @@ The normal closure still includes shell terminal/PTY utilities needed by native
 tools; these are not the pager UI. Raw JSON fields and `x.ai/*` method names
 retain upstream protocol semantics even though ACP Rust types are private.
 `scripts/check-sdk-boundary.sh` checks the upstream digests, normal dependency
-tree and resolved public rustdoc signatures/reexports for ACP/TUI leakage.
+tree and resolved SDK-declared rustdoc signatures/reexports for ACP/TUI leakage.
+Dependency blanket implementations (for example ACP schema's `IntoOption<T>`
+for every `T`) can still appear in rustdoc. They are not SDK declarations and
+are excluded from that check; explicit SDK trait implementations are checked.
+This is private ACP adaptation, not removal of ACP from the compile closure.
 
 At startup the SDK loads and resolves Grok Build's effective configuration; it
 does not replace it with defaults. Persisted sessions, web fetch, tools, skills,
