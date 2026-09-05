@@ -1566,7 +1566,8 @@ async fn attach_restore_preserves_head_when_routing_slug_differs_from_catalog_ke
     let agent = build_minimal_agent_for_tests();
     let mut entry = ModelEntry::fallback("catalog-key", &EndpointsConfig::default());
     entry.info.model = "routing-slug".to_owned();
-    entry.info.agent_type = "grok".to_owned();
+    entry.info.agent_type = "codex".to_owned();
+    assert!(!harnesses_are_compatible("grok-build", "codex"));
     agent.models_manager.insert_test_entry("catalog-key", entry);
     let sid = acp::SessionId::new("attach-preserve-head");
     let (mut handle, _tx, mut rx) = make_live_session_handle(&sid, None);
@@ -1575,7 +1576,7 @@ async fn attach_restore_preserves_head_when_routing_slug_differs_from_catalog_ke
         while let Some(command) = rx.recv().await {
             match command {
                 SessionCommand::GetActiveAgent { responds_to } => {
-                    let _ = responds_to.send(Some("different-harness".to_owned()));
+                    let _ = responds_to.send(Some("grok-build".to_owned()));
                 }
                 SessionCommand::RebuildAgentForDefinition { .. } => {
                     panic!("attach must not rebuild the authored head");
