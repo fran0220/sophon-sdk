@@ -613,11 +613,17 @@ impl SessionActor {
             .unwrap_or_else(|| active_session_config.clone());
         sampling_config.reasoning_effort = None;
         let routed_model = sampling_config.model.clone();
+        let supports_reasoning = self
+            .models_manager
+            .model_supports_reasoning_effort(&routed_model);
         let suggest_reasoning = prompt_suggest::resolve_suggest_reasoning(
-            configured_reasoning_effort,
+            prompt_suggest::suggest_request_effort(
+                configured_reasoning_effort,
+                &routed_model,
+                supports_reasoning,
+            ),
             &routed_model,
-            self.models_manager
-                .model_supports_reasoning_effort(&routed_model),
+            supports_reasoning,
             self.models_manager.model_supports_reasoning_effort_value(
                 &routed_model,
                 xai_grok_sampling_types::ReasoningEffort::None,
@@ -713,16 +719,9 @@ impl SessionActor {
         let latency_ms = Some(started.elapsed().as_millis() as u64);
 
         let raw = response.assistant_text();
-        // The prompt asks the model not to repeat a past user prompt; this guarantees it.
         let suggestion = match prompt_suggest::sanitize_suggestion(&raw) {
             None => {
                 log_fetch(PsAction::FetchedEmpty, 0, 0, latency_ms);
-                None
-            }
-            Some(s) if prompt_suggest::is_repeat_of_user_message(&s, &conversation) => {
-                tracing::debug!("prompt suggest: rejected repeat of a past user prompt");
-                let (chars, words) = prompt_suggest::suggestion_size(&s);
-                log_fetch(PsAction::Filtered, chars, words, latency_ms);
                 None
             }
             Some(s) => {

@@ -23,6 +23,60 @@ async fn actor_with_history(history: Vec<ConversationItem>) -> SessionActor {
     actor
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn reasoning_option_advances_config_clock_without_rewriting_explicit_head_or_route() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use crate::agent::config::{EndpointsConfig, ModelEntry};
+            use xai_grok_sampling_types::ReasoningEffort;
+            let actor = std::sync::Arc::new(
+                actor_with_history(vec![
+                    ConversationItem::system("SDK authored head"),
+                    ConversationItem::user("retained history"),
+                ])
+                .await,
+            );
+            let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+            entry.info.supports_reasoning_effort = true;
+            actor
+                .models_manager
+                .insert_test_entry("effort-model", entry);
+            actor
+                .handle_set_session_model(
+                    xai_grok_sampler::SamplerConfig {
+                        model: "effort-model".into(),
+                        base_url: "https://provider.example/v1".into(),
+                        ..Default::default()
+                    },
+                    false,
+                    false,
+                    true,
+                    true,
+                    85,
+                )
+                .await
+                .unwrap();
+            actor
+                .handle_replace_system_prompt("SDK explicit override".into())
+                .await;
+            let before = actor.tool_context.config_clock.snapshot();
+            let history = actor.chat_state_handle.get_conversation().await;
+            actor
+                .handle_set_reasoning_effort(ReasoningEffort::Low)
+                .await
+                .unwrap();
+            assert_ne!(actor.tool_context.config_clock.snapshot(), before);
+            let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Low));
+            assert_eq!(cfg.base_url, "https://provider.example/v1");
+            assert_eq!(
+                serde_json::to_value(actor.chat_state_handle.get_conversation().await).unwrap(),
+                serde_json::to_value(history).unwrap()
+            );
+        })
+        .await;
+}
+
 /// Exercise the actual model-update and override actor paths with a persisted
 /// authored head, not the stock agent template. No model/network turn is needed.
 #[tokio::test(flavor = "current_thread")]

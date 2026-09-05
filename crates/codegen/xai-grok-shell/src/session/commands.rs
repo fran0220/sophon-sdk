@@ -60,6 +60,11 @@ pub enum PromptCompletionKind {
     /// See `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
 }
+/// `_meta.completionKind` on a `PromptResponse`. Distinguishes a queued prompt
+/// that never ran from a real cancelled turn (both use `StopReason::Cancelled`).
+pub const COMPLETION_KIND_KEY: &str = "completionKind";
+/// `_meta.completionKind` value for [`PromptCompletionKind::RemovedFromQueue`].
+pub const REMOVED_FROM_QUEUE_KIND: &str = "removedFromQueue";
 /// `_meta.cancellationCategory` of a hook-denied cancel; the pager matches it to render the blocked-by-a-hook marker.
 pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
 /// `_meta.cancellationCategory` of a max-turns end; headless matches it to drive the max-turns exit code.
@@ -130,6 +135,8 @@ pub struct SessionDrainSnapshot {
     pub running_prompt: bool,
     pub pending_interactions: usize,
     pub outstanding_background_tasks: usize,
+    /// In-flight turn/workflow jobs, including workflows between prompt turns.
+    pub active_work: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,6 +179,7 @@ impl SessionDrainSnapshot {
             && !self.running_prompt
             && self.pending_interactions == 0
             && self.outstanding_background_tasks == 0
+            && self.active_work == 0
     }
 }
 
@@ -477,6 +485,12 @@ pub enum SessionCommand {
         /// Per-model remote settings and per-model user TOML overrides then target the right model after a `/model` switch.
         /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
         auto_compact_threshold_percent: u8,
+        responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
+    },
+    /// Set only the reasoning effort on the session's live model. Carrying no
+    /// model keeps a concurrent `SetSessionModel` from being reverted.
+    SetReasoningEffort {
+        effort: xai_grok_sampling_types::ReasoningEffort,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the session's `AgentRebuildSpec` and the new `AgentDefinition`.

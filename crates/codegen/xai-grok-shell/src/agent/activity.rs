@@ -101,19 +101,16 @@ impl QuiesceReport {
 struct SessionActivityEntry {
     id: String,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
-    /// `Some` while a turn is running (relay- or IPC-driven alike).
     current_prompt_id: Arc<Mutex<Option<String>>>,
-    /// Non-empty while a blocking reverse-request (permission / question / plan approval) is parked.
     pending_interactions: PendingInteractions,
+    active_work: Arc<AtomicUsize>,
 }
 
 impl SessionActivityEntry {
-    /// The actor still holds the command receiver.
     fn is_live(&self) -> bool {
         !self.cmd_tx.is_closed()
     }
 
-    /// A running turn or a parked blocking interaction.
     fn is_busy(&self) -> bool {
         self.current_prompt_id
             .lock()
@@ -124,6 +121,7 @@ impl SessionActivityEntry {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
+            || self.active_work.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -163,6 +161,7 @@ impl AgentActivity {
             cmd_tx: handle.cmd_tx.clone(),
             current_prompt_id: handle.current_prompt_id.clone(),
             pending_interactions: handle.pending_interactions.clone(),
+            active_work: handle.active_work.clone(),
         });
     }
 
@@ -178,12 +177,7 @@ impl AgentActivity {
         }
     }
 
-    /// Whether the agent has live work: a running turn, a parked blocking interaction, or an initializing/running subagent.
-    ///
-    /// Known gap: prompts queued but not yet started (`pending_inputs` in the actor) are not mirrored here.
-    /// A prompt submitted exactly at a turn boundary can therefore read as idle.
-    /// `session_has_live_work` closes that window with an actor round-trip, which a sync `Send` probe cannot do.
-    /// The flush's quiesce loop re-snapshots and still ends such an actor via its Shutdown arm.
+    /// Whether the agent has live session, workflow, subagent, or presentation work.
     pub fn is_busy(&self) -> bool {
         self.inner.subagents.load(Ordering::Relaxed) > 0
             || self.inner.presentations.load(Ordering::Acquire) > 0
@@ -379,6 +373,7 @@ impl AgentActivity {
             cmd_tx,
             current_prompt_id: current_prompt_id.clone(),
             pending_interactions: pending_interactions.clone(),
+            active_work: Arc::new(AtomicUsize::new(0)),
         });
         (cmd_rx, current_prompt_id, pending_interactions)
     }
@@ -620,6 +615,7 @@ mod tests {
                     running_prompt: true,
                     pending_interactions: 0,
                     outstanding_background_tasks: 1,
+                    active_work: 1,
                 },
                 crate::session::commands::SessionDrainSnapshot {
                     session_id: "s1".into(),
@@ -642,6 +638,51 @@ mod tests {
             rejection.state,
             xai_grok_tools::management::admission::AdmissionState::Quiesced
         );
+        actor.abort();
+    }
+
+    #[tokio::test]
+    async fn quiesce_waits_for_workflow_between_turns() {
+        let activity = AgentActivity::default();
+        let (rx, _prompt_id, _pending) = register_raw(&activity, "workflow");
+        let actor = spawn_drain_actor(
+            rx,
+            vec![
+                crate::session::commands::SessionDrainSnapshot {
+                    session_id: "workflow".into(),
+                    active_work: 1,
+                    ..Default::default()
+                },
+                crate::session::commands::SessionDrainSnapshot {
+                    session_id: "workflow".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let report = activity.quiesce(Duration::from_secs(1)).await;
+        assert!(!report.initial.is_idle());
+        assert_eq!(report.initial.running_prompts(), 0);
+        assert!(report.drained());
+        assert!(report.polls > 1);
+        actor.abort();
+    }
+
+    #[tokio::test]
+    async fn quiesce_times_out_on_workflow_without_a_running_prompt() {
+        let activity = AgentActivity::default();
+        let (rx, _prompt_id, _pending) = register_raw(&activity, "workflow");
+        let actor = spawn_drain_actor(
+            rx,
+            vec![crate::session::commands::SessionDrainSnapshot {
+                session_id: "workflow".into(),
+                active_work: 1,
+                ..Default::default()
+            }],
+        );
+        let report = activity.quiesce(Duration::from_millis(100)).await;
+        assert!(report.timed_out);
+        assert!(!report.drained());
+        assert!(!report.final_snapshot.is_idle());
         actor.abort();
     }
 }

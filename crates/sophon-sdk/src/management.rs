@@ -179,6 +179,8 @@ pub struct SessionDrainSnapshot {
     pub running_prompt: bool,
     pub pending_interactions: usize,
     pub outstanding_background_tasks: usize,
+    /// Turn/workflow jobs that may remain active between prompts.
+    pub active_work: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -199,6 +201,7 @@ impl AgentDrainSnapshot {
                     && !session.running_prompt
                     && session.pending_interactions == 0
                     && session.outstanding_background_tasks == 0
+                    && session.active_work == 0
             })
     }
 }
@@ -1464,6 +1467,7 @@ fn drain_snapshot(
                 running_prompt: session.running_prompt,
                 pending_interactions: session.pending_interactions,
                 outstanding_background_tasks: session.outstanding_background_tasks,
+                active_work: session.active_work,
             })
             .collect(),
         subagents: snapshot.subagents,

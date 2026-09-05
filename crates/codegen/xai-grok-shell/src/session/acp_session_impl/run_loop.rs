@@ -23,6 +23,22 @@ mod yolo_toggle_report_tests {
         assert_eq!(yolo_toggle_report(true, true), None);
     }
 }
+fn spawn_dream_check(session: &Arc<SessionActor>) -> tokio::task::JoinHandle<()> {
+    let session = session.clone();
+    tokio::task::spawn_local(async move {
+        session.memory.await_init_reindex().await;
+        session.maybe_run_dream().await;
+    })
+}
+/// Abort a still-running dream and wait for it to stop, so session-end index work never overlaps it.
+/// A finished dream makes this a no-op; a live one is parked on the model call, so the abort returns
+/// at once without stamping the marker, leaving the gate open for the next launch.
+async fn stop_dream(dream_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = dream_task.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
 /// Best-effort removal of this session's scratch staging on teardown.
 /// A no-op in builds without a scratch producer.
 fn cleanup_session_scratch(_session: &SessionActor) {}
@@ -204,6 +220,81 @@ async fn emit_session_end_timings(timer: &SharedSessionEndTimer, is_subagent: bo
     )
     .await;
 }
+/// The deferred startup jobs, owned by the run loop so a session ending mid-startup aborts them instead of leaving them detached.
+struct StartupTasks {
+    _mcp_init_prompt_promote: crate::util::AbortOnDrop,
+    _context_snapshot: Option<crate::util::AbortOnDrop>,
+}
+impl StartupTasks {
+    fn spawn(
+        session: &Arc<SessionActor>,
+        completion_tx: mpsc::UnboundedSender<super::turn_task::TurnCompletionMsg>,
+    ) -> Self {
+        let session_for_mcp = session.clone();
+        let mcp_init_prompt_promote =
+            crate::util::AbortOnDrop(tokio::task::spawn_local(async move {
+                session_for_mcp.wait_for_mcp_initialized().await;
+                SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx)
+                    .await;
+            }));
+        let context_snapshot = if session.startup_hints.is_subagent {
+            tracing::info!("session_context_snapshot: skipped (subagent)");
+            None
+        } else {
+            let s = session.clone();
+            Some(crate::util::AbortOnDrop(tokio::task::spawn_local(
+                instrument_task!("session.context_snapshot", Parent::Inherit, async move {
+                    s.wait_for_mcp_initialized().await;
+                    s.emit_session_context_snapshot().await;
+                }),
+            )))
+        };
+        Self {
+            _mcp_init_prompt_promote: mcp_init_prompt_promote,
+            _context_snapshot: context_snapshot,
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_task_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_startup_prevents_late_mcp_prompt_promotion() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (session, _) = super::super::support::build_actor().await;
+                {
+                    let mut mcp = session.mcp_state.lock().await;
+                    mcp.cancel_init();
+                    assert!(mcp.try_start_init());
+                }
+                session.state.lock().await.pending_inputs.push_back(
+                    super::super::support::user_item("queued-at-shutdown", "owner"),
+                );
+                let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+                let tasks = StartupTasks::spawn(&session, completion_tx);
+                let promotion = tasks._mcp_init_prompt_promote.0.abort_handle();
+                tokio::task::yield_now().await;
+                assert!(!promotion.is_finished());
+                drop(tasks);
+                session.mcp_state.lock().await.finish_init();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !promotion.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("startup promotion aborts");
+                let state = session.state.lock().await;
+                assert!(state.running_task.is_none());
+                assert_eq!(state.pending_inputs.len(), 1);
+            })
+            .await;
+    }
+}
+
 pub(super) async fn run_session(
     session: Arc<SessionActor>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -272,12 +363,6 @@ pub(super) async fn run_session(
     {
         let s = session.clone();
         tokio::task::spawn_local(async move { s.maybe_notify_git_branch().await });
-    }
-    if session.startup_hints.is_subagent {
-        tracing::info!("session_context_snapshot: skipped (subagent)");
-    } else {
-        session.wait_for_mcp_initialized().await;
-        session.emit_session_context_snapshot().await;
     }
     tokio::task::spawn_local(super::status_line::run_status_emitter(Arc::downgrade(
         &session,
@@ -356,13 +441,7 @@ pub(super) async fn run_session(
             .await;
         });
     }
-    let session_for_mcp = session.clone();
-    let completion_tx_for_mcp = completion_tx.clone();
-    tokio::task::spawn_local(async move {
-        session_for_mcp.ensure_mcp_tools_initialized().await;
-        SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx_for_mcp)
-            .await;
-    });
+    let mut startup_tasks = Some(StartupTasks::spawn(&session, completion_tx.clone()));
     let mut model_switch_rx = session.models_manager.subscribe_model_switch();
     let _ = *model_switch_rx.borrow_and_update();
     let idle_flush_sleep = match session.idle_flush_timeout {
@@ -375,6 +454,10 @@ pub(super) async fn run_session(
         None => tokio::time::sleep(std::time::Duration::MAX),
     };
     tokio::pin!(dream_check_sleep);
+    let mut dream_task: Option<tokio::task::JoinHandle<()>> = None;
+    if !session.startup_hints.is_subagent && session.memory.is_enabled() {
+        dream_task = Some(spawn_dream_check(&session));
+    }
     loop {
         tokio::select! {
                 biased;
@@ -411,15 +494,15 @@ pub(super) async fn run_session(
                 }
                 // Dream check timer: periodically run dream consolidation
                 _ = &mut dream_check_sleep, if session.dream_check_timeout.is_some()
-                    && session.memory.is_enabled() => {
+                    && session.memory.is_enabled()
+                    && !session.startup_hints.is_subagent => {
                     tracing::debug!(target: xai_grok_telemetry::memory_log::TARGET,
                         "MEMORY_DREAM_CHECK: timer fired");
-                    tokio::task::spawn_local({
-                        let session = session.clone();
-                        async move {
-                            session.maybe_run_dream().await;
-                        }
-                    });
+                    // Only start a new dream when the previous one has finished; a shorter check
+                    // interval must not abort an in-flight consolidation.
+                    if dream_task.as_ref().is_none_or(|h| h.is_finished()) {
+                        dream_task = Some(spawn_dream_check(&session));
+                    }
                     if let Some(timeout) = session.dream_check_timeout {
                         dream_check_sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
@@ -508,12 +591,20 @@ pub(super) async fn run_session(
                 }
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
+                        drop(startup_tasks.take());
+                        session
+                            .settle_all_parent_messages(
+                                xai_message_delivery_core::TerminalCause::ActorDrop,
+                            )
+                            .await;
                         // ── session_end (channel-closed path) ────────
                         // Queued reports first, so an earlier turn's report precedes the session-end `Stop`
                         // Hooks fire BEFORE memory auto-save
                         let end_timer = session_end::SessionEndTimer::new_shared();
                         turn_end_queue.flush().await;
                         fire_session_end_hooks(&session, "channel_closed", &end_timer).await;
+                        // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                        stop_dream(&mut dream_task).await;
                         session
                             .run_session_end_memory_pipeline(
                                 "channel closed, session summary saved",
@@ -719,6 +810,10 @@ pub(super) async fn run_session(
                         }
                         SessionCommand::SetSessionModel { sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
                             let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
+                            let _ = responds_to.send(updated_model_id);
+                        }
+                        SessionCommand::SetReasoningEffort { effort, responds_to } => {
+                            let updated_model_id = session.handle_set_reasoning_effort(effort).await;
                             let _ = responds_to.send(updated_model_id);
                         }
                         SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
@@ -1280,14 +1375,7 @@ pub(super) async fn run_session(
                                 .send(PersistenceMsg::CopyFile { one_shot: respond_to });
                         }
                         SessionCommand::IsBusy { respond_to } => {
-                            // "Any work pending?" means a running turn or queued inputs
-                            // Consulted by the leader's idle-unload decision
-                            // Cheap: a single state lock
-                            let busy = {
-                                let state = session.state.lock().await;
-                                state_is_busy(&state)
-                            };
-                            let _ = respond_to.send(busy);
+                            let _ = respond_to.send(session.is_busy().await);
                         }
                         SessionCommand::GetDrainSnapshot { respond_to } => {
                             let (queued_prompts, running_prompt, pending_interactions) = {
@@ -1326,6 +1414,9 @@ pub(super) async fn run_session(
                                     running_prompt,
                                     pending_interactions,
                                     outstanding_background_tasks,
+                                    active_work: session.active_work.load(
+                                        std::sync::atomic::Ordering::Acquire,
+                                    ),
                                 },
                             );
                         }
@@ -2327,6 +2418,9 @@ pub(super) async fn run_session(
                             );
                         }
                         SessionCommand::Shutdown(kind) => {
+                            // Stop deferred promotion before the first teardown await, not
+                            // only when this loop finally returns after hooks and persistence.
+                            drop(startup_tasks.take());
                             let end_timer = session_end::SessionEndTimer::new_shared();
                             shutdown_workflows(&session, &end_timer).await;
                             // Flush the actor-owned replay buffer so streamed chunks still pending at shutdown are committed to updates.jsonl
@@ -2352,6 +2446,11 @@ pub(super) async fn run_session(
                                     })
                                     .await;
                             }
+                            session
+                                .settle_all_parent_messages(
+                                    xai_message_delivery_core::TerminalCause::HardTeardown,
+                                )
+                                .await;
                             // Drop any queued synthetic auto-wake prompts and pending notifications before running hooks
                             // A synthetic prompt can slip through the per-tool-result sweep
                             // A later persistence path would then flush it to chat_history.jsonl
@@ -2363,6 +2462,8 @@ pub(super) async fn run_session(
                             // Hooks fire BEFORE memory auto-save
                             turn_end_queue.flush().await;
                             fire_session_end_hooks(&session, "shutdown", &end_timer).await;
+                            // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                            stop_dream(&mut dream_task).await;
                             session
                                 .run_session_end_memory_pipeline(
                                     "session summary saved",
@@ -2390,11 +2491,19 @@ pub(super) async fn run_session(
                         processed,
                     }) = maybe_completion
                     else {
+                        drop(startup_tasks.take());
+                        session
+                            .settle_all_parent_messages(
+                                xai_message_delivery_core::TerminalCause::ActorDrop,
+                            )
+                            .await;
                         // Completion channel closed: full feedback teardown so the final signal sync and upload drain still run
                         // Cancel alone does not force-sync; shutdown owns that
                         // No session-end hooks here, but the flush still precedes `shutdown_workflows`, which makes a queued report's entry durable
                         let end_timer = session_end::SessionEndTimer::new_shared();
                         turn_end_queue.flush().await;
+                        // Stop the dream so it does not outlive the session holding the mutex.
+                        stop_dream(&mut dream_task).await;
                         shutdown_workflows(&session, &end_timer).await;
                         turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session, &end_timer).await;
