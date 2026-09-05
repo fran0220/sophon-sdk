@@ -62,6 +62,8 @@ workspace files and `AGENTS.md` remain available to the agent.
 At 1.0.16 the same boundary excludes system Grok policies, Claude managed
 settings and macOS MDM at their shared discovery sources, before any process
 cache. Embedding-owned managed config and requirements remain effective.
+The first-party policy supervisor/fetch is disabled, and orphan cleanup cannot
+delete those host-owned files merely because no grok.com account is signed in.
 Detached, redirect-following sampler origin prewarming is skipped in this mode;
 ordinary routed sampling and connection pooling are unchanged.
 
@@ -82,6 +84,8 @@ Approved files (digest: `hermetic-discovery.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/sampler_prewarm.rs`
 - `crates/codegen/xai-grok-shell/src/config/mod.rs`
 - `crates/codegen/xai-grok-shell/src/config/watcher.rs`
+- `crates/codegen/xai-grok-shell/src/managed_config/store.rs`
+- `crates/codegen/xai-grok-shell/src/managed_config/supervisor.rs`
 - `crates/codegen/xai-grok-shell/src/session/workflow/registry.rs`
 - `crates/codegen/xai-grok-shell/src/util/config/mcp.rs`
 - `crates/codegen/xai-grok-shell/src/util/hooks.rs`

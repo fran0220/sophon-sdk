@@ -120,6 +120,8 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             assert!(xai_grok_config::system_config_dir().is_none());
             assert!(xai_grok_config::claude_managed_settings_path().is_none());
             assert!(xai_grok_config::claude_managed_settings_probe_path().is_none());
+            assert!(!xai_grok_shell::managed_config::is_fetch_enabled());
+            xai_grok_shell::managed_config::clear_orphan();
             let layers = xai_grok_config::managed_config_layers();
             assert_eq!(layers.len(), 1);
             assert_eq!(layers[0].path, grok_home.path().join("managed_config.toml"));

@@ -366,6 +366,8 @@ Ordinary workspace files and project `AGENTS.md` instructions remain visible.
 System Grok configuration, Claude managed settings and macOS MDM discovery are
 also excluded; managed configuration and requirements under the embedding's
 `GROK_HOME` remain effective, including native model/MCP/plugin policy.
+First-party managed-policy refresh and orphan cleanup do not overwrite or
+delete these embedding-owned files when no grok.com account is signed in.
 The SDK then overlays only its explicit model/media routes and headless embedding
 mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
 upstream data directory rather than the default `~/.grok`.

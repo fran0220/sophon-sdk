@@ -124,6 +124,11 @@ pub(super) fn team_principal_signed_in() -> std::io::Result<bool> {
 
 /// Best-effort; a fail_closed opt-in is kept — swapping `auth.json` must not escape policy.
 pub fn clear_orphan() {
+    // In an embedding these are host-owned policy files, not an orphaned
+    // first-party account cache. A missing grok.com principal cannot own a clear.
+    if xai_grok_config::hermetic_discovery() {
+        return;
+    }
     if resolve_deployment_key().is_some() {
         return;
     }
@@ -586,6 +591,9 @@ pub(super) fn deployment_key_fingerprint(key: &str) -> String {
 
 /// Overlay-free read: a `GROK_CONFIG` overlay must not suppress a policy-enforcement sync.
 pub fn is_fetch_enabled() -> bool {
+    if xai_grok_config::hermetic_discovery() {
+        return false;
+    }
     if let Some(v) = crate::agent::config::env_bool("GROK_MANAGED_CONFIG") {
         return v;
     }

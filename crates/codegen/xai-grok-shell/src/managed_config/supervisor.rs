@@ -196,6 +196,9 @@ pub(super) static REFRESH_SUPERVISOR: std::sync::Mutex<Option<ManagedConfigRefre
 
 /// The one place a managed-config refresh can be scheduled; called per boot, post-gate.
 pub fn start_refresh_supervisor(auth_manager: &std::sync::Arc<crate::auth::AuthManager>) {
+    if xai_grok_config::hermetic_discovery() {
+        return;
+    }
     // Every boot: a respawn after a contended logout cleanup must not serve the prior team.
     store::clear_orphan();
     let auth_manager = auth_manager.clone();

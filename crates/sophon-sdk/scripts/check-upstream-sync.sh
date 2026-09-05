@@ -46,6 +46,8 @@ hermetic_discovery=(
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/sampler_prewarm.rs
   crates/codegen/xai-grok-shell/src/config/mod.rs
   crates/codegen/xai-grok-shell/src/config/watcher.rs
+  crates/codegen/xai-grok-shell/src/managed_config/store.rs
+  crates/codegen/xai-grok-shell/src/managed_config/supervisor.rs
   crates/codegen/xai-grok-shell/src/session/workflow/registry.rs
   crates/codegen/xai-grok-shell/src/util/config/mcp.rs
   crates/codegen/xai-grok-shell/src/util/hooks.rs
