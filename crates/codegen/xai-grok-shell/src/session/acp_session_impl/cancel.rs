@@ -875,6 +875,14 @@ impl SessionActor {
             CancelFinalization::Keep(lease) => self.finish_finalization_lease(lease).await,
             CancelFinalization::Rewind => false,
         };
+        if settled {
+            // Publish only after the owning lease releases the task and pin.
+            // The promotion kick cannot do this for an empty or edit-held FIFO.
+            // Read under the lock so even a concurrent promotion is reflected
+            // authoritatively; a cancel that lost finalization publishes nothing.
+            let state = self.state.lock().await;
+            self.broadcast_queue_changed(&state);
+        }
         CancelOutcome {
             barrier: if suppress_task_wakes {
                 WakeBarrier::Armed

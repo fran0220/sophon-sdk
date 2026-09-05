@@ -2961,10 +2961,9 @@ async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
         })
         .await;
 }
-/// Cancel (Esc/Ctrl+C) with prompts waiting behind the running one: the queue broadcast to clients keeps waiting prompts in order.
-/// It drops only the cancelled prompt and leaves the next free to start.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
+/// Exercise the actual notification rail, including a promotion kick that cannot
+/// publish for either an empty queue or an edit-held successor.
+async fn assert_cancel_publishes_settled_queue(held_successors: bool) {
     fn make_item(prompt_id: &str, queue_id: &str) -> InputItem {
         let (respond_to, _rx) = tokio::sync::oneshot::channel();
         InputItem {
@@ -3001,11 +3000,13 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _gateway_rx) =
+            let (gateway_tx, mut gateway_rx) =
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) =
+            let (persistence_tx, mut persistence_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let actor = std::sync::Arc::new(
+                create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await,
+            );
             *actor
                 .current_prompt_id
                 .lock()
@@ -3022,26 +3023,88 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 state
                     .pending_inputs
                     .push_back(make_item("running", "running"));
-                state.pending_inputs.push_back(make_item("q1-pid", "q1"));
-                state.pending_inputs.push_back(make_item("q2-pid", "q2"));
+                if held_successors {
+                    state.pending_inputs.push_back(make_item("q1-pid", "q1"));
+                    state.pending_inputs.push_back(make_item("q2-pid", "q2"));
+                    state
+                        .edit_holds
+                        .insert("q1-pid".into(), std::time::Instant::now());
+                }
             }
-            let _ = actor
+            let outcome = actor
                 .cancel_running_task(crate::session::CancelOptions {
                     cancel_subagents: true,
+                    trigger: Some(crate::session::CancelTrigger::CtrlC),
                     user_initiated: true,
                     ..Default::default()
                 })
                 .await;
+            assert!(outcome.settled);
+            let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+            actor.clone().maybe_start_running_task(completion_tx).await;
+
+            let mut broadcasts = Vec::new();
+            while let Ok(msg) = gateway_rx.try_recv() {
+                if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg
+                    && args.request.method.as_ref()
+                        == crate::session::prompt_queue::QUEUE_CHANGED_METHOD
+                {
+                    broadcasts.push(
+                        serde_json::from_str::<crate::session::prompt_queue::QueueChanged>(
+                            args.request.params.get(),
+                        )
+                        .expect("valid queue snapshot"),
+                    );
+                }
+            }
+            assert_eq!(broadcasts.len(), 1, "cancel must publish its settled queue");
+            let snapshot = &broadcasts[0];
+            assert!(snapshot.running_prompt_id.is_none());
+            let expected = if held_successors {
+                vec!["q1", "q2"]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            for (position, entry) in snapshot.entries.iter().enumerate() {
+                assert_eq!(entry.position, position);
+            }
+            let mut terminals = 0;
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::AppendUpdateDurablyAndAck {
+                    update: crate::session::storage::SessionUpdate::Xai(notification),
+                    ..
+                } = msg
+                    && let XaiSessionUpdate::TurnCompleted {
+                        prompt_id,
+                        stop_reason,
+                        ..
+                    } = notification.update
+                {
+                    assert_eq!(prompt_id, "running");
+                    assert_eq!(stop_reason, "cancelled");
+                    terminals += 1;
+                }
+            }
+            assert_eq!(
+                terminals, 1,
+                "cancel must emit exactly one durable terminal"
+            );
             let state = actor.state.lock().await;
+            assert!(state.running_task.is_none());
             let wire = actor.build_queue_wire(&state);
             let wire_ids: Vec<&str> = wire.iter().map(|e| e.id.as_str()).collect();
             assert_eq!(
-                wire_ids,
-                vec!["q1", "q2"],
+                wire_ids, expected,
                 "clients must still see the waiting prompts, in order, cancelled one gone"
             );
-            assert_eq!(wire[0].position, 0, "positions must renumber from 0");
-            assert_eq!(wire[1].position, 1);
             assert!(
                 actor
                     .current_prompt_id
@@ -3052,4 +3115,14 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
             );
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
+    assert_cancel_publishes_settled_queue(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_publishes_empty_queue_to_clients() {
+    assert_cancel_publishes_settled_queue(false).await;
 }
