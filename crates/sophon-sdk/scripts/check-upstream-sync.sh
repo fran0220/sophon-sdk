@@ -81,6 +81,7 @@ goal_reliability=(
 )
 
 typed_management=(
+  crates/codegen/xai-acp-lib/src/gateway.rs
   crates/codegen/xai-grok-agent/src/builder.rs
   crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs
   crates/codegen/xai-grok-pager/src/app/app_view.rs
@@ -105,6 +106,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_queue_actor_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_types.rs

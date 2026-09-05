@@ -271,6 +271,9 @@ impl SessionActor {
             crate::session::CancelHistoryDisposition::RewindIfNoOutput { prompt_id } => {
                 prompt_id.clone()
             }
+            crate::session::CancelHistoryDisposition::KeepIfFront { prompt_id } => {
+                Some(prompt_id.clone())
+            }
             crate::session::CancelHistoryDisposition::Keep => None,
         };
         // Claim the named front under one lock before teardown; a stale id (a new turn already promoted) is a no-op
@@ -281,7 +284,7 @@ impl SessionActor {
             usize,
             Vec<super::parent_message::ParentOwnedDelivery>,
         )> = None;
-        if let Some(requested) = requested_prompt_id.as_deref() {
+        if rewind_requested && let Some(requested) = requested_prompt_id.as_deref() {
             let mut state = self.state.lock().await;
             let front_prompt_id = state.pending_inputs.front().map(|f| f.prompt_id.clone());
             if front_prompt_id.as_deref() != Some(requested) {
@@ -379,7 +382,14 @@ impl SessionActor {
         let mut finalization = if rewind_requested {
             CancelFinalization::Rewind
         } else {
-            let Some(lease) = self.state.lock().await.claim_cancel_finalization() else {
+            let mut state = self.state.lock().await;
+            // Target validation and ownership claim must be atomic with promotion.
+            if let Some(requested) = requested_prompt_id.as_deref()
+                && state.pending_inputs.front().map(|f| f.prompt_id.as_str()) != Some(requested)
+            {
+                return CancelOutcome::noop();
+            }
+            let Some(lease) = state.claim_cancel_finalization() else {
                 return CancelOutcome::noop();
             };
             CancelFinalization::Keep(lease)
@@ -503,8 +513,12 @@ impl SessionActor {
                 "current_prompt_id pin disagrees with running_task identity"
             );
 
+            // Recheck the target after teardown awaits, before mutating the queue.
             if let CancelFinalization::Keep(lease) = &finalization
-                && !state.finalization_binding_is_current(lease)
+                && (!state.finalization_binding_is_current(lease)
+                    || requested_prompt_id.as_deref().is_some_and(|id| {
+                        state.pending_inputs.front().map(|f| f.prompt_id.as_str()) != Some(id)
+                    }))
             {
                 tracing::error!(
                     binding = ?lease.binding,
@@ -957,9 +971,10 @@ impl SessionActor {
         }
         let settled = match &mut finalization {
             CancelFinalization::Keep(lease) => self.finish_finalization_lease(lease).await,
-            CancelFinalization::Rewind => false,
+            // A completed rewind permits the actor's post-cancel kick, unlike a stale target.
+            CancelFinalization::Rewind => true,
         };
-        if settled {
+        if settled && !rewind_requested {
             // Publish only after the owning lease releases the task and pin.
             // The promotion kick cannot do this for an empty or edit-held FIFO.
             // Read under the lock so even a concurrent promotion is reflected

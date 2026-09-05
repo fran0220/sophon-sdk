@@ -367,6 +367,8 @@ pub enum CancelHistoryDisposition {
     /// Leave the cancelled turn's user message in history.
     #[default]
     Keep,
+    /// Keep history, but cancel only if this prompt is still the actor's front.
+    KeepIfFront { prompt_id: String },
     /// Pop the named front if the no-output window is still open. `None` is a legacy client.
     RewindIfNoOutput { prompt_id: Option<String> },
 }

@@ -1114,20 +1114,15 @@ pub(super) async fn run_session(
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
                             }
-                            // Clear, don't flush: converting interjections to prompt turns would restart the model after a stop
-                            session.pending_interjections.clear();
                             // Do not abort turn summary here
                             // Summaries spawn only after a successful turn, so a summary call still running describes that prior success
                             // Cancel targets the current turn; the prior summary line shows until replaced, so it should still finish
                             // New real prompts and rewind abort separately
-                            let is_rewind = matches!(
-                                &options.history,
-                                crate::session::CancelHistoryDisposition::RewindIfNoOutput { .. }
-                            );
                             let cancel = session.cancel_running_task(options).await;
-                            // A rewind settles on its own rail (`settled` stays false), so it still gets the post-cancel kick.
-                            // An unsettled non-rewind cancel lost the finalization claim; the owner's release re-kicks the queue.
-                            if cancel.settled || is_rewind {
+                            // A stale target or lost finalization claim must not mutate the new turn.
+                            if cancel.settled {
+                                // Clear, don't flush: queued interjections must not restart a stopped turn.
+                                session.pending_interjections.clear();
                                 // Auto-pause the active goal so timers stop and the pager shows "paused" instead of "active"
                                 // Shared with the doom-loop and back-off paths via `auto_pause_goal_if_active`
                                 session
@@ -1479,10 +1474,11 @@ pub(super) async fn run_session(
                                     owner,
                                 } => {
                                     let applied = session
-                                        .handle_remove_queued_prompt(
+                                        .handle_remove_queued_prompt_with_policy(
                                             &id,
                                             expected_entry_version,
                                             owner.as_deref(),
+                                            false,
                                         )
                                         .await;
                                     reengages = applied;
@@ -1525,11 +1521,12 @@ pub(super) async fn run_session(
                                     new_text,
                                 } => {
                                     let outcome = session
-                                        .handle_interject_queued_prompt(
+                                        .handle_interject_queued_prompt_with_policy(
                                             &id,
                                             expected_entry_version,
                                             owner.as_deref(),
                                             new_text.as_deref(),
+                                            false,
                                         )
                                         .await;
                                     reengages = outcome.mutated;
@@ -1554,7 +1551,7 @@ pub(super) async fn run_session(
                             if settled && reengages {
                                 session.release_hook_block_hold("typed_queue_mutation").await;
                             }
-                            if settled {
+                            if settled && applied {
                                 SessionActor::maybe_start_running_task(
                                     session.clone(),
                                     completion_tx.clone(),

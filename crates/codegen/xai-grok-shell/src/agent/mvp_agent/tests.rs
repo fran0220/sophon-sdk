@@ -4328,6 +4328,52 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
         );
     });
 }
+#[test]
+fn sdk_041_mode_missing_and_closed_session_fails_promptly() {
+    use acp::Agent as _;
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-mode-closed");
+        let (handle, _tx, _rx) = make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        drive_close(&agent, sid.0.as_ref()).await.unwrap();
+        for id in [sid, acp::SessionId::new("missing")] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                agent.set_session_mode(acp::SetSessionModeRequest::new(id, "code")),
+            ).await.expect("missing mode request must not hang");
+            assert_eq!(result.unwrap_err().code, acp::Error::invalid_params().code);
+        }
+    });
+}
+
+#[test]
+fn sdk_041_cancel_target_metadata_and_rewind_compatibility() {
+    use acp::Agent as _;
+    use crate::session::CancelHistoryDisposition;
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-target");
+        let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        for (meta, expected) in [
+            (serde_json::json!({"targetPromptId": "p"}), CancelHistoryDisposition::KeepIfFront { prompt_id: "p".into() }),
+            (serde_json::json!({"promptId": "legacy"}), CancelHistoryDisposition::Keep),
+            (serde_json::json!({"targetPromptId": "p", "rewindIfNoOutput": true}), CancelHistoryDisposition::RewindIfNoOutput { prompt_id: Some("p".into()) }),
+            (serde_json::json!({"targetPromptId": "p", "promptId": "p", "rewindIfPristine": true}), CancelHistoryDisposition::RewindIfNoOutput { prompt_id: Some("p".into()) }),
+        ] {
+            agent.cancel(acp::CancelNotification::new(sid.clone()).meta(meta.as_object().cloned())).await.unwrap();
+            let crate::session::SessionCommand::Cancel(options) = cmd_rx.try_recv().unwrap() else {
+                panic!("expected cancel");
+            };
+            assert_eq!(options.history, expected);
+        }
+        let meta = serde_json::json!({"targetPromptId": "p", "promptId": "other", "rewindIfNoOutput": true});
+        let err = agent.cancel(acp::CancelNotification::new(sid).meta(meta.as_object().cloned())).await.unwrap_err();
+        assert_eq!(err.code, acp::Error::invalid_params().code);
+        assert!(cmd_rx.try_recv().is_err());
+    });
+}
 /// Regression (post-cancel slot hang, first bad release 0.2.101; see `dispatch_lock`).
 /// SDK e2e shape: `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
 #[test]

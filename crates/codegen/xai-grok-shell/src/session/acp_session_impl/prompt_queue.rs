@@ -881,6 +881,18 @@ impl SessionActor {
         expected_version: u64,
         owner: Option<&str>,
     ) -> bool {
+        self.handle_remove_queued_prompt_with_policy(id, expected_version, owner, true)
+            .await
+    }
+
+    /// Legacy notifications release leaked holds on misses; typed mutations must not.
+    pub(super) async fn handle_remove_queued_prompt_with_policy(
+        &self,
+        id: &str,
+        expected_version: u64,
+        owner: Option<&str>,
+        clear_hold_on_miss: bool,
+    ) -> bool {
         let mut state = self.state.lock().await;
         let mut removed = false;
         if !Self::is_running_prompt(&state, id)
@@ -894,8 +906,8 @@ impl SessionActor {
             }
             removed = true;
         }
-        // A remove that misses (row gone or version stale) still clears a leaked hold; a protected row is a no-op
-        if !Self::has_protected_row(&state, id) {
+        // Legacy misses clear leaked holds; typed misses and protected rows preserve them.
+        if (removed || clear_hold_on_miss) && !Self::has_protected_row(&state, id) {
             state.edit_holds.remove(id);
         }
         if !removed {
@@ -932,6 +944,18 @@ impl SessionActor {
         expected_version: u64,
         owner: Option<&str>,
         new_text: Option<&str>,
+    ) -> SendNowOutcome {
+        self.handle_interject_queued_prompt_with_policy(id, expected_version, owner, new_text, true)
+            .await
+    }
+
+    pub(super) async fn handle_interject_queued_prompt_with_policy(
+        &self,
+        id: &str,
+        expected_version: u64,
+        owner: Option<&str>,
+        new_text: Option<&str>,
+        clear_hold_on_miss: bool,
     ) -> SendNowOutcome {
         let mut state = self.state.lock().await;
         let running_front_id = state.running_prompt_id().map(str::to_string);
@@ -1015,7 +1039,7 @@ impl SessionActor {
                 "queue send-now no-op (running id / stale / drained / not owner); rebroadcasting"
             );
         }
-        if !Self::has_protected_row(&state, id) {
+        if (mutated || clear_hold_on_miss) && !Self::has_protected_row(&state, id) {
             state.edit_holds.remove(id);
         }
         // Always re-broadcast the authoritative queue so the client reconciles.
@@ -1128,7 +1152,7 @@ impl SessionActor {
     /// - The id names the currently-running turn (editing the live turn is out of scope).
     /// - `new_text` is blank (a queued prompt is never blanked).
     ///
-    /// Every path clears the id's hold under the queue lock so a stale edit request cannot leave promote parked.
+    /// Legacy edits clear the id's hold even on misses; versioned edits clear it only when applied.
     /// Returns whether the edit was applied.
     pub(super) async fn handle_edit_queued_prompt(
         &self,
@@ -1176,7 +1200,7 @@ impl SessionActor {
                 "queue edit no-op: id not found (already drained / removed)"
             );
         }
-        if !Self::has_protected_row(&state, id) {
+        if (should_broadcast || expected_version.is_none()) && !Self::has_protected_row(&state, id) {
             state.edit_holds.remove(id);
         }
         if should_broadcast {

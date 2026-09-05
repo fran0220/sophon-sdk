@@ -172,10 +172,17 @@ actors remain authoritative:
 - existing terminal-task and subagent authorities expose typed list/inspect/
   cancel/kill paths without a second store.
 
+SDK correctness repairs retain legacy queue-edit behavior while making failed
+typed entry-version mutations side-effect-free. Targeted cancellation checks
+front identity atomically with the finalization claim; unknown-session mode
+changes fail instead of hanging. The gateway optionally cancels orphaned
+permission callbacks; the default remains unchanged for native TUI/stdio users.
+
 The SDK projection, public DTOs, and JSON parsing of fixed legacy extension
 routes remain under `crates/sophon-sdk` and are excluded from upstream-path
 validation. Approved upstream files (digest: `typed-management.sha256`):
 
+- `crates/codegen/xai-acp-lib/src/gateway.rs`
 - `crates/codegen/xai-grok-agent/src/builder.rs`
 - `crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs`
 - `crates/codegen/xai-grok-pager/src/app/app_view.rs`
@@ -200,6 +207,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_queue_actor_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_types.rs`

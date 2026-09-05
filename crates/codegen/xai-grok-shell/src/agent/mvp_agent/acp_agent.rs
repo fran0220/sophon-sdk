@@ -2206,10 +2206,25 @@ impl acp::Agent for MvpAgent {
                 .and_then(|m| m.get("promptId"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
+            let target_prompt_id = args
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("targetPromptId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            if rewind_if_no_output
+                && let (Some(target), Some(rewind)) = (&target_prompt_id, &rewind_prompt_id)
+                && target != rewind
+            {
+                return Err(acp::Error::invalid_params()
+                    .data("targetPromptId and promptId must match for rewind"));
+            }
             let history = if rewind_if_no_output {
                 crate::session::CancelHistoryDisposition::RewindIfNoOutput {
-                    prompt_id: rewind_prompt_id,
+                    prompt_id: rewind_prompt_id.or(target_prompt_id),
                 }
+            } else if let Some(prompt_id) = target_prompt_id {
+                crate::session::CancelHistoryDisposition::KeepIfFront { prompt_id }
             } else {
                 crate::session::CancelHistoryDisposition::Keep
             };
@@ -2234,16 +2249,17 @@ impl acp::Agent for MvpAgent {
         args: acp::SetSessionModeRequest,
     ) -> Result<acp::SetSessionModeResponse, acp::Error> {
         tracing::info!("Received set session mode request {args:?}");
-        let handle = self.session_handle_waiting_for_load(&args.session_id).await;
+        let handle = self
+            .session_handle_waiting_for_load(&args.session_id)
+            .await
+            .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
         let (tx, rx) = oneshot::channel();
-        if let Some(handle) = handle {
-            let _ = handle
-                .cmd_tx
-                .send(SessionCommand::SessionMode {
-                    session_mode: args.mode_id,
-                    responds_to: tx,
-                });
-        }
+        let _ = handle
+            .cmd_tx
+            .send(SessionCommand::SessionMode {
+                session_mode: args.mode_id,
+                responds_to: tx,
+            });
         let _ = rx
             .await
             .map_err(|_| {

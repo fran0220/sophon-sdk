@@ -25,6 +25,7 @@ pub struct AcpGatewayReceiver<S: AcpSide, C> {
     tracing: bool,
     spawn_fn: SpawnFn,
     on_meta: Option<OnMetaFn>,
+    orphaned_permission_cancel: bool,
 }
 
 impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
@@ -37,7 +38,15 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
                 tokio::task::spawn_local(fut);
             }),
             on_meta: None,
+            orphaned_permission_cancel: false,
         }
+    }
+
+    /// Cancel agent-side permission callbacks when their response receiver is dropped.
+    /// Disabled by default; all other handlers are unaffected.
+    pub fn with_orphaned_permission_cancel(mut self, enabled: bool) -> Self {
+        self.orphaned_permission_cancel = enabled;
+        self
     }
 
     pub fn with_tracing(mut self, tracing: bool) -> Self {
@@ -238,6 +247,27 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
         while let Some(msg) = self.rx.recv().await {
             let conn = conn.clone();
             match msg {
+                AcpClientMessage::RequestPermission(mut args)
+                    if self.orphaned_permission_cancel =>
+                {
+                    let span = on_meta
+                        .as_ref()
+                        .zip(args.request.meta.as_ref())
+                        .map(|(f, meta)| f(meta))
+                        .unwrap_or_else(tracing::Span::none);
+                    let tracing = self.tracing;
+                    spawn(Box::pin(
+                        async move {
+                            let method = before_request(&args, tracing);
+                            let response = tokio::select! {
+                                _ = args.response_tx.closed() => return,
+                                response = conn.request_permission(args.request) => response,
+                            };
+                            let _ = after_request(args.response_tx, response, method);
+                        }
+                        .instrument(span),
+                    ));
+                }
                 AcpClientMessage::RequestPermission(args) => {
                     handle!(args, self.tracing, conn, request_permission, spawn, on_meta);
                 }
@@ -528,6 +558,150 @@ mod tests {
     use std::rc::Rc;
 
     use agent_client_protocol as acp;
+
+    struct DropSignal(Rc<tokio::sync::Notify>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    struct PermissionClient {
+        pending: bool,
+        started: Rc<tokio::sync::Notify>,
+        dropped: Rc<tokio::sync::Notify>,
+        notified: Rc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for PermissionClient {
+        async fn request_permission(
+            &self,
+            _: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            let _guard = DropSignal(self.dropped.clone());
+            self.started.notify_one();
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ))
+        }
+
+        async fn session_notification(&self, _: acp::SessionNotification) -> acp::Result<()> {
+            tokio::task::yield_now().await;
+            self.notified.notify_one();
+            Ok(())
+        }
+    }
+
+    fn permission_request() -> acp::RequestPermissionRequest {
+        acp::RequestPermissionRequest::new(
+            acp::SessionId::new("s"),
+            acp::ToolCallUpdate::new("tool", acp::ToolCallUpdateFields::default()),
+            vec![],
+        )
+    }
+
+    async fn check_orphaned_permission_cancel(enabled: Option<bool>) {
+        let local = tokio::task::LocalSet::new();
+        let dropped = Rc::new(tokio::sync::Notify::new());
+        local
+            .run_until(async {
+                let started = Rc::new(tokio::sync::Notify::new());
+                let (sender, receiver) = acp_gateway::<acp::AgentSide, _>(PermissionClient {
+                    pending: true,
+                    started: started.clone(),
+                    dropped: dropped.clone(),
+                    notified: Rc::new(tokio::sync::Notify::new()),
+                });
+                let receiver = match enabled {
+                    Some(enabled) => receiver.with_orphaned_permission_cancel(enabled),
+                    None => receiver,
+                };
+                tokio::task::spawn_local(receiver.run());
+                let response = sender.forward_with_completion(permission_request());
+                tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("permission callback must start");
+                drop(response);
+
+                if enabled == Some(true) {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), dropped.notified())
+                        .await
+                        .expect("orphaned callback must be dropped while LocalSet is running");
+                } else {
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(50),
+                            dropped.notified(),
+                        )
+                        .await
+                        .is_err(),
+                        "legacy callback must survive its caller"
+                    );
+                }
+            })
+            .await;
+        drop(local);
+        if enabled != Some(true) {
+            // Verify the guard was live until runtime teardown, not merely absent.
+            tokio::time::timeout(std::time::Duration::from_secs(1), dropped.notified())
+                .await
+                .expect("LocalSet teardown must drop the legacy callback");
+        }
+    }
+
+    #[tokio::test]
+    async fn orphaned_permission_cancel_is_opt_in() {
+        check_orphaned_permission_cancel(None).await;
+        check_orphaned_permission_cancel(Some(false)).await;
+        check_orphaned_permission_cancel(Some(true)).await;
+    }
+
+    #[tokio::test]
+    async fn permission_success_and_notifications_are_unaffected() {
+        for enabled in [false, true] {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let notified = Rc::new(tokio::sync::Notify::new());
+                    let (sender, receiver) = acp_gateway::<acp::AgentSide, _>(PermissionClient {
+                        pending: false,
+                        started: Rc::new(tokio::sync::Notify::new()),
+                        dropped: Rc::new(tokio::sync::Notify::new()),
+                        notified: notified.clone(),
+                    });
+                    tokio::task::spawn_local(
+                        receiver.with_orphaned_permission_cancel(enabled).run(),
+                    );
+                    let response = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        sender.send(permission_request()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(matches!(
+                        response.outcome,
+                        acp::RequestPermissionOutcome::Cancelled
+                    ));
+
+                    // Fire-and-forget drops the response receiver immediately.
+                    assert!(sender.forward_fire_and_forget(text_notification("orphan")));
+                    tokio::time::timeout(std::time::Duration::from_secs(1), notified.notified())
+                        .await
+                        .expect("notification must finish despite its dropped response receiver");
+                    sender
+                        .forward_with_completion(text_notification("completion"))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                })
+                .await;
+        }
+    }
 
     struct OrderTrackingClient {
         log: Rc<RefCell<Vec<String>>>,

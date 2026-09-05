@@ -2,6 +2,70 @@
 use super::support::*;
 use super::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_041_stale_typed_mutations_preserve_edit_hold() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (actor, _) = build_actor().await;
+        actor.state.lock().await.pending_inputs.push_back(user_item("p", "alice"));
+        assert!(actor.handle_hold_edit("p".into()).await);
+        let held_at = actor.state.lock().await.edit_holds["p"];
+        assert!(!actor.handle_edit_queued_prompt_versioned("p", Some(99), "stale".into(), Some("bob")).await);
+        assert_eq!(actor.state.lock().await.edit_holds["p"], held_at);
+        assert!(!actor.handle_remove_queued_prompt_with_policy("p", 99, Some("alice"), false).await);
+        assert_eq!(actor.state.lock().await.edit_holds["p"], held_at);
+        let outcome = actor.handle_interject_queued_prompt_with_policy("p", 99, Some("alice"), Some("stale"), false).await;
+        assert!(!outcome.mutated && !outcome.cancel_running_turn);
+        assert_eq!(actor.state.lock().await.edit_holds["p"], held_at);
+        actor.clone().maybe_start_running_task(tokio::sync::mpsc::unbounded_channel().0).await;
+        let state = actor.state.lock().await;
+        assert!(state.running_task.is_none());
+        assert_eq!(state.pending_inputs.len(), 1);
+        assert_eq!(state.pending_inputs.front().unwrap().queue_meta.as_ref().unwrap().version, 0);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_041_targeted_cancel_checks_actor_front_not_pin() {
+    tokio::task::LocalSet::new().run_until(async {
+        for promote_first in [false, true] {
+            let (actor, _) = build_actor().await;
+            let (item, mut response) = user_item_with_rx("front", "alice");
+            actor.state.lock().await.pending_inputs.push_back(item);
+            if promote_first {
+                actor.clone().maybe_start_running_task(tokio::sync::mpsc::unbounded_channel().0).await;
+            }
+            // Even a pin naming the stale target is not authoritative.
+            *actor.current_prompt_id.lock().unwrap() = Some("old".into());
+            let stale = actor.cancel_running_task(crate::session::CancelOptions {
+                history: crate::session::CancelHistoryDisposition::KeepIfFront { prompt_id: "old".into() },
+                cancel_subagents: true,
+                kill_background_tasks: true,
+                trigger: Some(crate::session::CancelTrigger::CtrlC),
+                user_initiated: true,
+            }).await;
+            assert!(!stale.settled && !stale.turn_stopped);
+            assert!(response.try_recv().is_err());
+            {
+                let state = actor.state.lock().await;
+                assert!(!state.notifications_suppressed);
+                assert_eq!(state.pending_inputs.front().unwrap().prompt_id, "front");
+                if let Some(task) = state.running_task.as_ref() {
+                    assert!(!task.handle.is_finished());
+                }
+            }
+            // A pinned front without a task, and a live task without a pin, both work.
+            *actor.current_prompt_id.lock().unwrap() = (!promote_first).then(|| "front".into());
+            let current = actor.cancel_running_task(crate::session::CancelOptions {
+                history: crate::session::CancelHistoryDisposition::KeepIfFront { prompt_id: "front".into() },
+                trigger: Some(crate::session::CancelTrigger::CtrlC),
+                ..Default::default()
+            }).await;
+            assert!(current.settled);
+            assert!(response.try_recv().is_ok());
+        }
+    }).await;
+}
+
 /// The shared-queue text must use a block's compact `displayText` (e.g. a locally-expanded `/loop` invocation) rather than the raw wire text.
 /// Other clients' turn-start shim renders that text as the user block, and the raw text is the full skill instruction.
 #[test]
