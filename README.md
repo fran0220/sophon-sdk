@@ -50,7 +50,7 @@ while their implementation and request lifecycle remain upstream-owned. This
 provider-routing seam also keeps web search and prompt suggestions attached to
 their selected provider. Separately digested hermetic-discovery and Windows
 portability patches protect the embedding boundary and supported build hosts; a
-fourth digest records one stale public-test import repair. A fifth reviewed
+fourth digest records public-snapshot test repairs. A fifth reviewed
 patch protects Goal publication and failure handling. A sixth adds
 actor-authoritative typed management: native FIFO CAS, Agent-wide
 admission/quiesce, scheduler/tasks, rewind, health, credential-free effective

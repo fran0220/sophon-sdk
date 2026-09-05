@@ -245,3 +245,43 @@ diff for its exact file set, so either boundary detects drift.
 
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
+
+## 1.0.16 validation (2026-09-05, Linux x86_64)
+
+- `scripts/check-upstream-sync.sh`: untouched paths and all six digests pass.
+  The imported public commit is also a Git ancestor, so a full clone retains
+  the pinned object instead of depending on a previous orb's fetch.
+- `cargo test --locked -p sophon-sdk`: 20 unit tests and the three-protocol
+  Agent/Session integration test pass. The integration covers host-owned policy
+  survival, no detached startup provider connections, model/prompt ownership,
+  independent provider credentials and management behavior.
+- Config, MCP, memory, sampler, tools, prompt queue and message-delivery test
+  targets pass (including 3,151 tools unit tests). Compaction's focused
+  `xai-chat-state` run passes 166 tests; workspace managed policy passes 17.
+- Production `cargo clippy --locked -p sophon-sdk -p xai-grok-shell
+  -p xai-grok-tools -p xai-prompt-queue --lib -- -D warnings` passes.
+  All-target Clippy is not green: existing test-only disallowed raw spawn and
+  HTTP-client construction remain in `computer/local/lifecycle.rs` and
+  `util/shared_http.rs` (unchanged by this upgrade). No lint was suppressed.
+- Full shell unit execution completes with 6,781 passing, 30 failing and
+  5 ignored tests under a four-thread runner. Of the 30 failures, 23 pass when
+  isolated (crypto-provider/global-state interference); five worktree fixtures
+  pass with test-only Git configuration disabling inherited commit signing
+  and selecting `main`. Two still fail in isolation: `provider_expiry_source_precedence`
+  (JWT provider initialization) and `parse_list_req_forces_kind_under_process_chat_mode_only`
+  (empty kind filter expectation). Both source files are unchanged by this
+  upgrade; these failures remain visible rather than weakening their assertions.
+  New peer Queue/Steer, workflow drain, startup cancellation and reasoning/head
+  ownership regressions pass. External-auth and image-recovery integration
+  tests pass after removing the orb's inherited `GROK_AUTH` from their process.
+- Use `env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0` for shell
+  test commands here; the default test-thread stack overflows on the large
+  debug actor future. For Git fixtures also set process-local
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false
+  GIT_CONFIG_KEY_1=init.defaultBranch GIT_CONFIG_VALUE_1=main`.
+- Pager and PTY scenario binaries build. The native `welcome.yaml` and
+  `slash_resize_storm.yaml` scenarios pass with no reported bugs; normal and
+  tiny-terminal captures were visually inspected. Pager remains outside the
+  SDK's normal dependency closure, as do `ratatui` and `crossterm`.
+- Windows/macOS execution and live external-provider credentials were not
+  exercised in this Linux orb; portability patches are retained.
