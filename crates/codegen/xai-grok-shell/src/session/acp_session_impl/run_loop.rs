@@ -533,7 +533,9 @@ pub(super) async fn run_session(
                     };
 
                     match cmd {
-                        SessionCommand::Initialize { system_prompt } => {
+                        SessionCommand::Initialize { system_prompt, explicit_override } => {
+                            *session.explicit_system_prompt.borrow_mut() =
+                                explicit_override.then(|| system_prompt.clone());
                             session.initialize(system_prompt).await;
                             let s = session.clone();
                             let handle = tokio::task::spawn_local(instrument_task!(

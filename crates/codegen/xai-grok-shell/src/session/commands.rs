@@ -374,6 +374,8 @@ pub struct CancelOptions {
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
+        /// Whether the fresh prompt came from explicit systemPromptOverride metadata.
+        explicit_override: bool,
     },
     /// Non-destructive system-prompt sync on session attach: swaps only the leading `System` message, keeping user/assistant turns.
     /// Backed by the atomic `ChatStateCommand::ReplaceSystemHead` (see its doc for the serialization guarantees).

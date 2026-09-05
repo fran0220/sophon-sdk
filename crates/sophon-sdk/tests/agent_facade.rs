@@ -12,7 +12,10 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(
         grok_home.path().join("config.toml"),
-        "[features]\nsession_recap = false\nweb_fetch = true\n",
+        "[features]\nsession_recap = false\nweb_fetch = true\n\
+         [model.sdk-concise]\nuse_concise = true\n\
+         [model.sdk-codex]\nagent_type = 'codex'\n\
+         [model.sdk-codex-concise]\nagent_type = 'codex'\nuse_concise = true\n",
     )
     .expect("write effective Grok config");
     let _grok_home = EnvGuard::set("GROK_HOME", grok_home.path());
@@ -57,10 +60,13 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
 
         for (provider, path, auth_header, auth_value) in providers {
             let request_start = server.requests().len();
-            let suggestion_request_start = suggestion_server.requests().len();
             let provider = provider.header("x-sdk-test", "configured");
             let agent = Agent::start(
-                AgentConfig::new(ModelConfig::new("sdk-model", provider))
+                AgentConfig::new(ModelConfig::new("sdk-model", provider.clone()))
+                    .model(ModelConfig::new("sdk-other", provider.clone()))
+                    .model(ModelConfig::new("sdk-concise", provider.clone()))
+                    .model(ModelConfig::new("sdk-codex", provider.clone()))
+                    .model(ModelConfig::new("sdk-codex-concise", provider))
                     .model(ModelConfig::new(
                         "suggestion-model",
                         ProviderConfig::openai_responses(
@@ -71,6 +77,8 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                         .header("x-suggestion-tenant", "tenant")
                         .query_param("tenant", "suggestion"),
                     ))
+                    // Keep title side-calls off the main inference capture.
+                    .session_summary_model("suggestion-model")
                     .prompt_suggestion_model("suggestion-model"),
             )
             .await
@@ -136,6 +144,7 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             .expect("assistant event timeout");
             assert!(assistant_text.contains("response from Grok Build"));
 
+            let suggestion_request_start = suggestion_server.requests().len();
             let suggestion_response = session
                 .extension("x.ai/suggestPrompt", serde_json::json!({ "generation": 1 }))
                 .await
@@ -220,6 +229,20 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                     .resume_session(session_id.clone(), config)
                     .await
                     .expect("attach authored session");
+                if replace {
+                    attached
+                        .set_model("sdk-other")
+                        .await
+                        .expect("switch after attach");
+                    attached
+                        .set_model("sdk-concise")
+                        .await
+                        .expect("concise after attach");
+                    attached
+                        .set_model("sdk-model")
+                        .await
+                        .expect("restore model after attach");
+                }
                 let start = server.requests().len();
                 attached
                     .prompt("verify attached prompt head")
@@ -256,7 +279,108 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                 .await
                 .expect("resume session");
             resumed.close().await.expect("close resumed session");
+            verify_model_switch_prompts(&agent, &server, workspace.path(), path).await;
             agent.shutdown().await.expect("shutdown agent");
         }
     });
+}
+
+/// Runs the real facade, session command loop, harness builder and sampler.
+/// Only the provider is mocked; assertions inspect the actual wire system head.
+async fn verify_model_switch_prompts(
+    agent: &Agent,
+    server: &MockInferenceServer,
+    workspace: &std::path::Path,
+    path: &str,
+) {
+    const AUTHORED: &str =
+        "CLIENT_AUTHORED: retain my exact instructions, including whitespace.\n ";
+    const COMPACT: &str = "You are an AI coding agent. You operate in a workspace with a provided codebase.\n\nYour main goal is to complete the user's request, denoted within the <user_query> tag.";
+    for explicit in [false, true] {
+        for rebuild in [false, true] {
+            let mut config = SessionConfig::new(workspace).model("sdk-model");
+            if explicit {
+                config = config.metadata("systemPromptOverride", serde_json::json!(AUTHORED));
+            }
+            let session = agent
+                .create_session(config)
+                .await
+                .expect("model-switch session");
+            let initial_agent = session.info().await.expect("initial harness").agent_name;
+            assert_ne!(initial_agent.as_deref(), Some("codex"));
+            let models = if rebuild {
+                ["sdk-codex", "sdk-codex-concise", "sdk-codex"]
+            } else {
+                ["sdk-other", "sdk-concise", "sdk-model"]
+            };
+            let mut normal_head = None;
+            for (step, model) in models.into_iter().enumerate() {
+                // The first codex switch must rebuild the zero-turn harness.
+                session
+                    .set_model(model)
+                    .await
+                    .expect("explicit model switch");
+                if rebuild {
+                    assert_eq!(
+                        session
+                            .info()
+                            .await
+                            .expect("rebuilt harness")
+                            .agent_name
+                            .as_deref(),
+                        Some("codex"),
+                        "zero-turn model switch must actually rebuild the harness"
+                    );
+                }
+                let start = server.requests().len();
+                session
+                    .prompt("verify model switch prompt")
+                    .await
+                    .expect("model-switch turn");
+                let requests = server.requests();
+                let body = requests[start..]
+                    .iter()
+                    .find(|request| request.path == path)
+                    .expect("model-switch inference request")
+                    .body
+                    .as_ref()
+                    .unwrap();
+                let head = match path {
+                    "/v1/chat/completions" => {
+                        body["messages"][0]["content"].as_str().unwrap().to_owned()
+                    }
+                    "/v1/responses" => body["input"][0]["content"].as_str().unwrap().to_owned(),
+                    "/v1/messages" => body["system"][0]["text"].as_str().unwrap().to_owned(),
+                    _ => unreachable!(),
+                };
+                if explicit {
+                    assert_eq!(
+                        head, AUTHORED,
+                        "override lost: rebuild={rebuild}, model={model}, protocol={path}"
+                    );
+                } else if step == 1 {
+                    assert_eq!(
+                        head, COMPACT,
+                        "unconfigured concise model must still use compact prompt"
+                    );
+                } else {
+                    assert!(!head.is_empty());
+                    assert_ne!(
+                        head, COMPACT,
+                        "normal model must restore its harness template"
+                    );
+                    assert!(!head.contains("CLIENT_AUTHORED"));
+                    if let Some(original) = &normal_head {
+                        assert_eq!(
+                            &head, original,
+                            "normal harness prompt changed after concise round trip"
+                        );
+                    } else {
+                        normal_head = Some(head);
+                    }
+                }
+            }
+            session.close().await.expect("close model-switch session");
+        }
+    }
 }

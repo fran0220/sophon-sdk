@@ -86,7 +86,9 @@ impl SessionActor {
             let mut conversation = self.chat_state_handle.get_conversation().await;
             for item in conversation.iter_mut() {
                 if let ConversationItem::System(sys) = item {
-                    if use_concise {
+                    if let Some(prompt) = self.explicit_system_prompt.borrow().as_deref() {
+                        sys.content = std::sync::Arc::<str>::from(prompt);
+                    } else if use_concise {
                         sys.content = std::sync::Arc::<str>::from(
                             xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
                         );
@@ -189,7 +191,11 @@ impl SessionActor {
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
-        let new_system_prompt = new_agent.system_prompt().to_string();
+        let new_system_prompt = self
+            .explicit_system_prompt
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| new_agent.system_prompt().to_string());
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();
         self.abort_and_clear_prefire().await;
@@ -338,6 +344,7 @@ impl SessionActor {
             return;
         };
         save_system_prompt(&self.session_info, &system_prompt);
+        *self.explicit_system_prompt.borrow_mut() = Some(system_prompt.clone());
         if changed {
             tracing::info!(
                 session_id = %self.session_info.id.0,

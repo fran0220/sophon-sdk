@@ -1671,6 +1671,7 @@ pub(crate) async fn spawn_session_actor(
         }
     };
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
+        explicit_system_prompt: Default::default(),
         status_wake: Default::default(),
         session_info: session_info.clone(),
         transient_retry_enabled: !startup_hints.is_subagent

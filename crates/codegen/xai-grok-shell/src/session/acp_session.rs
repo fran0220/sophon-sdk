@@ -697,6 +697,9 @@ impl ImageStripRewriteBarrier {
     }
 }
 pub(crate) struct SessionActor {
+    /// Current client-authored prompt, not inferred from conversation contents.
+    /// Process-local: cold loads must supply systemPromptOverride again.
+    pub(crate) explicit_system_prompt: std::cell::RefCell<Option<String>>,
     pub(crate) repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState,
     pub(crate) session_info: SessionInfo,
     /// Transient turn-retry kill switch, resolved once at spawn; flips apply to new sessions.

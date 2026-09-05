@@ -4888,6 +4888,8 @@ impl MvpAgent {
                 .cmd_tx
                 .send(SessionCommand::Initialize {
                     system_prompt,
+                    explicit_override: system_prompt_override_from_meta(session_meta, init_meta)
+                        .is_some(),
                 });
             tracing::debug!(session_id = %session_info.id.0, "enqueued SessionCommand::Initialize");
         }
