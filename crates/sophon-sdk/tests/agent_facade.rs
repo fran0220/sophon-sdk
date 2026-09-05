@@ -35,6 +35,34 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
+        // Observe TCP accepts, not only inference routes: upstream prewarm is
+        // an origin GET and would evade the mock provider's POST capture.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("prewarm probe listener");
+        let agent = Agent::start(AgentConfig::new(ModelConfig::new(
+            "no-prewarm",
+            ProviderConfig::openai_chat(
+                format!("http://{}/v1", listener.local_addr().unwrap()),
+                "sdk-secret",
+                "wire-model",
+            ),
+        )))
+        .await
+        .expect("start without provider traffic");
+        let session = agent
+            .create_session(SessionConfig::new(workspace.path()))
+            .await
+            .expect("create without provider traffic");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err(),
+            "hermetic startup must not initiate detached provider prewarming"
+        );
+        session.close().await.expect("close unprompted session");
+        agent.shutdown().await.expect("stop unprompted agent");
+
         let server = MockInferenceServer::start().await.expect("mock provider");
         server.set_response("response from Grok Build");
         let suggestion_server = MockInferenceServer::start()
