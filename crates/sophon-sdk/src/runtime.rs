@@ -600,7 +600,7 @@ fn run_worker(
                     None,
                 );
                 let _ = ready.send(Ok(initialization_response));
-                command_loop(
+                let result = command_loop(
                     agent,
                     gateway,
                     commands,
@@ -611,8 +611,15 @@ fn run_worker(
                 update_runtime_health(
                     &runtime_health,
                     &management,
-                    mgmt::RuntimeState::Stopped,
-                    None,
+                    if result.is_ok() {
+                        mgmt::RuntimeState::Stopped
+                    } else {
+                        mgmt::RuntimeState::Failed
+                    },
+                    result.err().map(|error| mgmt::RuntimeFailure {
+                        code: "shutdown_flush".into(),
+                        message: error.to_string(),
+                    }),
                 );
             }
             Err(error) => {
@@ -704,7 +711,9 @@ async fn finish_worker(
     agent: &MvpAgent,
     gateway: &AcpGatewaySender<acp::AgentSide>,
 ) -> Result<(), Error> {
-    agent.flush_all_sessions(Duration::from_secs(10)).await;
+    let flushed = agent
+        .flush_all_sessions_checked(Duration::from_secs(10))
+        .await;
     // Notification handlers execute inline, so this ACK proves every earlier
     // notification has reached the SDK broadcast streams (not every subscriber).
     let barrier = acp::ExtNotification::new(
@@ -720,7 +729,13 @@ async fn finish_worker(
     .await
     .map_err(|_| Error::Operation("notification drain timed out".into()))?
     .map_err(|_| Error::RuntimeStopped)?
-    .map_err(acp_error)
+    .map_err(acp_error)?;
+    if !flushed {
+        return Err(Error::Operation(
+            "session flush timed out; persistence is not confirmed".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn command_loop(
@@ -729,7 +744,7 @@ async fn command_loop(
     mut commands: mpsc::UnboundedReceiver<Command>,
     management: ManagementEmitter,
     runtime_health: watch::Sender<mgmt::RuntimeHealth>,
-) {
+) -> Result<(), Error> {
     let mut pending: Option<PendingDrain> = None;
     let mut open = true;
     loop {
@@ -754,14 +769,13 @@ async fn command_loop(
                         };
                         let _ = reply.send(response);
                     }
-                    break;
+                    return result;
                 }
                 for reply in drain.shutdown {
                     let _ = reply.send(Err(Error::QuiesceTimedOut(Box::new(report.clone()))));
                 }
                 if !open {
-                    let _ = finish_worker(&agent, &gateway).await;
-                    break;
+                    return finish_worker(&agent, &gateway).await;
                 }
                 continue;
             }
@@ -770,8 +784,7 @@ async fn command_loop(
         let Some(command) = command else {
             open = false;
             if pending.is_none() {
-                let _ = finish_worker(&agent, &gateway).await;
-                break;
+                return finish_worker(&agent, &gateway).await;
             }
             continue;
         };

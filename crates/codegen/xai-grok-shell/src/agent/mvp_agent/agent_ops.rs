@@ -438,6 +438,10 @@ impl MvpAgent {
     pub async fn flush_all_sessions(&self, grace: std::time::Duration) {
         self.activity.flush_all_sessions(grace).await;
     }
+    /// Checked embedding flush; false means session actors exceeded the grace.
+    pub async fn flush_all_sessions_checked(&self, grace: std::time::Duration) -> bool {
+        self.activity.flush_all_sessions_checked(grace).await
+    }
     /// Atomically close Agent-wide prompt admission and drain all work that
     /// was accepted before the fence.
     pub async fn quiesce(

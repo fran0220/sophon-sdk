@@ -354,6 +354,9 @@ receiver falls behind the bounded buffer.
   fence, not ordering between concurrent SDK calls, decides acceptance.
 - After drain, shutdown performs native session flushing (10-second grace)
   and an ordered in-process notification barrier (2-second budget). The barrier
+  and actor flush are checked: failure stops the worker with `Failed` health
+  and an error, never a successful replacement claim.
+  The barrier
   proves earlier notifications reached the broadcast streams, not that slow
   subscribers consumed them or that lagged history can be recovered. Retained
   Agent/Session handles retain senders: stop consumers on terminal runtime

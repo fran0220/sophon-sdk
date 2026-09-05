@@ -301,6 +301,12 @@ impl AgentActivity {
     /// Either way, session state must be durable before the drop aborts remaining tasks.
     /// Actors that miss the grace are logged and abandoned.
     pub async fn flush_all_sessions(&self, grace: Duration) {
+        let _ = self.flush_all_sessions_checked(grace).await;
+    }
+
+    /// Report whether every actor exited, so embeddings do not report successful
+    /// shutdown when native session flushing exceeded its grace.
+    pub async fn flush_all_sessions_checked(&self, grace: Duration) -> bool {
         let _span = session_end::span(Phase::SessionFlush);
         let deadline = tokio::time::Instant::now() + grace;
         // Every distinct channel signaled so far (id kept for logging).
@@ -322,7 +328,7 @@ impl AgentActivity {
             }
 
             if signaled.iter().all(|(_, tx)| tx.is_closed()) {
-                return; // nothing to flush, or all actors exited
+                return true; // nothing to flush, or all actors exited
             }
             if tokio::time::Instant::now() >= deadline {
                 for (id, tx) in &signaled {
@@ -333,7 +339,7 @@ impl AgentActivity {
                         );
                     }
                 }
-                return;
+                return false;
             }
             tokio::time::sleep(FLUSH_POLL).await;
         }
@@ -511,7 +517,7 @@ mod tests {
         // Simulated actor: exits (drops rx) when it receives Shutdown.
         let actor = spawn_actor(rx, Duration::ZERO);
 
-        activity.flush_all_sessions(Duration::from_secs(5)).await;
+        assert!(activity.flush_all_sessions_checked(Duration::from_secs(5)).await);
         assert!(actor.await.unwrap(), "actor should have received Shutdown");
     }
 
@@ -587,7 +593,7 @@ mod tests {
         let (_rx, _prompt_id, _pending) = register_raw(&activity, "s1");
 
         let start = tokio::time::Instant::now();
-        activity.flush_all_sessions(Duration::from_secs(2)).await;
+        assert!(!activity.flush_all_sessions_checked(Duration::from_secs(2)).await);
         assert!(
             start.elapsed() >= Duration::from_secs(2),
             "flush should wait out the grace period"

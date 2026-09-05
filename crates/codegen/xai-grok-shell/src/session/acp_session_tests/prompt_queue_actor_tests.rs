@@ -9,6 +9,7 @@ async fn sdk_041_stale_typed_mutations_preserve_edit_hold() {
         actor.state.lock().await.pending_inputs.push_back(user_item("p", "alice"));
         assert!(actor.handle_hold_edit("p".into()).await);
         let held_at = actor.state.lock().await.edit_holds["p"];
+        let version = actor.tool_context.queue_clock.snapshot();
         assert!(!actor.handle_edit_queued_prompt_versioned("p", Some(99), "stale".into(), Some("bob")).await);
         assert_eq!(actor.state.lock().await.edit_holds["p"], held_at);
         assert!(!actor.handle_remove_queued_prompt_with_policy("p", 99, Some("alice"), false).await);
@@ -17,6 +18,7 @@ async fn sdk_041_stale_typed_mutations_preserve_edit_hold() {
         assert!(!outcome.mutated && !outcome.cancel_running_turn);
         assert_eq!(actor.state.lock().await.edit_holds["p"], held_at);
         actor.clone().maybe_start_running_task(tokio::sync::mpsc::unbounded_channel().0).await;
+        assert_eq!(actor.tool_context.queue_clock.snapshot(), version);
         let state = actor.state.lock().await;
         assert!(state.running_task.is_none());
         assert_eq!(state.pending_inputs.len(), 1);
