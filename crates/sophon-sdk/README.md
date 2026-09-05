@@ -271,15 +271,17 @@ let resource = session
 
 ### Agent capability coverage
 
-The audit boundary is Grok Build's `MvpAgent`, not pager/TUI commands. Every
-non-TUI capability reachable from that agent has an SDK path:
+The audit boundary is the compiled public-source Grok Build `MvpAgent`, not
+pager/TUI commands or private services. The table distinguishes typed access,
+native agent execution, and raw forwarding. A reachable extension is not a
+stable typed SDK contract or evidence that every route has been exercised.
 
 | Grok Build capability | SDK access |
 |---|---|
 | Prompt loop; text/image/audio/resource input; image understanding | typed `Session` prompt methods plus raw blocks/metadata |
 | Native repository, terminal, web-fetch, web-search, image and video tools | executed by the upstream agent; configured through `GROK_HOME` and provider routes |
 | Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; raw summary/compaction extensions |
-| Runtime lifecycle and lossless Agent replacement | typed health watch, Agent-wide admission fence, `quiesce`, and loss-refusing `shutdown` |
+| Runtime lifecycle and Agent replacement | typed health watch, Agent-wide admission fence, cancellable `quiesce`, and drain-before-stop `shutdown` |
 | Native prompt FIFO | typed running/pending snapshot with prompt origin; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
 | Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events; typed durable terminal for directly admitted foreground occurrences |
 | Background terminal tasks | typed records/list and kill outcomes; snapshot-required start/completion events |
@@ -321,7 +323,7 @@ baseline: Grok Build declares Cargo feature `local-workspace`, but the public
 snapshot omits its `gateway_bridge` module and the feature does not compile.
 The SDK therefore does not claim the private Computer Hub own/attach path.
 Ordinary local repositories, git worktrees, session rehydration, tools, and all
-compiled `MvpAgent` extensions remain covered. Reimplementing that missing
+compiled `MvpAgent` extensions retain their native entry points. Reimplementing that missing
 private service would violate the thin-wrapper boundary.
 
 Image/video generation remains a native agent tool rather than a parallel
@@ -334,6 +336,36 @@ not copied into the SDK.
 is intentionally `!Send`; the public handles remain `Send + Sync`. Event
 delivery uses Tokio broadcast semantics, including an explicit lag error when a
 receiver falls behind the bounded buffer.
+
+### Correctness and validation boundary (0.4.1)
+
+- `tests/agent_facade.rs` exercises three mocked provider protocols, model/head
+  ownership, management access and hermetic policy. `tests/lifecycle.rs`
+  exercises actual Agent/Session timeout/retry, concurrent drain/cancel,
+  targeted cancellation, closed-session errors and terminal-event delivery.
+  Native actor tests cover queue CAS and targeted cancel. Raw route families
+  are forwarded, not exhaustively integration-tested; live providers and
+  Windows/macOS execution are not verified by these Linux tests.
+- `shutdown_with_timeout` bounds admission drain. Concurrent quiesce/shutdown
+  requests share the first drain's deadline. Timeout returns without joining
+  the live worker; admission stays closed so callers can cancel outstanding
+  work and retry. Successful shutdown is idempotent, and dropping a caller's
+  future does not abandon an already-enqueued drain. Native admission at the
+  fence, not ordering between concurrent SDK calls, decides acceptance.
+- After drain, shutdown performs native session flushing (10-second grace)
+  and an ordered in-process notification barrier (2-second budget). The barrier
+  proves earlier notifications reached the broadcast streams, not that slow
+  subscribers consumed them or that lagged history can be recovered. Retained
+  Agent/Session handles retain senders: stop consumers on terminal runtime
+  health, not by waiting indefinitely for broadcast channel closure.
+- `cancel_prompt(id)` atomically checks the actor's front; stale IDs are no-ops.
+  Queued rows use typed Remove. Legacy cancellation metadata `promptId` is
+  rewind-only; `targetPromptId` explicitly targets cancellation. Reserved native
+  synthetic IDs are rejected only at SDK prompt ingress, preserving native
+  scheduler/TUI behavior.
+- Failed typed entry-version Edit/Remove/Interject preserves holds and does not
+  kick promotion. Permission callback futures are cancelled when their native
+  waiter disappears; host-spawned independent tasks remain host-owned.
 
 ## Ownership boundary
 
@@ -353,6 +385,11 @@ closure still contains `agent-client-protocol` and `xai-acp-lib`; removing them
 would require feature-gating/refactoring the upstream agent rather than a thin
 facade change. The pager/TUI, `ratatui`, and `crossterm` are absent from the
 normal `sophon-sdk` dependency closure.
+The normal closure still includes shell terminal/PTY utilities needed by native
+tools; these are not the pager UI. Raw JSON fields and `x.ai/*` method names
+retain upstream protocol semantics even though ACP Rust types are private.
+`scripts/check-sdk-boundary.sh` checks the upstream digests, normal dependency
+tree and resolved public rustdoc signatures/reexports for ACP/TUI leakage.
 
 At startup the SDK loads and resolves Grok Build's effective configuration; it
 does not replace it with defaults. Persisted sessions, web fetch, tools, skills,
@@ -413,7 +450,7 @@ complete public snapshot, updates provenance, reconciles those boundaries,
 then adapts only this facade for public API changes.
 
 ```sh
-crates/sophon-sdk/scripts/check-upstream-sync.sh
+crates/sophon-sdk/scripts/check-sdk-boundary.sh
 CARGO_INCREMENTAL=0 cargo clippy --locked -p xai-prompt-queue -p xai-grok-tools -p xai-grok-shell -p sophon-sdk --all-targets -- -D warnings
 CARGO_INCREMENTAL=0 cargo test --locked -p xai-prompt-queue
 CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-tools

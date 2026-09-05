@@ -154,8 +154,8 @@ cargo test -p xai-grok-config # per-crate tests
 cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
 cargo fmt --all               # rustfmt.toml at the repo root
 
-# verify untouched upstream paths and each declared divergence digest
-crates/sophon-sdk/scripts/check-upstream-sync.sh
+# verify upstream digests, TUI dependency exclusion and public ACP type isolation
+crates/sophon-sdk/scripts/check-sdk-boundary.sh
 ```
 
 ## Contributing
