@@ -262,7 +262,10 @@ maintaining a duplicate implementation.
   -p xai-grok-tools -p xai-prompt-queue --lib -- -D warnings` passes.
   All-target Clippy is not green: existing test-only disallowed raw spawn and
   HTTP-client construction remain in `computer/local/lifecycle.rs` and
-  `util/shared_http.rs` (unchanged by this upgrade). No lint was suppressed.
+  `util/shared_http.rs`. A separate SDK/shell all-target run also reports
+  five existing test lints in shell `leader/mod.rs` and
+  `session/unified_list/mod.rs` (raw spawn, boolean assertions and identical
+  branches). All four files are unchanged by this upgrade. No lint was suppressed.
 - Full shell unit execution completes with 6,781 passing, 30 failing and
   5 ignored tests under a four-thread runner. Of the 30 failures, 23 pass when
   isolated (crypto-provider/global-state interference); five worktree fixtures
