@@ -97,7 +97,10 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             );
             let mut events = agent.subscribe();
             let session = agent
-                .create_session(SessionConfig::new(workspace.path()))
+                .create_session(SessionConfig::new(workspace.path()).metadata(
+                    "rules",
+                    serde_json::json!("ORIGINAL_ATTACH_RULES: retain this authored rule"),
+                ))
                 .await
                 .expect("create session");
             assert!(
@@ -199,6 +202,54 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             assert_eq!(listed.title.as_deref(), Some("SDK facade test"));
 
             let session_id = session.id().clone();
+            // The catalog key is sdk-model while persistence uses wire-model.
+            // Exercise both live reattach and actor eviction/reload, first without
+            // an override (original rules survive), then with explicit replacement.
+            for (cold, replace) in [(false, false), (true, false), (false, true), (true, true)] {
+                if cold {
+                    session.close().await.expect("evict before cold attach");
+                }
+                let mut config = SessionConfig::new(workspace.path());
+                if replace {
+                    config = config.metadata(
+                        "systemPromptOverride",
+                        serde_json::json!("ADMISSION_ATTACH_OVERRIDE: replacement system prompt"),
+                    );
+                }
+                let attached = agent
+                    .resume_session(session_id.clone(), config)
+                    .await
+                    .expect("attach authored session");
+                let start = server.requests().len();
+                attached
+                    .prompt("verify attached prompt head")
+                    .await
+                    .expect("attached turn");
+                let requests = server.requests();
+                let body = requests[start..]
+                    .iter()
+                    .find(|request| request.path == path)
+                    .expect("attached inference request")
+                    .body
+                    .as_ref()
+                    .unwrap()
+                    .to_string();
+                let expected = if replace {
+                    "ADMISSION_ATTACH_OVERRIDE"
+                } else {
+                    "ORIGINAL_ATTACH_RULES"
+                };
+                assert!(
+                    body.contains(expected),
+                    "authored head lost: cold={cold}, replace={replace}, protocol={path}"
+                );
+                if replace {
+                    assert!(
+                        !body.contains("ORIGINAL_ATTACH_RULES"),
+                        "override must replace, not append"
+                    );
+                }
+            }
             session.close().await.expect("close session");
             let resumed = agent
                 .resume_session(session_id, SessionConfig::new(workspace.path()))
