@@ -23,6 +23,13 @@ async fn sdk_041_stale_typed_mutations_preserve_edit_hold() {
         assert!(state.running_task.is_none());
         assert_eq!(state.pending_inputs.len(), 1);
         assert_eq!(state.pending_inputs.front().unwrap().queue_meta.as_ref().unwrap().version, 0);
+        drop(state);
+        assert!(actor.handle_edit_queued_prompt_versioned("p", Some(0), "valid edit".into(), Some("bob")).await);
+        let state = actor.state.lock().await;
+        assert!(!state.edit_holds.contains_key("p"));
+        let row = state.pending_inputs.front().unwrap().queue_meta.as_ref().unwrap();
+        assert_eq!(row.text, "valid edit");
+        assert_eq!(row.version, 1);
     }).await;
 }
 
