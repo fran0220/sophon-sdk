@@ -70,6 +70,7 @@ windows_portability=(
 
 public_snapshot_repairs=(
   crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs
 )
 
 goal_reliability=(

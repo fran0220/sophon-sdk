@@ -121,10 +121,13 @@ The post-1.0.13 public snapshot adds a memory-archive test with stale imports
 for two helpers that are not present in the public source. The repair removes
 only those nonexistent/unused imports so the upstream shell test target
 compiles; the test and production implementation are unchanged.
+The 1.0.16 image payload regression uses `if let` instead of a single-arm
+`match` to satisfy the repository's Clippy policy without changing its assertion.
 
-Approved file (digest: `public-snapshot-repairs.sha256`):
+Approved files (digest: `public-snapshot-repairs.sha256`):
 
 - `crates/codegen/xai-grok-shell/src/upload/memory_tests.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs`
 
 ## Goal reliability
 
