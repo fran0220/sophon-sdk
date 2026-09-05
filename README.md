@@ -51,22 +51,24 @@ provider-routing seam also keeps web search and prompt suggestions attached to
 their selected provider. Separately digested hermetic-discovery and Windows
 portability patches protect the embedding boundary and supported build hosts; a
 fourth digest records one stale public-test import repair. A fifth reviewed
-patch adds actor-authoritative typed management: native FIFO CAS, Agent-wide
+patch protects Goal publication and failure handling. A sixth adds
+actor-authoritative typed management: native FIFO CAS, Agent-wide
 admission/quiesce, scheduler/tasks, rewind, health, credential-free effective
 configuration, hooks/MCP and subagent observation. Stable management no longer
 requires downstream `x.ai/*` JSON; the raw extension seam remains for new,
 experimental and uncommon operations. The upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`bb7f39d5858cbf5e00de639367f59debbdcb0138` (a post-1.0.13 public source sync,
-crate metadata 1.0.13, `SOURCE_REV`
-`d761e8ba538084df023de79d26892eaf73ed7411`). This is an independent
+`72a61251fcffb464bcc687aeb5a998e5a98ec0c9` (crate metadata 1.0.16, `SOURCE_REV`
+`a549186d9d39311f2d3ee4208db62af8c65aa476`). This is an independent
 redistribution, not an official xAI SDK.
 
-The synchronized source advances the previous 1.0.6-era public pin through the
-1.0.7–1.0.13 releases and the latest public source sync. Highlights include
-length-limit salvage, complete pre/post-tool hook context delivery, effort-based
-model variants, configurable prompt suggestions, persisted usage, managed-config
-supervision, safer worktree cleanup, and sampler/subagent reliability work.
+The synchronized source includes the complete 1.0.16 public snapshot. New
+runtime improvements include safe-point parent-to-child steering, startup-ready
+subagent messaging, workflow liveness, background session initialization,
+MCP OAuth deadlock repair and protocol updates, serialized model/effort options,
+and loop/workflow context preservation during compaction. SDK admission, queue
+versions, authored prompts and provider isolation remain intact. Hermetic
+embeddings exclude ambient system policies and detached connection prewarming.
 TUI-only features remain available to the upstream application but are
 deliberately not mirrored by the SDK. See the
 [SDK boundary and usage guide](crates/sophon-sdk/README.md).

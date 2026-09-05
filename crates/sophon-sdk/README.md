@@ -8,10 +8,10 @@ official xAI SDK.
 
 Current source identity:
 
-- released product baseline: 1.0.13 plus the subsequent public source sync
-- public Grok Build commit: `bb7f39d5858cbf5e00de639367f59debbdcb0138`
-- public crate metadata: 1.0.13
-- embedded monorepo revision: `d761e8ba538084df023de79d26892eaf73ed7411`
+- public product source baseline: 1.0.16
+- public Grok Build commit: `72a61251fcffb464bcc687aeb5a998e5a98ec0c9`
+- public crate metadata: 1.0.16
+- embedded monorepo revision: `a549186d9d39311f2d3ee4208db62af8c65aa476`
 
 ## Use it
 
@@ -186,7 +186,8 @@ The management invariants are:
   fires, and old `Session` handles acquire from one Agent-owned fence. Closing
   it and admitting work share one lock. Quiesce then waits for all accepted
   permits, native FIFO/running prompts, interactions, background tasks,
-  subagents, and completion presentations. Shutdown refuses to proceed after a
+  live workflows (including between turns), subagents, and completion presentations.
+  Shutdown refuses to proceed after a
   timed-out drain.
 - **CAS plus idempotency.** Queue and scheduler writes require the exact actor
   generation/revision and a caller operation ID. Conflicts return the current
@@ -362,33 +363,48 @@ resolved Grok home plus explicit or injected paths remain, while project config,
 vendor home directories, rules, MCP/LSP servers, hooks, plugins, workflows and
 subprocess-environment overlays are not discovered from the ambient workspace.
 Ordinary workspace files and project `AGENTS.md` instructions remain visible.
+System Grok configuration, Claude managed settings and macOS MDM discovery are
+also excluded; managed configuration and requirements under the embedding's
+`GROK_HOME` remain effective, including native model/MCP/plugin policy.
 The SDK then overlays only its explicit model/media routes and headless embedding
 mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
 upstream data directory rather than the default `~/.grok`.
 
-## What the post-1.0.13 source sync contributes
+## What the 1.0.16 source sync contributes
 
-The public commit retains version 1.0.13 metadata but advances the embedded
-monorepo revision. Agent-facing improvements inherited by the facade include
-length-limit salvage and completed-tool delivery before continuation,
-replacement/context delivery from `PostToolUse` hooks, model effort variants,
-configurable prompt-suggestion reasoning and telemetry, persisted usage data,
-managed-config supervision, safer linked-worktree cleanup, and sampler/subagent
-reliability improvements. The SDK continues to expose these through Grok
-Build's native behavior and forward-compatible event/extension seams rather
-than mirroring their internal schemas.
+The complete public snapshot adds safe-point parent-to-child steering and
+startup-ready subagent messaging, workflow liveness, MCP OAuth deadlock repair,
+rmcp 3.2 / MCP 2026-07-28 support and multi-round elicitation, bind-time MCP
+injection, and serialized model/reasoning configuration options. The facade
+retains authored and explicitly replaced system prompts across those changes.
+Effort-only mutations advance the effective-config clock like model changes.
 
-TUI-only additions such as the credit-limit Try Again action, iTerm2 pasted-image
-pixel previews, prompt stashing, modal/catalog changes, and selection behavior
-remain in the upstream application source but are intentionally not SDK
-concepts.
+Session creation can return before deferred MCP startup completes; the native
+actor still gates prompt promotion on readiness, and teardown cancels that
+startup work before awaiting cleanup. Quiesce snapshots now expose `active_work`
+so workflow-only sessions cannot falsely report a completed drain.
+
+Memory consolidation runs on launch/periodically rather than blocking session
+close. Compaction retains scheduled loops, live workflows and goal context.
+Native task/subagent output waits support a one-hour ceiling (omitted timeout
+on get-output remains nonblocking). Existing provider protocols and media
+routing remain unchanged.
+
+The upstream connection-prewarm optimization is skipped in hermetic embeddings:
+it issues a detached, redirect-following origin GET outside the Agent drain
+contract. Normal sampling still uses the shared connection pool. Auth prewarm
+and external OTEL exporter initialization are not added to SDK startup; existing
+telemetry configuration remains upstream-owned.
+
+Dock, spinner, slash-menu and keyboard/copy improvements remain in the upstream
+application source, not in the SDK dependency closure or public API.
 
 ## Upstream sync policy
 
 Upstream-owned directories remain byte-for-byte equal to the commit in
 `UPSTREAM_GROK_BUILD_COMMIT`, except for the separately digested provider
 routing, hermetic embedded discovery, Windows portability, public snapshot
-repair, and typed-management authority groups documented in
+repair, Goal reliability, and typed-management authority groups documented in
 [`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md). The sync check validates the
 untouched tree and each approved patch independently. An upgrade imports the
 complete public snapshot, updates provenance, reconciles those boundaries,

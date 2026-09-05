@@ -28,6 +28,12 @@ impl MvpAgent {
 // Detached by design: the warm state is process-global, not session state,
 // and the dial is PREWARM_TIMEOUT-bounded.
 pub(super) fn spawn_sampler_transport_prewarm(base_url: &str) {
+    // Embedded providers own their request lifecycle. This optional origin GET
+    // follows redirects and is detached from Agent quiesce, so do not start it
+    // in hermetic embeddings. Normal sampling still uses the shared pool.
+    if xai_grok_config::hermetic_discovery() {
+        return;
+    }
     tokio::spawn(prewarm_and_record(base_url.to_owned()));
 }
 

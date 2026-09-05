@@ -19,9 +19,10 @@ pub fn grok_application_in(home: &std::path::Path) -> PathBuf {
     home.join("bin").join(name)
 }
 
-/// System-wide config directory: `/etc/grok/` on Unix, `None` on Windows.
+/// System-wide config directory: `/etc/grok/` on Unix, `None` on Windows
+/// or when the embedding owns discovery through `$GROK_HOME`.
 pub fn system_config_dir() -> Option<PathBuf> {
-    if cfg!(unix) {
+    if cfg!(unix) && !crate::hermetic_discovery() {
         Some(PathBuf::from("/etc/grok"))
     } else {
         None
@@ -31,6 +32,9 @@ pub fn system_config_dir() -> Option<PathBuf> {
 /// System path for the managed-settings.json used for settings compat, if it exists.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn claude_managed_settings_path() -> Option<PathBuf> {
+    if crate::hermetic_discovery() {
+        return None;
+    }
     let path = PathBuf::from(CLAUDE_MANAGED_SETTINGS_PATH);
     path.exists().then_some(path)
 }
@@ -44,6 +48,9 @@ pub fn claude_managed_settings_path() -> Option<PathBuf> {
 /// `None` on unsupported platforms.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn claude_managed_settings_probe_path() -> Option<PathBuf> {
+    if crate::hermetic_discovery() {
+        return None;
+    }
     Some(PathBuf::from(CLAUDE_MANAGED_SETTINGS_PATH))
 }
 

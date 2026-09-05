@@ -35,6 +35,7 @@ xai-prompt-queue = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 xai-grok-test-support = { workspace = true }
+xai-grok-workspace = { workspace = true }
 
 [lints]
 workspace = true

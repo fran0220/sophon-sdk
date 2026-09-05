@@ -10064,6 +10064,7 @@ dependencies = [
  "xai-grok-shell",
  "xai-grok-test-support",
  "xai-grok-tools",
+ "xai-grok-workspace",
  "xai-prompt-queue",
 ]
 

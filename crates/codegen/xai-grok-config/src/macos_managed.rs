@@ -15,6 +15,9 @@ pub const MDM_REQUIREMENTS_SOURCE: &str = "ai.x.grok:requirements_toml_base64";
 
 /// The MDM-forced requirements TOML, or `None` when none is forced (or not macOS).
 pub(crate) fn managed_preferences_requirements() -> Option<toml::Value> {
+    if crate::hermetic_discovery() {
+        return None;
+    }
     // Read once and cache for the process lifetime: the forced policy is fixed per launch, so a profile change isn't picked up until restart
     // That is fine for a short-lived CLI, and it avoids re-crossing the CoreFoundation boundary
     static CACHED: std::sync::OnceLock<Option<toml::Value>> = std::sync::OnceLock::new();

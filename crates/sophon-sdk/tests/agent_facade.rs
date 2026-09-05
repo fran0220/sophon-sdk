@@ -18,6 +18,11 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
          [model.sdk-codex-concise]\nagent_type = 'codex'\nuse_concise = true\n",
     )
     .expect("write effective Grok config");
+    std::fs::write(
+        grok_home.path().join("managed_config.toml"),
+        "plugin_auto_update = false\n",
+    )
+    .expect("write embedding-owned managed policy");
     let _grok_home = EnvGuard::set("GROK_HOME", grok_home.path());
     let _telemetry = EnvGuard::set("GROK_TELEMETRY_ENABLED", "false");
     let _trace_upload = EnvGuard::set("GROK_TRACE_UPLOAD", "false");
@@ -83,6 +88,25 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             )
             .await
             .expect("start agent");
+            assert!(xai_grok_config::hermetic_discovery());
+            assert!(xai_grok_config::system_config_dir().is_none());
+            assert!(xai_grok_config::claude_managed_settings_path().is_none());
+            assert!(xai_grok_config::claude_managed_settings_probe_path().is_none());
+            let layers = xai_grok_config::managed_config_layers();
+            assert_eq!(layers.len(), 1);
+            assert_eq!(layers[0].path, grok_home.path().join("managed_config.toml"));
+            assert!(!layers[0].is_system);
+            assert!(
+                xai_grok_config::requirements_layers()
+                    .iter()
+                    .all(|l| !l.is_system)
+            );
+            let policy = xai_grok_workspace::permission::managed_policy::managed_settings();
+            assert!(policy.plugin_auto_update.is_disabled());
+            assert_eq!(
+                policy.plugin_auto_update.source(),
+                Some(layers[0].path.as_path())
+            );
             assert!(
                 agent
                     .initialization_response()
