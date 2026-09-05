@@ -1042,8 +1042,11 @@ impl SessionActor {
         if (mutated || clear_hold_on_miss) && !Self::has_protected_row(&state, id) {
             state.edit_holds.remove(id);
         }
-        // Always re-broadcast the authoritative queue so the client reconciles.
-        self.broadcast_queue_changed(&state);
+        // Legacy clients reconcile via broadcast; typed misses already return
+        // a snapshot and must not advance the authoritative queue revision.
+        if mutated || clear_hold_on_miss {
+            self.broadcast_queue_changed(&state);
+        }
         SendNowOutcome {
             cancel_running_turn,
             mutated,

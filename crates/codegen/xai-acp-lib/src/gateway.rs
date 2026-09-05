@@ -26,6 +26,7 @@ pub struct AcpGatewayReceiver<S: AcpSide, C> {
     spawn_fn: SpawnFn,
     on_meta: Option<OnMetaFn>,
     orphaned_permission_cancel: bool,
+    inline_notifications: bool,
 }
 
 impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
@@ -39,6 +40,7 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
             }),
             on_meta: None,
             orphaned_permission_cancel: false,
+            inline_notifications: false,
         }
     }
 
@@ -46,6 +48,14 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
     /// Disabled by default; all other handlers are unaffected.
     pub fn with_orphaned_permission_cancel(mut self, enabled: bool) -> Self {
         self.orphaned_permission_cancel = enabled;
+        self
+    }
+
+    /// Process agent-side Session/extension notifications in receive order.
+    /// Only use with bounded local handlers: a blocked notification otherwise
+    /// blocks the entire gateway. Requests still run through the spawner.
+    pub fn with_inline_notifications(mut self, enabled: bool) -> Self {
+        self.inline_notifications = enabled;
         self
     }
 
@@ -260,6 +270,7 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
                         async move {
                             let method = before_request(&args, tracing);
                             let response = tokio::select! {
+                                biased;
                                 _ = args.response_tx.closed() => return,
                                 response = conn.request_permission(args.request) => response,
                             };
@@ -276,6 +287,19 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
                 }
                 AcpClientMessage::WriteTextFile(args) => {
                     handle!(args, self.tracing, conn, write_text_file, spawn, on_meta);
+                }
+                AcpClientMessage::SessionNotification(args) if self.inline_notifications => {
+                    let span = on_meta
+                        .as_ref()
+                        .zip(args.request.meta.as_ref())
+                        .map(|(f, meta)| f(meta))
+                        .unwrap_or_else(tracing::Span::none);
+                    let method = before_request(&args, self.tracing);
+                    let response = conn
+                        .session_notification(args.request)
+                        .instrument(span)
+                        .await;
+                    let _ = after_request(args.response_tx, response, method);
                 }
                 AcpClientMessage::SessionNotification(args) => {
                     handle!(
@@ -319,6 +343,11 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
                         spawn,
                         on_meta
                     );
+                }
+                AcpClientMessage::ExtNotification(args) if self.inline_notifications => {
+                    let method = before_request(&args, self.tracing);
+                    let response = conn.ext_notification(args.request).await;
+                    let _ = after_request(args.response_tx, response, method);
                 }
                 AcpClientMessage::ExtNotification(args) => {
                     handle!(
@@ -705,6 +734,64 @@ mod tests {
 
     struct OrderTrackingClient {
         log: Rc<RefCell<Vec<String>>>,
+    }
+
+    struct BarrierClient {
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for BarrierClient {
+        async fn request_permission(
+            &self,
+            _: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            std::future::pending().await
+        }
+
+        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+            // Force a scheduling point: a separately spawned barrier could
+            // overtake this handler, even though messages arrived in order.
+            tokio::task::yield_now().await;
+            OrderTrackingClient {
+                log: self.log.clone(),
+            }
+            .session_notification(args)
+            .await
+        }
+
+        async fn ext_notification(&self, _: acp::ExtNotification) -> acp::Result<()> {
+            self.log.borrow_mut().push("barrier".into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_barrier_waits_for_notifications_not_permission_requests() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let (sender, receiver) =
+                    acp_gateway::<acp::AgentSide, _>(BarrierClient { log: log.clone() });
+                tokio::task::spawn_local(receiver.with_inline_notifications(true).run());
+                let _permission = sender.forward_with_completion(permission_request());
+                sender.forward_fire_and_forget(text_notification("first"));
+                sender.forward_fire_and_forget(text_notification("second"));
+                let barrier = acp::ExtNotification::new(
+                    "barrier",
+                    serde_json::value::to_raw_value(&()).unwrap().into(),
+                );
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    sender.forward_with_completion(barrier),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(&*log.borrow(), &["first", "second", "barrier"]);
+            })
+            .await;
     }
 
     #[async_trait::async_trait(?Send)]

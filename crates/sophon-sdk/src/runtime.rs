@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,7 +112,24 @@ enum Command {
         mgmt::SubagentId,
         ManagementReply<mgmt::SubagentCancelOutcome>,
     ),
-    Shutdown(Reply<()>),
+    Shutdown(Duration, Reply<()>),
+}
+
+// One drain owns the admission fence; concurrent callers share its deadline.
+struct PendingDrain {
+    future: Pin<Box<dyn Future<Output = mgmt::QuiesceReport>>>,
+    quiesce: Vec<ManagementReply<mgmt::QuiesceReport>>,
+    shutdown: Vec<Reply<()>>,
+}
+
+impl PendingDrain {
+    fn new(agent: Rc<MvpAgent>, timeout: Duration) -> Self {
+        Self {
+            future: Box::pin(async move { mgmt::quiesce_report(agent.quiesce(timeout).await) }),
+            quiesce: Vec::new(),
+            shutdown: Vec::new(),
+        }
+    }
 }
 
 struct AgentInner {
@@ -142,7 +161,9 @@ impl ManagementEmitter {
 impl Drop for AgentInner {
     fn drop(&mut self) {
         let (reply, _) = oneshot::channel();
-        let _ = self.commands.send(Command::Shutdown(reply));
+        let _ = self
+            .commands
+            .send(Command::Shutdown(Duration::from_secs(30), reply));
     }
 }
 
@@ -241,6 +262,8 @@ impl Agent {
 
     /// Atomically fence Agent-wide prompt admission and wait for all work
     /// accepted before the fence to settle.
+    /// Concurrent quiesce/shutdown calls share the first drain's deadline.
+    /// Cancellation and management commands remain available while draining.
     pub async fn quiesce(
         &self,
         timeout: Duration,
@@ -425,7 +448,21 @@ impl Agent {
     }
 
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let result = self.request(Command::Shutdown).await;
+        self.shutdown_with_timeout(Duration::from_secs(30)).await
+    }
+
+    /// Drain with a bounded budget, then flush and stop the worker. Concurrent
+    /// drains share the first caller's deadline. A drain timeout leaves the
+    /// worker alive and admission closed: cancel outstanding work, then retry.
+    /// Successful shutdown is idempotent. Flush/delivery adds its own bounded
+    /// budget after drain; dropping this future does not cancel the shutdown.
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        let result = self
+            .request(|reply| Command::Shutdown(timeout, reply))
+            .await;
+        if matches!(&result, Err(Error::QuiesceTimedOut(_))) {
+            return result;
+        }
         let worker = self
             .inner
             .worker
@@ -437,6 +474,21 @@ impl Agent {
                 .await
                 .map_err(|error| Error::Operation(error.to_string()))?
                 .map_err(|_| Error::Operation("Grok Build worker panicked".into()))?;
+        }
+        let mut health = self.subscribe_runtime_health();
+        health
+            .wait_for(|health| {
+                matches!(
+                    health.state,
+                    mgmt::RuntimeState::Stopped | mgmt::RuntimeState::Failed
+                )
+            })
+            .await
+            .map_err(|_| Error::RuntimeStopped)?;
+        if matches!(&result, Err(Error::RuntimeStopped))
+            && self.runtime_health().state == mgmt::RuntimeState::Stopped
+        {
+            return Ok(());
         }
         result
     }
@@ -540,7 +592,7 @@ fn run_worker(
     runtime.block_on(local.run_until(async move {
         let result = start_worker(config, commands, events, management.clone()).await;
         match result {
-            Ok((agent, commands, initialization_response)) => {
+            Ok((agent, gateway, commands, initialization_response)) => {
                 update_runtime_health(
                     &runtime_health,
                     &management,
@@ -548,7 +600,14 @@ fn run_worker(
                     None,
                 );
                 let _ = ready.send(Ok(initialization_response));
-                command_loop(agent, commands, management.clone(), runtime_health.clone()).await;
+                command_loop(
+                    agent,
+                    gateway,
+                    commands,
+                    management.clone(),
+                    runtime_health.clone(),
+                )
+                .await;
                 update_runtime_health(
                     &runtime_health,
                     &management,
@@ -580,6 +639,7 @@ async fn start_worker(
 ) -> Result<
     (
         Rc<MvpAgent>,
+        AcpGatewaySender<acp::AgentSide>,
         mpsc::UnboundedReceiver<Command>,
         serde_json::Value,
     ),
@@ -588,14 +648,10 @@ async fn start_worker(
     let (grok_config, models) = grok_config(&config)?;
     let auth_manager = Arc::new(grok_config.create_auth_manager());
     let (gateway_tx, gateway_rx) = mpsc::unbounded_channel();
+    let gateway = AcpGatewaySender::new(gateway_tx);
     let agent = Rc::new(
-        MvpAgent::new(
-            AcpGatewaySender::new(gateway_tx),
-            &grok_config,
-            auth_manager,
-            Some(models),
-        )
-        .map_err(|error| Error::Start(error.to_string()))?,
+        MvpAgent::new(gateway.clone(), &grok_config, auth_manager, Some(models))
+            .map_err(|error| Error::Start(error.to_string()))?,
     );
     let client = EmbeddedClient {
         events,
@@ -604,7 +660,10 @@ async fn start_worker(
         handler: config.client_handler,
     };
     tokio::task::spawn_local(
-        AcpGatewayReceiver::<acp::AgentSide, _>::new(gateway_rx, client).run(),
+        AcpGatewayReceiver::<acp::AgentSide, _>::new(gateway_rx, client)
+            .with_orphaned_permission_cancel(true)
+            .with_inline_notifications(true)
+            .run(),
     );
 
     let initialized = agent
@@ -636,16 +695,86 @@ async fn start_worker(
         .await
         .map_err(acp_error)?;
     let initialization_response = raw_response(&initialized)?;
-    Ok((agent, commands, initialization_response))
+    Ok((agent, gateway, commands, initialization_response))
+}
+
+const FLUSH_BARRIER: &str = "sophon-sdk/flush-barrier";
+
+async fn finish_worker(
+    agent: &MvpAgent,
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+) -> Result<(), Error> {
+    agent.flush_all_sessions(Duration::from_secs(10)).await;
+    // Notification handlers execute inline, so this ACK proves every earlier
+    // notification has reached the SDK broadcast streams (not every subscriber).
+    let barrier = acp::ExtNotification::new(
+        FLUSH_BARRIER,
+        serde_json::value::to_raw_value(&serde_json::Value::Null)
+            .expect("serialize null")
+            .into(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        gateway.forward_with_completion(barrier),
+    )
+    .await
+    .map_err(|_| Error::Operation("notification drain timed out".into()))?
+    .map_err(|_| Error::RuntimeStopped)?
+    .map_err(acp_error)
 }
 
 async fn command_loop(
     agent: Rc<MvpAgent>,
+    gateway: AcpGatewaySender<acp::AgentSide>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     management: ManagementEmitter,
     runtime_health: watch::Sender<mgmt::RuntimeHealth>,
 ) {
-    while let Some(command) = commands.recv().await {
+    let mut pending: Option<PendingDrain> = None;
+    let mut open = true;
+    loop {
+        let command = tokio::select! {
+            // The first drain poll installs the fence before another command
+            // can be received. Native admission, not API call order, linearizes prompts.
+            biased;
+            report = async { pending.as_mut().expect("guarded drain").future.as_mut().await }, if pending.is_some() => {
+                let drain = pending.take().expect("completed drain");
+                if report.drained() {
+                    update_runtime_health(&runtime_health, &management, mgmt::RuntimeState::Quiesced, None);
+                }
+                for reply in drain.quiesce {
+                    let _ = reply.send(Ok(report.clone()));
+                }
+                if report.drained() && !drain.shutdown.is_empty() {
+                    let result = finish_worker(&agent, &gateway).await;
+                    for reply in drain.shutdown {
+                        let response = match &result {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(Error::Operation(error.to_string())),
+                        };
+                        let _ = reply.send(response);
+                    }
+                    break;
+                }
+                for reply in drain.shutdown {
+                    let _ = reply.send(Err(Error::QuiesceTimedOut(Box::new(report.clone()))));
+                }
+                if !open {
+                    let _ = finish_worker(&agent, &gateway).await;
+                    break;
+                }
+                continue;
+            }
+            command = commands.recv(), if open => command,
+        };
+        let Some(command) = command else {
+            open = false;
+            if pending.is_none() {
+                let _ = finish_worker(&agent, &gateway).await;
+                break;
+            }
+            continue;
+        };
         match command {
             Command::CreateSession(config, reply) => {
                 let agent = agent.clone();
@@ -803,22 +932,16 @@ async fn command_loop(
                 let _ = reply.send(result);
             }
             Command::Quiesce(timeout, reply) => {
-                update_runtime_health(
-                    &runtime_health,
-                    &management,
-                    mgmt::RuntimeState::Quiescing,
-                    None,
-                );
-                let report = mgmt::quiesce_report(agent.quiesce(timeout).await);
-                if report.drained() {
+                let drain = pending.get_or_insert_with(|| {
                     update_runtime_health(
                         &runtime_health,
                         &management,
-                        mgmt::RuntimeState::Quiesced,
+                        mgmt::RuntimeState::Quiescing,
                         None,
                     );
-                }
-                let _ = reply.send(Ok(report));
+                    PendingDrain::new(agent.clone(), timeout)
+                });
+                drain.quiesce.push(reply);
             }
             Command::QueueSnapshot(id, reply) => {
                 let result = match management_session(&agent, &id) {
@@ -1018,27 +1141,17 @@ async fn command_loop(
                 };
                 let _ = reply.send(Ok(result));
             }
-            Command::Shutdown(reply) => {
-                update_runtime_health(
-                    &runtime_health,
-                    &management,
-                    mgmt::RuntimeState::Quiescing,
-                    None,
-                );
-                let report = mgmt::quiesce_report(agent.quiesce(Duration::from_secs(30)).await);
-                if !report.drained() {
-                    let _ = reply.send(Err(Error::QuiesceTimedOut(Box::new(report))));
-                    continue;
-                }
-                update_runtime_health(
-                    &runtime_health,
-                    &management,
-                    mgmt::RuntimeState::Quiesced,
-                    None,
-                );
-                agent.flush_all_sessions(Duration::from_secs(10)).await;
-                let _ = reply.send(Ok(()));
-                break;
+            Command::Shutdown(timeout, reply) => {
+                let drain = pending.get_or_insert_with(|| {
+                    update_runtime_health(
+                        &runtime_health,
+                        &management,
+                        mgmt::RuntimeState::Quiescing,
+                        None,
+                    );
+                    PendingDrain::new(agent.clone(), timeout)
+                });
+                drain.shutdown.push(reply);
             }
         }
     }
@@ -1652,6 +1765,9 @@ impl acp::Client for EmbeddedClient {
     }
 
     async fn ext_notification(&self, notification: acp::ExtNotification) -> acp::Result<()> {
+        if notification.method.as_ref() == FLUSH_BARRIER {
+            return Ok(());
+        }
         let method = notification.method.to_string();
         let payload = serde_json::from_str(notification.params.get()).unwrap_or_default();
         let mut terminal = None;
@@ -2056,6 +2172,13 @@ impl Session {
         blocks: impl IntoIterator<Item = PromptBlock>,
         metadata: serde_json::Map<String, serde_json::Value>,
     ) -> Result<PromptResult, Error> {
+        if let Some(id) = metadata.get("promptId").and_then(serde_json::Value::as_str)
+            && xai_grok_shell::session::PromptOrigin::from_prompt_id(id).is_synthetic()
+        {
+            return Err(Error::invalid_config(
+                "promptId uses a reserved native origin prefix",
+            ));
+        }
         let blocks = blocks.into_iter().collect::<Vec<_>>();
         if blocks.is_empty() {
             return Err(Error::invalid_config(
@@ -2121,8 +2244,20 @@ impl Session {
         self.cancel_with_metadata(serde_json::Map::new()).await
     }
 
-    /// Cancel with upstream metadata such as `cancelSubagents`,
-    /// `rewindIfNoOutput`, or a specific `promptId`.
+    /// Cancel only if this prompt is still the actor's front. A stale ID is a
+    /// no-op; remove queued prompts with `mutate_queue` instead. Completion is
+    /// observed through the prompt future or TurnCompleted event.
+    pub async fn cancel_prompt(&self, prompt_id: impl Into<String>) -> Result<(), Error> {
+        self.cancel_with_metadata(serde_json::Map::from_iter([(
+            "targetPromptId".into(),
+            serde_json::Value::String(prompt_id.into()),
+        )]))
+        .await
+    }
+
+    /// Cancel with upstream metadata such as `cancelSubagents` or
+    /// `rewindIfNoOutput`. Legacy `promptId` applies only to rewind, not targeted
+    /// cancellation; use `cancel_prompt` (or `targetPromptId`) for that.
     pub async fn cancel_with_metadata(
         &self,
         metadata: serde_json::Map<String, serde_json::Value>,

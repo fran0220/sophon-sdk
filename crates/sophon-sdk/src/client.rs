@@ -41,6 +41,9 @@ pub enum PermissionDecision {
 /// agent-to-client extension requests (for example ask-user and SDK MCP calls).
 #[async_trait::async_trait]
 pub trait ClientHandler: Send + Sync + 'static {
+    /// The future is dropped when its requesting turn abandons the permission
+    /// response. Keep this callback cancellation-safe. Independently spawned
+    /// host tasks are not cancelled by dropping the callback future.
     async fn request_permission(&self, _request: PermissionRequest) -> PermissionDecision {
         PermissionDecision::Cancel
     }
