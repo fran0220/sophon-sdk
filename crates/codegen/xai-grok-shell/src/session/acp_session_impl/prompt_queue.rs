@@ -917,8 +917,10 @@ impl SessionActor {
                 "queue remove was a no-op (drained / stale / not owner); rebroadcasting"
             );
         }
-        // Always re-broadcast the authoritative queue so the client reconciles.
-        self.broadcast_queue_changed(&state);
+        // Typed misses return their snapshot without advancing the revision.
+        if removed || clear_hold_on_miss {
+            self.broadcast_queue_changed(&state);
+        }
         removed
     }
 
