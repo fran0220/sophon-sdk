@@ -602,6 +602,7 @@ impl MvpAgent {
                     self,
                     acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
                     switch_effort,
+                    crate::agent::handlers::model_switch::PromptHeadPolicy::Rewrite,
                 )
                 .await
             });
@@ -1016,19 +1017,6 @@ impl MvpAgent {
             });
             false
         };
-        {
-            let init_meta = self
-                .initialize_request
-                .get()
-                .and_then(|init| init.meta.as_ref());
-            if let Some(handle) = self.resident_handle(&session_id) {
-                enqueue_replace_system_prompt_override(
-                    &handle.cmd_tx,
-                    request_meta.as_ref(),
-                    init_meta,
-                );
-            }
-        }
         if let Some(hooks) = crate::extensions::hooks::reconnect_client_hooks(request_meta.as_ref())
             && let Some(handle) = self.resident_handle(&session_id)
         {
@@ -1055,6 +1043,21 @@ impl MvpAgent {
             .await;
         self.restore_persisted_model(&session_id, &summary, initial_reasoning_effort)
             .await;
+        // Both cold and resident attach restore the authored head. An explicit override
+        // wins last, including after any family compaction performed by model restore.
+        {
+            let init_meta = self
+                .initialize_request
+                .get()
+                .and_then(|init| init.meta.as_ref());
+            if let Some(handle) = self.resident_handle(&session_id) {
+                enqueue_replace_system_prompt_override(
+                    &handle.cmd_tx,
+                    request_meta.as_ref(),
+                    init_meta,
+                );
+            }
+        }
         let (model_state, response_meta) = self
             .build_attach_response_meta(&session_id, &summary, persist_data, code_restore_info)
             .await;
@@ -1437,6 +1440,7 @@ impl MvpAgent {
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id),
                 restore_effort,
+                crate::agent::handlers::model_switch::PromptHeadPolicy::Preserve,
             )
             .await
             {

@@ -1557,6 +1557,81 @@ async fn new_session_without_meta_keeps_current_effort_over_catalog_default() {
         "/clear must keep last-used / config effort, not the catalog default",
     );
 }
+/// Catalog normalization on attach must not author a new prompt, even with a
+/// zero-turn harness mismatch. Exercise the real restore/apply command producer.
+#[tokio::test]
+async fn attach_restore_preserves_head_when_routing_slug_differs_from_catalog_key() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use crate::session::SessionCommand;
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("catalog-key", &EndpointsConfig::default());
+    entry.info.model = "routing-slug".to_owned();
+    entry.info.agent_type = "grok".to_owned();
+    agent.models_manager.insert_test_entry("catalog-key", entry);
+    let sid = acp::SessionId::new("attach-preserve-head");
+    let (mut handle, _tx, mut rx) = make_live_session_handle(&sid, None);
+    handle.model_id = acp::ModelId::new("routing-slug");
+    let commands = tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                SessionCommand::GetActiveAgent { responds_to } => {
+                    let _ = responds_to.send(Some("different-harness".to_owned()));
+                }
+                SessionCommand::RebuildAgentForDefinition { .. } => {
+                    panic!("attach must not rebuild the authored head");
+                }
+                SessionCommand::SetSessionModel {
+                    sampling_config,
+                    skip_prompt_rewrite,
+                    responds_to,
+                    ..
+                } => {
+                    assert!(
+                        skip_prompt_rewrite,
+                        "slug normalization must retain the head"
+                    );
+                    assert_eq!(sampling_config.model, "routing-slug");
+                    let _ = responds_to.send(Ok(acp::ModelId::new(sampling_config.model)));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("restore never applied the model");
+    });
+    let summary =
+        crate::session::persistence::Summary::new(&handle.info, handle.model_id.clone()).unwrap();
+    agent.insert_resident(&sid, handle);
+    agent.restore_persisted_model(&sid, &summary, None).await;
+    commands.await.unwrap();
+    assert_eq!(
+        agent.resident_handle(&sid).unwrap().model_id.0.as_ref(),
+        "catalog-key"
+    );
+}
+
+#[test]
+fn attach_override_is_enqueued_after_awaited_model_restore() {
+    let source = include_str!("session_setup.rs");
+    let restore = source
+        .find("self.restore_persisted_model(&session_id, &summary, initial_reasoning_effort)")
+        .unwrap();
+    let replace = source
+        .find("enqueue_replace_system_prompt_override(")
+        .unwrap();
+    assert!(
+        restore < replace,
+        "cold and resident attach must replace after restore"
+    );
+    assert!(source[restore..replace].contains(".await;"));
+    assert_eq!(
+        source
+            .matches("enqueue_replace_system_prompt_override(")
+            .count(),
+        1
+    );
+}
+
 /// Drive the real `restore_persisted_model` for a session pinned to an effort-capable model and report the effort it lands on the session handle.
 async fn restore_effort_via_load(
     initial: Option<xai_grok_sampling_types::ReasoningEffort>,

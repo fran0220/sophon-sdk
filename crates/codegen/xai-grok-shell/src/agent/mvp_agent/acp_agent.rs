@@ -1012,6 +1012,7 @@ impl acp::Agent for MvpAgent {
                             restore_model_id.clone(),
                         ),
                         None,
+                        crate::agent::handlers::model_switch::PromptHeadPolicy::Rewrite,
                     )
                     .await
                 {
@@ -2214,6 +2215,7 @@ impl acp::Agent for MvpAgent {
                 self,
                 args,
                 effort_override,
+                crate::agent::handlers::model_switch::PromptHeadPolicy::Rewrite,
             )
             .await;
         if res.is_ok()

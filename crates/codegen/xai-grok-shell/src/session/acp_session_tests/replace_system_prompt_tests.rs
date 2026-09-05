@@ -23,6 +23,57 @@ async fn actor_with_history(history: Vec<ConversationItem>) -> SessionActor {
     actor
 }
 
+/// Exercise the actual model-update and override actor paths with a persisted
+/// authored head, not the stock agent template. No model/network turn is needed.
+#[tokio::test(flavor = "current_thread")]
+async fn attach_restore_retains_original_rules_and_explicit_override_wins() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for original in [
+                "Original system prompt\nOriginal project rules",
+                "ADMISSION explicit persisted override",
+            ] {
+                let actor = std::sync::Arc::new(
+                    actor_with_history(vec![
+                        ConversationItem::system(original),
+                        ConversationItem::user("existing turn"),
+                        ConversationItem::assistant("existing reply"),
+                    ])
+                    .await,
+                );
+                let cfg = xai_grok_sampler::SamplerConfig {
+                    model: "routing-slug".to_owned(),
+                    context_window: 256_000,
+                    ..Default::default()
+                };
+                let model = actor
+                    .handle_set_session_model(cfg, false, false, true, true, 75)
+                    .await
+                    .unwrap();
+                assert_eq!(model.0.as_ref(), "routing-slug");
+                assert_eq!(actor.compaction.threshold_percent.get(), 75);
+                let restored = actor.chat_state_handle.get_conversation().await;
+                assert_eq!(head_text(&restored).as_deref(), Some(original));
+                assert_eq!(restored.len(), 3);
+
+                actor
+                    .handle_replace_system_prompt("ADMISSION replacement".to_owned())
+                    .await;
+                let replaced = actor.chat_state_handle.get_conversation().await;
+                assert_eq!(
+                    head_text(&replaced).as_deref(),
+                    Some("ADMISSION replacement")
+                );
+                assert_eq!(replaced.len(), 3);
+                assert_eq!(
+                    serde_json::to_value(&replaced[1..]).unwrap(),
+                    serde_json::to_value(&restored[1..]).unwrap()
+                );
+            }
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn handle_replace_system_prompt_replaces_head_and_preserves_turns() {
     let local = tokio::task::LocalSet::new();

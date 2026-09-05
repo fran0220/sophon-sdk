@@ -10,11 +10,18 @@ use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::ReasoningEffort;
+/// Attach restores an authored head; only a new session or explicit switch may author one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptHeadPolicy {
+    Rewrite,
+    Preserve,
+}
 /// Apply a model switch to a session (no gate; `set_session_model` gates first).
 pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
     effort_override: Option<ReasoningEffort>,
+    prompt_head_policy: PromptHeadPolicy,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     xai_grok_telemetry::unified_log::info(
@@ -103,7 +110,7 @@ pub(crate) async fn apply(
             };
             return Err(err_payload.into_acp_error());
         }
-        if is_mismatch && turn_count == 0 {
+        if is_mismatch && turn_count == 0 && prompt_head_policy == PromptHeadPolicy::Rewrite {
             let cwd = handle.tool_context.cwd.as_path();
             let resolved = xai_grok_agent::discovery::by_name_in_cwd_with_plugins(
                 required,
@@ -207,7 +214,9 @@ pub(crate) async fn apply(
         use_concise,
         is_family_switch,
         apply_prompt_override,
-        skip_prompt_rewrite: did_rebuild || model_unchanged,
+        skip_prompt_rewrite: prompt_head_policy == PromptHeadPolicy::Preserve
+            || did_rebuild
+            || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
         responds_to: tx,
     });
