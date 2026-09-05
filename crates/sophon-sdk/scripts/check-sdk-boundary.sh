@@ -11,7 +11,11 @@ fi
 
 # Inspect resolved, public rustdoc signatures rather than grepping Rust source:
 # aliases, multiline declarations and public reexports must not hide ACP types.
-cargo doc --manifest-path "$root/Cargo.toml" --locked -p sophon-sdk --no-deps
+# Without local dependency docs rustdoc can render an external type as bare
+# text, hiding its origin. Build the forbidden-but-internal ACP docs first.
+cargo doc --manifest-path "$root/Cargo.toml" --locked --no-deps \
+  -p agent-client-protocol -p agent-client-protocol-schema -p xai-acp-lib
+cargo rustdoc --manifest-path "$root/Cargo.toml" --locked -p sophon-sdk -- -D rustdoc::broken_intra_doc_links
 target="$(cargo metadata --manifest-path "$root/Cargo.toml" --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 python3 - "$target/doc/sophon_sdk" <<'PY'
 import pathlib
@@ -34,7 +38,8 @@ class Signatures(HTMLParser):
         attrs = dict(attrs)
         if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr", "source", "area", "base", "embed", "param", "track", "col"}:
             self.depth += 1
-        if {"item-decl", "code-header", "reexport"} & set(attrs.get("class", "").split()):
+        if ({"item-decl", "code-header"} & set(attrs.get("class", "").split())
+                or attrs.get("id", "").startswith("reexport.")):
             self.signature = self.depth
             self.count += 1
         if self.signature is not None and tag == "a":
@@ -51,6 +56,9 @@ class Signatures(HTMLParser):
 # Negative fixture: an innocent-looking alias still resolves to forbidden ACP.
 probe = Signatures()
 probe.feed('<pre class="rust item-decl"><code>pub type Alias =\n<a href="../agent_client_protocol/struct.SessionId.html">Alias</a>;</code></pre>')
+assert probe.count == 1 and len(probe.leaks) == 1
+probe = Signatures()
+probe.feed('<dt id="reexport.Alias"><code>pub use <a href="../xai_acp_lib/struct.Sender.html">Alias</a>;</code></dt>')
 assert probe.count == 1 and len(probe.leaks) == 1
 probe = Signatures()
 probe.feed('<div class="docblock"><a href="../agent_client_protocol/index.html">internal docs</a></div>')
