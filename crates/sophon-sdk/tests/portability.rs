@@ -92,19 +92,42 @@ fn portable_conversation_roundtrip_keeps_actor_usable_and_continues_native_conte
                     .await,
                 Err(PortabilityError::ActiveSession(_))
             ));
+            let mut projection = agent.subscribe();
             let (concurrent_capture, later_prompt) = bounded(async {
                 tokio::join!(
-                    session.export_portable(),
+                    session.history_snapshot(),
                     session.prompt("source-only-later-turn")
                 )
             })
             .await;
             let concurrent_capture = concurrent_capture.unwrap();
-            assert!(
-                !String::from_utf8_lossy(&concurrent_capture.to_vec().unwrap())
-                    .contains("source-only-later-turn")
-            );
+            assert!(concurrent_capture.records.iter().all(|record| record.is_replay));
+            assert!(concurrent_capture.records.iter().any(|record| matches!(&record.update, sophon_sdk::SessionUpdate::UserText(text) if text == "portable-original-question")));
+            let native_user = concurrent_capture.records.iter().find(|record| matches!(&record.update, sophon_sdk::SessionUpdate::UserText(text) if text == "portable-original-question")).unwrap();
+            assert!(native_user.event_id.is_some());
+            assert!(native_user.prompt_index.is_some());
+            assert!(!concurrent_capture.records.iter().any(|record| matches!(&record.update, sophon_sdk::SessionUpdate::UserText(text) if text == "source-only-later-turn")));
             later_prompt.unwrap();
+            let mut boundary_seen = false;
+            let mut later_echoes = 0;
+            loop {
+                let event = match projection.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(error) => panic!("history stream invalidated: {error}"),
+                };
+                match event {
+                    sophon_sdk::Event::HistoryBoundary { boundary_id, .. } if boundary_id == concurrent_capture.boundary_id => boundary_seen = true,
+                    sophon_sdk::Event::HistoryRecord(record) if matches!(&record.update, sophon_sdk::SessionUpdate::UserText(text) if text == "source-only-later-turn") => {
+                        assert!(boundary_seen, "live echo must follow acknowledged snapshot boundary");
+                        assert!(!record.is_replay);
+                        later_echoes += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(boundary_seen);
+            assert_eq!(later_echoes, 1);
             assert_ne!(capture(&session).await.revision(), snapshot.revision());
             // Dropping the caller does not leave a permanent admission fence.
             let cancelled = {
@@ -230,6 +253,13 @@ fn portable_conversation_roundtrip_keeps_actor_usable_and_continues_native_conte
             let restored = bounded(agent.load_session(id, SessionConfig::new(destination.path())))
                 .await
                 .unwrap();
+            let history = bounded(restored.history_snapshot()).await.unwrap();
+            assert!(history.records.iter().any(|record| matches!(&record.update, sophon_sdk::SessionUpdate::AssistantText(text) if text.contains("portable-native-answer"))));
+            assert!(history.records.iter().all(|record| record.is_replay));
+            let repeated = bounded(restored.history_snapshot()).await.unwrap();
+            assert_eq!(history.revision, repeated.revision);
+            assert_ne!(history.boundary_id, repeated.boundary_id);
+            assert_eq!(server.request_count_for("/v1/chat/completions"), before_requests, "history capture/replay must not start inference");
             assert!(matches!(
                 agent
                     .portable_import_status(snapshot.clone(), destination.path().into())

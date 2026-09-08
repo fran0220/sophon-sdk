@@ -25,7 +25,8 @@ pub use config::{
     ProviderProtocol,
 };
 pub use event::{
-    Event, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate, TurnCompletion, TurnUsage,
+    Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
+    TurnCompletion, TurnUsage,
 };
 pub use runtime::Agent;
 pub use xai_grok_shell::session::portability::{

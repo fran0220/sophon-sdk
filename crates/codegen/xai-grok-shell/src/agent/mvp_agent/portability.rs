@@ -6,6 +6,15 @@ impl MvpAgent {
     /// Conservatively reserves agent-wide admission: no accepted root work
     /// may straddle the capture, including scheduler/peer work.
     pub async fn export_portable(&self, id: &str) -> Result<PortableSession, PortabilityError> {
+        self.capture_portable(id, None).await
+    }
+
+    /// Deliver a unique projection handoff marker before releasing admission.
+    pub async fn capture_portable(
+        &self,
+        id: &str,
+        history_boundary: Option<String>,
+    ) -> Result<PortableSession, PortabilityError> {
         let fence = self
             .activity
             .admission_controller()
@@ -31,7 +40,11 @@ impl MvpAgent {
         let (respond_to, response) = oneshot::channel();
         handle
             .cmd_tx
-            .send(SessionCommand::ExportPortable { fence, respond_to })
+            .send(SessionCommand::ExportPortable {
+                fence,
+                history_boundary,
+                respond_to,
+            })
             .map_err(|_| PortabilityError::Unavailable)?;
         response.await.map_err(|_| PortabilityError::Unavailable)?
     }

@@ -199,6 +199,42 @@ No package-version-only compatibility is
 assumed: upgrade the application's Git pin to a revision implementing this API;
 older SDK 0.4.1 pins do not implement it.
 
+### Display history and live handoff
+
+`Session::history_snapshot().await` returns `HistorySnapshot { session_id,
+revision, boundary_id, records }`. It uses the native portable flush/capture
+boundary and shares its idle/unsupported-state errors. Records are in unfiltered
+persisted order (including rewind markers), not reconstructed live Turns.
+Each `HistoryRecord` retains native `event_id`, optional `prompt_id`,
+`prompt_index`, `hide_from_scrollback`, `model`, envelope/chunk metadata,
+`is_replay`, and the typed `SessionUpdate` (including terminal/tool status).
+Absent legacy identities remain `None`; never invent prompt IDs or infer
+settlement. Unknown updates remain `Other` rather than being silently dropped.
+
+For a lossless display handoff within one runtime:
+
+1. Subscribe with `Agent::subscribe()` **before** requesting the snapshot.
+2. Buffer the stream while awaiting success. Replace the display projection
+   using snapshot records; they all have `is_replay = true`.
+3. Discard this Session's buffered projection records through
+   `Event::HistoryBoundary` with the returned unique `boundary_id`.
+4. Apply subsequent `Event::HistoryRecord` values in stream order. Do not also
+   project `Event::Session`/`Extension`, which would duplicate live output.
+
+The actor awaits boundary delivery to the SDK broadcast stream before releasing
+its admission fence. This is the snapshot-completion barrier, not a promise that
+every subscriber has consumed it. A fresh boundary ID disambiguates identical
+repeated snapshots; event-ID dedup is not required across the cut, including
+legacy or natively merged records. On broadcast `Lagged`, invalidate the handoff,
+resubscribe and resnapshot; never silently continue. Scope the boundary/records
+by Session ID. Concurrent explicit load/resume/replay on the same Session is
+not part of this handoff protocol.
+
+Native `isReplay` callbacks are emitted only as display `HistoryRecord`, never
+as live `Session` or management settlement events. Both native xAI terminal
+routes are projected. No replay calls prompt execution, creates a synthetic
+Turn, or writes a Host checkpoint. The portable payload format is unchanged.
+
 ## Stable typed management
 
 `management` is the stable embedded control plane. It does not expose ACP or

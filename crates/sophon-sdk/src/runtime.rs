@@ -32,6 +32,10 @@ type Reply<T> = oneshot::Sender<Result<T, Error>>;
 type ManagementReply<T> = oneshot::Sender<Result<T, mgmt::ManagementError>>;
 
 enum Command {
+    HistorySnapshot(
+        SessionId,
+        oneshot::Sender<Result<crate::HistorySnapshot, crate::PortabilityError>>,
+    ),
     ExportPortable(
         SessionId,
         oneshot::Sender<Result<crate::PortableSession, crate::PortabilityError>>,
@@ -834,6 +838,14 @@ async fn command_loop(
             continue;
         };
         match command {
+            Command::HistorySnapshot(id, reply) => {
+                let boundary_id = uuid::Uuid::new_v4().to_string();
+                let result = agent
+                    .capture_portable(id.as_str(), Some(boundary_id.clone()))
+                    .await
+                    .and_then(|snapshot| history_snapshot(snapshot, boundary_id));
+                let _ = reply.send(result);
+            }
             Command::ExportPortable(id, reply) => {
                 // Do not dispatch another SDK mutation until capture settles.
                 let result = agent.export_portable(id.as_str()).await;
@@ -1819,6 +1831,15 @@ impl acp::Client for EmbeddedClient {
         &self,
         notification: acp::SessionNotification,
     ) -> acp::Result<()> {
+        let payload =
+            serde_json::to_value(&notification).map_err(|_| acp::Error::internal_error())?;
+        if let Some(record) = history_record(&payload, false) {
+            let replay = record.is_replay;
+            let _ = self.events.send(Event::HistoryRecord(Box::new(record)));
+            if replay {
+                return Ok(());
+            }
+        }
         let session_id = SessionId(notification.session_id.0.to_string());
         if let Ok(raw_update) = serde_json::to_value(&notification.update)
             && let Some(kind) =
@@ -1840,8 +1861,30 @@ impl acp::Client for EmbeddedClient {
         }
         let method = notification.method.to_string();
         let payload = serde_json::from_str(notification.params.get()).unwrap_or_default();
+        if method == "sophon-sdk/history-boundary" {
+            if let (Some(id), Some(boundary_id)) = (
+                string_field(&payload, &["sessionId"]),
+                string_field(&payload, &["boundaryId"]),
+            ) {
+                let _ = self.events.send(Event::HistoryBoundary {
+                    session_id: SessionId(id),
+                    boundary_id,
+                });
+            }
+            return Ok(());
+        }
         let mut terminal = None;
-        if method == "x.ai/session_notification" {
+        if matches!(
+            method.as_str(),
+            "x.ai/session_notification" | "x.ai/session/update"
+        ) {
+            if let Some(record) = history_record(&payload, false) {
+                let replay = record.is_replay;
+                let _ = self.events.send(Event::HistoryRecord(Box::new(record)));
+                if replay {
+                    return Ok(());
+                }
+            }
             if let Some(session_id) =
                 string_field(&payload, &["sessionId", "session_id"]).map(SessionId)
                 && let Some(update) = field(&payload, &["update"])
@@ -1864,6 +1907,73 @@ impl acp::Client for EmbeddedClient {
         }
         Ok(())
     }
+}
+
+fn history_record(payload: &serde_json::Value, historical: bool) -> Option<crate::HistoryRecord> {
+    let raw = field(payload, &["update"])?;
+    let envelope = field(payload, &["_meta", "meta"]);
+    let chunk = field(raw, &["_meta", "meta"]);
+    let metadata_string = |keys: &[&str]| {
+        chunk
+            .and_then(|meta| string_field(meta, keys))
+            .or_else(|| envelope.and_then(|meta| string_field(meta, keys)))
+    };
+    let update = serde_json::from_value::<acp::SessionUpdate>(raw.clone())
+        .map(session_update)
+        .unwrap_or_else(|_| other_session_update(raw.clone()));
+    Some(crate::HistoryRecord {
+        session_id: SessionId(string_field(payload, &["sessionId", "session_id"])?),
+        event_id: envelope.and_then(|meta| string_field(meta, &["eventId"])),
+        prompt_id: string_field(raw, &["promptId", "prompt_id"])
+            .or_else(|| metadata_string(&["promptId", "prompt_id"])),
+        prompt_index: chunk
+            .and_then(|meta| field(meta, &["promptIndex"]))
+            .or_else(|| envelope.and_then(|meta| field(meta, &["promptIndex"])))
+            .and_then(serde_json::Value::as_u64),
+        hide_from_scrollback: chunk
+            .and_then(|meta| meta.get("hideFromScrollback"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        model: metadata_string(&["modelId", "model"]),
+        is_replay: historical
+            || envelope
+                .and_then(|meta| meta.get("isReplay"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        update,
+        envelope_metadata: envelope.cloned(),
+        chunk_metadata: chunk.cloned(),
+    })
+}
+
+fn history_snapshot(
+    snapshot: crate::PortableSession,
+    boundary_id: String,
+) -> Result<crate::HistorySnapshot, crate::PortabilityError> {
+    // SDK-owned projection of this pinned native format; consumers never parse
+    // portable files or replay these rows as agent input.
+    let value = serde_json::to_value(&snapshot)
+        .map_err(|error| crate::PortabilityError::Malformed(error.to_string()))?;
+    let lines = value["files"]["updates.jsonl"]
+        .as_str()
+        .ok_or_else(|| crate::PortabilityError::Incomplete("missing native history".into()))?;
+    let records = lines
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|error| crate::PortabilityError::Malformed(error.to_string()))?;
+            history_record(value.get("params").unwrap_or(&value), true).ok_or_else(|| {
+                crate::PortabilityError::Malformed("invalid native history record".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::HistorySnapshot {
+        session_id: SessionId::from(snapshot.session_id()),
+        revision: snapshot.revision().into(),
+        boundary_id,
+        records,
+    })
 }
 
 fn typed_xai_session_event(payload: &serde_json::Value) -> Option<Event> {
@@ -2205,6 +2315,21 @@ impl SessionConfig {
 }
 
 impl Session {
+    /// Projection-only persisted history plus an ordered live handoff marker.
+    /// Subscribe first; see [`crate::HistorySnapshot`] for the handoff protocol.
+    /// Uses the same idle/unsupported-state checks as portable export.
+    pub async fn history_snapshot(
+        &self,
+    ) -> Result<crate::HistorySnapshot, crate::PortabilityError> {
+        let (tx, rx) = oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(Command::HistorySnapshot(self.id.clone(), tx))
+            .map_err(|_| crate::PortabilityError::Unavailable)?;
+        rx.await.map_err(|_| crate::PortabilityError::Unavailable)?
+    }
+
     /// Flush and atomically capture the native current conversation and all
     /// persisted event history. The same actor remains usable. This is not a
     /// filesystem backup, execution migration, or content-sanitization API.
@@ -2602,6 +2727,64 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[tokio::test]
+    async fn historical_callbacks_preserve_metadata_and_never_emit_live_settlement() {
+        use acp::Client as _;
+        let (events, mut receiver) = broadcast::channel(32);
+        let (management, _) = broadcast::channel(32);
+        let client = EmbeddedClient {
+            events: events.clone(),
+            management: ManagementEmitter {
+                events: management,
+                ordered_events: events,
+                sequence: Arc::new(AtomicU64::new(0)),
+            },
+            permission_policy: PermissionPolicy::DenyAll,
+            handler: None,
+        };
+        let user = serde_json::json!({"sessionId":"s", "_meta":{"eventId":"native-1","isReplay":true}, "update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hidden native text"},"_meta":{"promptIndex":7,"hideFromScrollback":true,"modelId":"model"}}});
+        client
+            .session_notification(serde_json::from_value(user).unwrap())
+            .await
+            .unwrap();
+        let Event::HistoryRecord(record) = receiver.recv().await.unwrap() else {
+            panic!("projection expected")
+        };
+        assert_eq!(record.event_id.as_deref(), Some("native-1"));
+        assert_eq!(record.prompt_id, None);
+        assert_eq!(record.prompt_index, Some(7));
+        assert!(record.hide_from_scrollback && record.is_replay);
+        assert_eq!(record.model.as_deref(), Some("model"));
+        assert_eq!(
+            record.update,
+            SessionUpdate::UserText("hidden native text".into())
+        );
+        for method in ["x.ai/session/update", "x.ai/session_notification"] {
+            let payload = serde_json::json!({"sessionId":"s", "_meta":{"eventId":"native-2","isReplay":true},"update":{"sessionUpdate":"turn_completed","prompt_id":"actual-prompt","stop_reason":"end_turn"}});
+            client
+                .ext_notification(acp::ExtNotification::new(
+                    method,
+                    serde_json::value::to_raw_value(&payload).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let Event::HistoryRecord(record) = receiver.recv().await.unwrap() else {
+                panic!("projection expected")
+            };
+            assert_eq!(record.prompt_id.as_deref(), Some("actual-prompt"));
+            assert!(matches!(record.update, SessionUpdate::TurnCompleted(_)));
+            assert!(
+                receiver.try_recv().is_err(),
+                "replay must not produce live/management/extension settlement"
+            );
+        }
+        let tool = serde_json::json!({"sessionId":"s", "update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed"}});
+        let record = history_record(&tool, true).unwrap();
+        assert!(
+            matches!(record.update, SessionUpdate::ToolCallUpdate(update) if update.id == "tool-1" && update.status.as_deref() == Some("completed"))
+        );
+    }
 
     fn config() -> AgentConfig {
         AgentConfig::new(ModelConfig::new(

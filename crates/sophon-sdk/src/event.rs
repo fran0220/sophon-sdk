@@ -6,6 +6,13 @@ use crate::{SessionId, StopReason};
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
+    /// Display-only history/live projection. Never drive prompt settlement from this variant.
+    HistoryRecord(Box<HistoryRecord>),
+    /// Ordered handoff delivered under the native capture admission fence.
+    HistoryBoundary {
+        session_id: SessionId,
+        boundary_id: String,
+    },
     /// Stable typed management state published in causal order with the raw
     /// Session or extension notification that produced it.
     Management(crate::management::ManagementEvent),
@@ -89,4 +96,32 @@ pub struct PlanEntry {
     pub content: String,
     pub priority: String,
     pub status: String,
+}
+
+/// One native record. Missing identity stays missing; no synthetic turns or IDs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryRecord {
+    pub session_id: SessionId,
+    pub event_id: Option<String>,
+    pub prompt_id: Option<String>,
+    pub prompt_index: Option<u64>,
+    pub hide_from_scrollback: bool,
+    pub model: Option<String>,
+    pub is_replay: bool,
+    pub update: SessionUpdate,
+    pub envelope_metadata: Option<Value>,
+    pub chunk_metadata: Option<Value>,
+}
+
+/// Complete projection at an idle persistence cut, not a list of live turns.
+/// Subscribe before requesting. Replace display from records, discard buffered
+/// projection events through the matching boundary_id, then consume subsequent
+/// records. Broadcast lag invalidates the handoff: resubscribe and resnapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistorySnapshot {
+    pub session_id: SessionId,
+    pub revision: String,
+    pub boundary_id: String,
+    /// Unfiltered native persistence order, including rewind markers.
+    pub records: Vec<HistoryRecord>,
 }

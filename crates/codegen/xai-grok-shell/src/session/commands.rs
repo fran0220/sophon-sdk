@@ -654,6 +654,7 @@ pub enum SessionCommand {
     /// Fence is owned by this mailbox operation, not the cancellable caller.
     ExportPortable {
         fence: xai_grok_tools::management::admission::ExclusiveAdmission,
+        history_boundary: Option<String>,
         respond_to: oneshot::Sender<
             Result<super::portability::PortableSession, super::portability::PortabilityError>,
         >,

@@ -1577,7 +1577,7 @@ pub(super) async fn run_session(
                                 },
                             );
                         }
-                        SessionCommand::ExportPortable { fence, respond_to } => {
+                        SessionCommand::ExportPortable { fence, history_boundary, respond_to } => {
                             use crate::session::portability::PortabilityError;
                             // Keep the actor's mailbox closed to mutations through
                             // replay flush AND persistence capture. No actor restart.
@@ -1601,7 +1601,20 @@ pub(super) async fn run_session(
                                 session.notifications.persistence_tx
                                     .send(PersistenceMsg::CapturePortable { respond_to: tx })
                                     .map_err(|_| PortabilityError::Unavailable)?;
-                                rx.await.map_err(|_| PortabilityError::Unavailable)?
+                                let snapshot = rx.await.map_err(|_| PortabilityError::Unavailable)??;
+                                if let Some(boundary_id) = history_boundary {
+                                    let params = serde_json::json!({"sessionId": snapshot.session_id(), "boundaryId": boundary_id});
+                                    let notification = acp::ExtNotification::new(
+                                        "sophon-sdk/history-boundary",
+                                        serde_json::value::to_raw_value(&params).map_err(|error| PortabilityError::Malformed(error.to_string()))?.into(),
+                                    );
+                                    tokio::time::timeout(std::time::Duration::from_secs(10),
+                                        session.notifications.gateway.forward_with_completion(notification))
+                                        .await.map_err(|_| PortabilityError::Unavailable)?
+                                        .map_err(|_| PortabilityError::Unavailable)?
+                                        .map_err(|_| PortabilityError::Unavailable)?;
+                                }
+                                Ok(snapshot)
                             }.await;
                             drop(fence);
                             let _ = respond_to.send(result);
