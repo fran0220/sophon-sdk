@@ -778,6 +778,8 @@ impl SessionActor {
                 // ordered through chat-state observes the new prompt index.
                 let mut rewind_version = self.tool_context.rewind_authority.0.lock().await;
                 self.chat_state_handle.increment_prompt_index();
+                self.turn_report
+                    .consume_index(prompt_id, current_prompt_index);
                 *self.tool_context.prompt_index.lock().await = current_prompt_index;
                 self.tool_context
                     .active_message_parent_prompt_index
@@ -1583,6 +1585,7 @@ impl SessionActor {
                 }
                 Ok(crate::session::commands::PromptTurnOk {
                     stop_reason,
+                    prompt_index: self.turn_report.prompt_index(prompt_id),
                     total_tokens,
                     turn_snapshot: snapshot,
                     completion_kind,

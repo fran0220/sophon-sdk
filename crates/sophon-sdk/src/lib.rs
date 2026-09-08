@@ -147,6 +147,12 @@ pub enum StopReason {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptResult {
     pub stop_reason: StopReason,
+    pub prompt_id: Option<String>,
+    /// Native consumed index, never inferred from history length. Unstarted
+    /// or hook-blocked inputs have no index. Valid after runtime final exit.
+    pub prompt_index: Option<u64>,
+    /// Per-prompt receipt, not cumulative session usage; may be incomplete.
+    pub usage: Option<TurnUsage>,
     /// Complete upstream prompt response, including usage, prompt identity,
     /// structured output, cancellation context, and future response fields.
     pub raw_response: serde_json::Value,

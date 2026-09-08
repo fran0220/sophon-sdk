@@ -1552,6 +1552,7 @@ impl acp::Agent for MvpAgent {
             Ok(turn_ok) => {
                 let crate::session::commands::PromptTurnOk {
                     stop_reason,
+                    prompt_index,
                     total_tokens,
                     turn_snapshot,
                     completion_kind,
@@ -1982,10 +1983,7 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 let last_turn_usage = last_turn_usage_for_meta;
-                Ok(
-                    acp::PromptResponse::new(stop_reason)
-                        .meta(
-                            build_prompt_response_meta(PromptResponseMetaArgs {
+                let mut response_meta = build_prompt_response_meta(PromptResponseMetaArgs {
                                     session_id: &arguments.session_id.to_string(),
                                     prompt_id: &prompt_id,
                                     total_tokens,
@@ -1998,11 +1996,11 @@ impl acp::Agent for MvpAgent {
                                     structured_output,
                                     tool_overrides: applied_tool_overrides,
                                     completion_kind: None,
-                                })
-                                .as_object()
-                                .cloned(),
-                        ),
-                )
+                                });
+                if let Some(index) = prompt_index {
+                    response_meta["promptIndex"] = serde_json::json!(index);
+                }
+                Ok(acp::PromptResponse::new(stop_reason).meta(response_meta.as_object().cloned()))
             }
             Err(err) => {
                 let subagent_refs = self

@@ -870,6 +870,7 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
                 &identity,
                 Ok(PromptTurnOk {
                     stop_reason: acp::StopReason::Cancelled,
+                    prompt_index: None,
                     total_tokens: 0,
                     turn_snapshot: None,
                     completion_kind: PromptCompletionKind::Cancelled {
@@ -899,6 +900,7 @@ async fn a_completion_reports_its_own_cancel_reason() {
         let ok = |kind| {
             Ok(PromptTurnOk {
                 stop_reason: acp::StopReason::EndTurn,
+                prompt_index: None,
                 total_tokens: 0,
                 turn_snapshot: None,
                 completion_kind: kind,

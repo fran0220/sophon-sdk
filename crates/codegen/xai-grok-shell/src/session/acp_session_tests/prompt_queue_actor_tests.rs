@@ -2842,6 +2842,7 @@ async fn stale_completion_does_not_clear_promoted_turns_running_task() {
                     &std::rc::Rc::new(()),
                     Ok(crate::session::commands::PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: crate::session::commands::PromptCompletionKind::Completed,

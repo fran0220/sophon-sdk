@@ -4466,6 +4466,7 @@ fn prompt_routes_only_non_send_now_through_human_delivery_handle() {
                                 .send(
                                     Ok(crate::session::commands::PromptTurnOk {
                                         stop_reason: acp::StopReason::Cancelled,
+                                        prompt_index: None,
                                         total_tokens: 0,
                                         turn_snapshot: None,
                                         completion_kind: crate::session::commands::PromptCompletionKind::RemovedFromQueue,

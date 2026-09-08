@@ -456,6 +456,7 @@ async fn timed_out_monitor_admission_queues_one_fallback_and_late_actor_drops_pr
     assert!(admission.respond_to.send(true).is_err());
     let _ = respond_to.send(Ok(crate::session::commands::PromptTurnOk {
         stop_reason: acp::StopReason::Cancelled,
+        prompt_index: None,
         total_tokens: 0,
         turn_snapshot: None,
         completion_kind: crate::session::commands::PromptCompletionKind::RemovedFromQueue,

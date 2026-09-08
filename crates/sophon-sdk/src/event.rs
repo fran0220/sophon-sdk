@@ -48,6 +48,8 @@ pub enum SessionUpdate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnCompletion {
     pub prompt_id: String,
+    /// Native consumed index; old persisted terminals may omit it.
+    pub prompt_index: Option<u64>,
     pub stop_reason: StopReason,
     pub agent_result: Option<String>,
     pub error_kind: Option<String>,

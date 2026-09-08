@@ -114,6 +114,8 @@ impl PromptCompletionKind {
 #[derive(Debug, Clone)]
 pub struct PromptTurnOk {
     pub stop_reason: acp::StopReason,
+    /// Native consumed conversation index; absent for unstarted/blocked input.
+    pub prompt_index: Option<usize>,
     pub total_tokens: u64,
     pub turn_snapshot: Option<TurnDeltaSnapshot>,
     pub completion_kind: PromptCompletionKind,
@@ -251,6 +253,7 @@ pub enum QueueMutationResult {
 pub(crate) fn ok_end_turn(tokens: u64, snapshot: Option<TurnDeltaSnapshot>) -> PromptTurnResult {
     Ok(PromptTurnOk {
         stop_reason: acp::StopReason::EndTurn,
+        prompt_index: None,
         total_tokens: tokens,
         turn_snapshot: snapshot,
         completion_kind: PromptCompletionKind::Completed,

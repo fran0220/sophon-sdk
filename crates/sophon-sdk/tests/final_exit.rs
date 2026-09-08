@@ -54,6 +54,7 @@ fn tool(
     server.expect_response(id, xai_grok_test_support::InferenceRequestMatcher::foreground(xai_grok_test_support::InferenceEndpoint::ChatCompletions), ScriptedResponse::sse(vec![
         SseEvent::data(chunk(json!({"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]}), Value::Null).to_string()),
         SseEvent::data(chunk(json!({}), json!("tool_calls")).to_string()),
+        SseEvent::data(json!({"id":"exit-test","object":"chat.completion.chunk","created":1234567890,"model":"wire-model","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}).to_string()),
         SseEvent::data("[DONE]".to_owned()),
     ]))
 }
@@ -86,7 +87,8 @@ fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
         let session = bounded(agent.create_session(SessionConfig::new(workspace.path()))).await.unwrap();
         let pidfile = workspace.path().join("exit-child.pid");
         let _process_turn = tool(&server, "running-process", "run_terminal_command", json!({"command":format!("echo $$ > '{}'; exec /bin/sleep 600", pidfile.display()),"description":"final exit process lifecycle test","is_background":true}));
-        bounded(session.prompt("start the test background process")).await.unwrap();
+        let first = bounded(session.prompt("start the test background process")).await.unwrap();
+        assert_eq!(first.prompt_index, Some(0));
         let pid: u32 = bounded(async {
             loop {
                 if let Ok(text) = std::fs::read_to_string(&pidfile)
@@ -121,9 +123,18 @@ fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
         bounded(agent.final_exit(Duration::from_secs(20))).await.unwrap();
         assert_eq!(agent.runtime_health().state, sophon_sdk::management::RuntimeState::Stopped);
         assert!(questions.released.load(Ordering::SeqCst), "pending callback future must be dropped");
-        assert_eq!(bounded(running).await.unwrap().unwrap().stop_reason, StopReason::Cancelled);
-        assert_eq!(bounded(queued).await.unwrap().unwrap().stop_reason, StopReason::Cancelled);
-        assert_eq!(bounded(foreground).await.unwrap().unwrap().stop_reason, StopReason::Cancelled);
+        let running = bounded(running).await.unwrap().unwrap();
+        let queued = bounded(queued).await.unwrap().unwrap();
+        let foreground = bounded(foreground).await.unwrap().unwrap();
+        assert_eq!(running.stop_reason, StopReason::Cancelled);
+        assert_eq!(queued.stop_reason, StopReason::Cancelled);
+        assert_eq!(foreground.stop_reason, StopReason::Cancelled);
+        assert_eq!(running.prompt_index, Some(1));
+        assert_eq!(foreground.prompt_index, Some(0));
+        assert_eq!(queued.prompt_index, None, "unstarted inputs never inherit the running index");
+        assert!(running.prompt_id.is_some() && queued.prompt_id.is_some());
+        assert_eq!(running.usage.as_ref().map(|usage| usage.total_tokens), Some(18));
+        assert_eq!(queued.usage, None);
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "native process must be reaped before final exit success");
         assert!(!std::path::Path::new(&format!("/proc/{foreground_pid}")).exists(), "foreground process must be reaped before final exit success");
         let info = xai_grok_shell::session::info::Info { id: agent_client_protocol::SessionId::new(session.id().as_str().to_owned()), cwd: workspace.path().to_str().unwrap().into() };
@@ -134,6 +145,8 @@ fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
         assert!(events.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).any(|event| {
             let event = event.get("params").unwrap_or(&event);
             event["update"]["sessionUpdate"] == "turn_completed" && event["update"]["stop_reason"] == "cancelled"
+                && event["update"]["prompt_id"].as_str() == running.prompt_id.as_deref()
+                && event["_meta"]["promptIndex"].as_u64() == running.prompt_index
         }), "native cancellation terminal must survive checked final flush");
     });
 }

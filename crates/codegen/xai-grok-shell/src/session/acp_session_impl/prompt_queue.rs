@@ -865,6 +865,7 @@ impl SessionActor {
     pub(super) fn respond_removed_prompt(respond_to: oneshot::Sender<PromptTurnResult>) {
         let _ = respond_to.send(Ok(PromptTurnOk {
             stop_reason: acp::StopReason::Cancelled,
+            prompt_index: None,
             total_tokens: 0,
             turn_snapshot: None,
             completion_kind: PromptCompletionKind::RemovedFromQueue,

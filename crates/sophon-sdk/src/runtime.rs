@@ -873,6 +873,15 @@ async fn final_exit_stage(
         })
 }
 
+/// Actor idle can precede native ACP response assembly. This is the receipt
+/// delivery barrier, not an acknowledgement of Host storage/consumption.
+async fn join_prompt_receipts(tasks: &mut tokio::task::JoinSet<()>) -> std::io::Result<()> {
+    while let Some(result) = tasks.join_next().await {
+        result.map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn finish_worker(
     agent: &MvpAgent,
     gateway: &AcpGatewaySender<acp::AgentSide>,
@@ -913,12 +922,19 @@ async fn command_loop(
     exit_callbacks: watch::Sender<bool>,
 ) -> Result<(), Error> {
     let mut pending: Option<PendingDrain> = None;
+    let mut prompt_tasks = tokio::task::JoinSet::new();
     let mut open = true;
     loop {
         let command = tokio::select! {
             // The first drain poll installs the fence before another command
             // can be received. Native admission, not API call order, linearizes prompts.
             biased;
+            result = prompt_tasks.join_next(), if !prompt_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    return Err(Error::Operation(format!("native prompt receipt task failed: {error}")));
+                }
+                continue;
+            },
             report = async { pending.as_mut().expect("guarded drain").future.as_mut().await }, if pending.is_some() => {
                 let drain = pending.take().expect("completed drain");
                 if report.drained() {
@@ -971,12 +987,13 @@ async fn command_loop(
                 agent.fence_final_exit();
                 let _ = exit_callbacks.send(true);
                 let result = async {
-                    final_exit_stage(
-                        deadline,
-                        &phase,
-                        FinalExitPhase::CancelAndDrain,
-                        agent.cancel_for_final_exit(deadline),
-                    )
+                    final_exit_stage(deadline, &phase, FinalExitPhase::CancelAndDrain, async {
+                        agent.cancel_for_final_exit(deadline).await?;
+                        // Native actor idle precedes ACP post-turn response
+                        // assembly. Deliver every dispatched SDK RPC receipt
+                        // before shutting its actor/gateway down.
+                        join_prompt_receipts(&mut prompt_tasks).await
+                    })
                     .await?;
                     final_exit_stage(
                         deadline,
@@ -1110,7 +1127,7 @@ async fn command_loop(
             }
             Command::Prompt(id, prompt, metadata, reply) => {
                 let agent = agent.clone();
-                tokio::task::spawn_local(async move {
+                prompt_tasks.spawn_local(async move {
                     let blocks = prompt
                         .into_iter()
                         .map(prompt_block)
@@ -1127,6 +1144,15 @@ async fn command_loop(
                                 let stop_reason = stop_reason(response.stop_reason);
                                 raw_response(&response).map(|raw_response| PromptResult {
                                     stop_reason,
+                                    prompt_id: string_field(
+                                        &raw_response["_meta"],
+                                        &["promptId", "prompt_id"],
+                                    ),
+                                    prompt_index: raw_response["_meta"]["promptIndex"].as_u64(),
+                                    usage: raw_response["_meta"]
+                                        .get("usage")
+                                        .filter(|v| v.is_object())
+                                        .map(turn_usage),
                                     raw_response,
                                 })
                             }),
@@ -2096,7 +2122,7 @@ fn history_record(payload: &serde_json::Value, historical: bool) -> Option<crate
     };
     let update = serde_json::from_value::<acp::SessionUpdate>(raw.clone())
         .map(session_update)
-        .unwrap_or_else(|_| other_session_update(raw.clone()));
+        .unwrap_or_else(|_| other_session_update(raw.clone(), envelope));
     Some(crate::HistoryRecord {
         session_id: SessionId(string_field(payload, &["sessionId", "session_id"])?),
         event_id: envelope.and_then(|meta| string_field(meta, &["eventId"])),
@@ -2153,7 +2179,10 @@ fn history_snapshot(
 }
 
 fn typed_xai_session_event(payload: &serde_json::Value) -> Option<Event> {
-    let update = other_session_update(field(payload, &["update"])?.clone());
+    let update = other_session_update(
+        field(payload, &["update"])?.clone(),
+        field(payload, &["_meta", "meta"]),
+    );
     if !matches!(update, SessionUpdate::TurnCompleted(_)) {
         return None;
     }
@@ -2373,24 +2402,30 @@ fn session_update(update: acp::SessionUpdate) -> SessionUpdate {
                 })
                 .collect(),
         ),
-        other => other_session_update(serde_json::to_value(other).unwrap_or_default()),
+        other => other_session_update(serde_json::to_value(other).unwrap_or_default(), None),
     }
 }
 
-fn other_session_update(value: serde_json::Value) -> SessionUpdate {
+fn other_session_update(
+    value: serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+) -> SessionUpdate {
     if value
         .get("sessionUpdate")
         .and_then(serde_json::Value::as_str)
         == Some("turn_completed")
-        && let Some(completion) = turn_completion(&value)
+        && let Some(mut completion) = turn_completion(&value)
     {
+        completion.prompt_index = metadata
+            .and_then(|meta| meta.get("promptIndex"))
+            .and_then(serde_json::Value::as_u64);
         return SessionUpdate::TurnCompleted(completion);
     }
     SessionUpdate::Other(value)
 }
 
-fn turn_completion(value: &serde_json::Value) -> Option<crate::TurnCompletion> {
-    let usage = value.get("usage").map(|usage| crate::TurnUsage {
+fn turn_usage(usage: &serde_json::Value) -> crate::TurnUsage {
+    crate::TurnUsage {
         input_tokens: unsigned_field(usage, &["inputTokens", "input_tokens"]),
         output_tokens: unsigned_field(usage, &["outputTokens", "output_tokens"]),
         total_tokens: unsigned_field(usage, &["totalTokens", "total_tokens"]),
@@ -2411,9 +2446,14 @@ fn turn_completion(value: &serde_json::Value) -> Option<crate::TurnCompletion> {
         incomplete: field(usage, &["usageIsIncomplete", "usage_is_incomplete"])
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-    });
+    }
+}
+
+fn turn_completion(value: &serde_json::Value) -> Option<crate::TurnCompletion> {
+    let usage = value.get("usage").filter(|v| v.is_object()).map(turn_usage);
     Some(crate::TurnCompletion {
         prompt_id: string_field(value, &["promptId", "prompt_id"])?,
+        prompt_index: None,
         stop_reason: completion_stop_reason(&string_field(value, &["stopReason", "stop_reason"])?),
         agent_result: string_field(value, &["agentResult", "agent_result"]),
         error_kind: string_field(value, &["errorKind", "error_kind"]),
@@ -2905,6 +2945,28 @@ mod tests {
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
 
     #[tokio::test]
+    async fn final_exit_waits_for_delayed_native_receipt_delivery() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let (release, gate) = oneshot::channel();
+        let (receipt, delivered) = oneshot::channel();
+        tasks.spawn(async move {
+            gate.await.unwrap();
+            receipt.send(()).unwrap();
+        });
+        let mut barrier = Box::pin(join_prompt_receipts(&mut tasks));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut barrier)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        barrier.await.unwrap();
+        delivered.await.unwrap();
+        tasks.spawn(async { panic!("receipt assembly failed") });
+        assert!(join_prompt_receipts(&mut tasks).await.is_err());
+    }
+
+    #[tokio::test]
     async fn final_exit_preserves_phase_timeout_and_persistence_failure() {
         let phase = Mutex::new(FinalExitPhase::Dispatch);
         let result = final_exit_stage(
@@ -3317,8 +3379,17 @@ mod tests {
                     "usageIsIncomplete": true
                 }
             },
-            "_meta": { "eventId": "s1-17" },
+            "_meta": { "eventId": "s1-17", "promptIndex": 9 },
         });
+        let historical = history_record(&payload, true).expect("historical terminal");
+        assert_eq!(historical.prompt_index, Some(9));
+        assert!(matches!(
+            historical.update,
+            SessionUpdate::TurnCompleted(crate::TurnCompletion {
+                prompt_index: Some(9),
+                ..
+            })
+        ));
         let Event::Session {
             session_id,
             update,
@@ -3339,6 +3410,7 @@ mod tests {
             update,
             SessionUpdate::TurnCompleted(crate::TurnCompletion {
                 prompt_id,
+                prompt_index: Some(9),
                 stop_reason: crate::StopReason::Error,
                 agent_result: Some(agent_result),
                 error_kind: Some(error_kind),

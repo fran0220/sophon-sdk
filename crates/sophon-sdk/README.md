@@ -489,6 +489,24 @@ callback futures. It then checks native settlement, final persistence ACKs,
 notification delivery and worker joining against **one total deadline**.
 Conversation history is retained; this never replays a Host queue.
 
+Each prompt future's `PromptResult` carries `prompt_id: Option<String>`,
+`prompt_index: Option<u64>`, and `usage: Option<TurnUsage>` alongside its outcome
+and raw response. These are native per-prompt receipts, usable after the worker
+stops. The index is stamped where native conversation state consumes it, not
+inferred from history length; unstarted, removed, hook-blocked and rewound inputs
+have no retained index. `TurnCompletion.prompt_index` exposes the same native
+terminal attribution (older persisted terminals may omit it). Usage is
+per-prompt, possibly absent/incomplete, not a cumulative session balance.
+Final exit joins dispatched SDK prompt tasks before actor shutdown so their
+receipts are delivered even when native post-turn response assembly is delayed.
+
+Final exit proves SDK notification **delivery**, not Host consumption or durable
+projection. Hosts must settle delivered prompt receipts/terminal events and
+await their own storage acknowledgement before claiming clean app exit. Do not
+query session history, usage, checkpoints or context from the stopped worker.
+Keep missing indices/usage unavailable rather than synthesizing them. Replay
+remains projection-only and must not run live settlement.
+
 `FinalExitError::{TimedOut { phase }, Failed { phase, message }, RuntimeStopped}`
 is an explicit failed retirement, never permission to automatically replace the
 account/runtime. Phases are `Dispatch`, `CancelAndDrain`, `FlushAndStop`,

@@ -231,6 +231,7 @@ impl SessionActor {
         }
         let _ = input.respond_to.send(Ok(PromptTurnOk {
             stop_reason: acp::StopReason::Cancelled,
+            prompt_index: None,
             total_tokens,
             turn_snapshot: None,
             completion_kind: PromptCompletionKind::Rewound,
@@ -362,6 +363,7 @@ impl SessionActor {
             let total_tokens = self.chat_state_handle.get_total_tokens().await;
             let result = Ok(PromptTurnOk {
                 stop_reason: acp::StopReason::Cancelled,
+                prompt_index: None,
                 total_tokens,
                 turn_snapshot: None,
                 completion_kind: PromptCompletionKind::Rewound,
@@ -896,6 +898,7 @@ impl SessionActor {
             self.cancel_pending_image_strips_for_rewind();
             let result = Ok(PromptTurnOk {
                 stop_reason: acp::StopReason::Cancelled,
+                prompt_index: None,
                 total_tokens,
                 turn_snapshot: None,
                 completion_kind: PromptCompletionKind::Rewound,
@@ -911,6 +914,7 @@ impl SessionActor {
 
         let message_result = Ok(PromptTurnOk {
             stop_reason: acp::StopReason::Cancelled,
+            prompt_index: None,
             total_tokens,
             turn_snapshot: None,
             completion_kind: PromptCompletionKind::Cancelled {
@@ -935,6 +939,11 @@ impl SessionActor {
                 .respond_to
                 .send(Ok(PromptTurnOk {
                     stop_reason: acp::StopReason::Cancelled,
+                    prompt_index: if is_running_turn {
+                        self.turn_report.prompt_index(&input.prompt_id)
+                    } else {
+                        None
+                    },
                     total_tokens,
                     turn_snapshot: None,
                     completion_kind: PromptCompletionKind::Cancelled {

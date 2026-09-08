@@ -411,6 +411,9 @@ impl SessionActor {
         let (stop_reason, agent_result, error_kind) =
             crate::sampling::error::prompt_complete_fields(mapped);
         let mut extra = serde_json::Map::new();
+        if let Some(index) = self.turn_report.prompt_index(&prompt_id) {
+            extra.insert("promptIndex".into(), serde_json::json!(index));
+        }
         if let Some(t) = cancel_trigger {
             extra.insert("cancelTrigger".to_string(), serde_json::json!(t));
         }

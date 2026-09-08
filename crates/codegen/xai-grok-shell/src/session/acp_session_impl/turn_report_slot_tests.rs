@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn consumed_index_is_prompt_bound_and_reset_on_promotion() {
+    let slot = TurnReportSlot::default();
+    assert_eq!(slot.prompt_index("first"), None);
+    slot.consume_index("first", 7);
+    assert_eq!(slot.prompt_index("first"), Some(7));
+    assert_eq!(slot.prompt_index("queued"), None);
+    slot.start_next_turn();
+    assert_eq!(slot.prompt_index("first"), None);
+    assert_eq!(slot.prompt_index("queued"), None);
+    slot.consume_index("queued", 8);
+    assert_eq!(slot.prompt_index("queued"), Some(8));
+}
+
+#[test]
 fn a_release_for_a_stale_epoch_leaves_the_live_claim_alone() {
     let slot = TurnReportSlot::default();
     let stale = slot.epoch();

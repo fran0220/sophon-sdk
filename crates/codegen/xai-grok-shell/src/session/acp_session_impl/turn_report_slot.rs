@@ -44,6 +44,7 @@ pub(crate) struct TurnReportSlot {
 struct Inner {
     state: TurnReportState,
     epoch: TurnEpoch,
+    consumed_index: Option<(String, usize)>,
     /// Never reset, so a claim id is unique for the life of the session.
     next_claim: u64,
 }
@@ -74,6 +75,20 @@ impl Drop for TurnReportClaim<'_> {
 }
 
 impl TurnReportSlot {
+    /// Stamped only where native chat state consumes an index, not at admission.
+    pub(super) fn consume_index(&self, prompt_id: &str, index: usize) {
+        self.inner.borrow_mut().consumed_index = Some((prompt_id.to_owned(), index));
+    }
+
+    pub(super) fn prompt_index(&self, prompt_id: &str) -> Option<usize> {
+        self.inner
+            .borrow()
+            .consumed_index
+            .as_ref()
+            .filter(|(id, _)| id == prompt_id)
+            .map(|(_, index)| *index)
+    }
+
     pub(super) fn epoch(&self) -> TurnEpoch {
         self.inner.borrow().epoch
     }
@@ -127,6 +142,7 @@ impl TurnReportSlot {
         }
         inner.epoch.0 += 1;
         inner.state = TurnReportState::Free;
+        inner.consumed_index = None;
         inner.epoch
     }
 

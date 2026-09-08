@@ -446,6 +446,7 @@ async fn hook_denied_completion_holds_queue_until_release() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::Cancelled,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Cancelled {
@@ -546,6 +547,7 @@ async fn hook_denied_completion_does_not_rearm_cleared_hold() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::Cancelled,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Cancelled {
@@ -605,6 +607,7 @@ async fn non_hook_cancel_does_not_hold_queue() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::Cancelled,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Cancelled {
@@ -1062,7 +1065,11 @@ async fn blocked_prompt_consumes_no_prompt_index() {
                 /* parsed_prompt_tx */ None,
             ))
             .await;
-            result.expect("a hook block must resolve Ok(Cancelled)");
+            let receipt = result.expect("a hook block must resolve Ok(Cancelled)");
+            assert_eq!(
+                receipt.prompt_index, None,
+                "blocked receipt has no consumed index"
+            );
             assert_eq!(
                 actor.chat_state_handle.get_prompt_index().await,
                 before,

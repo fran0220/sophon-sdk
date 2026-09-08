@@ -306,6 +306,7 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Completed,
@@ -392,6 +393,7 @@ async fn same_prompt_and_epoch_wrong_allocation_does_not_settle_successor() {
                     &wrong_allocation,
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Completed,
@@ -616,6 +618,7 @@ async fn completion_without_elapsed_persists_none() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Completed,
@@ -914,6 +917,7 @@ async fn hook_denied_cancel_stamps_cancellation_category_on_turn_end() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::Cancelled,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Cancelled {
@@ -1011,6 +1015,7 @@ async fn removed_from_queue_completion_emits_no_turn_completed() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::Cancelled,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::RemovedFromQueue,
@@ -1056,6 +1061,7 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
                     &completion_identity(&actor),
                     Ok(PromptTurnOk {
                         stop_reason: acp::StopReason::EndTurn,
+                        prompt_index: None,
                         total_tokens: 0,
                         turn_snapshot: None,
                         completion_kind: PromptCompletionKind::Completed,

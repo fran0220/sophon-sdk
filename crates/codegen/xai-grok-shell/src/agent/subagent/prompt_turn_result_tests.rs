@@ -14,6 +14,7 @@ fn prompt_turn_ok(
 ) -> crate::session::commands::PromptTurnOk {
     crate::session::commands::PromptTurnOk {
         stop_reason: agent_client_protocol::StopReason::EndTurn,
+        prompt_index: None,
         total_tokens: 0,
         turn_snapshot: None,
         completion_kind,
