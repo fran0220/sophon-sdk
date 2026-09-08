@@ -28,7 +28,7 @@ pub use event::{
     Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
     TurnCompletion, TurnUsage,
 };
-pub use runtime::Agent;
+pub use runtime::{Agent, FinalExitError, FinalExitPhase};
 pub use xai_grok_shell::session::portability::{
     MAX_PORTABLE_BYTES, PORTABLE_COMPATIBILITY, PORTABLE_FORMAT_VERSION, PortabilityError,
     PortableCompleteness, PortableImportStatus, PortableSession,

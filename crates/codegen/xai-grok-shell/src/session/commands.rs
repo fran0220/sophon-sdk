@@ -651,6 +651,14 @@ pub enum SessionCommand {
     FlushComplete {
         respond_to: oneshot::Sender<std::io::Result<()>>,
     },
+    /// Explicit final exit only: cancel native work, retaining conversation.
+    PrepareFinalExit {
+        respond_to: oneshot::Sender<std::io::Result<()>>,
+    },
+    /// After final-exit drain, stop with a checked final persistence ACK.
+    ShutdownChecked {
+        respond_to: oneshot::Sender<std::io::Result<()>>,
+    },
     /// Fence is owned by this mailbox operation, not the cancellable caller.
     ExportPortable {
         fence: xai_grok_tools::management::admission::ExclusiveAdmission,

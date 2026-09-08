@@ -450,6 +450,19 @@ impl MvpAgent {
     ) -> crate::agent::activity::QuiesceReport {
         self.activity.quiesce(timeout).await
     }
+    /// Irreversible prompt fence for explicit process/account final exit.
+    pub fn fence_final_exit(&self) {
+        self.activity.admission_controller().begin_quiesce();
+    }
+    pub async fn cancel_for_final_exit(&self, deadline: tokio::time::Instant) -> std::io::Result<()> {
+        while self.session_registry.attaching_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.activity.cancel_for_final_exit(deadline).await
+    }
+    pub async fn stop_for_final_exit(&self) -> std::io::Result<()> {
+        self.activity.stop_for_final_exit().await
+    }
     /// Typed embedding-management access to one resident session actor.
     /// The returned handle sends directly to the actor that owns FIFO,
     /// scheduler, rewind, tasks, hooks and MCP state.

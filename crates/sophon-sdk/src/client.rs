@@ -48,6 +48,9 @@ pub trait ClientHandler: Send + Sync + 'static {
         PermissionDecision::Cancel
     }
 
+    /// Final exit drops this future to release pending reverse interactions.
+    /// Keep it cancellation-safe; independently spawned host tasks remain
+    /// host-owned. Ordinary native interaction resolution is not an answer ACK.
     async fn extension(&self, method: &str, _params: Value) -> Result<Value, Error> {
         Err(Error::UnsupportedClientRequest(method.to_owned()))
     }

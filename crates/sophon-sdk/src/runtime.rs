@@ -32,6 +32,11 @@ type Reply<T> = oneshot::Sender<Result<T, Error>>;
 type ManagementReply<T> = oneshot::Sender<Result<T, mgmt::ManagementError>>;
 
 enum Command {
+    FinalExit {
+        deadline: tokio::time::Instant,
+        phase: Arc<Mutex<FinalExitPhase>>,
+        reply: oneshot::Sender<Result<(), FinalExitError>>,
+    },
     HistorySnapshot(
         SessionId,
         oneshot::Sender<Result<crate::HistorySnapshot, crate::PortabilityError>>,
@@ -189,6 +194,28 @@ impl Drop for AgentInner {
 #[derive(Clone)]
 pub struct Agent {
     inner: Arc<AgentInner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalExitPhase {
+    Dispatch,
+    CancelAndDrain,
+    FlushAndStop,
+    NotificationDrain,
+    WorkerJoin,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum FinalExitError {
+    #[error("final exit timed out during {phase:?}; retirement is not confirmed")]
+    TimedOut { phase: FinalExitPhase },
+    #[error("final exit failed during {phase:?}: {message}")]
+    Failed {
+        phase: FinalExitPhase,
+        message: String,
+    },
+    #[error("runtime unavailable; final exit is not confirmed")]
+    RuntimeStopped,
 }
 
 impl Agent {
@@ -500,6 +527,61 @@ impl Agent {
         self.shutdown_with_timeout(Duration::from_secs(30)).await
     }
 
+    /// Explicit final app exit/account retirement ONLY. Cancels native work,
+    /// releases reverse callbacks, checks persistence, stops and joins worker.
+    /// One total budget; errors never authorize account replacement. This is
+    /// irreversible and must not be used for portable capture/live replacement.
+    pub async fn final_exit(&self, timeout: Duration) -> Result<(), FinalExitError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let phase = Arc::new(Mutex::new(FinalExitPhase::Dispatch));
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::FinalExit {
+                deadline,
+                phase: phase.clone(),
+                reply,
+            })
+            .map_err(|_| FinalExitError::RuntimeStopped)?;
+        let result = tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|_| FinalExitError::TimedOut {
+                phase: *phase.lock().unwrap_or_else(|p| p.into_inner()),
+            })?
+            .map_err(|_| FinalExitError::RuntimeStopped)?;
+        loop {
+            let finished = self
+                .inner
+                .worker
+                .lock()
+                .map_err(|_| FinalExitError::RuntimeStopped)?
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return result.and(Err(FinalExitError::TimedOut {
+                    phase: FinalExitPhase::WorkerJoin,
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if let Some(worker) = self
+            .inner
+            .worker
+            .lock()
+            .map_err(|_| FinalExitError::RuntimeStopped)?
+            .take()
+        {
+            worker.join().map_err(|_| FinalExitError::Failed {
+                phase: FinalExitPhase::WorkerJoin,
+                message: "worker panicked".into(),
+            })?;
+        }
+        result
+    }
+
     /// Drain with a bounded budget, then flush and stop the worker. Concurrent
     /// drains share the first caller's deadline. A drain timeout leaves the
     /// worker alive and admission closed: cancel outstanding work, then retry.
@@ -641,7 +723,7 @@ fn run_worker(
     runtime.block_on(local.run_until(async move {
         let result = start_worker(config, commands, events, management.clone()).await;
         match result {
-            Ok((agent, gateway, commands, initialization_response)) => {
+            Ok((agent, gateway, commands, initialization_response, exit_callbacks)) => {
                 update_runtime_health(
                     &runtime_health,
                     &management,
@@ -655,6 +737,7 @@ fn run_worker(
                     commands,
                     management.clone(),
                     runtime_health.clone(),
+                    exit_callbacks,
                 )
                 .await;
                 update_runtime_health(
@@ -698,6 +781,7 @@ async fn start_worker(
         AcpGatewaySender<acp::AgentSide>,
         mpsc::UnboundedReceiver<Command>,
         serde_json::Value,
+        watch::Sender<bool>,
     ),
     Error,
 > {
@@ -709,11 +793,13 @@ async fn start_worker(
         MvpAgent::new(gateway.clone(), &grok_config, auth_manager, Some(models))
             .map_err(|error| Error::Start(error.to_string()))?,
     );
+    let (exit_callbacks, retired) = watch::channel(false);
     let client = EmbeddedClient {
         events,
         management,
         permission_policy: config.permission_policy,
         handler: config.client_handler,
+        retired,
     };
     tokio::task::spawn_local(
         AcpGatewayReceiver::<acp::AgentSide, _>::new(gateway_rx, client)
@@ -751,10 +837,41 @@ async fn start_worker(
         .await
         .map_err(acp_error)?;
     let initialization_response = raw_response(&initialized)?;
-    Ok((agent, gateway, commands, initialization_response))
+    Ok((
+        agent,
+        gateway,
+        commands,
+        initialization_response,
+        exit_callbacks,
+    ))
 }
 
 const FLUSH_BARRIER: &str = "sophon-sdk/flush-barrier";
+
+async fn final_exit_stage(
+    deadline: tokio::time::Instant,
+    current: &Mutex<FinalExitPhase>,
+    phase: FinalExitPhase,
+    operation: impl Future<Output = std::io::Result<()>>,
+) -> Result<(), FinalExitError> {
+    *current.lock().unwrap_or_else(|p| p.into_inner()) = phase;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(FinalExitError::TimedOut { phase });
+    }
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| FinalExitError::TimedOut { phase })?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                FinalExitError::TimedOut { phase }
+            } else {
+                FinalExitError::Failed {
+                    phase,
+                    message: error.to_string(),
+                }
+            }
+        })
+}
 
 async fn finish_worker(
     agent: &MvpAgent,
@@ -793,6 +910,7 @@ async fn command_loop(
     mut commands: mpsc::UnboundedReceiver<Command>,
     management: ManagementEmitter,
     runtime_health: watch::Sender<mgmt::RuntimeHealth>,
+    exit_callbacks: watch::Sender<bool>,
 ) -> Result<(), Error> {
     let mut pending: Option<PendingDrain> = None;
     let mut open = true;
@@ -838,6 +956,58 @@ async fn command_loop(
             continue;
         };
         match command {
+            Command::FinalExit {
+                deadline,
+                phase,
+                reply,
+            } => {
+                drop(pending.take());
+                update_runtime_health(
+                    &runtime_health,
+                    &management,
+                    mgmt::RuntimeState::Quiescing,
+                    None,
+                );
+                agent.fence_final_exit();
+                let _ = exit_callbacks.send(true);
+                let result = async {
+                    final_exit_stage(
+                        deadline,
+                        &phase,
+                        FinalExitPhase::CancelAndDrain,
+                        agent.cancel_for_final_exit(deadline),
+                    )
+                    .await?;
+                    final_exit_stage(
+                        deadline,
+                        &phase,
+                        FinalExitPhase::FlushAndStop,
+                        agent.stop_for_final_exit(),
+                    )
+                    .await?;
+                    let barrier = acp::ExtNotification::new(
+                        FLUSH_BARRIER,
+                        serde_json::value::to_raw_value(&serde_json::Value::Null)
+                            .expect("null")
+                            .into(),
+                    );
+                    final_exit_stage(deadline, &phase, FinalExitPhase::NotificationDrain, async {
+                        gateway
+                            .forward_with_completion(barrier)
+                            .await
+                            .map_err(|_| std::io::Error::other("gateway barrier dropped"))?
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    })
+                    .await
+                }
+                .await;
+                let worker_result = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| Error::Operation(error.to_string()));
+                let _ = reply.send(result);
+                return worker_result;
+            }
             Command::HistorySnapshot(id, reply) => {
                 let boundary_id = uuid::Uuid::new_v4().to_string();
                 let result = agent
@@ -1743,6 +1913,7 @@ struct EmbeddedClient {
     management: ManagementEmitter,
     permission_policy: PermissionPolicy,
     handler: Option<Arc<dyn ClientHandler>>,
+    retired: watch::Receiver<bool>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1766,14 +1937,17 @@ impl acp::Client for EmbeddedClient {
                     kind: permission_option_kind(option.kind),
                 })
                 .collect();
-            let decision = handler
-                .request_permission(PermissionRequest {
+            let mut retired = self.retired.clone();
+            let decision = tokio::select! {
+                biased;
+                _ = retired.wait_for(|value| *value) => PermissionDecision::Cancel,
+                decision = handler.request_permission(PermissionRequest {
                     session_id: SessionId(request.session_id.0.to_string()),
                     tool_call: serde_json::to_value(&request.tool_call).unwrap_or_default(),
                     options,
                     metadata: request.meta.map(serde_json::Value::Object),
-                })
-                .await;
+                }) => decision,
+            };
             let outcome = match decision {
                 PermissionDecision::Select(id) => request
                     .options
@@ -1818,10 +1992,12 @@ impl acp::Client for EmbeddedClient {
         };
         let params = serde_json::from_str(request.params.get())
             .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
-        let response = handler
-            .extension(request.method.as_ref(), params)
-            .await
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let mut retired = self.retired.clone();
+        let response = tokio::select! {
+            biased;
+            _ = retired.wait_for(|value| *value) => return Err(acp::Error::internal_error().data("SDK final exit released reverse request")),
+            response = handler.extension(request.method.as_ref(), params) => response,
+        }.map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let response = serde_json::value::to_raw_value(&response)
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         Ok(acp::ExtResponse::new(response.into()))
@@ -2729,6 +2905,39 @@ mod tests {
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
 
     #[tokio::test]
+    async fn final_exit_preserves_phase_timeout_and_persistence_failure() {
+        let phase = Mutex::new(FinalExitPhase::Dispatch);
+        let result = final_exit_stage(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &phase,
+            FinalExitPhase::FlushAndStop,
+            async { Err(std::io::Error::other("injected durability failure")) },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FinalExitError::Failed {
+                phase: FinalExitPhase::FlushAndStop,
+                ..
+            })
+        ));
+        let result = final_exit_stage(
+            tokio::time::Instant::now() + Duration::from_millis(5),
+            &phase,
+            FinalExitPhase::CancelAndDrain,
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FinalExitError::TimedOut {
+                phase: FinalExitPhase::CancelAndDrain
+            })
+        ));
+        assert_eq!(*phase.lock().unwrap(), FinalExitPhase::CancelAndDrain);
+    }
+
+    #[tokio::test]
     async fn historical_callbacks_preserve_metadata_and_never_emit_live_settlement() {
         use acp::Client as _;
         let (events, mut receiver) = broadcast::channel(32);
@@ -2742,6 +2951,7 @@ mod tests {
             },
             permission_policy: PermissionPolicy::DenyAll,
             handler: None,
+            retired: watch::channel(false).1,
         };
         let user = serde_json::json!({"sessionId":"s", "_meta":{"eventId":"native-1","isReplay":true}, "update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hidden native text"},"_meta":{"promptIndex":7,"hideFromScrollback":true,"modelId":"model"}}});
         client

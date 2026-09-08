@@ -291,6 +291,69 @@ impl AgentActivity {
         }
     }
 
+    /// Final-exit cancellation uses each native actor's authority, never a Host queue mirror.
+    pub(crate) async fn cancel_for_final_exit(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<()> {
+        loop {
+            self.final_exit_roundtrip(false).await?;
+            let snapshot = self.drain_snapshot(deadline).await;
+            if snapshot.is_idle() && self.inner.admission.snapshot().active == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let snapshot = self.drain_snapshot(deadline).await;
+                if snapshot.is_idle() && self.inner.admission.snapshot().active == 0 {
+                    self.inner.admission.mark_quiesced();
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("final-exit work remains: {snapshot:?}"),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    pub(crate) async fn stop_for_final_exit(&self) -> std::io::Result<()> {
+        self.final_exit_roundtrip(true).await?;
+        while !self.lock_live_sessions().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    }
+
+    async fn final_exit_roundtrip(&self, stop: bool) -> std::io::Result<()> {
+        let entries: Vec<_> = self
+            .lock_live_sessions()
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.cmd_tx.clone()))
+            .collect();
+        let mut pending = FuturesUnordered::new();
+        for (id, tx) in entries {
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            let command = if stop {
+                SessionCommand::ShutdownChecked { respond_to }
+            } else {
+                SessionCommand::PrepareFinalExit { respond_to }
+            };
+            tx.send(command).map_err(|_| {
+                std::io::Error::other(format!("final-exit actor unavailable: {id}"))
+            })?;
+            pending.push(async move {
+                response
+                    .await
+                    .map_err(|_| std::io::Error::other(format!("final-exit ACK dropped: {id}")))?
+            });
+        }
+        while let Some(result) = pending.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
     /// Send [`SessionCommand::Shutdown`] to every live session actor and wait up to `grace` for them to exit, observed via `cmd_tx.is_closed()`.
     /// Shutdown runs the replay-buffer flush, then hooks, then the memory save, then the actor returns.
     ///

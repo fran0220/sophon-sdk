@@ -155,6 +155,18 @@ impl SessionActor {
         Some(fallback)
     }
 }
+async fn flush_for_exit(session: &SessionActor) -> std::io::Result<()> {
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    session
+        .notifications
+        .persistence_tx
+        .send(PersistenceMsg::FlushForExit { respond_to })
+        .map_err(|_| std::io::Error::other("final persistence channel closed"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("final persistence ACK dropped"))?
+}
+
 async fn shutdown_workflows(session: &SessionActor, timer: &SharedSessionEndTimer) {
     let span = session_end::span(Phase::Workflows);
     {
@@ -2456,7 +2468,32 @@ pub(super) async fn run_session(
                                 PersistenceMsg::GitHead { commit, branch },
                             );
                         }
-                        SessionCommand::Shutdown(kind) => {
+                        SessionCommand::PrepareFinalExit { respond_to } => {
+                            drop(startup_tasks.take());
+                            session.abort_turn_summary();
+                            session.abort_title_refresh();
+                            if let Some(notification) = replay_buffer.flush() {
+                                session.emit_buffered(notification).await;
+                            }
+                            let _ = session.cancel_running_task(crate::session::CancelOptions {
+                                cancel_subagents: true,
+                                kill_background_tasks: true,
+                                history: crate::session::CancelHistoryDisposition::Keep,
+                                trigger: Some(crate::session::CancelTrigger::Shutdown),
+                                user_initiated: false,
+                            }).await;
+                            let result = session.workflow_manager.lock().await
+                                .cancel_all_and_drain(std::time::Duration::from_secs(7)).await
+                                .map_err(|runs| std::io::Error::other(format!("workflow exit incomplete: {runs:?}")));
+                            let flushed = flush_for_exit(&session).await;
+                            let _ = respond_to.send(result.and(flushed));
+                        }
+                        command @ (SessionCommand::Shutdown(_) | SessionCommand::ShutdownChecked { .. }) => {
+                            let (kind, exit_reply) = match command {
+                                SessionCommand::Shutdown(kind) => (kind, None),
+                                SessionCommand::ShutdownChecked { respond_to } => (crate::session::ShutdownKind::Graceful, Some(respond_to)),
+                                _ => unreachable!(),
+                            };
                             // Stop deferred promotion before the first teardown await, not
                             // only when this loop finally returns after hooks and persistence.
                             drop(startup_tasks.take());
@@ -2514,6 +2551,9 @@ pub(super) async fn run_session(
                             finish_session_exit_feedback(&session, &end_timer).await;
                             emit_session_end_timings(&end_timer, session.startup_hints.is_subagent)
                                 .await;
+                            if let Some(respond_to) = exit_reply {
+                                let _ = respond_to.send(flush_for_exit(&session).await);
+                            }
                             return;
                         }
                     }

@@ -323,6 +323,10 @@ pub enum PersistenceMsg {
     FlushAndAck {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    /// Final exit must not forget earlier unconfirmed logical writes.
+    FlushForExit {
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     CapturePortable {
         respond_to: tokio::sync::oneshot::Sender<
             Result<super::portability::PortableSession, super::portability::PortabilityError>,
@@ -1810,6 +1814,16 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::FlushAndAck { respond_to } => {
                     let result = self.flush_and_sync().await;
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::FlushForExit { respond_to } => {
+                    let result = self.flush_and_sync().await.and_then(|()| {
+                        if self.portability_write_failed {
+                            Err(io::Error::other("native write failed; final persistence completeness is unconfirmed"))
+                        } else {
+                            Ok(())
+                        }
+                    });
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CapturePortable { respond_to } => {

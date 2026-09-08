@@ -551,6 +551,16 @@ async fn portable_capture_propagates_real_sync_failure_without_artifact() {
         portable_capture(&actor.handle).await,
         Err(super::super::portability::PortabilityError::Persistence(_))
     ));
+    let (respond_to, ack) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushForExit { respond_to })
+        .unwrap();
+    assert!(
+        ack.await.unwrap().is_err(),
+        "final exit must propagate real fsync failure"
+    );
     actor.stop().await;
 }
 
@@ -587,6 +597,16 @@ async fn portable_capture_cannot_forget_a_lost_write_after_an_ack_consumes_its_e
         portable_capture(&actor.handle).await,
         Err(super::super::portability::PortabilityError::Incomplete(_))
     ));
+    let (respond_to, ack) = tokio::sync::oneshot::channel();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::FlushForExit { respond_to })
+        .unwrap();
+    assert!(
+        ack.await.unwrap().is_err(),
+        "final exit cannot forget unconfirmed writes"
+    );
     actor.stop().await;
 }
 

@@ -480,6 +480,32 @@ receiver falls behind the bounded buffer.
 
 ### Correctness and validation boundary (0.4.1)
 
+For **explicit app final exit or account retirement**, call
+`Agent::final_exit(timeout).await` directly, not `quiesce(120s)` followed by
+another drain within the same outer budget. This irreversible operation fences
+native admission, cancels native queued/running turns and foreground/background
+tasks, cancels subagents/workflows, and releases pending SDK permission/extension
+callback futures. It then checks native settlement, final persistence ACKs,
+notification delivery and worker joining against **one total deadline**.
+Conversation history is retained; this never replays a Host queue.
+
+`FinalExitError::{TimedOut { phase }, Failed { phase, message }, RuntimeStopped}`
+is an explicit failed retirement, never permission to automatically replace the
+account/runtime. Phases are `Dispatch`, `CancelAndDrain`, `FlushAndStop`,
+`NotificationDrain`, and `WorkerJoin`. Earlier unconfirmed native writes remain
+failures even if an ordinary flush consumed their error latch. Failure may leave
+partial teardown or an OS-blocked worker; success/durability is not claimed.
+Do not reuse this runtime or infer success by retrying another shutdown method.
+Dropping the caller does not retract its enqueued exit request. Use a single
+retirement owner; do not race this with ordinary shutdown or session replacement.
+
+This is **not** portable capture, clean live replacement, or ordinary quiesce.
+Pending Host callback futures must be cancellation-safe; independently spawned
+Host tasks remain Host-owned. Native process reaping is exercised on Linux;
+external MCP services/remote jobs are not processes owned by this SDK, and the
+operation does not promise to terminate them. Windows/macOS execution has not
+been verified by these Linux tests.
+
 - `tests/agent_facade.rs` exercises three mocked provider protocols, model/head
   ownership, management access and hermetic policy. `tests/lifecycle.rs`
   exercises actual Agent/Session timeout/retry, concurrent drain/cancel,
@@ -495,8 +521,9 @@ receiver falls behind the bounded buffer.
   fence, not ordering between concurrent SDK calls, decides acceptance.
 - After drain, shutdown performs native session flushing (10-second grace)
   and an ordered in-process notification barrier (2-second budget). The barrier
-  and actor flush are checked: failure stops the worker with `Failed` health
-  and an error, never a successful replacement claim.
+  and actor exit are checked: failure stops the worker with `Failed` health
+  and an error. Unlike `final_exit`, ordinary shutdown does not propagate every
+  native persistence write/fsync failure.
   The barrier proves earlier notifications reached the broadcast streams, not that slow
   subscribers consumed them or that lagged history can be recovered. Retained
   Agent/Session handles retain senders: stop consumers on terminal runtime
