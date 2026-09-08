@@ -146,6 +146,11 @@ fn portable_conversation_roundtrip_keeps_actor_usable_and_continues_native_conte
                 cwd: source.path().to_str().unwrap().into(),
             };
             let source_dir = xai_grok_shell::session::persistence::session_dir(&source_info);
+            // No Agent is running here: offline inspection cannot load old cwd,
+            // providers or pending tool work. Native persisted data is sufficient.
+            let offline = PortableSession::from_native_persistence(&source_dir, snapshot.session_id(), &source_info.cwd).unwrap();
+            assert_eq!(offline.session_id(), snapshot.session_id());
+            assert!(String::from_utf8_lossy(&offline.to_vec().unwrap()).contains("source-only-later-turn"));
             std::fs::rename(&source_dir, home.path().join("source-archive")).unwrap();
             let agent = bounded(Agent::start(config)).await.unwrap();
             let destination_info = xai_grok_shell::session::info::Info {

@@ -199,6 +199,36 @@ No package-version-only compatibility is
 assumed: upgrade the application's Git pin to a revision implementing this API;
 older SDK 0.4.1 pins do not implement it.
 
+### Offline legacy conversation inspection
+
+`PortableSession::from_native_persistence(scratch_dir: &Path, session_id: &str,
+source_cwd: &str) -> Result<PortableSession, PortabilityError>` is synchronous
+and read-only. It constructs no Agent, loads no configuration, runs no provider,
+tool, workflow or scheduler, and never opens `source_cwd`; that string only
+checks the native summary identity. It creates no lock or persistence files.
+Normal file reads may update filesystem access times.
+
+The caller must stop the source, inventory the selected Session, then copy
+present inputs into an exclusively owned private disposable scratch directory:
+
+| Input | Requirement |
+| --- | --- |
+| `summary.json` | Required, unchanged native identity/schema |
+| `chat_history.jsonl`, `updates.jsonl` | Copy whenever present; omission allowed only when corresponding native summary count is zero |
+| `plan.json`, `plan_mode.json`, `usage.json`, `plan.md` | Copy whenever present; do not omit unsupported state |
+| `resources_state.json` | Copy whenever present for scheduler rejection; inspection only, never exported |
+| `goal`, `workflows` | Reject their presence at source, or preserve presence markers in scratch so SDK returns `Incomplete`; never silently omit |
+
+Do not copy configuration, credentials, resource custody, filesystem rewind
+snapshots, process files, or whole Session directories into the target. The
+scratch root/ancestors and immediate entries must not be symlinks; input files
+must be regular files. The SDK cannot detect files deliberately omitted during
+copying, nor flush an old process or guarantee a concurrently mutated source's
+consistency. Exclusive stopped-source custody is a caller precondition, not an
+inferred promise from a lock file. Do not use `load_session` as an inspection
+shortcut. After successful inspection, use validated create-only
+`Agent::import_portable(snapshot, destination_cwd)`; the source stays unchanged.
+
 ### Display history and live handoff
 
 `Session::history_snapshot().await` returns `HistorySnapshot { session_id,

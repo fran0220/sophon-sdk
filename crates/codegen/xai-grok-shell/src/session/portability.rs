@@ -137,6 +137,44 @@ pub enum PortabilityError {
 }
 
 impl PortableSession {
+    /// Read an exclusively owned, consistent native scratch directory without
+    /// constructing an Agent or touching configuration, cwd or execution state.
+    /// The caller must stop the source before copying ALL present input files
+    /// and preserve/reject goal/workflows presence; see the SDK README.
+    /// This is not a flush barrier for a live or concurrently modified source.
+    pub fn from_native_persistence(
+        scratch_dir: &Path,
+        session_id: &str,
+        source_cwd: &str,
+    ) -> Result<Self, PortabilityError> {
+        uuid::Uuid::parse_str(session_id).map_err(malformed)?;
+        if !scratch_dir.is_absolute() || !std::fs::symlink_metadata(scratch_dir)?.is_dir() {
+            return Err(malformed(
+                "scratch must be an absolute nonsymlink directory",
+            ));
+        }
+        for ancestor in scratch_dir.ancestors() {
+            if std::fs::symlink_metadata(ancestor)?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(malformed("scratch ancestry must not contain symlinks"));
+            }
+        }
+        for entry in std::fs::read_dir(scratch_dir)? {
+            if entry?.file_type()?.is_symlink() {
+                return Err(PortabilityError::Incomplete(
+                    "symlink in native scratch".into(),
+                ));
+            }
+        }
+        let info = Info {
+            id: agent_client_protocol::SessionId::new(session_id.to_owned()),
+            cwd: source_cwd.to_owned(),
+        };
+        read_capture(scratch_dir, &info, false)
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -369,6 +407,12 @@ pub(crate) fn capture(dir: &Path, info: &Info) -> Result<PortableSession, Portab
             error.into()
         }
     })?;
+    read_capture(dir, info, true)
+}
+
+/// `sync` is used only by live actor capture/import recovery. Offline scratch
+/// inspection never writes, creates a lock file, fsyncs or initializes storage.
+fn read_capture(dir: &Path, info: &Info, sync: bool) -> Result<PortableSession, PortabilityError> {
     for unsupported in ["goal", "workflows"] {
         if dir.join(unsupported).try_exists()? {
             return Err(PortabilityError::Incomplete(format!(
@@ -378,6 +422,11 @@ pub(crate) fn capture(dir: &Path, info: &Info) -> Result<PortableSession, Portab
     }
     let resources_path = dir.join("resources_state.json");
     if resources_path.try_exists()? {
+        if !std::fs::symlink_metadata(&resources_path)?.is_file() {
+            return Err(PortabilityError::Incomplete(
+                "nonregular resources_state.json".into(),
+            ));
+        }
         use std::io::Read;
         let resources: Value = serde_json::from_reader(
             std::fs::File::open(resources_path)?.take(MAX_PORTABLE_BYTES as u64 + 1),
@@ -414,7 +463,7 @@ pub(crate) fn capture(dir: &Path, info: &Info) -> Result<PortableSession, Portab
         // Windows FlushFileBuffers requires a writable handle as well.
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(sync)
             .open(path)?;
         let mut data = String::new();
         (&mut file)
@@ -425,7 +474,9 @@ pub(crate) fn capture(dir: &Path, info: &Info) -> Result<PortableSession, Portab
             return Err(PortabilityError::TooLarge);
         }
         // Include files such as plan.md that are not on the append dirty set.
-        st::sync_file_durable(&file)?;
+        if sync {
+            st::sync_file_durable(&file)?;
+        }
         files.insert((*name).to_owned(), data);
     }
     let summary = files
@@ -703,6 +754,137 @@ mod tests {
                 .revision(),
             snapshot.revision()
         );
+    }
+
+    #[test]
+    fn offline_portable_export_is_read_only_and_never_opens_source_cwd() {
+        let (dir, mut info) = fixture();
+        info.cwd = dir
+            .path()
+            .join("must-not-be-created")
+            .to_string_lossy()
+            .into_owned();
+        let summary_path = dir.path().join(st::SUMMARY_FILE);
+        let mut summary: Value =
+            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+        summary["info"]["cwd"] = info.cwd.clone().into();
+        std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        // Invalid configuration is irrelevant: offline export must not load it.
+        std::fs::write(dir.path().join("config.toml"), "invalid config [").unwrap();
+        let before: BTreeMap<_, _> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    (
+                        std::fs::read(entry.path()).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let snapshot =
+            PortableSession::from_native_persistence(dir.path(), &info.id.to_string(), &info.cwd)
+                .unwrap();
+        assert_eq!(snapshot.session_id(), info.id.to_string());
+        assert!(snapshot.files[st::UPDATES_FILE].contains("rewound-native-event"));
+        assert!(!snapshot.files.contains_key("config.toml"));
+        assert!(!Path::new(&info.cwd).exists());
+        let after: BTreeMap<_, _> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    (
+                        std::fs::read(entry.path()).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            before, after,
+            "offline export must not write or create lock/storage files"
+        );
+        assert_eq!(
+            capture(dir.path(), &info).unwrap().revision(),
+            snapshot.revision()
+        );
+    }
+
+    #[test]
+    fn offline_portable_export_rejects_orchestration_before_reading_conversation() {
+        let (dir, info) = fixture();
+        // A malformed conversation proves rejection occurs at orchestration
+        // inventory, not after an attempted load/continuation.
+        std::fs::write(dir.path().join(st::CHAT_HISTORY_FILE), "invalid").unwrap();
+        for unsupported in ["goal", "workflows"] {
+            std::fs::create_dir(dir.path().join(unsupported)).unwrap();
+            assert!(matches!(
+                PortableSession::from_native_persistence(
+                    dir.path(),
+                    &info.id.to_string(),
+                    &info.cwd
+                ),
+                Err(PortabilityError::Incomplete(_))
+            ));
+            assert!(!dir.path().join("summary.json.lock").exists());
+            std::fs::remove_dir(dir.path().join(unsupported)).unwrap();
+        }
+        let task =
+            xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask::new(
+                60,
+                "must not execute".into(),
+                true,
+                true,
+            );
+        std::fs::write(
+            dir.path().join("resources_state.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"state":{"grok_build.Scheduler":{"tasks":[task]}}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            PortableSession::from_native_persistence(dir.path(), &info.id.to_string(), &info.cwd),
+            Err(PortabilityError::Incomplete(_))
+        ));
+        std::fs::remove_file(dir.path().join("resources_state.json")).unwrap();
+        assert!(matches!(
+            PortableSession::from_native_persistence(dir.path(), &info.id.to_string(), &info.cwd),
+            Err(PortabilityError::Malformed(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(st::CHAT_HISTORY_FILE)).unwrap(),
+            "invalid"
+        );
+        assert!(!dir.path().join("summary.json.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_portable_export_rejects_symlinks_without_following_them() {
+        let (dir, info) = fixture();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), dir.path().join("resources_state.json"))
+            .unwrap();
+        assert!(matches!(
+            PortableSession::from_native_persistence(dir.path(), &info.id.to_string(), &info.cwd),
+            Err(PortabilityError::Incomplete(_))
+        ));
+        assert!(std::fs::read_dir(external.path()).unwrap().next().is_none());
+        let alias = external.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        assert!(matches!(
+            PortableSession::from_native_persistence(&alias, &info.id.to_string(), &info.cwd),
+            Err(PortabilityError::Malformed(_))
+        ));
+        assert!(!dir.path().join("summary.json.lock").exists());
     }
 
     #[test]
