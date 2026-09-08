@@ -28,6 +28,10 @@ pub use event::{
     Event, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate, TurnCompletion, TurnUsage,
 };
 pub use runtime::Agent;
+pub use xai_grok_shell::session::portability::{
+    MAX_PORTABLE_BYTES, PORTABLE_COMPATIBILITY, PORTABLE_FORMAT_VERSION, PortabilityError,
+    PortableCompleteness, PortableImportStatus, PortableSession,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

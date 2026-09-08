@@ -9,6 +9,7 @@ pub mod merge;
 pub(crate) mod message_delivery;
 pub mod notifications;
 pub mod pending_interaction;
+pub mod portability;
 pub mod prompt_queue;
 pub mod two_pass;
 pub mod visibility;

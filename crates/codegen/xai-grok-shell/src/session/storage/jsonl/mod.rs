@@ -1154,6 +1154,16 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 }
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
+    fn capture_portable(
+        &self,
+        info: &Info,
+    ) -> Result<
+        crate::session::portability::PortableSession,
+        crate::session::portability::PortabilityError,
+    > {
+        crate::session::portability::capture(&self.session_dir(info), info)
+    }
+
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary> {
         self.create_session_dir_owner_only(info)?;
         let summary_path = self.summary_file(info);

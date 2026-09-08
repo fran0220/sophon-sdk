@@ -323,6 +323,11 @@ pub enum PersistenceMsg {
     FlushAndAck {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    CapturePortable {
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<super::portability::PortableSession, super::portability::PortabilityError>,
+        >,
+    },
     ProbeWritable {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
@@ -1318,6 +1323,9 @@ struct SessionPersistence {
     /// `FlushAndAck` must not return `Ok` after a chat/update append that never reached disk.
     /// Fsyncing the previous bytes is not durability for that write.
     pending_write_error: Option<io::Error>,
+    /// A failed logical write can leave this actor's memory ahead of disk.
+    /// Ordinary ACKs may consume their error latch; portable capture must not.
+    portability_write_failed: bool,
     last_usage_live: Option<crate::session::usage_file::UsageSummary>,
     last_usage_turn: Option<u32>,
     last_incoming_turn: Option<u32>,
@@ -1430,6 +1438,7 @@ impl SessionPersistence {
     }
 
     fn note_write_failure(&mut self, error: &io::Error) {
+        self.portability_write_failed = true;
         if self.pending_write_error.is_none() {
             self.pending_write_error = Some(io::Error::new(error.kind(), error.to_string()));
         }
@@ -1443,6 +1452,7 @@ impl SessionPersistence {
     }
 
     fn observe_io<T>(&mut self, result: &io::Result<T>) {
+        self.portability_write_failed |= result.is_err();
         match result {
             Ok(_) => self.clear_disk_full(),
             Err(error) if is_disk_full_io_error(error) => self.mark_disk_full(),
@@ -1670,7 +1680,9 @@ impl SessionPersistence {
             // The latch is for buffered chat/update/rewind misses.
             // This path already reports via AppendUpdateDurablyAndAck
             // Latching would make the next FlushAndAck fail after it has already synced later prompt bytes (TurnCompleted drops its ack)
-            Err(crate::session::storage::AppendUpdateError::NotCommitted(_)) => {}
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(_)) => {
+                self.portability_write_failed = true;
+            }
         }
         match (&update, &result) {
             (SessionUpdate::Acp(notification), Ok(()))
@@ -1800,6 +1812,14 @@ impl SessionPersistence {
                     let result = self.flush_and_sync().await;
                     let _ = respond_to.send(result);
                 }
+                PersistenceMsg::CapturePortable { respond_to } => {
+                    let result = match self.flush_and_sync().await {
+                        Ok(()) if self.portability_write_failed => Err(super::portability::PortabilityError::Incomplete("a native write failed during this actor's lifetime; memory/disk agreement is unconfirmed".into())),
+                        Ok(()) => self.storage.capture_portable(&self.info),
+                        Err(error) => Err(error.into()),
+                    };
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::ProbeWritable { respond_to } => {
                     let result = self.probe_writable().await;
                     self.observe_io(&result);
@@ -1925,6 +1945,7 @@ impl SessionPersistence {
                         )
                         .await
                     {
+                        self.portability_write_failed = true;
                         tracing::warn!(?e, "failed to update current model");
                     }
                     if let Some(sync) = &self.remote_sync {
@@ -1944,11 +1965,13 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::PlanModeState(state) => {
                     if let Err(e) = self.storage.write_plan_mode_state(&self.info, &state).await {
+                        self.portability_write_failed = true;
                         tracing::warn!(?e, "failed to write plan mode state");
                     }
                 }
                 PersistenceMsg::GoalModeState(state) => {
                     if let Err(e) = self.storage.write_goal_mode_state(&self.info, &state).await {
+                        self.portability_write_failed = true;
                         tracing::warn!(?e, "failed to write goal mode state");
                     }
                 }
@@ -2127,6 +2150,7 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::UsageTurn { turn_number, live } => {
                     if let Err(e) = self.persist_usage_turn(turn_number, &live).await {
+                        self.portability_write_failed = true;
                         tracing::warn!(?e, turn_number, "failed to write session usage");
                     }
                 }
@@ -2564,6 +2588,7 @@ pub(crate) async fn new(
             disk_full_notified: false,
             dirty_files: Default::default(),
             pending_write_error: None,
+            portability_write_failed: false,
             last_usage_live: None,
             last_usage_turn: None,
             last_incoming_turn: None,
@@ -2643,6 +2668,7 @@ pub(crate) async fn new_with_explicit_dir(
             disk_full_notified: false,
             dirty_files: Default::default(),
             pending_write_error: None,
+            portability_write_failed: false,
             last_usage_live: None,
             last_usage_turn: None,
             last_incoming_turn: None,
@@ -2770,6 +2796,7 @@ pub(crate) async fn load_light(
             disk_full_notified: false,
             dirty_files: Default::default(),
             pending_write_error: None,
+            portability_write_failed: false,
             last_usage_live: None,
             last_usage_turn: None,
             last_incoming_turn: None,

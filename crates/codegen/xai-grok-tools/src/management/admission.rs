@@ -50,6 +50,7 @@ pub struct AdmissionRejection {
 struct ControllerState {
     generation: u64,
     state: AdmissionState,
+    exclusive: bool,
     active: u64,
     accepted: u64,
     rejected: u64,
@@ -75,6 +76,7 @@ impl Default for AdmissionController {
                 state: Mutex::new(ControllerState {
                     generation: 0,
                     state: AdmissionState::Open,
+                    exclusive: false,
                     active: 0,
                     accepted: 0,
                     rejected: 0,
@@ -97,11 +99,15 @@ impl AdmissionController {
         source: AdmissionSource,
     ) -> Result<AdmissionPermit, AdmissionRejection> {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.state != AdmissionState::Open {
+        if state.state != AdmissionState::Open || state.exclusive {
             state.rejected = state.rejected.saturating_add(1);
             let rejection = AdmissionRejection {
                 generation: state.generation,
-                state: state.state,
+                state: if state.exclusive && state.state == AdmissionState::Open {
+                    AdmissionState::Quiescing
+                } else {
+                    state.state
+                },
                 admission_source: source,
             };
             drop(state);
@@ -153,6 +159,17 @@ impl AdmissionController {
         snapshot(&state)
     }
 
+    /// Reserve an idle admission boundary without irreversibly quiescing.
+    /// The guard must follow the operation to its actor, not its caller future.
+    pub fn try_exclusive(&self) -> Option<ExclusiveAdmission> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.state != AdmissionState::Open || state.exclusive || state.active != 0 {
+            return None;
+        }
+        state.exclusive = true;
+        Some(ExclusiveAdmission(self.clone()))
+    }
+
     /// Wait until every accepted permit has settled, bounded by `deadline`.
     pub async fn wait_for_zero(&self, deadline: tokio::time::Instant) -> bool {
         loop {
@@ -174,6 +191,23 @@ fn snapshot(state: &ControllerState) -> AdmissionSnapshot {
         active: state.active,
         accepted: state.accepted,
         rejected: state.rejected,
+    }
+}
+
+/// A cancellation-safe temporary admission fence. A concurrent permanent
+/// quiesce is never reopened when this guard is released.
+#[derive(Debug)]
+pub struct ExclusiveAdmission(AdmissionController);
+
+impl Drop for ExclusiveAdmission {
+    fn drop(&mut self) {
+        self.0
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .exclusive = false;
+        self.0.inner.changed.notify_waiters();
     }
 }
 
@@ -218,6 +252,29 @@ impl Drop for PermitInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_fence_rejects_all_origins_and_releases_without_reopening_quiesce() {
+        let controller = AdmissionController::default();
+        let permit = controller.try_admit(AdmissionSource::Human).unwrap();
+        assert!(controller.try_exclusive().is_none());
+        drop(permit);
+        let fence = controller.try_exclusive().unwrap();
+        for source in [
+            AdmissionSource::Human,
+            AdmissionSource::Peer,
+            AdmissionSource::Scheduler,
+        ] {
+            assert!(controller.try_admit(source).is_err());
+        }
+        assert!(controller.try_exclusive().is_none());
+        drop(fence);
+        drop(controller.try_admit(AdmissionSource::Human).unwrap());
+        let fence = controller.try_exclusive().unwrap();
+        controller.begin_quiesce();
+        drop(fence);
+        assert!(controller.try_admit(AdmissionSource::Human).is_err());
+    }
 
     #[test]
     fn quiesce_linearizes_with_admission_and_rejects_after_fence() {

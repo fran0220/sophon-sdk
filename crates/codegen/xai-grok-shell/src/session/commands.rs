@@ -651,6 +651,13 @@ pub enum SessionCommand {
     FlushComplete {
         respond_to: oneshot::Sender<std::io::Result<()>>,
     },
+    /// Fence is owned by this mailbox operation, not the cancellable caller.
+    ExportPortable {
+        fence: xai_grok_tools::management::admission::ExclusiveAdmission,
+        respond_to: oneshot::Sender<
+            Result<super::portability::PortableSession, super::portability::PortabilityError>,
+        >,
+    },
     #[cfg(test)]
     InjectTurnCompletion {
         prompt_id: String,

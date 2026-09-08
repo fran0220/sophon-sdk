@@ -1127,6 +1127,16 @@ impl SessionFileSet {
 /// Abstracts over different storage backends (JSONL, SQLite, etc.)
 #[async_trait]
 pub trait StorageAdapter: Send + Sync {
+    /// Synchronous capture inside the persistence actor's checked barrier.
+    fn capture_portable(
+        &self,
+        _info: &Info,
+    ) -> Result<super::portability::PortableSession, super::portability::PortabilityError> {
+        Err(super::portability::PortabilityError::Incomplete(
+            "storage backend does not support portable capture".into(),
+        ))
+    }
+
     /// Initialize a new session or load existing one
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary>;
 

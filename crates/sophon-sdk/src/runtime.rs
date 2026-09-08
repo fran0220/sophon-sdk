@@ -32,6 +32,20 @@ type Reply<T> = oneshot::Sender<Result<T, Error>>;
 type ManagementReply<T> = oneshot::Sender<Result<T, mgmt::ManagementError>>;
 
 enum Command {
+    ExportPortable(
+        SessionId,
+        oneshot::Sender<Result<crate::PortableSession, crate::PortabilityError>>,
+    ),
+    ImportPortable(
+        crate::PortableSession,
+        PathBuf,
+        oneshot::Sender<Result<SessionId, crate::PortabilityError>>,
+    ),
+    PortableImportStatus(
+        crate::PortableSession,
+        PathBuf,
+        oneshot::Sender<Result<crate::PortableImportStatus, crate::PortabilityError>>,
+    ),
     CreateSession(SessionConfig, Reply<(SessionId, serde_json::Value)>),
     LoadSession(SessionConfig, SessionId, Reply<serde_json::Value>),
     ResumeSession(SessionConfig, SessionId, Reply<serde_json::Value>),
@@ -286,6 +300,37 @@ impl Agent {
             .request(|reply| Command::CreateSession(config, reply))
             .await?;
         Ok(Session::new(self.clone(), id, initial_response))
+    }
+
+    /// Create-only conversation transfer. Does not attach an actor or run
+    /// imported actions. Load/resume explicitly with destination-local config.
+    pub async fn import_portable(
+        &self,
+        snapshot: crate::PortableSession,
+        cwd: PathBuf,
+    ) -> Result<SessionId, crate::PortabilityError> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::ImportPortable(snapshot, cwd, tx))
+            .map_err(|_| crate::PortabilityError::Unavailable)?;
+        rx.await.map_err(|_| crate::PortabilityError::Unavailable)?
+    }
+
+    /// Reconcile an uncertain import before attaching. Only MatchesSnapshot
+    /// proves current persisted portable data equals the supplied snapshot.
+    /// An active/attaching target is an error, never an implicit success.
+    pub async fn portable_import_status(
+        &self,
+        snapshot: crate::PortableSession,
+        cwd: PathBuf,
+    ) -> Result<crate::PortableImportStatus, crate::PortabilityError> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::PortableImportStatus(snapshot, cwd, tx))
+            .map_err(|_| crate::PortabilityError::Unavailable)?;
+        rx.await.map_err(|_| crate::PortabilityError::Unavailable)?
     }
 
     pub async fn load_session(
@@ -789,6 +834,18 @@ async fn command_loop(
             continue;
         };
         match command {
+            Command::ExportPortable(id, reply) => {
+                // Do not dispatch another SDK mutation until capture settles.
+                let result = agent.export_portable(id.as_str()).await;
+                let _ = reply.send(result);
+            }
+            Command::ImportPortable(snapshot, cwd, reply) => {
+                let result = agent.import_portable(&snapshot, &cwd).map(SessionId);
+                let _ = reply.send(result);
+            }
+            Command::PortableImportStatus(snapshot, cwd, reply) => {
+                let _ = reply.send(agent.portable_import_status(&snapshot, &cwd));
+            }
             Command::CreateSession(config, reply) => {
                 let agent = agent.clone();
                 tokio::task::spawn_local(async move {
@@ -2148,6 +2205,21 @@ impl SessionConfig {
 }
 
 impl Session {
+    /// Flush and atomically capture the native current conversation and all
+    /// persisted event history. The same actor remains usable. This is not a
+    /// filesystem backup, execution migration, or content-sanitization API.
+    /// Busy/Incomplete are actionable: settle work or finish unsupported
+    /// orchestration before retrying. Never fall back to transcript replay.
+    pub async fn export_portable(&self) -> Result<crate::PortableSession, crate::PortabilityError> {
+        let (tx, rx) = oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(Command::ExportPortable(self.id.clone(), tx))
+            .map_err(|_| crate::PortabilityError::Unavailable)?;
+        rx.await.map_err(|_| crate::PortabilityError::Unavailable)?
+    }
+
     pub(crate) fn new(agent: Agent, id: SessionId, initial_response: serde_json::Value) -> Self {
         Self {
             agent,

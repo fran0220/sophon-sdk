@@ -1386,6 +1386,7 @@ mod resource_telemetry;
 mod session_registry;
 mod session_lifecycle;
 mod agent_ops;
+mod portability;
 mod acp_agent;
 pub(crate) mod reasoning_effort;
 mod sampler_prewarm;

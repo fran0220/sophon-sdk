@@ -189,6 +189,10 @@ impl AgentActivity {
         self.lock_live_sessions().len()
     }
 
+    pub(crate) fn has_live_session(&self, id: &str) -> bool {
+        self.lock_live_sessions().iter().any(|entry| entry.id == id)
+    }
+
     /// Fence all new Agent prompt admissions and wait for every unit accepted
     /// before the fence, its FIFO turn, related session actor work, background
     /// process, subagent, and completion presentation to settle.

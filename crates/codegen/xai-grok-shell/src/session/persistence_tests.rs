@@ -61,6 +61,7 @@ fn test_actor_inner(
             disk_full_notified: false,
             dirty_files: Default::default(),
             pending_write_error: None,
+            portability_write_failed: false,
             last_usage_live: None,
             last_usage_turn: None,
             last_incoming_turn: None,
@@ -451,6 +452,142 @@ fn actor_with_barrier_probes(dir: &std::path::Path, info: &Info) -> (ActorGuard,
     ));
     let actor = test_actor(info.clone(), storage);
     (actor, SyncBarrierProbe { appends, syncs })
+}
+
+async fn portable_capture(
+    handle: &PersistenceHandle,
+) -> Result<super::super::portability::PortableSession, super::super::portability::PortabilityError>
+{
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(PersistenceMsg::CapturePortable { respond_to })
+        .unwrap();
+    response.await.unwrap()
+}
+
+#[tokio::test]
+async fn portable_capture_flushes_recent_events_and_state_at_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(
+            &info,
+            "recent-secret-text",
+        )))
+        .unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CurrentModel {
+            model_id: acp::ModelId::new("new-model"),
+            agent_name: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+    let captured = portable_capture(&actor.handle).await.unwrap();
+    let value = serde_json::to_value(&captured).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_str(value["files"]["summary.json"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["current_model_id"], "new-model");
+    assert!(
+        value["files"]["updates.jsonl"]
+            .as_str()
+            .unwrap()
+            .contains("recent-secret-text")
+    );
+    assert!(
+        probe
+            .syncs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|files| files.updates)
+    );
+    assert!(!captured.completeness().content_sanitized);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "next-update")))
+        .unwrap();
+    let later = portable_capture(&actor.handle).await.unwrap();
+    assert_ne!(captured.revision(), later.revision());
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn portable_capture_propagates_real_sync_failure_without_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_probes(
+        dir.path().into(),
+        |_| Ok(()),
+        |_| Err(io::Error::other("injected fsync failure")),
+    ));
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "pending")))
+        .unwrap();
+    assert!(matches!(
+        portable_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Persistence(_))
+    ));
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn portable_capture_cannot_forget_a_lost_write_after_an_ack_consumes_its_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let chat = dir.path().join("chat_history.jsonl");
+    std::fs::create_dir(&chat).unwrap();
+    let storage = Arc::new(JsonlStorageAdapter::with_explicit_session_dir(
+        dir.path().to_path_buf(),
+    ));
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Chat(ConversationItem::user("lost")))
+        .unwrap();
+    assert!(matches!(
+        portable_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Persistence(_))
+    ));
+    std::fs::remove_dir(&chat).unwrap();
+    std::fs::write(&chat, "").unwrap();
+    flush_ack(&actor.handle).await.unwrap();
+    assert!(matches!(
+        portable_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Incomplete(_))
+    ));
+    actor.stop().await;
 }
 
 #[tokio::test]

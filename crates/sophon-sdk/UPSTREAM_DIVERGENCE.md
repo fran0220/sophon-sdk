@@ -1,9 +1,24 @@
 # Maintained Grok Build divergences
 
-Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for six
+Upstream-owned paths match `UPSTREAM_GROK_BUILD_COMMIT` except for seven
 explicitly reviewed patch groups. Each group has its own file list and SHA-256
 digest under `upstream-patches/`; `scripts/check-upstream-sync.sh` rejects both
 changes outside these lists and drift within a listed group.
+
+## Portable conversation transfer
+
+`portable-conversation.sha256` covers the native actor admission fence,
+persistence flush/capture barrier, validated conversation projection and atomic
+create-only import. Its exact paths are the `portable_conversation` list in
+`scripts/check-upstream-sync.sh`; shared admission/actor files also remain in
+the typed-management digest. No upstream pin or package version is rewritten.
+
+Format v1 preserves current model context and unfiltered persisted events, not
+destroyed historical model contexts, filesystem rewind custody or resumable
+orchestration. Structural machine configuration is excluded; transcript text
+is not sanitized. Import recovery compares current native data without actor
+attachment, rather than trusting an import receipt after later mutations.
+The SDK README specifies the public contract and limitations.
 
 ## Provider routing
 

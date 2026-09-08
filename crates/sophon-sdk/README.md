@@ -124,6 +124,81 @@ or ambient environment flags. The SDK only routes existing upstream tools; it
 does not add parallel `generate_image` / `generate_video` APIs or own polling
 state.
 
+## Portable conversation transfer
+
+Use the typed actor operation, **not** separate `x.ai/session/state` and
+`x.ai/session/updates` calls or `CopyFile`:
+
+```rust
+# async fn transfer(source: &sophon_sdk::Session, destination: &sophon_sdk::Agent,
+#     cwd: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+let snapshot = source.export_portable().await?;
+let bytes = snapshot.to_vec()?; // opaque; store with authenticated access control
+// On the destination, bound downloads before allocating; this decoder also
+// rejects inputs above MAX_PORTABLE_BYTES (200 MiB) before JSON parsing.
+let snapshot = sophon_sdk::PortableSession::from_slice(&bytes)?;
+let id = destination.import_portable(snapshot, cwd.clone()).await?;
+let session = destination.load_session(id, sophon_sdk::SessionConfig::new(cwd)).await?;
+// Only an explicit new prompt runs the agent, with destination-local config.
+# let _ = session;
+# Ok(())
+# }
+```
+
+Version 1 (`PORTABLE_COMPATIBILITY`) preserves **current native conversation
+context and unfiltered persisted event history**, plus the allowlisted native
+summary, todo plan, inactive plan-mode state, plan text and usage. It does not
+reconstruct model contexts already removed by native compaction/rewind. Inspect
+`completeness()`; `historical_model_context_branches`, `filesystem_rollback`,
+`execution_custody`, and `content_sanitized` are explicitly false. Call this a
+**conversation transfer**, not a complete Session backup.
+
+No filesystem rewind snapshots, process state, tool/resources configuration,
+credential configuration, MCP/skill announcement cache, telemetry, or
+goal/workflow/scheduler execution custody is transferred. Summary metadata is
+allowlisted; the destination cwd is supplied explicitly, never inferred from
+source paths. Arbitrary user/assistant/tool text and event payloads can contain
+secrets and paths; this API does not sanitize them. Remote images in current
+model context are `Incomplete` unless already inline. Historical event resource
+links are preserved as links, not downloaded attachments. The payload hash is a
+content revision/corruption check, not authentication or a monotonic Sync version.
+
+Export reserves an idle native admission boundary (conservatively Agent-wide),
+checks actor activity, flushes its replay buffer, then asks the persistence actor
+to flush, sync and capture without processing intervening writes. The same actor
+remains resident. `Busy` means retry after accepted work settles. The operation
+owns its fence even if the caller future is dropped; it releases after capture
+or failure, without reopening a concurrent permanent quiesce. Unsupported
+orchestration, active/pending plan mode, missing/corrupt native data, or prior
+unreconciled native write failures fail closed; never fall back to replaying a
+Host-owned transcript. Use one owning SDK runtime per live Session; concurrent
+external/raw disk mutation is not a supported ownership model.
+
+Import is **original-ID, create-only**: `ActiveSession` and `ExistingSession`
+are actionable conflicts, never success/no-op or overwrite. It validates format,
+compatibility, completeness, native records and the capture revision before
+writing. Staging is outside native Session discovery; publication uses an atomic
+no-replace directory rename. A crash before publication leaves only hidden
+staging data and can be retried. After publication the complete Session exists;
+a lost response or parent-directory sync error can therefore be followed by
+`ExistingSession`. Reconcile that existing Session rather than deleting or
+overwriting it: **before attaching**, call
+`agent.portable_import_status(snapshot, cwd).await`. Only
+`PortableImportStatus::MatchesSnapshot` confirms that current persisted native
+data exactly matches the supplied portable revision after destination metadata
+normalization (including cwd), with file/parent durability checked.
+`Missing` permits retry; `Different`, `ActiveSession`, and validation failures
+require conflict handling. Never ACK an arbitrary `ExistingSession`, or attach
+and then export to infer import success: attachment can change native data.
+There is no stale receipt or second journal involved in this comparison.
+Native directory publication is implemented for Linux, macOS and
+Windows; other platforms fail closed. Execution is verified on Linux only.
+Windows retains the native directory-sync policy (NTFS journaling, no explicit
+directory fsync); it does not claim Linux-style power-loss durability.
+No package-version-only compatibility is
+assumed: upgrade the application's Git pin to a revision implementing this API;
+older SDK 0.4.1 pins do not implement it.
+
 ## Stable typed management
 
 `management` is the stable embedded control plane. It does not expose ACP or
@@ -450,7 +525,7 @@ application source, not in the SDK dependency closure or public API.
 Upstream-owned directories remain byte-for-byte equal to the commit in
 `UPSTREAM_GROK_BUILD_COMMIT`, except for the separately digested provider
 routing, hermetic embedded discovery, Windows portability, public snapshot
-repair, Goal reliability, and typed-management authority groups documented in
+repair, Goal reliability, typed-management authority, and portable-conversation groups documented in
 [`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md). The sync check validates the
 untouched tree and each approved patch independently. An upgrade imports the
 complete public snapshot, updates provenance, reconciles those boundaries,

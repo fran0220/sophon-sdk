@@ -1577,6 +1577,35 @@ pub(super) async fn run_session(
                                 },
                             );
                         }
+                        SessionCommand::ExportPortable { fence, respond_to } => {
+                            use crate::session::portability::PortabilityError;
+                            // Keep the actor's mailbox closed to mutations through
+                            // replay flush AND persistence capture. No actor restart.
+                            let result = async {
+                                if session.is_busy().await {
+                                    return Err(PortabilityError::Busy);
+                                }
+                                let bridge = session.tool_bridge_handle();
+                                let tasks = bridge.list_tasks().await
+                                    .ok_or_else(|| PortabilityError::Incomplete("background task inventory unavailable".into()))?;
+                                if tasks.iter().any(|task| task.is_outstanding()) {
+                                    return Err(PortabilityError::Busy);
+                                }
+                                if !session.workflow_tracker().await.lock().list().is_empty() {
+                                    return Err(PortabilityError::Incomplete("workflow state is not portable".into()));
+                                }
+                                if let Some(notification) = replay_buffer.flush() {
+                                    session.emit_buffered(notification).await;
+                                }
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                session.notifications.persistence_tx
+                                    .send(PersistenceMsg::CapturePortable { respond_to: tx })
+                                    .map_err(|_| PortabilityError::Unavailable)?;
+                                rx.await.map_err(|_| PortabilityError::Unavailable)?
+                            }.await;
+                            drop(fence);
+                            let _ = respond_to.send(result);
+                        }
                         SessionCommand::FlushComplete { respond_to } => {
                             // Flush the actor-owned replay buffer inline
                             // This branch already runs inside `run_session()`

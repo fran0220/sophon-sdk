@@ -137,6 +137,21 @@ typed_management=(
   crates/codegen/xai-prompt-queue/src/types.rs
 )
 
+portable_conversation=(
+  crates/codegen/xai-grok-shell/src/agent/activity.rs
+  crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
+  crates/codegen/xai-grok-shell/src/agent/mvp_agent/portability.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs
+  crates/codegen/xai-grok-shell/src/session/commands.rs
+  crates/codegen/xai-grok-shell/src/session/mod.rs
+  crates/codegen/xai-grok-shell/src/session/persistence.rs
+  crates/codegen/xai-grok-shell/src/session/persistence_tests.rs
+  crates/codegen/xai-grok-shell/src/session/portability.rs
+  crates/codegen/xai-grok-shell/src/session/storage/jsonl/mod.rs
+  crates/codegen/xai-grok-shell/src/session/storage/mod.rs
+  crates/codegen/xai-grok-tools/src/management/admission.rs
+)
+
 git -C "$root" cat-file -e "$pin^{commit}"
 
 all_approved=(
@@ -146,6 +161,7 @@ all_approved=(
   "${public_snapshot_repairs[@]}"
   "${goal_reliability[@]}"
   "${typed_management[@]}"
+  "${portable_conversation[@]}"
 )
 exclusions=(
   ':(exclude).agents'
@@ -204,3 +220,7 @@ verify_digest \
   typed-management \
   "$digest_dir/typed-management.sha256" \
   "${typed_management[@]}"
+verify_digest \
+  portable-conversation \
+  "$digest_dir/portable-conversation.sha256" \
+  "${portable_conversation[@]}"
