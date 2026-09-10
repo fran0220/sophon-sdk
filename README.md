@@ -66,9 +66,12 @@ redistribution, not an official xAI SDK.
 The synchronized source includes the complete 1.0.24 public snapshot. Runtime
 improvements include cancellable MCP initialization ownership, reactivated
 subagent attempts, durable task snapshots, unified model behavior resolution,
-opt-in Memory V2, and tool safety fixes. SDK admission, queue versions,
-foreground scheduling, portable conversations, authored prompts and provider
-isolation remain intact. Hermetic embeddings exclude ambient system policies,
+opt-in Memory V2, and tool safety fixes. SDK 0.5.0 replaces legacy management
+interfaces with attempt-scoped subagents, MCP lifecycle, workflow management,
+and effective model facts. It explicitly enables Memory V2 without embeddings
+and runs scheduled occurrences as native children, removing the foreground shim.
+SDK admission, queue versions, portable conversations, authored prompts and
+provider isolation remain intact. Hermetic embeddings exclude ambient system policies,
 first-party managed-policy fetching and detached connection prewarming.
 TUI-only features remain available to the upstream application but are
 deliberately not mirrored by the SDK. See the

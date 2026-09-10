@@ -350,15 +350,49 @@ crates/sophon-sdk/scripts/check-sdk-boundary.sh
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
 
-## SDK 0.5.0 boundary update
+## SDK 0.5.0 validation (2026-09-10, Linux x86_64)
 
 The path lists now include native attempt-scoped child operations, MCP
 persistence/readiness, workflow management, task coordinator tests and effective
 model facts. The removed scheduler ingress path is no longer approved.
-Digest regeneration and full compilation/runtime validation must follow the
-final native edits; the historical results below do **not** certify 0.5.0.
-README examples were reviewed against the new facade signatures; Cargo doc
-tests do not automatically compile README snippets.
+All seven digests were regenerated with new native files included in the index.
+
+- `cargo test --locked -p sophon-sdk --tests`: 35 unit tests and 18 integration
+  tests pass. Coverage includes three provider protocols, lifecycle/final exit,
+  portability, memory/model validation, MCP CRUD/auth/toggle/resource/readiness,
+  subagent attempt fencing and parent isolation, workflow pause/resume/stop,
+  durable snapshot replay, and scheduler CAS/idempotency/native execution.
+- Both recurring and one-shot schedules execute in native children. Their
+  completion can still wake the parent with a native internal
+  `subagent-completed-…` prompt; tests distinguish this from the removed
+  foreground scheduler ingress. Zero intervals are rejected and 59-second
+  intervals remain unclamped.
+- `cargo test --locked -p sophon-sdk --doc`: all five README examples pass.
+  The README is now included by a doctest-only module, so future interface
+  changes compile-check the current examples automatically.
+- `cargo test --locked -p xai-grok-tools --lib`: 3,239 pass, 2 ignored.
+- `cargo test --locked -p xai-grok-shell --lib --features test-support --
+  --test-threads=4`: 6,688 pass, 1 fails, 5 ignored. The sole failure remains
+  upstream's `parse_list_req_forces_kind_under_process_chat_mode_only`, unchanged
+  from the source-sync baseline. Newly added MCP, coordinator, workflow and
+  model-facts tests pass. MCP rollback runs in an isolated test process because
+  the native home path is process-cached; a serial environment guard alone
+  cannot reset a home resolved by earlier tests.
+- Production `cargo clippy --locked -p sophon-sdk -p xai-grok-shell
+  -p xai-grok-tools -p xai-prompt-queue --lib -- -D warnings` passes.
+  The existing build-script warning about an unreachable Clippy configured
+  method remains; no warning or lint was suppressed.
+- `scripts/check-sdk-boundary.sh` passes: no TUI dependencies, 3,695 SDK public
+  rustdoc signatures without ACP/TUI links, untouched upstream paths and all
+  seven patch digests verified. Modified Rust files pass rustfmt checks.
+
+Commands used `env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`; native suites additionally
+set process-local Git fixture defaults as recorded below. Tests use local mock
+inference and stdio MCP, not live credentials. Windows/macOS execution, live
+OAuth browser flows and external providers were not verified. Memory V2 is
+explicitly enabled with embeddings disabled; no separately routed embedding
+provider is exposed. Native daemon/TUI features remain outside the SDK facade.
 
 ## 1.0.24 validation (2026-09-10, Linux x86_64)
 
