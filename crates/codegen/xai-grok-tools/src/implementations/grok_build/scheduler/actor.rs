@@ -37,7 +37,6 @@ const SPAWN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum LoopFireOutcome {
     Spawned(String),
-    Foreground,
     Skipped,
 }
 
@@ -273,15 +272,10 @@ impl SchedulerActor {
             let (needs_wiring, wired) = {
                 let res = self.resources.lock().await;
                 let soon = Utc::now() + chrono::Duration::seconds(2);
-                let has_ingress = res
-                    .get::<crate::management::scheduler_ingress::SchedulerPromptIngress>()
-                    .is_some();
-                // SDK-owned foreground fires need no coordinator startup wait.
-                let needs_wiring = res.get::<State<SchedulerState>>().is_some_and(|s| {
-                    s.tasks.iter().any(|t| {
-                        t.next_wake_at() <= soon && !(has_ingress && (t.foreground || !t.recurring))
-                    })
-                });
+                // One-shots and recurring tasks both execute in native children.
+                let needs_wiring = res
+                    .get::<State<SchedulerState>>()
+                    .is_some_and(|s| s.tasks.iter().any(|t| t.next_wake_at() <= soon));
                 let wired = res.get::<SubagentEventSender>().is_some()
                     && res.get::<SessionIdResource>().is_some();
                 (needs_wiring, wired)
@@ -334,9 +328,6 @@ impl SchedulerActor {
         let admission = res
             .get::<crate::management::admission::AdmissionController>()
             .cloned();
-        let prompt_ingress = res
-            .get::<crate::management::scheduler_ingress::SchedulerPromptIngress>()
-            .cloned();
         let subagent_events = res.get::<SubagentEventSender>().cloned();
         let owner_session = res.get::<SessionIdResource>().map(|s| s.0.clone());
         let state = res.get_or_default::<State<SchedulerState>>();
@@ -352,7 +343,6 @@ impl SchedulerActor {
         let task_id = task.id.clone();
         let is_expired = task.recurring && task.is_expired(now);
         let should_remove = !task.recurring;
-        let sdk_foreground = prompt_ingress.is_some() && (task.foreground || should_remove);
         let prompt = task.prompt.clone();
         let human_schedule = interval_to_human(task.interval_secs);
         let is_durable = task.durable;
@@ -457,7 +447,7 @@ impl SchedulerActor {
             return;
         }
 
-        let mut agent_permit = match admission {
+        let agent_permit = match admission {
             Some(controller) => match controller
                 .try_admit(crate::management::admission::AdmissionSource::Scheduler)
             {
@@ -475,31 +465,7 @@ impl SchedulerActor {
             None => None,
         };
 
-        // Native fires (including one-shots) use upstream child execution.
-        // SDK foreground execution remains owned by the admitted ingress.
-        let spawn_deps = if sdk_foreground {
-            None
-        } else {
-            subagent_events.zip(owner_session)
-        };
-        let mut prompt_enqueued = false;
-        if !is_expired
-            && sdk_foreground
-            && let (Some(ingress), Some(permit)) = (prompt_ingress.as_ref(), agent_permit.take())
-        {
-            if let Err(error) = ingress.enqueue(
-                crate::management::scheduler_ingress::SchedulerPrompt {
-                    task_id: task_id.clone(),
-                    prompt: prompt.clone(),
-                    human_schedule: human_schedule.clone(),
-                },
-                permit,
-            ) {
-                tracing::warn!(%task_id, %error, "Scheduled foreground prompt ingress failed");
-                return;
-            }
-            prompt_enqueued = true;
-        }
+        let spawn_deps = subagent_events.zip(owner_session);
 
         let mut reservation = self.clock.prepare_transition(transition_count);
 
@@ -558,7 +524,6 @@ impl SchedulerActor {
                 )
                 .await
             }
-            None if prompt_enqueued => LoopFireOutcome::Foreground,
             None => {
                 tracing::error!(
                     task_id = %task_id,
@@ -585,23 +550,6 @@ impl SchedulerActor {
 
         match outcome {
             LoopFireOutcome::Skipped => unreachable!("skipped outcome returned above"),
-            LoopFireOutcome::Foreground => {
-                debug_assert!(prompt_enqueued);
-                let commit = reservation.commit_next(&mut self.clock);
-                log_rollover(transition, Some(&task_id), commit.rollover);
-                let fire_version = commit.version;
-                self.notification_handle
-                    .send_scheduled_task_fired(ScheduledTaskFired {
-                        task_id,
-                        prompt,
-                        human_schedule,
-                        next_fire_at,
-                        subagent_id: None,
-                        prompt_enqueued,
-                        generation: fire_version.generation(),
-                        revision: fire_version.revision(),
-                    });
-            }
             LoopFireOutcome::Spawned(id) => {
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover(transition, Some(&task_id), commit.rollover);
@@ -715,7 +663,7 @@ impl SchedulerActor {
                 } else {
                     // Coordinator channel closed — cannot verify whether the previous iteration is
                     // still running. Skip rather than treating this as "no previous snapshot",
-                    // which could fall through to Foreground inject and double-execute.
+                    // which could start a second child and double-execute.
                     tracing::warn!(
                         task_id = %task_id,
                         previous_subagent = %prev_id,
@@ -1623,163 +1571,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_one_shot_transfers_admission_and_failed_ingress_keeps_task() {
-        for accept in [false, true] {
-            let task = due_one_shot("sdk-fire");
+    async fn sdk_native_children_hold_admission_through_quiesce() {
+        for recurring in [false, true] {
+            let task = ScheduledTask::with_fire_immediately(
+                1,
+                "native child".into(),
+                recurring,
+                false,
+                true,
+            );
             let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
             let controller = crate::management::admission::AdmissionController::default();
             let (tx, mut rx) = mpsc::unbounded_channel();
             {
                 let mut resources = actor.resources.lock().await;
                 resources.insert(controller.clone());
-                resources.insert(
-                    crate::management::scheduler_ingress::SchedulerPromptIngress::new(
-                        move |prompt, permit| {
-                            if !accept {
-                                return Err(crate::management::scheduler_ingress::SchedulerIngressError::SessionUnavailable);
-                            }
-                            tx.send((prompt, permit)).unwrap();
-                            Ok(())
-                        },
-                    ),
-                );
+                resources.insert(SubagentEventSender(tx));
             }
-            actor.fire_next_task().await;
+            let child = async {
+                let mut event = rx.recv().await.unwrap();
+                ack_spawn_registration(&mut event);
+                let SubagentEvent::Spawn(spawn) = event else {
+                    panic!("expected native child");
+                };
+                spawn
+            };
+            let (_, spawn) = tokio::join!(actor.fire_next_task(), child);
+            assert!(spawn.runtime_overrides.agent_admission.is_some());
+            assert!(spawn.run_in_background);
+            assert_eq!(controller.snapshot().active, 1);
+            controller.begin_quiesce();
+            assert_eq!(
+                controller.mark_quiesced().state,
+                crate::management::admission::AdmissionState::Quiescing
+            );
             let snapshot = actor.scheduler_snapshot().await;
-            if accept {
-                let (prompt, permit) = rx.try_recv().unwrap();
-                assert_eq!(prompt.task_id, "sdk-fire");
-                assert_eq!(controller.snapshot().active, 1);
-                assert!(snapshot.tasks.is_empty());
-                assert_eq!(snapshot.version.revision(), 2);
-                assert!(
-                    matches!(notifications.try_recv().unwrap(), ToolNotification::ScheduledTaskFired(fired)
-                    if fired.prompt_enqueued && fired.subagent_id.is_none())
-                );
-                drop(permit);
-            } else {
-                assert_eq!(snapshot.tasks.len(), 1);
-                assert!(snapshot.tasks[0].last_fired_at.is_none());
-                assert_eq!(snapshot.version.revision(), 0);
-                assert!(notifications.try_recv().is_err());
-            }
-            assert_eq!(controller.snapshot().active, 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn recurring_foreground_requires_sdk_ingress_and_preserves_cadence_and_permit() {
-        for has_ingress in [false, true] {
-            for foreground in [false, true] {
-                let mut task = ScheduledTask::with_fire_immediately(
-                    300,
-                    "recurring SDK routing".into(),
-                    true,
-                    false,
-                    true,
-                );
-                task.foreground = foreground;
-                let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
-                let controller = crate::management::admission::AdmissionController::default();
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                {
-                    let mut resources = actor.resources.lock().await;
-                    resources.insert(controller.clone());
-                    if has_ingress {
-                        resources.insert(
-                            crate::management::scheduler_ingress::SchedulerPromptIngress::new(
-                                move |prompt, permit| {
-                                    tx.send((prompt, permit)).unwrap();
-                                    Ok(())
-                                },
-                            ),
-                        );
-                    }
-                }
-
-                actor.fire_next_task().await;
-                let snapshot = actor.scheduler_snapshot().await;
-                assert_eq!(snapshot.tasks.len(), 1);
+            let fired = notification!(notifications.try_recv().unwrap(), ScheduledTaskFired);
+            assert!(!fired.prompt_enqueued);
+            assert_eq!(fired.subagent_id.as_deref(), Some(spawn.id.as_str()));
+            if recurring {
                 assert_eq!(snapshot.version.revision(), 1);
                 let task = &snapshot.tasks[0];
+                assert_eq!(task.interval_secs, 1);
                 assert_eq!(
                     task.next_fire_at(),
-                    task.last_fired_at.unwrap() + chrono::Duration::seconds(300)
+                    task.last_fired_at.unwrap() + chrono::Duration::seconds(1)
                 );
-                let fired = notification!(notifications.try_recv().unwrap(), ScheduledTaskFired);
-                assert_eq!(fired.prompt_enqueued, has_ingress && foreground);
-                assert_eq!(fired.subagent_id.is_none(), has_ingress && foreground);
-                if has_ingress && foreground {
-                    let (prompt, permit) = rx.try_recv().unwrap();
-                    assert_eq!(prompt.task_id, task.id);
-                    assert_eq!(controller.snapshot().active, 1);
-                    drop(permit);
-                } else {
-                    assert!(rx.try_recv().is_err());
-                }
-                assert_eq!(controller.snapshot().active, 0);
-                actor.fire_next_task().await;
-                assert_eq!(actor.scheduler_snapshot().await.version, snapshot.version);
-                assert!(notifications.try_recv().is_err());
+            } else {
+                assert!(snapshot.tasks.is_empty());
+                assert_eq!(snapshot.version.revision(), 2);
+            }
+            drop(spawn);
+            assert_eq!(controller.snapshot().active, 0);
+            assert_eq!(
+                controller.mark_quiesced().state,
+                crate::management::admission::AdmissionState::Quiesced
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_native_children_restore_anchor_and_release_admission() {
+        for recurring in [false, true] {
+            let mut task = ScheduledTask::with_fire_immediately(
+                1,
+                "refused child".into(),
+                recurring,
+                false,
+                true,
+            );
+            task.chain_reset_pending = true;
+            let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
+            let controller = crate::management::admission::AdmissionController::default();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            {
+                let mut resources = actor.resources.lock().await;
+                resources.insert(controller.clone());
+                resources.insert(SubagentEventSender(tx));
+            }
+            let refuse = async {
+                let SubagentEvent::Spawn(spawn) = rx.recv().await.unwrap() else {
+                    panic!("expected native child");
+                };
+                assert!(spawn.runtime_overrides.agent_admission.is_some());
+                assert_eq!(controller.snapshot().active, 1);
+                drop(spawn);
+            };
+            tokio::join!(actor.fire_next_task(), refuse);
+            let snapshot = actor.scheduler_snapshot().await;
+            assert_eq!(snapshot.version.revision(), 0);
+            assert_eq!(snapshot.tasks.len(), 1);
+            let task = &snapshot.tasks[0];
+            // Native refusal retains the retry cadence, but restores the chain anchor.
+            assert!(task.last_fired_at.is_some());
+            assert!(task.last_subagent_id.is_none());
+            assert_eq!(task.iterations_since_fresh, 0);
+            assert!(task.chain_reset_pending);
+            assert_eq!(controller.snapshot().active, 0);
+            while let Ok(notification) = notifications.try_recv() {
+                assert!(!matches!(
+                    notification,
+                    ToolNotification::ScheduledTaskFired(_)
+                ));
             }
         }
     }
 
     #[tokio::test]
-    async fn sdk_recurring_failed_ingress_keeps_cadence_and_releases_permit() {
-        let mut task =
-            ScheduledTask::with_fire_immediately(300, "retry foreground".into(), true, false, true);
-        task.foreground = true;
-        let next_fire_at = task.next_fire_at();
-        let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
-        let controller = crate::management::admission::AdmissionController::default();
-        {
-            let mut resources = actor.resources.lock().await;
-            resources.insert(controller.clone());
-            resources.insert(
-                crate::management::scheduler_ingress::SchedulerPromptIngress::new(
-                    |_prompt, _permit| Err(
-                        crate::management::scheduler_ingress::SchedulerIngressError::SessionUnavailable,
-                    ),
-                ),
+    async fn agent_fence_rejects_native_children_without_advancing_cadence() {
+        for recurring in [false, true] {
+            let task = ScheduledTask::with_fire_immediately(
+                300,
+                "fenced child".into(),
+                recurring,
+                false,
+                true,
             );
+            let next_fire_at = task.next_fire_at();
+            let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
+            let controller = crate::management::admission::AdmissionController::default();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            {
+                let mut resources = actor.resources.lock().await;
+                resources.insert(controller.clone());
+                resources.insert(SubagentEventSender(tx));
+            }
+            controller.begin_quiesce();
+            actor.fire_next_task().await;
+            assert!(rx.try_recv().is_err());
+            assert!(notifications.try_recv().is_err());
+            let snapshot = actor.scheduler_snapshot().await;
+            assert_eq!(snapshot.version.revision(), 0);
+            assert_eq!(snapshot.tasks[0].next_fire_at(), next_fire_at);
+            assert_eq!(controller.snapshot().active, 0);
+            assert_eq!(controller.snapshot().rejected, 1);
+            assert_eq!(actor.compute_next_fire_delay().await, Duration::MAX);
         }
-        actor.fire_next_task().await;
-        let snapshot = actor.scheduler_snapshot().await;
-        assert_eq!(snapshot.version.revision(), 0);
-        assert_eq!(snapshot.tasks[0].next_fire_at(), next_fire_at);
-        assert!(snapshot.tasks[0].last_fired_at.is_none());
-        assert_eq!(controller.snapshot().active, 0);
-        assert!(notifications.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn agent_fence_rejects_internal_scheduler_ingress_without_advancing_cadence() {
-        let task = due_one_shot("fenced-fire");
-        let (mut actor, _notifications) = make_boundary_actor(vec![task], 0);
-        let controller = crate::management::admission::AdmissionController::default();
-        let enqueued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ingress_count = enqueued.clone();
-        {
-            let mut resources = actor.resources.lock().await;
-            resources.insert(controller.clone());
-            resources.insert(
-                crate::management::scheduler_ingress::SchedulerPromptIngress::new(
-                    move |_prompt, _permit| {
-                        ingress_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    },
-                ),
-            );
-        }
-        controller.begin_quiesce();
-
-        actor.fire_next_task().await;
-
-        assert_eq!(enqueued.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(actor.clock.snapshot().revision(), 0);
-        assert_eq!(actor.scheduler_snapshot().await.tasks.len(), 1);
-        assert_eq!(controller.snapshot().rejected, 1);
     }
 
     #[tokio::test]

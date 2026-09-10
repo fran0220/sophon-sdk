@@ -2,6 +2,62 @@ use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
+    /// Credential-free facts from the same chat-state snapshot used for the
+    /// route. Do not resolve the catalog again: model switches and effort
+    /// routing can leave session-local values different from catalog defaults.
+    pub(super) fn effective_model_facts(
+        &self,
+        sampling: &xai_grok_sampling_types::SamplingConfig,
+    ) -> crate::session::commands::EffectiveModelFacts {
+        let configured_max_retries = sampling.max_retries.unwrap_or(self.max_retries);
+        let max_retries = if configured_max_retries == 0 {
+            0
+        } else {
+            xai_grok_sampler::resolve_max_retries(Some(configured_max_retries))
+        };
+        let subagent_budget = self.rate_limit_wait_budget(sampling.rate_limit_retry_threshold);
+        crate::session::commands::EffectiveModelFacts {
+            max_completion_tokens: sampling.max_completion_tokens,
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            stream_tool_calls: sampling.stream_tool_calls.unwrap_or(false),
+            active_agent_type: self.agent.borrow().definition().name.clone(),
+            auto_compact_threshold_percent: self.compaction.threshold_percent.get(),
+            max_retries,
+            rate_limit_retry_threshold: sampling.rate_limit_retry_threshold.unwrap_or_else(|| {
+                super::spawn::subagent_sampler_rate_limit_threshold(
+                    self.startup_hints.is_subagent,
+                    self.rate_limit_waits.max_attempts,
+                )
+            }),
+            subagent_rate_limit_max_attempts: subagent_budget.max_attempts(),
+            subagent_rate_limit_max_total_wait_secs: if subagent_budget.can_wait() {
+                self.rate_limit_waits.max_total_wait.as_secs()
+            } else {
+                0
+            },
+            inference_idle_timeout_secs: self.inference_idle_timeout.as_secs(),
+            transient_retry_enabled: self.transient_retry_enabled,
+            transient_retries_per_step: if self.transient_retry_enabled {
+                MAX_TRANSIENT_TURN_RETRIES
+            } else {
+                0
+            },
+            transient_retries_per_prompt: if self.transient_retry_enabled {
+                MAX_TRANSIENT_RETRIES_PER_PROMPT
+            } else {
+                0
+            },
+            transient_retry_window_secs: if self.transient_retry_enabled {
+                MAX_TRANSIENT_RETRY_WINDOW.as_secs()
+            } else {
+                0
+            },
+            retry_only_before_output: self.tool_context.task_output_token_budget.is_some()
+                || self.tool_context.sampler_retry_only_before_output,
+        }
+    }
+
     pub(super) async fn handle_set_session_model(
         self: &std::sync::Arc<Self>,
         sampling_config: xai_grok_sampler::SamplerConfig,
@@ -407,5 +463,73 @@ impl SessionActor {
             self.compaction.prefire.finish();
         }
         self.compaction.prefire.clear();
+    }
+}
+
+#[cfg(test)]
+mod effective_model_facts_tests {
+    use super::*;
+
+    #[test]
+    fn asymmetric_sampling_values_follow_model_switch_not_catalog_defaults() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+                    let actor = super::super::support::actor_with_persistence_drain().await;
+                    let idle_timeout = actor.inference_idle_timeout.as_secs();
+                    let mut config = actor.reconstruct_full_config().await;
+                    for (model, temperature, top_p, tokens, context, threshold) in [
+                        ("model-a", Some(0.25), None, Some(1234), 100_000, 3),
+                        ("model-b", None, Some(0.8), None, 200_000, 7),
+                    ] {
+                        config.model = model.to_string();
+                        config.temperature = temperature;
+                        config.top_p = top_p;
+                        config.max_completion_tokens = tokens;
+                        config.context_window = context;
+                        config.rate_limit_retry_threshold = Some(threshold);
+                        config.reasoning_effort = None;
+                        actor
+                            .handle_set_session_model(config.clone(), false, false, false, true, 81)
+                            .await
+                            .unwrap();
+                        let sampling = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                        let facts = actor.effective_model_facts(&sampling);
+                        assert_eq!(sampling.model, model);
+                        assert_eq!(sampling.context_window.get(), context);
+                        assert_eq!(facts.temperature, temperature);
+                        assert_eq!(facts.top_p, top_p);
+                        assert_eq!(facts.max_completion_tokens, tokens);
+                        assert_eq!(facts.rate_limit_retry_threshold, threshold);
+                        assert_eq!(facts.auto_compact_threshold_percent, 81);
+                        // These are actor-spawn policy, not the new model's inputs.
+                        assert_eq!(facts.inference_idle_timeout_secs, idle_timeout);
+                        assert_eq!(facts.subagent_rate_limit_max_attempts, 0);
+                        let reconstructed = actor.reconstruct_full_config().await;
+                        assert_eq!(facts.temperature, reconstructed.temperature);
+                        assert_eq!(facts.top_p, reconstructed.top_p);
+                        assert_eq!(
+                            facts.max_completion_tokens,
+                            reconstructed.max_completion_tokens
+                        );
+                    }
+                    let mut sampling = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                    sampling.max_retries = Some(0);
+                    assert_eq!(actor.effective_model_facts(&sampling).max_retries, 0);
+                    sampling.max_retries = Some(4);
+                    assert_eq!(
+                        actor.effective_model_facts(&sampling).max_retries,
+                        xai_grok_sampler::resolve_max_retries(Some(4)),
+                    );
+                }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

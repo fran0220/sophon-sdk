@@ -373,6 +373,61 @@ impl ChannelBackend {
         response_rx.await.ok().flatten()
     }
 
+    /// Reactivate a completed logical child, retaining its identity and replacing
+    /// exactly the named attempt. The coordinator owns comparison and launch.
+    pub async fn reactivate(
+        &self,
+        mut request: SubagentRequest,
+        expected_attempt_id: String,
+    ) -> Result<SubagentResult, ToolError> {
+        let parent = self.parent_session_id().ok_or_else(|| {
+            ToolError::custom(
+                "not_owned",
+                "reactivation requires a session-bound coordinator backend",
+            )
+        })?;
+        request.parent_session_id = parent;
+        let (result_tx, result_rx) = oneshot::channel();
+        self.tx
+            .send(SubagentEvent::Reactivate {
+                spawn: SubagentSpawnRequest {
+                    request: Box::new(request),
+                    result_tx,
+                    registered_tx: None,
+                },
+                expected_attempt_id,
+            })
+            .map_err(|_| ToolError::custom("channel_closed", "subagent coordinator closed"))?;
+        result_rx.await.map_err(|_| {
+            ToolError::custom(
+                "channel_closed",
+                "subagent reactivation failed before launch",
+            )
+        })
+    }
+
+    pub async fn cancel_attempt(
+        &self,
+        id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<SubagentCancelOutcome, String> {
+        let parent_session_id = self
+            .parent_session_id()
+            .ok_or("cancellation requires a session-bound coordinator backend")?;
+        let (respond_to, response_rx) = oneshot::channel();
+        self.tx
+            .send(SubagentEvent::CancelAttempt {
+                parent_session_id,
+                subagent_id: id.to_owned(),
+                expected_attempt_id: expected_attempt_id.to_owned(),
+                respond_to,
+            })
+            .map_err(|_| "subagent coordinator closed")?;
+        response_rx
+            .await
+            .map_err(|_| "subagent cancellation response dropped")?
+    }
+
     pub async fn list_running(&self, parent_session_id: &str) -> Vec<SubagentInspection> {
         let (respond_to, response_rx) = oneshot::channel();
         if self

@@ -8,6 +8,7 @@ official xAI SDK.
 
 Current source identity:
 
+- SDK facade version: **0.5.0** (breaking management/configuration upgrade)
 - public product source baseline: 1.0.24
 - public Grok Build commit: `37949780c144e37df692e3d669051a21fec24f20`
 - public crate metadata: 1.0.24
@@ -91,6 +92,87 @@ suggestions. Each can be routed independently with
 `web_search_model` and must name an OpenAI Responses route because Grok Build's
 search implementation calls the Responses API with its `web_search` tool.
 Leaving it unset does not disable the separately configured web-fetch tool.
+
+### 0.5.0 configuration and management migration
+
+This release replaces the old subagent and MCP management DTOs rather than
+maintaining parallel compatibility registries:
+
+- Use `session.subagents()` for `start`, `resume`, `reactivate`, `list_running`, `query`,
+  `message`, and `cancel`. A `SubagentId` is a logical child identity;
+  `SubagentHandle` also carries the native `AttemptId`. Message/cancel target
+  exactly that attempt, never a successor. Resume creates a **new logical
+  child** from persisted history; reactivate replaces an exact completed
+  attempt of the same child. Message does neither. Start/resume await native
+  results, possibly a foreground-budget handoff rather than completion; retain
+  the request ID to query concurrently. An absent attempt ID is not fabricated.
+- Use `session.mcp()` for `list(cache)`, `auth_status`, `trigger_auth`, `setup`,
+  `set_enabled`, `set_tool_enabled`, `upsert`, `delete`, `read_resource`, and
+  `wait_ready`. Mutations acknowledge native application, **not readiness**.
+  `wait_ready(Duration)` accepts 1–60,000 ms and observes one generation without
+  initiating/retrying startup. `Replaced`, `Failed`, `TimedOut`, `NotStarted`,
+  and `Abandoned` are distinct outcomes. Configuration persists under the
+  host-owned `GROK_HOME`; managed policy still applies. Reduced inventory omits
+  connection secrets, but server labels, setup defaults, resources and serialized
+  configuration can contain sensitive data; opaque `Debug` is not sanitization.
+- Use `workflow_runs`, `start_workflow`, `pause_workflow`, `resume_workflow`,
+  and `stop_workflow` on `Session`. Launch accepts a name, inline script, or
+  script path. Mutations use the exact native run ID, not a display name.
+  Resume retains native source/args; `agent_budget` is an absolute cumulative
+  child-agent cap, not a fresh allowance. Acknowledgement is not completion.
+- Scheduler occurrences run as **native child tasks only**. There is no SDK
+  foreground option, parent prompt-ingress shim, or Host queue to replay.
+  Versioned scheduler records/events remain available; do not expect a parent
+  foreground `TurnCompleted` receipt for the scheduled execution itself.
+  Native child completion can still wake the parent with an internal
+  `subagent-completed-…` prompt and produce a separate parent turn.
+- `tasks::Snapshot` is a durable last-wins projection, not a registry or process
+  lease. Replace the prior view even for an empty or truncated snapshot; a
+  truncated view is incomplete. `Delivery::Replay` and recorded `Running`
+  status never authorize killing a process. Use live `background_tasks` and
+  `kill_background_task` for native operations; snapshot rows contain no stdout.
+
+`AgentConfig::new` explicitly selects `MemoryMode::V2`, with embeddings
+disabled (no ambient embedding-model fallback). Use `memory_mode` to select
+`Legacy` or `Disabled`, or `memory_enabled(false)` to disable memory.
+Re-enabling a disabled configuration selects V2; it does not force an explicitly
+selected Legacy mode to V2. `MemoryConfig` supplies native tuning for indexing,
+search, injection, sessions, watcher, GC, dream, flush and pruning. Unspecified
+tuning uses the native resolver, not invented SDK defaults.
+
+`ModelConfig` exposes `ModelBehaviorConfig` and `ModelRetryConfig` inputs.
+Agent route facts (`configured_behavior`, `configured_retry`) describe those
+inputs, **not effective provider defaults**. The session's
+`effective_config_snapshot` reports native `SessionModelFacts`, including the
+installed harness, sampling, compaction, retry budgets and per-chunk inference
+idle timeout. Omitted sampling values mean omitted provider parameters.
+Timeout and turn-level retry policy are **session-spawn state**: switching
+models need not replace them. Sampler transport retries can include a native
+environment override; do not infer them solely from the selected catalog row.
+`configured_memory` likewise differs from `resolved_memory`; `None` for the
+latter means unobserved, not disabled. Active-batch versus next-empty-FIFO
+overrides remain separate facts.
+
+```rust
+# async fn manage(session: &sophon_sdk::Session) -> Result<(), Box<dyn std::error::Error>> {
+use sophon_sdk::{subagent::SubagentStart, mcp::Readiness};
+let children = session.subagents();
+let request = SubagentStart::new("general-purpose", "Summarize the repository");
+let id = request.id.clone();
+let result = children.start(request).await?;
+let snapshot = children.query(&id).await?;
+// Query before deciding whether a returned attempt is still active.
+let readiness = session.mcp().wait_ready(std::time::Duration::from_secs(10)).await?;
+if readiness == Readiness::Ready {
+    let inventory = session.mcp().list(true).await?;
+    // Readiness was observed for one generation, not guaranteed for future calls.
+    let _ = inventory;
+}
+let runs = session.workflow_runs().await?;
+# let _ = (result, snapshot, runs);
+# Ok(())
+# }
+```
 
 ### Image and video provider routing
 
@@ -260,16 +342,18 @@ resubscribe and resnapshot; never silently continue. Scope the boundary/records
 by Session ID. Concurrent explicit load/resume/replay on the same Session is
 not part of this handoff protocol.
 
-Native `isReplay` callbacks are emitted only as display `HistoryRecord`, never
-as live `Session` or management settlement events. Both native xAI terminal
-routes are projected. No replay calls prompt execution, creates a synthetic
-Turn, or writes a Host checkpoint. The portable payload format is unchanged.
+Native `isReplay` callbacks are not live settlement events. History callbacks
+remain display `HistoryRecord`; typed task snapshots explicitly mark replay.
+Both native xAI terminal routes are projected. No replay calls prompt execution,
+creates a synthetic Turn, or writes a Host checkpoint. The portable payload
+format is unchanged.
 
 ## Stable typed management
 
-`management` is the stable embedded control plane. It does not expose ACP or
-`serde_json::Value`: IDs are newtypes, extensible enums are non-exhaustive,
-mutations carry actor generations/revisions, and failures are structured.
+`management` and the session-scoped capability modules form the embedded
+control plane. No SDK signature exposes ACP. Queue/scheduler mutations carry
+actor generations/revisions; subagent mutations carry exact attempt identities.
+Typed workflow args and resource metadata retain JSON where content is open-ended.
 
 ```rust
 use std::time::Duration;
@@ -342,10 +426,10 @@ The management invariants are:
   events carry full versioned snapshots, scheduler and effective-config events
   carry native versions, and other domains explicitly set `snapshot_required`.
   A management-only lag is recovered from the authoritative typed snapshot.
-  Queue rows expose their typed human, scheduler, or internal origin, and
-  scheduler-owned prompts emit a typed durable `SessionUpdate::TurnCompleted`
-  terminal, so an embedding never parses native prompt IDs or terminal JSON to
-  adopt autonomous work.
+  Queue rows expose their typed human, scheduler, or internal origin.
+  `SessionUpdate::TurnCompleted` carries native prompt terminals; scheduled
+  child execution is observed through native scheduler/subagent events, not
+  synthetic parent foreground prompt receipts.
 - **No credentials.** Effective configuration reports routing/model/protocol,
   context, media/auxiliary choices, and header/query *names*. API keys, bearer
   values, header/query values, credential files, and browser state are absent.
@@ -396,18 +480,14 @@ The management invariants are:
 For example, the raw seam remains available for deliberately untyped areas:
 
 ```rust
+# async fn discover(agent: &sophon_sdk::Agent) -> Result<(), sophon_sdk::Error> {
 let models = agent.extension("x.ai/models/list", serde_json::json!({})).await?;
 let session_matches = agent
     .extension("x.ai/session/search", serde_json::json!({ "query": "provider" }))
     .await?;
-let resource = session
-    .extension("x.ai/mcp/read_resource", serde_json::json!({
-        "server": "docs",
-        "uri": "docs://experimental"
-    }))
-    .await?;
-# let _ = (models, session_matches, resource);
-# Ok::<(), sophon_sdk::Error>(())
+# let _ = (models, session_matches);
+# Ok(())
+# }
 ```
 
 ### Agent capability coverage
@@ -424,18 +504,18 @@ stable typed SDK contract or evidence that every route has been exercised.
 | Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; raw summary/compaction extensions |
 | Runtime lifecycle and Agent replacement | typed health watch, Agent-wide admission fence, cancellable `quiesce`, and drain-before-stop `shutdown` |
 | Native prompt FIFO | typed running/pending snapshot with prompt origin; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
-| Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events; typed durable terminal for directly admitted foreground occurrences |
+| Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events; native child execution only |
 | Background terminal tasks | typed records/list and kill outcomes; snapshot-required start/completion events |
-| Subagents | typed running list, inspect, cancel, status/results, and snapshot-required lifecycle events |
+| Subagents | session-owned start/resume/reactivate/query; attempt-targeted message/cancel; native status/results and lifecycle events |
 | Rewind | typed points, generation/revision CAS, modes, file conflicts, result, and cross-compaction replay reporting |
 | Session info and usage | typed live identity/context and persisted usage/model totals |
 | Effective configuration | credential-free Agent and Session snapshots plus versioned invalidation; active batch versus next empty-FIFO state |
-| Hooks, skills and workflows | typed inventories/config/action outcomes and skill mutations; hook invalidation events |
-| MCP | typed credential-free inventory, transport facts, tool/status/auth/setup state, and snapshot-required status events |
+| Hooks, skills and workflows | typed inventories/config/action outcomes, skill mutations, and workflow run list/start/pause/resume/stop; hook invalidation events |
+| MCP | session-scoped reduced inventory, typed configuration/auth/setup/resource operations, generation-aware readiness and status events |
 | Session search/state/history/import/fork/repair/delete | raw `x.ai/session/*` / `x.ai/sessions/*`; content and persistence workflows are not runtime authority |
 | Models, modes, commands, workspaces, prompt history | typed model/mode switching plus `x.ai/models/*`, `x.ai/commands/*`, `x.ai/workspaces/*` |
 | Local file/content/code search, filesystem and terminal/PTY control | `x.ai/search/*`, `x.ai/code/*`, `x.ai/fs/*`, `x.ai/terminal/*` |
-| MCP tools/resources/auth/setup/toggles/config | typed inventory/status; raw mutation/auth/setup/resource calls and reverse `ClientHandler` calls |
+| MCP tools/resources/auth/setup/toggles/config | typed `Session::mcp` management/resources; raw tool calls and reverse `ClientHandler` calls |
 | Skills, workflows, plugins, marketplaces and hooks | typed skills/workflows/hooks; raw plugins and marketplaces |
 | Tasks, scheduler and subagents | typed records, supported mutations/results, snapshots, and events |
 | Git, diffs/staging/commits and linked worktrees | upstream tools plus `x.ai/git/*` and `x.ai/git/worktree/*` |
@@ -454,7 +534,7 @@ not an unimplemented management DTO:
 | account, auth, billing/credits, privacy/consent, feedback, sharing/cloud and rollout/survey routes | First-party control-plane or product-specific contracts, often identity-bearing. |
 | `plugins/*` and `marketplace/*` install/reload/action routes | Experimental product catalog and executable installation lifecycle. |
 | session content/search/import/fork/repair/history/state/delete, memory, compact, recap and suggest routes | Content/persistence workflows rather than runtime lifecycle authority; shapes evolve with upstream storage. |
-| MCP call/read-resource, mutation, auth, setup, toggle/upsert/delete routes | Provider interaction and credential/setup flows; typed inventory/status is stable and secret-free. |
+| MCP tool calls and uncommon extensions | Native tool execution and forward compatibility; configuration/auth/setup/resources have typed `Session::mcp` access. |
 | models, commands, workspaces and prompt-history catalogs | Discovery/UI catalogs not required for lifecycle correctness; model switching itself is typed. |
 | debug/internal/telemetry notifications | Diagnostic and explicitly unstable implementation details. |
 | raw queue/scheduler/rewind/task/subagent routes | Compatibility only. The typed native actor methods are the stable path and preserve CAS, idempotency, and recovery semantics. |
@@ -478,7 +558,7 @@ is intentionally `!Send`; the public handles remain `Send + Sync`. Event
 delivery uses Tokio broadcast semantics, including an explicit lag error when a
 receiver falls behind the bounded buffer.
 
-### Correctness and validation boundary (0.4.1)
+### Correctness and validation boundary
 
 For **explicit app final exit or account retirement**, call
 `Agent::final_exit(timeout).await` directly, not `quiesce(120s)` followed by
@@ -598,9 +678,9 @@ also excluded; managed configuration and requirements under the embedding's
 `GROK_HOME` remain effective, including native model/MCP/plugin policy.
 First-party managed-policy refresh and orphan cleanup do not overwrite or
 delete these embedding-owned files when no grok.com account is signed in.
-The SDK then overlays only its explicit model/media routes and headless embedding
-mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
-upstream data directory rather than the default `~/.grok`.
+The SDK then overlays its explicit model/media routes, memory configuration and
+headless embedding mode. Set `GROK_HOME` before starting an Agent to give the
+embedding its own upstream data directory rather than the default `~/.grok`.
 
 ## What the 1.0.24 source sync contributes
 
@@ -610,10 +690,11 @@ unified model behavior resolution, opt-in Memory V2, and Git/ripgrep safety
 fixes. Authentication now lives in upstream `xai-grok-login`; the SDK continues
 to supply its explicit provider catalog without CLI bootstrap prefetch.
 
-The SDK retains its existing public API. Foreground recurring tasks continue
-through the admitted SDK ingress even though upstream removed that task option;
-native sessions retain upstream child execution. Parent-forwarded human messages
-remain internal queue entries rather than editable direct-user submissions.
+SDK 0.5.0 deliberately breaks the earlier management API to expose native
+attempt-scoped subagents, MCP lifecycle, workflows and resolved configuration.
+Scheduled occurrences use native child execution without a foreground shim.
+Parent-forwarded human messages remain internal queue entries rather than
+editable direct-user submissions.
 The embedding explicitly opts into native user-message echo so live history
 records still follow the acknowledged snapshot boundary exactly once.
 MCP startup ownership is cancelled before final teardown, and new managed-policy

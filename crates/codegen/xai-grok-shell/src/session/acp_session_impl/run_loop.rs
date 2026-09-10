@@ -756,6 +756,9 @@ pub(super) async fn run_session(
                     };
 
                     match cmd {
+                        SessionCommand::ManageWorkflow { action, respond_to } => {
+                            let _ = respond_to.send(session.workflow_management(action).await);
+                        }
                         SessionCommand::Initialize { system_prompt, explicit_override } => {
                             *session.explicit_system_prompt.borrow_mut() =
                                 explicit_override.then(|| system_prompt.clone());

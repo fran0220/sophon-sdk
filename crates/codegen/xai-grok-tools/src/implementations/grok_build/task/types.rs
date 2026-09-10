@@ -414,6 +414,8 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
 /// Result returned by a completed subagent.
 #[derive(Debug, Clone)]
 pub struct SubagentResult {
+    /// Assigned by the coordinator, never by a caller or runner. None before launch.
+    pub attempt_id: Option<String>,
     pub success: bool,
     /// The subagent's final output text. Stored as `Arc<str>` so cloning into per-consumer summaries
     /// (`SubagentCompletionSummary`, snapshot status, etc.) is a refcount bump rather than a full copy. Subagent outputs
@@ -445,6 +447,7 @@ pub struct SubagentResult {
 impl Default for SubagentResult {
     fn default() -> Self {
         Self {
+            attempt_id: None,
             success: false,
             output: Arc::from(""),
             error: None,
@@ -562,6 +565,8 @@ pub struct SubagentSnapshot {
 /// Lifecycle metadata returned to shell presentation and extension callers.
 #[derive(Debug, Clone)]
 pub struct SubagentInspection {
+    /// None for queued or rejected work that has not launched an attempt.
+    pub attempt_id: Option<String>,
     pub snapshot: SubagentSnapshot,
     pub parent_session_id: String,
     pub child_session_id: String,
@@ -927,6 +932,17 @@ pub struct SubagentDescribeRequest {
 /// Coordinator message enum. Kept exhaustive so every actor command is handled.
 pub enum SubagentEvent {
     Spawn(SubagentSpawnRequest),
+    /// Management-only reactivation. Comparison and replacement happen in one actor command.
+    Reactivate {
+        spawn: SubagentSpawnRequest,
+        expected_attempt_id: String,
+    },
+    CancelAttempt {
+        parent_session_id: String,
+        subagent_id: String,
+        expected_attempt_id: String,
+        respond_to: oneshot::Sender<Result<SubagentCancelOutcome, String>>,
+    },
     Query(SubagentQueryRequest),
     Cancel(SubagentCancelRequest),
     ListActive(SubagentListActiveRequest),

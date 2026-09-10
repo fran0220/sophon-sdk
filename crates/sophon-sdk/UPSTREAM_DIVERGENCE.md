@@ -192,8 +192,21 @@ actors remain authoritative:
   reports cross-compaction replay;
 - actor snapshots expose credential-free effective configuration, including
   active FIFO batch versus next empty-FIFO overrides;
-- existing terminal-task and subagent authorities expose typed list/inspect/
-  cancel/kill paths without a second store.
+- existing terminal-task and subagent authorities expose live task list/kill
+  and session-owned child start/resume/reactivate/query/message/cancel paths
+  without a second store. Attempt identity is checked at native mutation;
+- MCP mutations persist native host-owned configuration and readiness waits
+  observe a single cancellable generation, not an SDK connection registry;
+- workflow run management uses exact native IDs and cumulative child budgets;
+- native effective model facts distinguish resolved sampling/harness behavior
+  from configured inputs, retaining spawn-sticky timeout/turn retry state;
+- scheduler one-shots and recurring occurrences use native child execution
+  only; the SDK foreground prompt ingress and task option have been removed.
+
+SDK 0.5.0 explicitly overlays Memory V2 by default, with embeddings disabled
+and no ambient embedding route fallback. Legacy/disabled modes and native
+tuning are explicit SDK inputs. Durable task snapshots are last-wins display
+projections with live/replay provenance, never process-custody evidence.
 
 SDK correctness repairs retain legacy queue-edit behavior while making failed
 typed entry-version mutations side-effect-free. Targeted cancellation checks
@@ -221,13 +234,23 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/subagent_spawn.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/attempt_runner.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/spawn.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/tests/rest.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/mcp.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/mcp/persistence.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/mcp/readiness.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/mod.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/task.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/workflow.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/notification_drain.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/parent_message.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/parent_message_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_queue.rs`
@@ -240,6 +263,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_task.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs`
@@ -263,12 +287,19 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/active_message.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/backend.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`
 - `crates/codegen/xai-grok-tools/src/lib.rs`
 - `crates/codegen/xai-grok-tools/src/management/admission.rs`
 - `crates/codegen/xai-grok-tools/src/management/mod.rs`
-- `crates/codegen/xai-grok-tools/src/management/scheduler_ingress.rs`
 - `crates/codegen/xai-grok-tools/src/notification/types.rs`
 - `crates/codegen/xai-grok-tools/src/registry/types.rs`
 - `crates/codegen/xai-grok-workspace/src/session/tool_config.rs`
@@ -290,15 +321,52 @@ diff for its exact file set, so either boundary detects drift.
 4. Regenerate each digest independently using the corresponding exact array
    and `git diff` command in `scripts/check-upstream-sync.sh`.
 
+Stage reviewed new upstream files before hashing: `git diff <pin>` includes
+tracked worktree/index changes but silently omits untracked files. Do not treat
+a passing digest with untracked native implementation files as verification.
+After all concurrent native edits and formatting settle, regenerate all seven
+digests (shared files intentionally affect multiple groups), then rerun the
+full `scripts/check-sdk-boundary.sh`, not just the hashes. From the repository
+root, this command uses the checker's exact arrays and canonical diff options:
+
+```sh
+bash <<'SH'
+set -euo pipefail
+script=crates/sophon-sdk/scripts/check-upstream-sync.sh
+# Load declarations only; do not execute the verification tail.
+eval "$(sed -n '/^provider_routing=(/,/^git -C .*cat-file/{ /^git -C .*cat-file/!p; }' "$script")"
+pin=$(tr -d '[:space:]' < UPSTREAM_GROK_BUILD_COMMIT)
+for group in provider_routing hermetic_discovery windows_portability public_snapshot_repairs goal_reliability typed_management portable_conversation; do
+  declare -n paths="$group"
+  git diff --no-ext-diff --no-color --no-renames \
+    --src-prefix=a/ --dst-prefix=b/ "$pin" -- "${paths[@]}" \
+    | sha256sum | cut -d' ' -f1 \
+    > "crates/sophon-sdk/upstream-patches/${group//_/-}.sha256"
+done
+SH
+crates/sophon-sdk/scripts/check-sdk-boundary.sh
+```
+
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
+
+## SDK 0.5.0 boundary update
+
+The path lists now include native attempt-scoped child operations, MCP
+persistence/readiness, workflow management, task coordinator tests and effective
+model facts. The removed scheduler ingress path is no longer approved.
+Digest regeneration and full compilation/runtime validation must follow the
+final native edits; the historical results below do **not** certify 0.5.0.
+README examples were reviewed against the new facade signatures; Cargo doc
+tests do not automatically compile README snippets.
 
 ## 1.0.24 validation (2026-09-10, Linux x86_64)
 
 Imported the complete public commit `37949780c144e37df692e3d669051a21fec24f20`
 as a merge ancestor, with `SOURCE_REV`
-`c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`. The SDK public API and portable
-format remain unchanged; the facade package stays at 0.4.1. Public binary
+`c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`. At this historical sync the SDK public
+API and portable format remained unchanged and the facade was 0.4.1; SDK 0.5.0
+changes the facade contract as described above. Public binary
 release 1.0.25 is not claimed as the source baseline.
 
 - Before merging, the old upstream-path/digest check passed and the worktree
@@ -311,9 +379,9 @@ release 1.0.25 is not claimed as the source baseline.
   protocols, final exit, lifecycle, portable conversation/history). The latter
   caught the new opt-in user-echo capability: the SDK now requests it, preserving
   exactly-once live user records after the acknowledged history boundary.
-- Prompt queue: 15 tests pass. Tools: 3,236 pass, 2 ignored. New scheduler
-  regressions verify SDK foreground recurring versus native/background routing,
-  failed-ingress cadence preservation and admission-permit lifetime.
+- Prompt queue: 15 tests pass. Tools: 3,236 pass, 2 ignored. Historical scheduler
+  regressions covered the since-removed SDK foreground shim and native child
+  routing; these results do not validate the 0.5.0 child-only replacement.
 - Shell: 6,683 pass, 1 fails, 5 ignored with four test threads. The remaining
   `parse_list_req_forces_kind_under_process_chat_mode_only` failure is the
   previously documented empty `kind` filter assertion; its file is byte-for-byte

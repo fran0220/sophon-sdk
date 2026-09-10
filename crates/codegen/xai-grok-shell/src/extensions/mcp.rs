@@ -21,8 +21,13 @@ use xai_grok_mcp::wire;
 
 use super::{ExtResult, parse_params, to_ext_response};
 
-/// Agent-only `x.ai/mcp/*` ACP method/notification names. Unlike [`wire::MCP_CALL`] (the cross-SDK contract, which stays in `xai_grok_mcp::wire`), these methods are NOT spoken by the SDK.
-/// They are private to the channel between the agent and the client. They are centralized here only to avoid scattering the same string literal across dispatch and notification send sites.
+mod persistence;
+mod readiness;
+
+/// Native `x.ai/mcp/*` ACP method/notification names. Unlike [`wire::MCP_CALL`]
+/// (the cross-SDK contract in `xai_grok_mcp::wire`), these are private native
+/// extensions. The in-process Sophon management facade delegates to these routes;
+/// it does not introduce a separate MCP authority or cross-language wire contract.
 pub mod mcp_methods {
     /// Shared prefix that routes every MCP ext method to this module's dispatcher.
     pub const PREFIX: &str = "x.ai/mcp/";
@@ -36,6 +41,7 @@ pub mod mcp_methods {
     pub const TOGGLE_TOOL: &str = "x.ai/mcp/toggle_tool";
     pub const UPSERT: &str = "x.ai/mcp/upsert";
     pub const DELETE: &str = "x.ai/mcp/delete";
+    pub const WAIT_READY: &str = "x.ai/mcp/wait_ready";
 
     pub const SERVERS_UPDATED: &str = "x.ai/mcp/servers_updated";
     pub const TOOLS_CHANGED: &str = "x.ai/mcp/tools_changed";
@@ -207,11 +213,19 @@ pub struct McpContentBlock {
 
 // ── Internal types (not serialized to wire) ─────────────────────────
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct McpStatusSnapshot {
     pub configs: Vec<acp::McpServer>,
     pub clients: Vec<McpClientStatus>,
     pub auth_required: std::collections::HashSet<String>,
+    /// The native authority, not a second inventory. Used only by bounded readiness observers.
+    pub(crate) state: Option<Arc<TokioMutex<McpState>>>,
+}
+
+impl std::fmt::Debug for McpStatusSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("McpStatusSnapshot { .. }")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +333,7 @@ enum McpRoute {
     ToggleTool,
     Upsert,
     Delete,
+    WaitReady,
 }
 
 fn route_mcp_method(method: &str) -> Option<McpRoute> {
@@ -333,6 +348,7 @@ fn route_mcp_method(method: &str) -> Option<McpRoute> {
         mcp_methods::TOGGLE_TOOL => McpRoute::ToggleTool,
         mcp_methods::UPSERT => McpRoute::Upsert,
         mcp_methods::DELETE => McpRoute::Delete,
+        mcp_methods::WAIT_READY => McpRoute::WaitReady,
         _ => return None,
     })
 }
@@ -350,6 +366,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         Some(McpRoute::ToggleTool) => handle_toggle_tool(agent, args).await,
         Some(McpRoute::Upsert) => handle_upsert(agent, args).await,
         Some(McpRoute::Delete) => handle_delete(agent, args).await,
+        Some(McpRoute::WaitReady) => readiness::handle_wait_ready(agent, args).await,
         None => Err(acp::Error::method_not_found()),
     }
 }
@@ -737,6 +754,7 @@ pub(crate) async fn build_mcp_status(
         configs,
         clients: client_statuses,
         auth_required,
+        state: Some(mcp_state.clone()),
     }
 }
 
@@ -1671,7 +1689,16 @@ async fn handle_setup(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         updated_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
     };
     match entry.config.resolve_setup(Some(&pending_preferences)) {
-        crate::util::config::McpSetupResolution::Resolved(_) => {}
+        crate::util::config::McpSetupResolution::Resolved(config) => {
+            let server = config
+                .to_acp_mcp_server(&req.server_name)
+                .ok_or_else(|| acp::Error::invalid_params().data("server config is disabled"))?;
+            let subject = upsert_policy_subject(&cwd, &req.server_name);
+            let ms = xai_grok_workspace::permission::resolution::managed_settings();
+            if let Some(message) = policy_enable_error(ms, &server, subject) {
+                return Err(acp::Error::invalid_params().data(message));
+            }
+        }
         crate::util::config::McpSetupResolution::Required(_) => {
             return Err(acp::Error::invalid_params().data("setup values incomplete"));
         }
@@ -2170,6 +2197,7 @@ async fn handle_upsert(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     // server must fail closed exactly like the setup/toggle siblings.
     let subject = upsert_policy_subject(&cwd, &req.server_name);
     let ms = xai_grok_workspace::permission::resolution::managed_settings();
+    let previous = persistence::PreviousConfig::capture(&req.server_name).await?;
     upsert_gate_then_persist(ms, &server_config, subject, || {
         crate::util::config::save_mcp_server_config(&req.server_name, &req.config)
     })
@@ -2178,10 +2206,13 @@ async fn handle_upsert(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     // Reuse the toggle path: enable=true with the built config.
-    handle
-        .toggle_mcp_server(req.server_name, true, Some(server_config))
+    if let Err(error) = handle
+        .toggle_mcp_server(req.server_name.clone(), true, Some(server_config))
         .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    {
+        previous.restore(&req.server_name).await?;
+        return Err(acp::Error::internal_error().data(error.to_string()));
+    }
 
     to_ext_response(Ok(McpToggleResponse { ok: true }))
 }
@@ -2197,6 +2228,11 @@ struct McpDeleteRequest {
 async fn handle_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let req = parse_params::<McpDeleteRequest>(args)?;
     let acp_id = acp::SessionId::new(req.session_id.clone());
+    // A dead session must not delete persistent configuration.
+    let handle = agent
+        .get_session_handle(&acp_id)
+        .ok_or_else(|| acp::Error::invalid_params().data("session not found"))?;
+    let previous = persistence::PreviousConfig::capture(&req.server_name).await?;
 
     // Verify the server exists in local config (not managed).
     let existed = crate::util::config::delete_mcp_server_config(&req.server_name)
@@ -2211,14 +2247,13 @@ async fn handle_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     }
 
     // Live teardown: disable the server in the running session.
-    let handle = agent
-        .get_session_handle(&acp_id)
-        .ok_or_else(|| acp::Error::invalid_params().data("session not found"))?;
-
-    handle
+    if let Err(error) = handle
         .toggle_mcp_server(req.server_name.clone(), false, None)
         .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    {
+        previous.restore(&req.server_name).await?;
+        return Err(acp::Error::internal_error().data(error.to_string()));
+    }
 
     // The toggle path spawns a task that adds the server to `disabled_mcp_servers`
     // Clear the user list only; leave any project-level disable in place
@@ -2230,6 +2265,71 @@ async fn handle_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_payloads_match_private_native_dtos() {
+        let snake = serde_json::json!({
+            "session_id": "s", "sessionId": "s", "server_name": "local",
+            "tool_name": "ping", "enabled": true,
+            "command": "python3", "args": [], "env": {"TOKEN": "secret"},
+        });
+        assert_eq!(
+            serde_json::from_value::<McpAuthStatusRequest>(snake.clone())
+                .unwrap()
+                .session_id,
+            "s"
+        );
+        assert_eq!(
+            serde_json::from_value::<McpAuthTriggerRequest>(snake.clone())
+                .unwrap()
+                .server_name,
+            "local"
+        );
+        assert!(
+            serde_json::from_value::<McpToggleRequest>(snake.clone())
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            serde_json::from_value::<McpToggleToolRequest>(snake.clone())
+                .unwrap()
+                .tool_name,
+            "ping"
+        );
+        let upsert = serde_json::from_value::<McpUpsertRequest>(snake.clone()).unwrap();
+        assert!(upsert.config.to_acp_mcp_server("local").is_some());
+        assert_eq!(
+            serde_json::from_value::<McpDeleteRequest>(snake)
+                .unwrap()
+                .server_name,
+            "local"
+        );
+        assert!(
+            serde_json::from_value::<McpAuthStatusRequest>(serde_json::json!({"sessionId":"s"}))
+                .is_err()
+        );
+        let camel = serde_json::json!({"sessionId": "s", "serverName": "local", "values": {"site": "us"}, "server": "local", "uri": "test://resource"});
+        assert_eq!(
+            serde_json::from_value::<McpSetupRequest>(camel.clone())
+                .unwrap()
+                .values["site"],
+            "us"
+        );
+        assert_eq!(
+            serde_json::from_value::<McpReadResourceRequest>(camel.clone())
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            serde_json::from_value::<McpListRequest>(camel)
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("s")
+        );
+    }
 
     /// The emit-only reverse method (`x.ai/mcp/sdk_call`) shares the `x.ai/mcp/` prefix. `mvp_agent`'s dispatcher therefore routes an inbound copy of it to this module's `handle`.
     /// It must NOT collide with any forward route, so it has no `McpRoute`. `handle` then returns `method_not_found` instead of misrouting a stray inbound reverse call to `handle_call`.

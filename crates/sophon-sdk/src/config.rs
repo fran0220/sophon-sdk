@@ -291,12 +291,148 @@ fn validate_headers(headers: &BTreeMap<String, String>, owner: &str) -> Result<(
     Ok(())
 }
 
+/// Native memory tuning. Embedding endpoints and credentials are deliberately
+/// not exposed: memory must not discover a separate ambient provider.
+pub use xai_grok_config_types::{
+    MemoryDreamSettings, MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings,
+    MemoryInitialInjectionSettings, MemorySearchSettings, MemorySessionSettings,
+    MemoryWatcherSettings, MmrSettings, PruningSettings, TemporalDecaySettings,
+};
+
+/// Persistent memory implementation. SDK sessions default to enabled Memory V2.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryMode {
+    Disabled,
+    Legacy,
+    #[default]
+    V2,
+}
+
+/// Native memory controls. Unspecified tuning uses upstream resolution, not SDK
+/// copies of upstream defaults. No implicit embedding provider is enabled.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoryConfig {
+    pub mode: MemoryMode,
+    pub index: MemoryIndexSettings,
+    pub search: MemorySearchSettings,
+    pub initial_injection: MemoryInitialInjectionSettings,
+    pub session: MemorySessionSettings,
+    pub watcher: MemoryWatcherSettings,
+    pub gc: MemoryGcSettings,
+    pub dream: MemoryDreamSettings,
+    pub flush: MemoryFlushSettings,
+    pub pruning: PruningSettings,
+}
+
+impl MemoryConfig {
+    pub fn new(mode: MemoryMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.mode != MemoryMode::Disabled
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        let index_defaults = xai_grok_config_types::MemoryIndexConfig::default();
+        let chunk_size = self
+            .index
+            .max_chunk_chars
+            .unwrap_or(index_defaults.max_chunk_chars);
+        let overlap = self
+            .index
+            .chunk_overlap_chars
+            .unwrap_or(index_defaults.chunk_overlap_chars);
+        if chunk_size == 0 || overlap >= chunk_size {
+            return Err(Error::invalid_config(
+                "memory chunk size must be positive and exceed overlap",
+            ));
+        }
+        for value in [
+            self.search.min_score,
+            self.search.vector_weight,
+            self.search.text_weight,
+            self.search.recency_decay,
+            self.initial_injection.min_score,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Error::invalid_config(
+                    "memory scores and weights must be finite values in 0..=1",
+                ));
+            }
+        }
+        for value in [
+            self.search.mmr.as_ref().and_then(|v| v.lambda),
+            self.flush.semantic_dedup_threshold,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Error::invalid_config(
+                    "memory similarity thresholds must be in 0..=1",
+                ));
+            }
+        }
+        if self
+            .search
+            .temporal_decay
+            .as_ref()
+            .and_then(|v| v.half_life_days)
+            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            || self
+                .search
+                .source_weights
+                .as_ref()
+                .is_some_and(|weights| weights.values().any(|v| !v.is_finite() || *v < 0.0))
+        {
+            return Err(Error::invalid_config(
+                "memory decay and source weights are invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-model native behavior overrides. `None` leaves the native model default
+/// and its runtime resolver authoritative.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelBehaviorConfig {
+    pub use_concise: Option<bool>,
+    pub agent_type: Option<String>,
+    pub system_prompt_label: Option<String>,
+    pub auto_compact_threshold_percent: Option<u8>,
+    pub max_completion_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub stream_tool_calls: Option<bool>,
+}
+
+/// Native per-model retry controls. Zero retries means no transient retries;
+/// rate-limit controls count total attempts and therefore must be nonzero.
+/// Idle timeout is per SSE chunk, not a total-turn deadline (native minimum 10s).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelRetryConfig {
+    pub max_retries: Option<u32>,
+    pub rate_limit_retry_threshold: Option<u32>,
+    pub subagent_rate_limit_max_attempts: Option<u32>,
+    pub inference_idle_timeout_secs: Option<u64>,
+}
+
 /// A public model ID mapped to an explicit provider route.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     pub id: String,
     pub provider: ProviderConfig,
     pub context_window: NonZeroU64,
+    pub behavior: ModelBehaviorConfig,
+    pub retry: ModelRetryConfig,
 }
 
 impl ModelConfig {
@@ -305,7 +441,52 @@ impl ModelConfig {
             id: id.into(),
             provider,
             context_window: NonZeroU64::new(200_000).expect("constant is non-zero"),
+            behavior: ModelBehaviorConfig::default(),
+            retry: ModelRetryConfig::default(),
         }
+    }
+
+    pub fn behavior(mut self, behavior: ModelBehaviorConfig) -> Self {
+        self.behavior = behavior;
+        self
+    }
+
+    pub fn retry(mut self, retry: ModelRetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        self.provider.validate()?;
+        let behavior = &self.behavior;
+        if [&behavior.agent_type, &behavior.system_prompt_label]
+            .into_iter()
+            .any(|v| v.as_ref().is_some_and(|v| v.trim().is_empty()))
+            || behavior
+                .auto_compact_threshold_percent
+                .is_some_and(|v| v > 100)
+            || behavior.max_completion_tokens == Some(0)
+            || behavior
+                .temperature
+                .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
+            || behavior
+                .top_p
+                .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+        {
+            return Err(Error::invalid_config("invalid model behavior controls"));
+        }
+        if self.retry.rate_limit_retry_threshold == Some(0)
+            || self.retry.subagent_rate_limit_max_attempts == Some(0)
+            || self
+                .retry
+                .inference_idle_timeout_secs
+                .is_some_and(|v| v < 10)
+        {
+            return Err(Error::invalid_config(
+                "retry attempts must be positive and inference idle timeout at least 10 seconds",
+            ));
+        }
+        Ok(())
     }
 
     pub fn context_window(mut self, tokens: NonZeroU64) -> Self {
@@ -337,6 +518,7 @@ pub struct AgentConfig {
     pub prompt_suggestion_model: Option<String>,
     pub permission_policy: PermissionPolicy,
     pub media: Option<MediaConfig>,
+    pub memory: MemoryConfig,
     pub client_handler: Option<Arc<dyn ClientHandler>>,
 }
 
@@ -351,6 +533,7 @@ impl fmt::Debug for AgentConfig {
             .field("prompt_suggestion_model", &self.prompt_suggestion_model)
             .field("permission_policy", &self.permission_policy)
             .field("media", &self.media)
+            .field("memory", &self.memory)
             .field("has_client_handler", &self.client_handler.is_some())
             .finish()
     }
@@ -368,6 +551,7 @@ impl AgentConfig {
             prompt_suggestion_model: None,
             permission_policy: PermissionPolicy::DenyAll,
             media: None,
+            memory: MemoryConfig::default(),
             client_handler: None,
         }
     }
@@ -416,6 +600,27 @@ impl AgentConfig {
         self
     }
 
+    pub fn memory(mut self, memory: MemoryConfig) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    pub fn memory_mode(mut self, mode: MemoryMode) -> Self {
+        self.memory.mode = mode;
+        self
+    }
+
+    /// Disable memory, or enable it (V2 when previously disabled). Use
+    /// `memory_mode` to explicitly select the Legacy implementation.
+    pub fn memory_enabled(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.memory.mode = MemoryMode::Disabled;
+        } else if self.memory.mode == MemoryMode::Disabled {
+            self.memory.mode = MemoryMode::V2;
+        }
+        self
+    }
+
     pub fn client_handler(mut self, handler: Arc<dyn ClientHandler>) -> Self {
         self.client_handler = Some(handler);
         self
@@ -436,7 +641,7 @@ impl AgentConfig {
                     model.id
                 )));
             }
-            model.provider.validate()?;
+            model.validate()?;
         }
         if let Some(default) = &self.default_model
             && !ids.contains(default.as_str())
@@ -478,6 +683,14 @@ impl AgentConfig {
         }
         if let Some(media) = &self.media {
             media.validate()?;
+        }
+        self.memory.validate()?;
+        if let Some(model) = &self.memory.flush.flush_model
+            && !ids.contains(model.as_str())
+        {
+            return Err(Error::invalid_config(
+                "memory flush model must be explicitly configured",
+            ));
         }
         Ok(())
     }

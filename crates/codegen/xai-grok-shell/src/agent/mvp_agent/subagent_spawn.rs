@@ -8,6 +8,107 @@
 use super::*;
 use crate::session::repo_changes::UploadMethod;
 impl MvpAgent {
+    /// SDK lifecycle entry point. Native tools continue using their own backend.
+    pub async fn start_subagent(
+        &self,
+        mut request: xai_grok_tools::implementations::grok_build::task::types::SubagentRequest,
+        expected_attempt_id: Option<String>,
+    ) -> Result<xai_grok_tools::implementations::grok_build::task::types::SubagentResult, String>
+    {
+        use xai_grok_tools::implementations::grok_build::task::backend::{
+            ChannelBackend, SubagentBackend,
+        };
+        use xai_grok_tools::management::admission::AdmissionSource;
+        if self
+            .session_handle_waiting_for_load(&acp::SessionId::new(
+                request.parent_session_id.as_str(),
+            ))
+            .await
+            .is_none()
+        {
+            return Err("parent session not found".into());
+        }
+        request.runtime_overrides.agent_admission = Some(
+            self.activity
+                .admission_controller()
+                .try_admit(AdmissionSource::Human)
+                .map_err(|error| error.to_string())?,
+        );
+        let backend = ChannelBackend::for_coordinator_session(
+            self.subagent_event_tx.clone(),
+            request.parent_session_id.clone(),
+        );
+        let result = if let Some(attempt) = expected_attempt_id {
+            backend.reactivate(request, attempt).await
+        } else {
+            backend.spawn(request, None).await
+        };
+        result.map_err(|error| error.to_string())
+    }
+
+    pub async fn inspect_owned_subagent(
+        &self,
+        parent: &str,
+        id: &str,
+    ) -> Option<xai_grok_tools::implementations::grok_build::task::types::SubagentInspection> {
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_coordinator_session(self.subagent_event_tx.clone(), parent)
+            .inspect(id).await
+    }
+
+    pub async fn cancel_subagent_attempt(
+        &self,
+        parent: &str,
+        id: &str,
+        attempt: &str,
+    ) -> Result<
+        xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome,
+        String,
+    > {
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_coordinator_session(self.subagent_event_tx.clone(), parent)
+            .cancel_attempt(id, attempt).await
+    }
+
+    pub async fn message_subagent_attempt(
+        &self,
+        parent: &str,
+        id: String,
+        attempt: String,
+        text: String,
+        operation: xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOperation,
+    ) -> Result<
+        xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOutcome,
+        String,
+    > {
+        use xai_grok_tools::implementations::grok_build::task::{
+            backend::{ChannelBackend, SubagentBackend},
+            types::ActiveAgentMessageRequest,
+        };
+        use xai_grok_tools::management::admission::AdmissionSource;
+        let _permit = self
+            .activity
+            .admission_controller()
+            .try_admit(AdmissionSource::Human)
+            .map_err(|error| error.to_string())?;
+        if !self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::ActiveAgentMessages)
+        {
+            return Ok(xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageOutcome::Unsupported);
+        }
+        let request = match ActiveAgentMessageRequest::try_new_for_human_attempt(
+            id, attempt, text, operation,
+        ) {
+            Ok(request) => request,
+            Err(outcome) => return Ok(outcome),
+        };
+        Ok(
+            ChannelBackend::for_coordinator_session(self.subagent_event_tx.clone(), parent)
+                .send_active_message(request)
+                .await,
+        )
+    }
+
     /// Starts the shared coordinator actor; idempotent.
     /// Takes the event receiver and the concurrency limits off private state and passes them to `spawn_subagent_coordinator`.
     /// `LocalRef` lets the `!Send` runner touch `self`.

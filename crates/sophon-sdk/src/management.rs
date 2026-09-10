@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::SessionId;
+use crate::subagent::SubagentId;
 
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -62,10 +63,6 @@ string_id!(
 string_id!(
     /// Stable ID of an upstream background terminal task.
     BackgroundTaskId
-);
-string_id!(
-    /// Stable ID of an upstream subagent.
-    SubagentId
 );
 
 /// Actor-incarnation generation and monotonic revision.
@@ -338,7 +335,6 @@ pub struct ScheduledTask {
     pub prompt: String,
     pub recurring: bool,
     pub durable: bool,
-    pub foreground: bool,
     pub created_at: String,
     pub last_fired_at: Option<String>,
     pub next_fire_at: Option<String>,
@@ -356,12 +352,11 @@ pub struct SchedulerSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduledTaskCreate {
-    /// Upstream supports recurring tasks only. Values below 60 seconds are
-    /// clamped to 60 seconds by the same rule as the native scheduler tool.
+    /// Positive native interval/delay. The SDK does not silently clamp it.
     pub interval_secs: u64,
     pub prompt: String,
+    pub recurring: bool,
     pub durable: bool,
-    pub foreground: bool,
     pub fire_immediately: bool,
 }
 
@@ -474,13 +469,17 @@ pub enum ProviderProtocol {
     Other,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteFacts {
     pub route_id: String,
     pub base_url: String,
     pub model: String,
     pub protocol: ProviderProtocol,
     pub context_window: Option<u64>,
+    /// SDK inputs, before native model-default and runtime resolution.
+    pub configured_behavior: crate::config::ModelBehaviorConfig,
+    /// SDK inputs, before native retry-policy resolution.
+    pub configured_retry: crate::config::ModelRetryConfig,
     /// Header/query names only. Values and credential locations are never
     /// included in a management snapshot.
     pub header_names: Vec<String>,
@@ -507,13 +506,36 @@ pub struct MediaRouteFacts {
     pub header_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Agent-level configured routes and inputs, not an actor-resolved session
+/// configuration. Use the session snapshot for authoritative live route facts.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentEffectiveConfigSnapshot {
     pub version: Version,
     pub default_model: Option<String>,
     pub routes: Vec<RouteFacts>,
     pub auxiliary: AuxiliaryRouteFacts,
     pub media: Option<MediaRouteFacts>,
+    /// SDK memory inputs. Unspecified tuning is resolved by the native runtime.
+    pub configured_memory: crate::config::MemoryConfig,
+    /// Native resolved tuning, when supplied by the runtime. `None` means not
+    /// observed, not disabled; configured inputs must not fill this field.
+    pub resolved_memory: Option<ResolvedMemoryFacts>,
+}
+
+/// Resolved native memory tuning, excluding embedding routes and credentials.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedMemoryFacts {
+    pub enabled: bool,
+    pub mode: crate::config::MemoryMode,
+    pub index: xai_grok_config_types::MemoryIndexConfig,
+    pub search: xai_grok_config_types::MemorySearchConfig,
+    pub initial_injection: xai_grok_config_types::MemoryInitialInjectionConfig,
+    pub session: xai_grok_config_types::MemorySessionConfig,
+    pub watcher: xai_grok_config_types::MemoryWatcherConfig,
+    pub gc: xai_grok_config_types::MemoryGcConfig,
+    pub dream: xai_grok_config_types::MemoryDreamConfig,
+    pub flush: xai_grok_config_types::MemoryFlushConfig,
+    pub pruning: xai_grok_config_types::PruningConfig,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -536,11 +558,12 @@ pub struct SessionRouteFacts {
     pub environment_header_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionEffectiveConfigSnapshot {
     pub session_id: SessionId,
     pub version: Version,
     pub route: SessionRouteFacts,
+    pub model: crate::SessionModelFacts,
     pub backend_search_active: bool,
     /// Configuration attached to the batch currently draining.
     pub active_batch_search: SearchOverrideFacts,
@@ -769,71 +792,7 @@ pub struct WorkflowsSnapshot {
     pub workflows: Vec<WorkflowInfo>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum McpServerSource {
-    Managed,
-    Local,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum McpServerStatus {
-    Ready,
-    Initializing,
-    SetupRequired,
-    Unavailable,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum McpTransportFacts {
-    Http {
-        url: String,
-        scope: Option<String>,
-        scope_id: Option<String>,
-        scope_name: Option<String>,
-    },
-    Stdio {
-        command: PathBuf,
-        args: Vec<String>,
-        /// Environment variable names only; values are deliberately omitted.
-        environment_names: Vec<String>,
-    },
-    ManagedGateway,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpToolInfo {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpServerInfo {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub source: McpServerSource,
-    pub source_label: Option<String>,
-    pub transport: McpTransportFacts,
-    pub enabled: Option<bool>,
-    pub status: Option<McpServerStatus>,
-    pub tools: Vec<McpToolInfo>,
-    pub auth_required: bool,
-    pub setup_required: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpInventorySnapshot {
-    pub servers: Vec<McpServerInfo>,
-}
-
-// ── Background tasks / subagents ──────────────────────────────────────
+// ── Background tasks ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -880,73 +839,6 @@ pub enum BackgroundTaskKillOutcome {
     NotFound,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunningSubagent {
-    pub id: SubagentId,
-    pub parent_session_id: SessionId,
-    pub child_session_id: SessionId,
-    pub subagent_type: String,
-    pub description: String,
-    pub started_at_epoch_ms: u64,
-    pub duration_ms: u64,
-    pub turn_count: u32,
-    pub tool_call_count: u32,
-    pub tokens_used: u64,
-    pub context_window_tokens: u64,
-    pub context_usage_percent: u8,
-    pub tools_used: Vec<String>,
-    pub error_count: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SubagentStatus {
-    Initializing,
-    Running {
-        turn_count: u32,
-        tool_call_count: u32,
-        tokens_used: u64,
-        context_window_tokens: u64,
-        context_usage_percent: u8,
-        tools_used: Vec<String>,
-        error_count: u32,
-    },
-    Completed {
-        output: String,
-        tool_calls: u32,
-        turns: u32,
-        worktree_path: Option<PathBuf>,
-    },
-    Failed {
-        error: String,
-    },
-    Cancelled {
-        reason: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubagentSnapshot {
-    pub id: SubagentId,
-    pub parent_session_id: SessionId,
-    pub child_session_id: SessionId,
-    pub subagent_type: String,
-    pub description: String,
-    pub started_at_epoch_ms: u64,
-    pub duration_ms: u64,
-    pub status: SubagentStatus,
-    pub fork_parent_prompt_id: Option<QueueEntryId>,
-    pub resumed_from: Option<SubagentId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SubagentCancelOutcome {
-    Cancelled,
-    AlreadyFinished { status: String },
-    NotFound,
-}
-
 // ── Management events ─────────────────────────────────────────────────
 
 /// Global monotonic sequence shared by all management event domains. A
@@ -984,12 +876,8 @@ pub enum ManagementEventKind {
         occurrence: BackgroundTaskEvent,
         snapshot_required: bool,
     },
-    Subagent {
-        session_id: SessionId,
-        subagent_id: SubagentId,
-        occurrence: SubagentEvent,
-        snapshot_required: bool,
-    },
+    BackgroundTasks(crate::tasks::Snapshot),
+    Subagent(crate::subagent::SubagentEvent),
     HooksChanged {
         session_id: SessionId,
         snapshot_required: bool,
@@ -1018,14 +906,6 @@ pub enum ScheduledTaskEvent {
 pub enum BackgroundTaskEvent {
     Started,
     Completed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SubagentEvent {
-    Spawned,
-    Progress,
-    Finished { status: String },
 }
 
 // ── Upstream projections (private to the facade) ──────────────────────
@@ -1201,7 +1081,6 @@ pub(crate) fn scheduled_task(
         prompt: task.prompt,
         recurring: task.recurring,
         durable: task.durable,
-        foreground: task.foreground,
         created_at: task.created_at.to_rfc3339(),
         last_fired_at: task.last_fired_at.map(|timestamp| timestamp.to_rfc3339()),
         next_fire_at,
@@ -1401,6 +1280,7 @@ pub(crate) fn effective_config_snapshot(
             query_parameter_names: snapshot.route.query_parameter_names,
             environment_header_names: snapshot.route.environment_header_names,
         },
+        model: snapshot.model.into(),
         backend_search_active: snapshot.backend_search_active,
         active_batch_search: search_facts(snapshot.active_batch_search),
         next_empty_fifo_search: search_facts(snapshot.next_empty_fifo_search),
@@ -1510,88 +1390,28 @@ pub(crate) fn background_task(task: xai_grok_tools::types::TaskSnapshot) -> Back
     }
 }
 
-pub(crate) fn running_subagent(
-    inspection: xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
-) -> RunningSubagent {
-    use xai_grok_tools::implementations::grok_build::task::types::SubagentSnapshotStatus;
-    let SubagentSnapshotStatus::Running {
-        turn_count,
-        tool_call_count,
-        tokens_used,
-        context_window_tokens,
-        context_usage_pct,
-        tools_used,
-        error_count,
-    } = inspection.snapshot.status
-    else {
-        unreachable!("the upstream list_running authority returned a terminal subagent")
-    };
-    RunningSubagent {
-        id: SubagentId::new(inspection.snapshot.subagent_id),
-        parent_session_id: SessionId(inspection.parent_session_id),
-        child_session_id: SessionId(inspection.child_session_id),
-        subagent_type: inspection.snapshot.subagent_type,
-        description: inspection.snapshot.description,
-        started_at_epoch_ms: inspection.snapshot.started_at_epoch_ms,
-        duration_ms: inspection.snapshot.duration_ms,
-        turn_count,
-        tool_call_count,
-        tokens_used,
-        context_window_tokens,
-        context_usage_percent: context_usage_pct,
-        tools_used,
-        error_count,
-    }
-}
-
-pub(crate) fn subagent_snapshot(
-    inspection: xai_grok_tools::implementations::grok_build::task::types::SubagentInspection,
-) -> SubagentSnapshot {
-    use xai_grok_tools::implementations::grok_build::task::types::SubagentSnapshotStatus as Upstream;
-    let status = match inspection.snapshot.status {
-        Upstream::Initializing => SubagentStatus::Initializing,
-        Upstream::Running {
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            error_count,
-        } => SubagentStatus::Running {
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_percent: context_usage_pct,
-            tools_used,
-            error_count,
+pub(crate) fn resolved_memory_facts(
+    memory: &xai_grok_config_types::MemoryConfig,
+) -> ResolvedMemoryFacts {
+    ResolvedMemoryFacts {
+        enabled: memory.enabled,
+        mode: if !memory.enabled {
+            crate::config::MemoryMode::Disabled
+        } else {
+            match memory.mode {
+                xai_grok_config_types::MemoryMode::Legacy => crate::config::MemoryMode::Legacy,
+                xai_grok_config_types::MemoryMode::V2 => crate::config::MemoryMode::V2,
+            }
         },
-        Upstream::Completed {
-            output,
-            tool_calls,
-            turns,
-            worktree_path,
-        } => SubagentStatus::Completed {
-            output,
-            tool_calls,
-            turns,
-            worktree_path: worktree_path.map(PathBuf::from),
-        },
-        Upstream::Failed { error } => SubagentStatus::Failed { error },
-        Upstream::Cancelled { reason } => SubagentStatus::Cancelled { reason },
-    };
-    SubagentSnapshot {
-        id: SubagentId::new(inspection.snapshot.subagent_id),
-        parent_session_id: SessionId(inspection.parent_session_id),
-        child_session_id: SessionId(inspection.child_session_id),
-        subagent_type: inspection.snapshot.subagent_type,
-        description: inspection.snapshot.description,
-        started_at_epoch_ms: inspection.snapshot.started_at_epoch_ms,
-        duration_ms: inspection.snapshot.duration_ms,
-        status,
-        fork_parent_prompt_id: inspection.fork_parent_prompt_id.map(QueueEntryId::new),
-        resumed_from: inspection.resumed_from.map(SubagentId::new),
+        index: memory.index.clone(),
+        search: memory.search.clone(),
+        initial_injection: memory.initial_injection.clone(),
+        session: memory.session.clone(),
+        watcher: memory.watcher.clone(),
+        gc: memory.gc.clone(),
+        dream: memory.dream,
+        flush: memory.flush.clone(),
+        pruning: memory.pruning.clone(),
     }
 }
 
@@ -1617,6 +1437,8 @@ pub(crate) fn agent_config_snapshot(
                 }
             },
             context_window: Some(model.context_window.get()),
+            configured_behavior: model.behavior.clone(),
+            configured_retry: model.retry.clone(),
             header_names: model.provider.headers.keys().cloned().collect(),
             query_parameter_names: model.provider.query_params.keys().cloned().collect(),
             environment_header_names: Vec::new(),
@@ -1645,6 +1467,8 @@ pub(crate) fn agent_config_snapshot(
             prompt_suggestion_model: config.prompt_suggestion_model.clone(),
         },
         media,
+        configured_memory: config.memory.clone(),
+        resolved_memory: None,
     }
 }
 
@@ -2104,166 +1928,6 @@ pub(crate) fn workflows_snapshot(
     })
 }
 
-#[derive(serde::Deserialize)]
-struct McpInventoryWire {
-    servers: Vec<McpServerWire>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct McpServerWire {
-    name: String,
-    #[serde(default)]
-    display_name: Option<String>,
-    source: String,
-    #[serde(default)]
-    source_label: Option<String>,
-    #[serde(flatten)]
-    transport: McpTransportWire,
-    #[serde(default)]
-    session: Option<McpSessionWire>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "type")]
-enum McpTransportWire {
-    #[serde(rename = "http")]
-    Http {
-        url: String,
-        #[serde(default)]
-        scope: Option<String>,
-        #[serde(default, rename = "scopeId")]
-        scope_id: Option<String>,
-        #[serde(default, rename = "scopeName")]
-        scope_name: Option<String>,
-    },
-    #[serde(rename = "stdio")]
-    Stdio {
-        command: PathBuf,
-        #[serde(default)]
-        args: Vec<String>,
-        #[serde(default)]
-        env: Vec<McpEnvironmentWire>,
-    },
-    #[serde(rename = "managedGateway")]
-    ManagedGateway,
-}
-
-#[derive(serde::Deserialize)]
-struct McpEnvironmentWire {
-    name: String,
-    #[allow(dead_code)]
-    value: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct McpSessionWire {
-    enabled: bool,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tools: Vec<McpToolWire>,
-    #[serde(default)]
-    auth_required: bool,
-    #[serde(default)]
-    setup_required: bool,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct McpToolWire {
-    name: String,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default = "default_true")]
-    enabled: bool,
-}
-
-pub(crate) fn mcp_inventory_snapshot(
-    response: serde_json::Value,
-) -> Result<McpInventorySnapshot, ManagementError> {
-    let wire: McpInventoryWire = deserialize_extension(response)?;
-    Ok(McpInventorySnapshot {
-        servers: wire
-            .servers
-            .into_iter()
-            .map(|server| {
-                let (enabled, status, tools, auth_required, setup_required) = server
-                    .session
-                    .map(|session| {
-                        (
-                            Some(session.enabled),
-                            session.status.map(|status| match status.as_str() {
-                                "ready" => McpServerStatus::Ready,
-                                "initializing" => McpServerStatus::Initializing,
-                                "setuprequired" | "setup_required" => {
-                                    McpServerStatus::SetupRequired
-                                }
-                                "unavailable" => McpServerStatus::Unavailable,
-                                _ => McpServerStatus::Unknown,
-                            }),
-                            session
-                                .tools
-                                .into_iter()
-                                .map(|tool| McpToolInfo {
-                                    name: tool.name,
-                                    display_name: tool.display_name,
-                                    description: tool.description,
-                                    enabled: tool.enabled,
-                                })
-                                .collect(),
-                            session.auth_required,
-                            session.setup_required,
-                        )
-                    })
-                    .unwrap_or((None, None, Vec::new(), false, false));
-                McpServerInfo {
-                    name: server.name,
-                    display_name: server.display_name,
-                    source: match server.source.as_str() {
-                        "managed" => McpServerSource::Managed,
-                        "local" => McpServerSource::Local,
-                        _ => McpServerSource::Unknown,
-                    },
-                    source_label: server.source_label,
-                    transport: match server.transport {
-                        McpTransportWire::Http {
-                            url,
-                            scope,
-                            scope_id,
-                            scope_name,
-                        } => McpTransportFacts::Http {
-                            url,
-                            scope,
-                            scope_id,
-                            scope_name,
-                        },
-                        McpTransportWire::Stdio { command, args, env } => {
-                            McpTransportFacts::Stdio {
-                                command,
-                                args,
-                                environment_names: env
-                                    .into_iter()
-                                    .map(|variable| variable.name)
-                                    .collect(),
-                            }
-                        }
-                        McpTransportWire::ManagedGateway => McpTransportFacts::ManagedGateway,
-                    },
-                    enabled,
-                    status,
-                    tools,
-                    auth_required,
-                    setup_required,
-                }
-            })
-            .collect(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2388,39 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_extension_parsers_drop_mcp_environment_values() {
-        let inventory = mcp_inventory_snapshot(serde_json::json!({
-            "result": {
-                "servers": [{
-                    "name": "local-tools",
-                    "displayName": "Local tools",
-                    "source": "local",
-                    "type": "stdio",
-                    "command": "/usr/bin/tool-server",
-                    "args": ["serve"],
-                    "env": [{"name": "SERVICE_TOKEN", "value": "secret-token-value"}],
-                    "session": {
-                        "enabled": true,
-                        "status": "ready",
-                        "tools": [{"name": "lookup", "enabled": true}],
-                        "authRequired": false,
-                        "setupRequired": false
-                    }
-                }]
-            },
-            "error": null
-        }))
-        .unwrap();
-        assert_eq!(inventory.servers.len(), 1);
-        assert!(matches!(
-            &inventory.servers[0].transport,
-            McpTransportFacts::Stdio {
-                environment_names,
-                ..
-            } if environment_names == &["SERVICE_TOKEN"]
-        ));
-        assert!(!format!("{inventory:?}").contains("secret-token-value"));
-
+    fn typed_usage_parser_preserves_totals_and_model_breakdown() {
         let usage = session_usage(serde_json::json!({
             "usage": {
                 "inputTokens": 10,

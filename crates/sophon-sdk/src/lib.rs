@@ -10,9 +10,19 @@
 
 mod client;
 mod config;
+mod config_native;
 mod event;
 pub mod management;
+pub mod mcp;
+mod model_facts;
 mod runtime;
+pub mod subagent;
+pub mod tasks;
+pub mod workflow;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 use std::fmt;
 use std::path::PathBuf;
@@ -21,13 +31,17 @@ pub use client::{
     ClientHandler, PermissionDecision, PermissionOption, PermissionOptionKind, PermissionRequest,
 };
 pub use config::{
-    AgentConfig, MediaConfig, MediaProviderConfig, ModelConfig, PermissionPolicy, ProviderConfig,
-    ProviderProtocol,
+    AgentConfig, MediaConfig, MediaProviderConfig, MemoryConfig, MemoryDreamSettings,
+    MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings, MemoryInitialInjectionSettings,
+    MemoryMode, MemorySearchSettings, MemorySessionSettings, MemoryWatcherSettings, MmrSettings,
+    ModelBehaviorConfig, ModelConfig, ModelRetryConfig, PermissionPolicy, ProviderConfig,
+    ProviderProtocol, PruningSettings, TemporalDecaySettings,
 };
 pub use event::{
     Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
     TurnCompletion, TurnUsage,
 };
+pub use model_facts::SessionModelFacts;
 pub use runtime::{Agent, FinalExitError, FinalExitPhase};
 pub use xai_grok_shell::session::portability::{
     MAX_PORTABLE_BYTES, PORTABLE_COMPATIBILITY, PORTABLE_FORMAT_VERSION, PortabilityError,

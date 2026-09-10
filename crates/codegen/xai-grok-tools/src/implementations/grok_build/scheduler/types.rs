@@ -230,9 +230,6 @@ pub struct ScheduledTask {
     pub recurring: bool,
     #[serde(default)]
     pub durable: bool,
-    /// SDK foreground routing preference; native scheduler fires still run in children.
-    #[serde(default)]
-    pub foreground: bool,
     pub created_at: DateTime<Utc>,
     pub last_fired_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -288,7 +285,6 @@ impl ScheduledTask {
             prompt,
             recurring,
             durable,
-            foreground: false,
             created_at,
             last_fired_at: None,
             expires_at: if recurring {
@@ -500,7 +496,6 @@ mod tests {
     fn new_recurring_task_has_ttl_expiry() {
         let task = ScheduledTask::new(300, "check deploy".into(), true, false);
         assert!(task.expires_at.is_some());
-        assert!(!task.foreground);
         let expiry = task.expires_at.unwrap();
         let diff = expiry - task.created_at;
         assert_eq!(diff.num_days(), RECURRING_TASK_TTL_DAYS);
@@ -554,12 +549,6 @@ mod tests {
                        "lastFiredAt":null,"expiresAt":null}"#;
         let task: ScheduledTask = serde_json::from_str(json).unwrap();
         assert!(task.recurring && !task.durable);
-        assert!(!task.foreground);
-        let mut task = task;
-        task.foreground = true;
-        let restored: ScheduledTask =
-            serde_json::from_value(serde_json::to_value(task).unwrap()).unwrap();
-        assert!(restored.foreground);
     }
 
     #[test]

@@ -126,15 +126,6 @@ enum Command {
         mgmt::BackgroundTaskKillSource,
         ManagementReply<mgmt::BackgroundTaskKillOutcome>,
     ),
-    RunningSubagents(SessionId, ManagementReply<Vec<mgmt::RunningSubagent>>),
-    Subagent(
-        mgmt::SubagentId,
-        ManagementReply<Option<mgmt::SubagentSnapshot>>,
-    ),
-    CancelSubagent(
-        mgmt::SubagentId,
-        ManagementReply<mgmt::SubagentCancelOutcome>,
-    ),
     Shutdown(Duration, Reply<()>),
 }
 
@@ -222,7 +213,6 @@ impl Agent {
     pub async fn start(config: AgentConfig) -> Result<Self, Error> {
         require_hermetic_discovery()?;
         config.validate()?;
-        let effective_config = mgmt::agent_config_snapshot(&config);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(1024);
         let (management_events, _) = broadcast::channel(256);
@@ -254,7 +244,7 @@ impl Agent {
             .map_err(|error| Error::Start(error.to_string()))?;
 
         match ready_rx.await {
-            Ok(Ok(initialization_response)) => Ok(Self {
+            Ok(Ok((initialization_response, effective_config))) => Ok(Self {
                 inner: Arc::new(AgentInner {
                     commands,
                     events,
@@ -698,7 +688,7 @@ fn run_worker(
     events: broadcast::Sender<Event>,
     management: ManagementEmitter,
     runtime_health: watch::Sender<mgmt::RuntimeHealth>,
-    ready: oneshot::Sender<Result<serde_json::Value, Error>>,
+    ready: oneshot::Sender<Result<(serde_json::Value, mgmt::AgentEffectiveConfigSnapshot), Error>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -723,14 +713,21 @@ fn run_worker(
     runtime.block_on(local.run_until(async move {
         let result = start_worker(config, commands, events, management.clone()).await;
         match result {
-            Ok((agent, gateway, commands, initialization_response, exit_callbacks)) => {
+            Ok((
+                agent,
+                gateway,
+                commands,
+                initialization_response,
+                exit_callbacks,
+                effective_config,
+            )) => {
                 update_runtime_health(
                     &runtime_health,
                     &management,
                     mgmt::RuntimeState::Ready,
                     None,
                 );
-                let _ = ready.send(Ok(initialization_response));
+                let _ = ready.send(Ok((initialization_response, effective_config)));
                 let result = command_loop(
                     agent,
                     gateway,
@@ -782,10 +779,16 @@ async fn start_worker(
         mpsc::UnboundedReceiver<Command>,
         serde_json::Value,
         watch::Sender<bool>,
+        mgmt::AgentEffectiveConfigSnapshot,
     ),
     Error,
 > {
     let (grok_config, models) = grok_config(&config)?;
+    let mut effective_config = mgmt::agent_config_snapshot(&config);
+    effective_config.resolved_memory = grok_config
+        .memory_config
+        .as_ref()
+        .map(mgmt::resolved_memory_facts);
     let auth_manager = Arc::new(grok_config.create_auth_manager());
     let (gateway_tx, gateway_rx) = mpsc::unbounded_channel();
     let gateway = AcpGatewaySender::new(gateway_tx);
@@ -855,6 +858,7 @@ async fn start_worker(
         commands,
         initialization_response,
         exit_callbacks,
+        effective_config,
     ))
 }
 
@@ -1188,8 +1192,14 @@ async fn command_loop(
                 let _ = reply.send(result);
             }
             Command::Extension(method, params, reply) => {
-                let result = extension_request(&agent, method, params).await;
-                let _ = reply.send(result);
+                // Lifecycle and readiness requests can wait for native work.
+                // Keep the command pump available for cancellation and quiesce,
+                // and join these receipts before final runtime teardown.
+                let agent = agent.clone();
+                prompt_tasks.spawn_local(async move {
+                    let result = extension_request(&agent, method, params).await;
+                    let _ = reply.send(result);
+                });
             }
             Command::ExtensionNotification(method, params, reply) => {
                 let result = extension_notification(&agent, method, params).await;
@@ -1396,41 +1406,6 @@ async fn command_loop(
                     });
                 let _ = reply.send(result);
             }
-            Command::RunningSubagents(id, reply) => {
-                if management_session(&agent, &id).is_err() {
-                    let _ = reply.send(Err(management_error(
-                        mgmt::ManagementErrorKind::NotFound,
-                        "session not found",
-                        &id,
-                    )));
-                    continue;
-                }
-                let result = agent
-                    .list_running_subagents(&id.0)
-                    .await
-                    .into_iter()
-                    .map(mgmt::running_subagent)
-                    .collect();
-                let _ = reply.send(Ok(result));
-            }
-            Command::Subagent(id, reply) => {
-                let result = agent
-                    .inspect_subagent(id.as_str())
-                    .await
-                    .map(mgmt::subagent_snapshot);
-                let _ = reply.send(Ok(result));
-            }
-            Command::CancelSubagent(id, reply) => {
-                use xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome as Upstream;
-                let result = match agent.cancel_subagent(id.as_str()).await {
-                    Upstream::Cancelled => mgmt::SubagentCancelOutcome::Cancelled,
-                    Upstream::AlreadyFinished { status } => {
-                        mgmt::SubagentCancelOutcome::AlreadyFinished { status }
-                    }
-                    Upstream::NotFound => mgmt::SubagentCancelOutcome::NotFound,
-                };
-                let _ = reply.send(Ok(result));
-            }
             Command::Shutdown(timeout, reply) => {
                 let drain = pending.get_or_insert_with(|| {
                     update_runtime_health(
@@ -1560,14 +1535,13 @@ async fn scheduler_create(
         .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
     let handle = scheduler_handle(agent, session_id)
         .map_err(|error| error.operation(operation_id.clone()))?;
-    let mut task = ScheduledTask::with_fire_immediately(
-        create.interval_secs.max(60),
+    let task = ScheduledTask::with_fire_immediately(
+        create.interval_secs,
         create.prompt,
-        true,
+        create.recurring,
         create.durable,
         create.fire_immediately,
     );
-    task.foreground = create.foreground;
     handle
         .create(operation_id.0.clone(), request_fingerprint, expected, task)
         .await
@@ -1610,7 +1584,7 @@ async fn scheduler_update(
             expected,
             update.id.0,
             update.prompt,
-            update.interval_secs.map(|seconds| seconds.max(60)),
+            update.interval_secs,
         )
         .await
         .map(mgmt::scheduler_task_result)
@@ -1656,8 +1630,9 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
     // facade fixes hermetic discovery before the first config load. Fail
     // closed if another caller already resolved this process to ambient mode.
     require_hermetic_discovery()?;
-    let raw_config = xai_grok_shell::config::load_effective_config()
+    let mut raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|error| Error::Start(format!("failed to load Grok config: {error}")))?;
+    crate::config_native::apply_raw_config(config, &mut raw_config)?;
     let mut grok = GrokConfig::new_from_toml_cfg(&raw_config).map_err(Error::Start)?;
     let remote_settings = Default::default();
     grok.resolve_runtime_fields(&RuntimeResolutionContext {
@@ -1667,12 +1642,13 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
         cli_subagents: None,
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        memory_enabled_override: None,
+        memory_enabled_override: Some(config.memory.enabled()),
         disable_web_search: false,
         todo_gate: false,
         laziness_debug_log: None,
         storage_mode: None,
     });
+    crate::config_native::apply_runtime_config(config, &mut grok);
     grok.remote_settings = Some(remote_settings);
     grok.mode = AgentMode::Headless;
     grok.default_model_override = config.default_model.clone();
@@ -1776,6 +1752,7 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
             entry.api_key = Some(model.provider.api_key.clone());
+            crate::config_native::apply_model_config(model, &mut entry);
             (model.id.clone(), entry)
         })
         .collect();
@@ -2092,6 +2069,10 @@ impl acp::Client for EmbeddedClient {
             method.as_str(),
             "x.ai/session_notification" | "x.ai/session/update"
         ) {
+            if let Some(snapshot) = crate::tasks::decode_snapshot(&payload) {
+                self.management
+                    .send(mgmt::ManagementEventKind::BackgroundTasks(snapshot));
+            }
             if let Some(record) = history_record(&payload, false) {
                 let replay = record.is_replay;
                 let _ = self.events.send(Event::HistoryRecord(Box::new(record)));
@@ -2264,7 +2245,7 @@ fn management_session_event(
             version: management_event_version(metadata)?,
             occurrence: mgmt::ScheduledTaskEvent::Fired {
                 subagent_id: string_field(update, &["subagentId", "subagent_id"])
-                    .map(mgmt::SubagentId::new),
+                    .map(crate::subagent::SubagentId::new),
             },
             snapshot_required: true,
         }),
@@ -2303,35 +2284,29 @@ fn management_session_event(
                 snapshot_required: true,
             })
         }
-        "subagent_spawned" => Some(mgmt::ManagementEventKind::Subagent {
-            session_id: session_id.clone(),
-            subagent_id: mgmt::SubagentId::new(string_field(
-                update,
-                &["subagentId", "subagent_id"],
-            )?),
-            occurrence: mgmt::SubagentEvent::Spawned,
-            snapshot_required: true,
-        }),
-        "subagent_progress" => Some(mgmt::ManagementEventKind::Subagent {
-            session_id: session_id.clone(),
-            subagent_id: mgmt::SubagentId::new(string_field(
-                update,
-                &["subagentId", "subagent_id"],
-            )?),
-            occurrence: mgmt::SubagentEvent::Progress,
-            snapshot_required: true,
-        }),
-        "subagent_finished" => Some(mgmt::ManagementEventKind::Subagent {
-            session_id: session_id.clone(),
-            subagent_id: mgmt::SubagentId::new(string_field(
-                update,
-                &["subagentId", "subagent_id"],
-            )?),
-            occurrence: mgmt::SubagentEvent::Finished {
-                status: string_field(update, &["status"]).unwrap_or_else(|| "unknown".into()),
-            },
-            snapshot_required: true,
-        }),
+        "subagent_spawned" | "subagent_progress" | "subagent_finished" => {
+            use crate::subagent::{
+                AttemptId, SubagentEvent, SubagentEventKind, SubagentId, SubagentState,
+            };
+            let kind = match kind.as_str() {
+                "subagent_spawned" => SubagentEventKind::Spawned,
+                "subagent_progress" => SubagentEventKind::Progress,
+                _ => SubagentEventKind::Finished {
+                    state: match string_field(update, &["status"])?.as_str() {
+                        "completed" => SubagentState::Completed,
+                        "failed" => SubagentState::Failed,
+                        "cancelled" => SubagentState::Cancelled,
+                        _ => return None,
+                    },
+                },
+            };
+            Some(mgmt::ManagementEventKind::Subagent(SubagentEvent {
+                parent_session_id: session_id.clone(),
+                id: SubagentId::new(string_field(update, &["subagentId", "subagent_id"])?),
+                attempt_id: string_field(update, &["attemptId", "attempt_id"]).map(AttemptId::new),
+                kind,
+            }))
+        }
         "hooks_changed" => Some(mgmt::ManagementEventKind::HooksChanged {
             session_id: session_id.clone(),
             snapshot_required: true,
@@ -2809,32 +2784,6 @@ impl Session {
             .await
     }
 
-    pub async fn running_subagents(
-        &self,
-    ) -> Result<Vec<mgmt::RunningSubagent>, mgmt::ManagementError> {
-        self.agent
-            .management_request(|reply| Command::RunningSubagents(self.id.clone(), reply))
-            .await
-    }
-
-    pub async fn subagent(
-        &self,
-        id: mgmt::SubagentId,
-    ) -> Result<Option<mgmt::SubagentSnapshot>, mgmt::ManagementError> {
-        self.agent
-            .management_request(|reply| Command::Subagent(id, reply))
-            .await
-    }
-
-    pub async fn cancel_subagent(
-        &self,
-        id: mgmt::SubagentId,
-    ) -> Result<mgmt::SubagentCancelOutcome, mgmt::ManagementError> {
-        self.agent
-            .management_request(|reply| Command::CancelSubagent(id, reply))
-            .await
-    }
-
     pub async fn usage(&self) -> Result<mgmt::SessionUsage, mgmt::ManagementError> {
         let response = self
             .extension("x.ai/session/usage", serde_json::json!({}))
@@ -2903,19 +2852,6 @@ impl Session {
         mgmt::workflows_snapshot(response).map_err(|error| error.session(self.id.clone()))
     }
 
-    /// Current MCP inventory/status. Configuration values and setup secrets
-    /// are deliberately omitted from the typed snapshot.
-    pub async fn mcp_inventory(
-        &self,
-        cache: bool,
-    ) -> Result<mgmt::McpInventorySnapshot, mgmt::ManagementError> {
-        let response = self
-            .extension("x.ai/mcp/list", serde_json::json!({ "cache": cache }))
-            .await
-            .map_err(|error| management_extension_error(error, Some(&self.id)))?;
-        mgmt::mcp_inventory_snapshot(response).map_err(|error| error.session(self.id.clone()))
-    }
-
     pub async fn close(&self) -> Result<(), Error> {
         self.agent.close(self.id.clone()).await
     }
@@ -2955,6 +2891,102 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[test]
+    fn subagent_events_preserve_attempts_and_reject_unknown_terminal_states() {
+        use crate::subagent::{SubagentEventKind, SubagentState};
+        for key in ["attemptId", "attempt_id"] {
+            for (update_kind, expected) in [
+                ("subagent_spawned", SubagentEventKind::Spawned),
+                ("subagent_progress", SubagentEventKind::Progress),
+                (
+                    "subagent_finished",
+                    SubagentEventKind::Finished {
+                        state: SubagentState::Failed,
+                    },
+                ),
+            ] {
+                let mut update = serde_json::json!({
+                    "sessionUpdate": update_kind, "subagentId": "child", "status": "failed"
+                });
+                update[key] = serde_json::json!("attempt-2");
+                let Some(mgmt::ManagementEventKind::Subagent(event)) =
+                    management_session_event(&SessionId::from("parent"), &update, None)
+                else {
+                    panic!("subagent event expected")
+                };
+                assert_eq!(event.parent_session_id.as_str(), "parent");
+                assert_eq!(event.id.as_str(), "child");
+                assert_eq!(event.attempt_id.unwrap().as_str(), "attempt-2");
+                assert_eq!(event.kind, expected);
+            }
+        }
+        for status in ["unknown", "running", "initializing"] {
+            assert!(management_session_event(&SessionId::from("parent"), &serde_json::json!({
+                "sessionUpdate": "subagent_finished", "subagentId": "child", "status": status
+            }), None).is_none());
+        }
+        let Some(mgmt::ManagementEventKind::Subagent(event)) = management_session_event(
+            &SessionId::from("parent"),
+            &serde_json::json!({"sessionUpdate":"subagent_finished", "subagentId":"child", "status":"cancelled"}),
+            None,
+        ) else {
+            panic!("pre-launch terminal expected")
+        };
+        assert!(event.attempt_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn background_replay_emits_snapshot_before_history_without_live_settlement() {
+        use acp::Client as _;
+        let (events, mut receiver) = broadcast::channel(32);
+        let (management, mut management_receiver) = broadcast::channel(32);
+        let client = EmbeddedClient {
+            events: events.clone(),
+            management: ManagementEmitter {
+                events: management,
+                ordered_events: events,
+                sequence: Arc::new(AtomicU64::new(0)),
+            },
+            permission_policy: PermissionPolicy::DenyAll,
+            handler: None,
+            retired: watch::channel(false).1,
+        };
+        for method in ["x.ai/session_notification", "x.ai/session/update"] {
+            let payload = serde_json::json!({
+                "sessionId":"s", "_meta":{"isReplay":true,"eventId":"snapshot-1"},
+                "update":{"sessionUpdate":"background_tasks","tasks":[],"truncated":true}
+            });
+            client
+                .ext_notification(acp::ExtNotification::new(
+                    method,
+                    serde_json::value::to_raw_value(&payload).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let Event::Management(mgmt::ManagementEvent {
+                kind: mgmt::ManagementEventKind::BackgroundTasks(snapshot),
+                ..
+            }) = receiver.recv().await.unwrap()
+            else {
+                panic!("snapshot expected first")
+            };
+            assert_eq!(snapshot.session_id.as_str(), "s");
+            assert_eq!(snapshot.delivery, crate::tasks::Delivery::Replay);
+            assert!(snapshot.tasks.is_empty() && snapshot.truncated);
+            assert!(matches!(
+                management_receiver.recv().await.unwrap().kind,
+                mgmt::ManagementEventKind::BackgroundTasks(_)
+            ));
+            let Event::HistoryRecord(record) = receiver.recv().await.unwrap() else {
+                panic!("history projection expected")
+            };
+            assert!(record.is_replay);
+            assert_eq!(record.event_id.as_deref(), Some("snapshot-1"));
+            assert!(receiver.try_recv().is_err());
+            assert!(management_receiver.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn final_exit_waits_for_delayed_native_receipt_delivery() {

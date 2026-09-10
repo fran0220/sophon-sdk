@@ -61,7 +61,10 @@ fn configured_memory_retrieval_mode(
 }
 /// One 429 layer per role, never stacked, never zero: an active subagent pacer disables the sampler retry, and a
 /// disabled pacer falls back to it (a true rollback). A per-model sampler threshold overrides this policy elsewhere.
-fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
+pub(super) fn subagent_sampler_rate_limit_threshold(
+    is_subagent: bool,
+    pacer_max_attempts: u32,
+) -> u32 {
     if is_subagent && pacer_max_attempts > 0 {
         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
     } else {
@@ -1066,38 +1069,6 @@ pub(crate) async fn spawn_session_actor(
         }
         Arc::new(TokioMutex::new(state))
     };
-    let scheduler_prompt_tx = cmd_tx.clone();
-    let scheduler_prompt_ingress =
-        xai_grok_tools::management::scheduler_ingress::SchedulerPromptIngress::new(
-            move |scheduled, permit| {
-                let (respond_to, _completion) = oneshot::channel();
-                scheduler_prompt_tx
-                    .send(SessionCommand::Prompt {
-                        prompt_id: format!("scheduler-fired-{}", uuid::Uuid::now_v7()),
-                        prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                            scheduled.prompt,
-                        ))],
-                        prompt_mode: PromptMode::Agent,
-                        artifact_upload_ctx: None,
-                        client_identifier: None,
-                        screen_mode: None,
-                        verbatim: true,
-                        traceparent: None,
-                        json_schema: None,
-                        send_now: false,
-                        admission: None,
-                        agent_admission: Some(permit),
-                        tool_overrides_update: None,
-                        respond_to,
-                        prompt_admitted: None,
-                        persist_ack: None,
-                        parsed_prompt_tx: None,
-                    })
-                    .map_err(|_| {
-                        xai_grok_tools::management::scheduler_ingress::SchedulerIngressError::SessionUnavailable
-                    })
-            },
-        );
     let plugin_registry = prefetch
         .join_plugin_registry()
         .instrument(tracing::info_span!("spawn.plugin_registry_wait"))
@@ -1182,7 +1153,6 @@ pub(crate) async fn spawn_session_actor(
             None
         },
         admission: tool_context.admission.clone(),
-        scheduler_prompt_ingress,
     });
     use xai_grok_telemetry::subagent_spawn::SubagentSpawnPhase;
     let builder_started_at = std::time::Instant::now();

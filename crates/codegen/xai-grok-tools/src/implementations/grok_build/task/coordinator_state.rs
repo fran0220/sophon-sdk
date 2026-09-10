@@ -415,6 +415,7 @@ pub(super) struct DisplacedCompletedChild {
 }
 
 pub(super) struct PendingChild {
+    pub(super) attempt_id: Option<String>,
     pub(super) request: SubagentRequest,
     pub(super) started_at: std::time::Instant,
     pub(super) cancellation: CancellationToken,
@@ -433,6 +434,7 @@ pub(super) struct PendingChild {
 }
 
 pub(super) struct ActiveChild<C> {
+    pub(super) attempt_id: Option<String>,
     pub(super) request: SubagentRequest,
     pub(super) started_at: std::time::Instant,
     pub(super) cancellation: CancellationToken,
@@ -534,6 +536,7 @@ where
 
 #[derive(Clone)]
 pub(super) struct RunningSeed {
+    pub(super) attempt_id: Option<String>,
     pub(super) subagent_id: String,
     pub(super) description: String,
     pub(super) subagent_type: String,
@@ -625,6 +628,7 @@ impl<C> ChildRecord<C> {
 
 pub(super) trait ForegroundChild {
     fn id(&self) -> &str;
+    fn attempt_id(&self) -> Option<&str>;
     fn child_session_id(&self) -> &str;
     fn deadline(&self) -> Option<tokio::time::Instant>;
     /// True when the spawn caller dropped its result receiver while this
@@ -638,6 +642,10 @@ pub(super) trait ForegroundChild {
 }
 
 impl ForegroundChild for PendingChild {
+    fn attempt_id(&self) -> Option<&str> {
+        self.attempt_id.as_deref()
+    }
+
     fn id(&self) -> &str {
         &self.request.id
     }
@@ -673,6 +681,10 @@ impl ForegroundChild for PendingChild {
 }
 
 impl<C: ChildControl> ForegroundChild for ActiveChild<C> {
+    fn attempt_id(&self) -> Option<&str> {
+        self.attempt_id.as_deref()
+    }
+
     fn id(&self) -> &str {
         &self.request.id
     }
@@ -725,10 +737,9 @@ pub(super) fn background_at_deadline(
         // Interim handoff, not a completion: keep `success: false` (default)
         // so `SubagentResult::status()` consumers cannot record a completed
         // status for a still-running child. Callers branch on `backgrounded`.
-        let _ = respond_to.send(SubagentResult::backgrounded(
-            child.id(),
-            child.child_session_id(),
-        ));
+        let mut result = SubagentResult::backgrounded(child.id(), child.child_session_id());
+        result.attempt_id = child.attempt_id().map(str::to_owned);
+        let _ = respond_to.send(result);
     }
     child.mark_backgrounded();
 }
@@ -786,6 +797,7 @@ pub(super) fn active_summary<C>(child: &ActiveChild<C>) -> ActiveSubagentSummary
 
 pub(super) fn running_seed<C>(child: &ActiveChild<C>) -> RunningSeed {
     RunningSeed {
+        attempt_id: child.attempt_id.clone(),
         subagent_id: child.request.id.clone(),
         description: child.request.description.clone(),
         subagent_type: child.request.subagent_type.clone(),
@@ -804,6 +816,7 @@ pub(super) fn running_inspection(
     progress: SubagentProgress,
 ) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: seed.attempt_id,
         snapshot: SubagentSnapshot {
             subagent_id: seed.subagent_id,
             description: seed.description,
@@ -842,6 +855,7 @@ pub(super) fn pending_snapshot(child: &PendingChild) -> SubagentSnapshot {
 
 pub(super) fn pending_inspection(child: &PendingChild) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: child.attempt_id.clone(),
         snapshot: pending_snapshot(child),
         parent_session_id: child.request.parent_session_id.clone(),
         child_session_id: String::new(),
@@ -874,6 +888,7 @@ pub(super) fn queued_inspection(
     queued_at: std::time::Instant,
 ) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: None,
         snapshot: queued_snapshot(request, queued_at),
         parent_session_id: request.parent_session_id.clone(),
         child_session_id: String::new(),
@@ -940,6 +955,7 @@ pub(super) fn completed_inspection(
     persisted_output: Option<&str>,
 ) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: child.result.attempt_id.clone(),
         snapshot: completed_snapshot(child, persisted_output),
         parent_session_id: child.request.parent_session_id.clone(),
         child_session_id: child.child_session_id.clone(),

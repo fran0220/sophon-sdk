@@ -242,6 +242,7 @@ pub(in crate::implementations::grok_build::task::coordinator) fn insert_child_wi
     coordinator.active.insert(
         id.to_owned(),
         ActiveChild {
+            attempt_id: None,
             request,
             started_at: std::time::Instant::now(),
             cancellation: CancellationToken::new(),
@@ -276,6 +277,7 @@ fn insert_pending(coordinator: &mut TestCoordinator, id: &str, parent: &str) {
     coordinator.pending.insert(
         id.to_owned(),
         PendingChild {
+            attempt_id: None,
             request,
             started_at: std::time::Instant::now(),
             cancellation: CancellationToken::new(),
@@ -1418,6 +1420,7 @@ async fn human_pending_address_is_not_active() {
     coordinator.pending.insert(
         "child".to_owned(),
         crate::implementations::grok_build::task::coordinator_state::PendingChild {
+            attempt_id: None,
             request,
             started_at: std::time::Instant::now(),
             cancellation: CancellationToken::new(),

@@ -1365,6 +1365,7 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
 }
 fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: None,
         snapshot: SubagentSnapshot {
             subagent_id: id.to_string(),
             description: "task".to_string(),

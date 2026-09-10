@@ -7,6 +7,78 @@ use super::named_workflow_args::parse_named_workflow_args;
 use crate::session::workflow::manager::ControlError;
 
 impl SessionActor {
+    /// Called by the actor command dispatcher, after native admission checks.
+    pub(crate) async fn workflow_management(
+        &self,
+        action: crate::extensions::workflow::Action,
+    ) -> anyhow::Result<serde_json::Value> {
+        use xai_grok_tools::implementations::grok_build::workflow::{
+            WorkflowLaunchAck, WorkflowLaunchRequest, WorkflowSource,
+        };
+        let Some(input) = action.into_input() else {
+            let tracker = self.workflow_tracker().await;
+            let tracker = tracker.lock();
+            let mut runs = tracker.list();
+            for run in &mut runs {
+                run.elapsed_ms_floor = tracker.elapsed_ms(&run.run_id);
+            }
+            return Ok(serde_json::json!({ "runs": runs }));
+        };
+        anyhow::ensure!(
+            self.background_workflows_enabled && !self.startup_hints.is_subagent,
+            "workflows_disabled: workflows require an enabled top-level session"
+        );
+        input.validate().map_err(anyhow::Error::msg)?;
+        let _admission = if matches!(
+            &input.source,
+            WorkflowSource::Name { .. }
+                | WorkflowSource::Script { .. }
+                | WorkflowSource::ScriptPath { .. }
+                | WorkflowSource::Resume { .. }
+        ) {
+            Some(
+                self.tool_context
+                    .admission
+                    .try_admit(xai_grok_tools::management::admission::AdmissionSource::Human)?,
+            )
+        } else {
+            None
+        };
+        // SDK selectors are exact IDs, never display names, prefixes, or a default run.
+        let selector = match &input.source {
+            WorkflowSource::Pause { run_id } | WorkflowSource::Stop { run_id } => Some(run_id),
+            WorkflowSource::Resume { resume_from_run_id } => Some(resume_from_run_id),
+            _ => None,
+        };
+        if let Some(id) = selector {
+            anyhow::ensure!(
+                self.workflow_tracker().await.lock().get(id).is_some(),
+                "workflow_unknown_run: exact run ID required: {id}"
+            );
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.workflow_launch_tx
+            .send((WorkflowLaunchRequest { input }, tx))
+            .map_err(|_| anyhow::anyhow!("workflow service stopped"))?;
+        match rx.await? {
+            WorkflowLaunchAck::Started {
+                run_id,
+                name,
+                script_path,
+                ..
+            } => Ok(
+                serde_json::json!({ "run_id": run_id, "name": name, "script_path": script_path }),
+            ),
+            WorkflowLaunchAck::Controlled { run_id, name, .. } => {
+                Ok(serde_json::json!({ "run_id": run_id, "name": name }))
+            }
+            WorkflowLaunchAck::Rejected { code, detail } => anyhow::bail!("{code}: {detail}"),
+            WorkflowLaunchAck::Validated { .. } => {
+                anyhow::bail!("unexpected validation acknowledgement")
+            }
+        }
+    }
+
     pub(crate) fn named_workflow_snapshot(
         &self,
     ) -> (

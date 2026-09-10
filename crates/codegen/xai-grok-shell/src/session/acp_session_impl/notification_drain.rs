@@ -834,6 +834,7 @@ mod live_orphan_hook_tests {
 
     fn running_inspection(id: &str) -> SubagentInspection {
         SubagentInspection {
+            attempt_id: None,
             snapshot: SubagentSnapshot {
                 subagent_id: id.to_string(),
                 description: "task".to_string(),

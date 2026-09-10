@@ -369,6 +369,22 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     fn handle_command(&mut self, command: SubagentEvent) {
         match command {
             SubagentEvent::Spawn(command) => self.handle_spawn(command),
+            SubagentEvent::Reactivate {
+                spawn,
+                expected_attempt_id,
+            } => {
+                self.handle_reactivate(spawn, &expected_attempt_id);
+            }
+            SubagentEvent::CancelAttempt {
+                parent_session_id,
+                subagent_id,
+                expected_attempt_id,
+                respond_to,
+            } => {
+                let outcome =
+                    self.cancel_attempt(&parent_session_id, &subagent_id, &expected_attempt_id);
+                let _ = respond_to.send(outcome);
+            }
             SubagentEvent::Query(query) => {
                 self.handle_query(
                     query.subagent_id,
@@ -682,6 +698,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 self.active.insert(
                     subagent_id,
                     ActiveChild {
+                        attempt_id: pending.attempt_id,
                         request: pending.request,
                         started_at: pending.started_at,
                         cancellation: pending.cancellation,
@@ -820,9 +837,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         // graph advertise target (main's lineage source of truth).
         let spawner_session_id =
             spawner_session_id.or_else(|| self.graph.advertise_target(&id).map(str::to_owned));
+        let attempt_id = xai_message_delivery_core::AttemptId::mint(uuid::Uuid::new_v4().as_u128());
         self.pending.insert(
             id.clone(),
             PendingChild {
+                attempt_id: Some(attempt_id.as_str().to_owned()),
                 request: request.clone(),
                 started_at: std::time::Instant::now(),
                 cancellation: cancellation.clone(),
@@ -843,7 +862,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         // Computed after the pending insert, so a non-workflow spawn counts
         // itself; max over launches gives a session's peak concurrency.
         let session_running = self.session_running_count(&request.parent_session_id);
-        let attempt_id = xai_message_delivery_core::AttemptId::mint(uuid::Uuid::new_v4().as_u128());
         let reporter = ChildReporter {
             subagent_id: id.clone(),
             tx: self.internal_tx.clone(),
@@ -1029,7 +1047,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         self.finish_child(id, output);
     }
 
-    fn finish_child(&mut self, id: &str, output: ChildRunOutput<R::CompletionData>) {
+    fn finish_child(&mut self, id: &str, mut output: ChildRunOutput<R::CompletionData>) {
         // Child is leaving the registry: human parked sends must not retry.
         self.reject_spawn_ready_ids(&[id.to_owned()]);
         let mut record = if let Some(child) = self.active.remove(id) {
@@ -1041,6 +1059,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         };
 
         if let Some(displaced) = record.take_failed_pre_start_wake(output.result.success) {
+            // An explicit lifecycle caller still receives the failed attempt;
+            // restoring the previous record must not silently drop its reply.
+            let reply = match &mut record {
+                ChildRecord::Pending(child) => {
+                    output.result.attempt_id = child.attempt_id.clone();
+                    child.spawn_reply.take()
+                }
+                ChildRecord::Active(child) => {
+                    output.result.attempt_id = child.attempt_id.clone();
+                    child.spawn_reply.take()
+                }
+            };
             tracing::warn!(
                 subagent_id = %id,
                 error = ?output.result.error,
@@ -1048,13 +1078,23 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             );
             let parent_session_id = displaced.completed.request.parent_session_id.clone();
             self.restore_displaced_completion(displaced);
+            if let Some(reply) = reply {
+                let _ = reply.send(output.result);
+            }
             self.running_count_changed();
             self.resolve_teardown_drain_waiters(&parent_session_id);
             self.start_queued_within_capacity();
             return;
         }
 
-        let request = record.request().clone();
+        output.result.attempt_id = match &record {
+            ChildRecord::Active(child) => child.attempt_id.clone(),
+            ChildRecord::Pending(child) => child.attempt_id.clone(),
+        };
+        let mut request = record.request().clone();
+        // Terminal cache entries are not admitted work; retaining this permit would
+        // make quiesce wait for cache eviction rather than completion.
+        request.runtime_overrides.agent_admission = None;
         let launched = match &record {
             ChildRecord::Active(_) => true,
             ChildRecord::Pending(child) => child.launched,
@@ -1202,6 +1242,32 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         self.resolve_teardown_drain_waiters(&parent_session_id);
         self.start_queued_within_capacity();
+    }
+
+    /// Compare and mutate without yielding: a stale caller can never cancel a successor.
+    fn cancel_attempt(
+        &mut self,
+        parent: &str,
+        id: &str,
+        expected: &str,
+    ) -> Result<SubagentCancelOutcome, String> {
+        if !self.is_reachable_from_session(id, Some(parent)) {
+            return Ok(SubagentCancelOutcome::NotFound);
+        }
+        let current = self
+            .active
+            .get(id)
+            .and_then(|c| c.attempt_id.as_deref())
+            .or_else(|| self.pending.get(id).and_then(|c| c.attempt_id.as_deref()))
+            .or_else(|| {
+                self.completed
+                    .get(id)
+                    .and_then(|c| c.result.attempt_id.as_deref())
+            });
+        if current != Some(expected) {
+            return Err("subagent attempt conflict".into());
+        }
+        Ok(self.cancel_one(id, Some(parent), true))
     }
 
     fn cancel_one(

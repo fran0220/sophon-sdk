@@ -13,6 +13,117 @@ use super::{
 };
 
 impl<R: ChildRunner> SubagentCoordinator<R> {
+    pub(super) fn handle_reactivate(&mut self, command: SubagentSpawnRequest, expected: &str) {
+        let SubagentSpawnRequest {
+            request,
+            result_tx,
+            registered_tx,
+        } = command;
+        let id = request.id.clone();
+        let reject = |result_tx: oneshot::Sender<SubagentResult>, message: &str| {
+            let _ = result_tx.send(SubagentResult::failed(&id, &id, message));
+        };
+        let Some(previous) = self.completed.get(&id).filter(|child| {
+            child.request.parent_session_id == request.parent_session_id
+                && !child.request.owner.is_workflow()
+        }) else {
+            reject(result_tx, "completed subagent not found or not owned");
+            return;
+        };
+        if previous.result.attempt_id.as_deref() != Some(expected) {
+            reject(result_tx, "subagent attempt conflict");
+            return;
+        }
+        if !previous
+            .terminal_published
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self.runner.supports_wake()
+            || self
+                .spawn_blocked_sessions
+                .contains(&request.parent_session_id)
+        {
+            reject(result_tx, "subagent reactivation is not available");
+            return;
+        }
+        // Reuse the native persisted-state wake path, not the active-only human message route.
+        let mut next = previous.request.clone();
+        next.prompt = request.prompt;
+        next.resume_from = Some(id.clone());
+        next.fork_context = false;
+        next.parent_prompt_id = None;
+        next.cancel_token = request.cancel_token;
+        next.run_in_background = request.run_in_background;
+        next.await_to_completion = request.await_to_completion;
+        next.runtime_overrides.agent_admission = request.runtime_overrides.agent_admission;
+        let admission = self
+            .admission
+            .admit(&next, self.session_running_count(&next.parent_session_id));
+        if let AdmissionDecision::Reject(error) = &admission {
+            self.notify_limit(
+                &next,
+                SubagentLimitDecision::RejectedAtConcurrentLimit {
+                    limit: self.admission.max_concurrent(),
+                },
+            );
+            reject(result_tx, &error.message());
+            return;
+        }
+        let previous = self
+            .completed
+            .remove(&id)
+            .expect("checked completed record");
+        self.completed_order.retain(|entry| entry != &id);
+        let address = previous.agent_address.clone();
+        let spawner = previous.spawner_session_id.clone();
+        let wake_origin = Some(super::WakeOrigin {
+            agent_id: id,
+            source: super::super::types::ActiveAgentMessageSource::Human,
+            message_id: format!("parent-message-{}", uuid::Uuid::now_v7()),
+        });
+        let wake = Some(super::super::coordinator_state::DisplacedCompletedChild {
+            completed: Box::new(previous),
+        });
+        match admission {
+            AdmissionDecision::Start => self.start_child(
+                next,
+                Some(result_tx),
+                registered_tx,
+                StartOrigin::Direct,
+                address,
+                spawner,
+                wake_origin,
+                wake,
+            ),
+            AdmissionDecision::Enqueue => {
+                self.notify_limit(
+                    &next,
+                    SubagentLimitDecision::QueuedAtConcurrentLimit {
+                        limit: self.admission.max_concurrent(),
+                    },
+                );
+                let deadline = next
+                    .awaits_in_foreground()
+                    .then(|| tokio::time::Instant::now() + self.config.foreground_budget);
+                self.queued.push_back(QueuedSpawn {
+                    request: Box::new(next),
+                    queued_at: tokio::time::Instant::now(),
+                    caller: QueuedCaller::Awaiting {
+                        result_tx,
+                        deadline,
+                    },
+                    agent_address: address,
+                    spawner_session_id: spawner,
+                    wake_origin,
+                    wake,
+                });
+                if let Some(registered_tx) = registered_tx {
+                    let _ = registered_tx.send(());
+                }
+            }
+            AdmissionDecision::Reject(_) => unreachable!("rejection handled before displacement"),
+        }
+    }
+
     pub(super) fn handle_spawn(&mut self, command: SubagentSpawnRequest) {
         let SubagentSpawnRequest {
             mut request,
@@ -241,6 +352,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         self.pending.insert(
             id.clone(),
             PendingChild {
+                attempt_id: None,
                 started_at: since,
                 cancellation: request.cancel_token.clone(),
                 spawn_reply,

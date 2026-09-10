@@ -94,6 +94,37 @@ fn respond<T: Serialize>(result: Result<T, impl std::fmt::Display>) -> ExtResult
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptMessageRequest {
+    session_id: String,
+    subagent_id: String,
+    expected_attempt_id: String,
+    text: String,
+    queue: bool,
+}
+
+pub(crate) async fn handle_attempt(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    let req: AttemptMessageRequest = super::parse_params(args)?;
+    let operation = if req.queue {
+        ActiveAgentMessageOperation::Queue
+    } else {
+        ActiveAgentMessageOperation::Steer
+    };
+    respond(
+        agent
+            .message_subagent_attempt(
+                &req.session_id,
+                req.subagent_id,
+                req.expected_attempt_id,
+                req.text,
+                operation,
+            )
+            .await
+            .map(SendSubagentMessageOutcome::from),
+    )
+}
+
 pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     if !agent
         .cfg

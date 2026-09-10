@@ -509,6 +509,23 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
 
     fn resolve_send(&self, target: &ActiveMessageTarget, sender_session_id: &str) -> ResolvedSend {
         match target {
+            ActiveMessageTarget::HumanAttempt {
+                subagent_id,
+                attempt_id,
+            } => {
+                let Some(child) = self.active.get(subagent_id).filter(|child| {
+                    child.request.parent_session_id == sender_session_id
+                        && !child.request.owner.is_workflow()
+                }) else {
+                    return ResolvedSend::Fail(ActiveAgentMessageOutcome::NotFoundOrNotOwned);
+                };
+                if child.attempt_id.as_deref() != Some(attempt_id.as_str()) {
+                    return ResolvedSend::Fail(ActiveAgentMessageOutcome::NotActiveOrFinalizing);
+                }
+                ResolvedSend::Admit {
+                    subagent_id: subagent_id.clone(),
+                }
+            }
             ActiveMessageTarget::Address(address) => {
                 self.resolve_address_send(address, sender_session_id)
             }

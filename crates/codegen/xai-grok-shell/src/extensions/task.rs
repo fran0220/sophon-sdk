@@ -141,6 +141,7 @@ struct ListRunningSubagentsResponse {
 #[serde(rename_all = "camelCase")]
 struct SubagentLiveSnapshotDto {
     subagent_id: String,
+    attempt_id: Option<String>,
     parent_session_id: String,
     child_session_id: String,
     subagent_type: String,
@@ -159,6 +160,7 @@ struct SubagentLiveSnapshotDto {
 impl From<SubagentInspection> for SubagentLiveSnapshotDto {
     fn from(inspection: SubagentInspection) -> Self {
         let SubagentInspection {
+            attempt_id,
             snapshot,
             parent_session_id,
             child_session_id,
@@ -178,6 +180,7 @@ impl From<SubagentInspection> for SubagentLiveSnapshotDto {
         };
         Self {
             subagent_id: snapshot.subagent_id,
+            attempt_id,
             parent_session_id,
             child_session_id,
             subagent_type: snapshot.subagent_type,
@@ -422,6 +425,98 @@ pub(crate) async fn handle_scheduler(agent: &MvpAgent, args: &acp::ExtRequest) -
 /// Handle `x.ai/subagent/*` extension methods.
 pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
+        "x.ai/subagent/start" | "x.ai/subagent/resume" | "x.ai/subagent/reactivate" => {
+            let req: ManagedSubagentStart = parse(args)?;
+            let reactivating = args.method.as_ref() == "x.ai/subagent/reactivate";
+            if (reactivating && req.expected_attempt_id.is_none())
+                || (args.method.as_ref() == "x.ai/subagent/resume" && req.resume_from.is_none())
+                || (args.method.as_ref() == "x.ai/subagent/start" && req.resume_from.is_some())
+                || (!reactivating && req.expected_attempt_id.is_some())
+                || req.prompt.is_empty()
+                // IDs become persistence path components. SDK clients may adopt
+                // existing IDs, but cannot supply arbitrary paths.
+                || uuid::Uuid::parse_str(&req.subagent_id).is_err()
+                || req.resume_from.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+            {
+                return respond(Err::<serde_json::Value, _>(
+                    "invalid subagent lifecycle request",
+                ));
+            }
+            use xai_grok_tools::implementations::grok_build::task::types::{
+                SubagentRequest, SubagentRuntimeOverrides,
+            };
+            let request = SubagentRequest {
+                id: req.subagent_id,
+                parent_session_id: req.session_id,
+                prompt: req.prompt,
+                description: req.description,
+                subagent_type: req.subagent_type,
+                parent_prompt_id: None,
+                resume_from: req.resume_from,
+                cwd: req.cwd,
+                runtime_overrides: SubagentRuntimeOverrides {
+                    model: req.model,
+                    ..Default::default()
+                },
+                run_in_background: false,
+                surface_completion: false,
+                await_to_completion: true,
+                fork_context: false,
+                owner: Default::default(),
+                cancel_token: Default::default(),
+                spawn_root: Default::default(),
+            };
+            let result = agent
+                .start_subagent(request, req.expected_attempt_id)
+                .await
+                .map(|result| {
+                    serde_json::json!({
+                        "subagentId": result.subagent_id, "attemptId": result.attempt_id,
+                        "childSessionId": result.child_session_id,
+                        "status": if result.backgrounded { "running" } else { result.status() },
+                        "output": &*result.output, "error": result.error,
+                        "turns": result.turns, "toolCalls": result.tool_calls,
+                    })
+                });
+            respond(result)
+        }
+        "x.ai/subagent/query" => {
+            let req: ManagedSubagentTarget = parse(args)?;
+            let snapshot = agent
+                .inspect_owned_subagent(&req.session_id, &req.subagent_id)
+                .await
+                .map(|inspection| {
+                    let attempt_id = inspection.attempt_id;
+                    let dto = SubagentSnapshotDto::from_snapshot(
+                        inspection.snapshot,
+                        inspection.parent_session_id,
+                        inspection.child_session_id,
+                        SubagentProvenance {
+                            fork_parent_prompt_id: inspection.fork_parent_prompt_id,
+                            resumed_from: inspection.resumed_from,
+                        },
+                    );
+                    serde_json::json!({ "attemptId": attempt_id, "snapshot": dto })
+                });
+            respond(Ok::<_, String>(snapshot))
+        }
+        "x.ai/subagent/cancel_attempt" => {
+            let req: ManagedSubagentTarget = parse(args)?;
+            let Some(attempt) = req.expected_attempt_id else {
+                return respond(Err::<SubagentCancelOutcomeDto, _>(
+                    "expectedAttemptId is required",
+                ));
+            };
+            respond(
+                agent
+                    .cancel_subagent_attempt(&req.session_id, &req.subagent_id, &attempt)
+                    .await
+                    .map(SubagentCancelOutcomeDto::from),
+            )
+        }
+        "x.ai/subagent/message_attempt" => {
+            crate::extensions::subagent_message::handle_attempt(agent, args).await
+        }
         "x.ai/subagent/message" => crate::extensions::subagent_message::handle(agent, args).await,
         "x.ai/subagent/cancel" => {
             let req: CancelSubagentRequest = parse(args)?;
@@ -480,6 +575,28 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedSubagentStart {
+    session_id: String,
+    subagent_id: String,
+    prompt: String,
+    description: String,
+    subagent_type: String,
+    resume_from: Option<String>,
+    expected_attempt_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedSubagentTarget {
+    session_id: String,
+    subagent_id: String,
+    expected_attempt_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +635,7 @@ mod tests {
     fn subagent_live_snapshot_dto_serializes_camel_case() {
         let dto = SubagentLiveSnapshotDto {
             subagent_id: "sub-1".into(),
+            attempt_id: Some("attempt-1".into()),
             parent_session_id: "parent-1".into(),
             child_session_id: "child-1".into(),
             subagent_type: "explore".into(),
@@ -534,6 +652,7 @@ mod tests {
         };
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json["subagentId"], "sub-1");
+        assert_eq!(json["attemptId"], "attempt-1");
         assert_eq!(json["parentSessionId"], "parent-1");
         assert_eq!(json["childSessionId"], "child-1");
         assert_eq!(json["subagentType"], "explore");
@@ -551,6 +670,7 @@ mod tests {
     #[test]
     fn from_resolved_running_subagent_maps_all_fields() {
         let resolved = SubagentInspection {
+            attempt_id: Some("attempt-s".into()),
             snapshot: SubagentSnapshot {
                 subagent_id: "s".into(),
                 subagent_type: "plan".into(),
@@ -575,6 +695,7 @@ mod tests {
         };
         let dto = SubagentLiveSnapshotDto::from(resolved);
         assert_eq!(dto.subagent_id, "s");
+        assert_eq!(dto.attempt_id.as_deref(), Some("attempt-s"));
         assert_eq!(dto.parent_session_id, "p");
         assert_eq!(dto.child_session_id, "c");
         assert_eq!(dto.context_usage_pct, 50);

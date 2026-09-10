@@ -17,13 +17,18 @@ pub use xai_message_delivery_core::AgentAddress;
 pub enum ActiveMessageTarget {
     ChildId(String),
     Address(AgentAddress),
+    /// SDK human ingress names exactly one live attempt, never wakes a successor.
+    HumanAttempt {
+        subagent_id: String,
+        attempt_id: String,
+    },
 }
 
 impl ActiveMessageTarget {
     pub fn source(&self) -> ActiveAgentMessageSource {
         match self {
             Self::ChildId(_) => ActiveAgentMessageSource::Agent,
-            Self::Address(_) => ActiveAgentMessageSource::Human,
+            Self::Address(_) | Self::HumanAttempt { .. } => ActiveAgentMessageSource::Human,
         }
     }
 }
@@ -60,6 +65,22 @@ pub struct ActiveAgentMessageRequest {
 }
 
 impl ActiveAgentMessageRequest {
+    pub fn try_new_for_human_attempt(
+        subagent_id: String,
+        attempt_id: String,
+        text: impl Into<Arc<str>>,
+        operation: ActiveAgentMessageOperation,
+    ) -> Result<Self, ActiveAgentMessageOutcome> {
+        Self::try_from_parts(
+            ActiveMessageTarget::HumanAttempt {
+                subagent_id,
+                attempt_id,
+            },
+            text,
+            operation,
+        )
+    }
+
     pub fn try_new(
         subagent_id: impl Into<String>,
         text: impl Into<Arc<str>>,

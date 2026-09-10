@@ -522,9 +522,11 @@ impl SessionActor {
             .cloned()
             .collect::<Vec<_>>();
         environment_header_names.sort();
+        let model = self.effective_model_facts(&sampling);
         Ok(crate::session::commands::SessionEffectiveConfigSnapshot {
             session_id: self.session_info.id.0.to_string(),
             version: self.tool_context.config_clock.snapshot(),
+            model,
             route: crate::session::commands::EffectiveRouteFacts {
                 base_url: sampling.base_url,
                 model: sampling.model,

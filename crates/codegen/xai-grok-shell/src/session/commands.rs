@@ -157,11 +157,32 @@ pub struct EffectiveRouteFacts {
     pub environment_header_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveModelFacts {
+    pub max_completion_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub stream_tool_calls: bool,
+    pub active_agent_type: String,
+    pub auto_compact_threshold_percent: u8,
+    pub max_retries: u32,
+    pub rate_limit_retry_threshold: u32,
+    pub subagent_rate_limit_max_attempts: u32,
+    pub subagent_rate_limit_max_total_wait_secs: u64,
+    pub inference_idle_timeout_secs: u64,
+    pub transient_retry_enabled: bool,
+    pub transient_retries_per_step: u32,
+    pub transient_retries_per_prompt: u32,
+    pub transient_retry_window_secs: u64,
+    pub retry_only_before_output: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionEffectiveConfigSnapshot {
     pub session_id: String,
     pub version: xai_prompt_queue::QueueVersion,
     pub route: EffectiveRouteFacts,
+    pub model: EffectiveModelFacts,
     pub backend_search_active: bool,
     /// Configuration already attached to the active FIFO batch.
     pub active_batch_search: SearchOverrideFacts,
@@ -418,6 +439,10 @@ impl From<SkillUpdateKind> for AdvertiseTrigger {
     }
 }
 pub enum SessionCommand {
+    ManageWorkflow {
+        action: crate::extensions::workflow::Action,
+        respond_to: tokio::sync::oneshot::Sender<anyhow::Result<serde_json::Value>>,
+    },
     Initialize {
         system_prompt: String,
         /// Whether the fresh prompt came from explicit systemPromptOverride metadata.

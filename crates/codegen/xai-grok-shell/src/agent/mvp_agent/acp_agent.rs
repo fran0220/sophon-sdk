@@ -2286,6 +2286,9 @@ impl acp::Agent for MvpAgent {
             s if s.starts_with(crate::extensions::mcp::mcp_methods::PREFIX) => {
                 crate::extensions::mcp::handle(self, &args).await
             }
+            "x.ai/workflow/manage" => {
+                crate::extensions::workflow::handle(self, &args).await
+            }
             s if s.starts_with("x.ai/task/") => {
                 crate::extensions::task::handle(self, &args).await
             }

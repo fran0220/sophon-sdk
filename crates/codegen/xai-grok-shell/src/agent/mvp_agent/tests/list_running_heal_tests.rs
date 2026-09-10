@@ -49,6 +49,7 @@ fn write_meta(dir: &std::path::Path, meta: &SubagentMeta) {
 
 fn running_inspection(id: &str, parent: &str) -> SubagentInspection {
     SubagentInspection {
+        attempt_id: None,
         snapshot: SubagentSnapshot {
             subagent_id: id.to_string(),
             description: "task".to_string(),

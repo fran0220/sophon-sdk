@@ -4100,3 +4100,250 @@ async fn workflow_spawns_bypass_the_session_concurrent_limit() {
     );
     harness.actor.abort();
 }
+
+#[tokio::test]
+async fn managed_stale_attempt_cancel_cannot_cancel_reactivated_successor() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = parent_backend(&harness);
+    let first = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .spawn(request("managed", false), None)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    harness.finish.send(()).unwrap();
+    let first = first.await.unwrap();
+    assert!(first.success);
+    let first_attempt = first.attempt_id.unwrap();
+    assert_eq!(
+        backend
+            .inspect("managed")
+            .await
+            .unwrap()
+            .attempt_id
+            .as_deref(),
+        Some(first_attempt.as_str())
+    );
+
+    let foreign = session_backend(&harness, "foreign");
+    let rejected = foreign
+        .reactivate(request("managed", false), first_attempt.clone())
+        .await
+        .unwrap();
+    assert!(!rejected.success);
+    let successor = tokio::spawn({
+        let backend = backend.clone();
+        let expected = first_attempt.clone();
+        async move {
+            backend
+                .reactivate(request("managed", false), expected)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    let current = backend.inspect("managed").await.unwrap();
+    let current_attempt = current.attempt_id.unwrap();
+    assert_ne!(first_attempt, current_attempt);
+    assert!(
+        backend
+            .cancel_attempt("managed", &first_attempt)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        foreign
+            .cancel_attempt("managed", &current_attempt)
+            .await
+            .unwrap(),
+        SubagentCancelOutcome::NotFound
+    );
+    assert!(
+        backend
+            .query("managed", false, None)
+            .await
+            .unwrap()
+            .is_running()
+    );
+
+    let stale_message = ActiveAgentMessageRequest::try_new_for_human_attempt(
+        "managed".into(),
+        first_attempt,
+        "do not deliver",
+        ActiveAgentMessageOperation::Queue,
+    )
+    .unwrap();
+    assert_eq!(
+        backend.send_active_message(stale_message).await,
+        ActiveAgentMessageOutcome::NotActiveOrFinalizing
+    );
+    assert!(harness.admitted_messages.try_recv().is_err());
+    let message = ActiveAgentMessageRequest::try_new_for_human_attempt(
+        "managed".into(),
+        current_attempt.clone(),
+        "deliver this",
+        ActiveAgentMessageOperation::Queue,
+    )
+    .unwrap();
+    assert_eq!(
+        foreign.send_active_message(message.clone()).await,
+        ActiveAgentMessageOutcome::NotFoundOrNotOwned
+    );
+    assert!(matches!(
+        backend.send_active_message(message).await,
+        ActiveAgentMessageOutcome::Accepted { .. }
+    ));
+    assert_eq!(
+        harness.admitted_messages.recv().await.unwrap().1,
+        "deliver this"
+    );
+    harness.finish.send(()).unwrap();
+    let successor = successor.await.unwrap();
+    assert!(successor.success);
+    assert_eq!(
+        successor.attempt_id.as_deref(),
+        Some(current_attempt.as_str())
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn managed_reactivation_admission_rejection_retains_completed_attempt() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Fail));
+    let backend = parent_backend(&harness);
+    let first = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .spawn(request("managed", false), None)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    harness.finish.send(()).unwrap();
+    let attempt = first.await.unwrap().attempt_id.unwrap();
+    let blocker = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .spawn(request("blocker", false), None)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    let rejected = backend
+        .reactivate(request("managed", false), attempt.clone())
+        .await
+        .unwrap();
+    assert!(!rejected.success);
+    assert!(rejected.attempt_id.is_none());
+    assert_eq!(
+        backend
+            .inspect("managed")
+            .await
+            .unwrap()
+            .attempt_id
+            .as_deref(),
+        Some(attempt.as_str())
+    );
+    harness.finish.send(()).unwrap();
+    assert!(blocker.await.unwrap().success);
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn managed_completion_does_not_retain_agent_admission_in_terminal_cache() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let admission = crate::management::admission::AdmissionController::default();
+    let mut req = request("managed", false);
+    req.runtime_overrides.agent_admission = Some(
+        admission
+            .try_admit(crate::management::admission::AdmissionSource::Human)
+            .unwrap(),
+    );
+    let spawn = tokio::spawn({
+        let backend = parent_backend(&harness);
+        async move { backend.spawn(req, None).await.unwrap() }
+    });
+    drop(harness.requests.recv().await.unwrap());
+    harness.started.recv().await.unwrap();
+    admission.begin_quiesce();
+    assert!(
+        admission
+            .try_admit(crate::management::admission::AdmissionSource::Human)
+            .is_err()
+    );
+    harness.finish.send(()).unwrap();
+    assert!(spawn.await.unwrap().success);
+    assert_eq!(admission.snapshot().active, 0);
+    assert!(harness.backend.inspect("managed").await.is_some());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn managed_reactivation_obeys_native_queue_admission() {
+    let mut harness = harness_with_config(false, limited(1, LimitBehavior::Queue));
+    let backend = parent_backend(&harness);
+    let first = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .spawn(request("managed", false), None)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    harness.finish.send(()).unwrap();
+    let previous = first.await.unwrap().attempt_id.unwrap();
+    let blocker = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            backend
+                .spawn(request("blocker", false), None)
+                .await
+                .unwrap()
+        }
+    });
+    harness.started.recv().await.unwrap();
+    let queued = tokio::spawn({
+        let backend = backend.clone();
+        let previous = previous.clone();
+        async move {
+            backend
+                .reactivate(request("managed", false), previous)
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = backend.inspect("managed").await.unwrap();
+            if matches!(
+                snapshot.snapshot.status,
+                SubagentSnapshotStatus::Initializing
+            ) {
+                assert!(snapshot.attempt_id.is_none());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(backend.cancel_attempt("managed", &previous).await.is_err());
+    harness.finish_one.send("blocker".into()).unwrap();
+    assert!(blocker.await.unwrap().success);
+    assert_eq!(harness.started.recv().await.unwrap(), "managed");
+    harness.finish_one.send("managed".into()).unwrap();
+    let result = queued.await.unwrap();
+    assert!(result.success);
+    assert_ne!(result.attempt_id.as_deref(), Some(previous.as_str()));
+    harness.actor.abort();
+}
