@@ -293,6 +293,57 @@ diff for its exact file set, so either boundary detects drift.
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
 
+## 1.0.24 validation (2026-09-10, Linux x86_64)
+
+Imported the complete public commit `37949780c144e37df692e3d669051a21fec24f20`
+as a merge ancestor, with `SOURCE_REV`
+`c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`. The SDK public API and portable
+format remain unchanged; the facade package stays at 0.4.1. Public binary
+release 1.0.25 is not claimed as the source baseline.
+
+- Before merging, the old upstream-path/digest check passed and the worktree
+  was clean. Historical test failures below were used as the baseline record;
+  the old full test suite was not rebuilt before import.
+- `scripts/check-sdk-boundary.sh` passes all seven digests and untouched-tree
+  verification. Normal dependencies exclude the TUI; 2,511 SDK public rustdoc
+  signatures contain no ACP/TUI type links.
+- SDK: 24 unit tests and all four integration binaries pass (three provider
+  protocols, final exit, lifecycle, portable conversation/history). The latter
+  caught the new opt-in user-echo capability: the SDK now requests it, preserving
+  exactly-once live user records after the acknowledged history boundary.
+- Prompt queue: 15 tests pass. Tools: 3,236 pass, 2 ignored. New scheduler
+  regressions verify SDK foreground recurring versus native/background routing,
+  failed-ingress cadence preservation and admission-permit lifetime.
+- Shell: 6,683 pass, 1 fails, 5 ignored with four test threads. The remaining
+  `parse_list_req_forces_kind_under_process_chat_mode_only` failure is the
+  previously documented empty `kind` filter assertion; its file is byte-for-byte
+  upstream. No assertion or production behavior was changed to hide it.
+  MCP startup cancellation, Goal, typed FIFO/CAS, portable persistence and all
+  four repaired image-strip concurrency tests pass.
+- Agent/config/hooks/MCP/memory libraries pass 559/216/271/223/368 tests.
+  External-auth conforming/expired-credential and image-recovery integration
+  binaries also pass. These use local fixtures, not live provider credentials.
+- Production `cargo clippy --locked -p sophon-sdk -p xai-grok-shell
+  -p xai-grok-tools -p xai-prompt-queue --lib -- -D warnings` passes.
+  All-target Clippy exposed and prompted repair of duplicate benchmark fields;
+  four pre-existing test lints in `session/unified_list/mod.rs` remain (boolean
+  assertions and identical branches). No lints were suppressed.
+- Pager and PTY harness build. Native `welcome.yaml` and
+  `slash_resize_storm.yaml` pass, including 6-row/40-column resizing. Captures
+  were inspected; the SVG rasterizer font was fitted to the capture's fixed
+  cell width, without changing native UI styles or contents.
+- `cargo test --locked -p sophon-sdk --doc` succeeds but discovers zero tests;
+  it does not validate README examples. Modified Rust files pass rustfmt checks.
+- Shell integration builds require `--features xai-grok-shell/test-support`.
+  Test commands used `env -u GROK_AUTH RUST_MIN_STACK=33554432
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
+  Git fixture runs also used process-local `GIT_CONFIG_COUNT=2`,
+  `GIT_CONFIG_KEY_0=commit.gpgsign`, `GIT_CONFIG_VALUE_0=false`,
+  `GIT_CONFIG_KEY_1=init.defaultBranch`, `GIT_CONFIG_VALUE_1=main`.
+- Windows/macOS execution and live external-provider calls were not exercised;
+  portability patches are retained. This is targeted SDK/runtime validation,
+  not a claim that every workspace crate or integration scenario was tested.
+
 ## 1.0.16 validation (2026-09-05, Linux x86_64)
 
 - `scripts/check-upstream-sync.sh`: untouched paths and all six digests pass.
