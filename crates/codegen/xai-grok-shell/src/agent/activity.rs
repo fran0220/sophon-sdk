@@ -31,12 +31,9 @@ use crate::session::{SessionCommand, SessionHandle, ShutdownKind};
 /// How often [`AgentActivity::flush_all_sessions`] re-polls actors that have not yet exited.
 const FLUSH_POLL: Duration = Duration::from_millis(50);
 
-/// Default bound on a process-exit session flush ([`AgentActivity::flush_all_sessions`]).
-/// Leader auto-update shutdown and the in-process agent's `/exit` / headless-quit path both use it.
+/// Default bound on a process-exit session flush ([`AgentActivity::flush_all_sessions`]). Leader auto-update shutdown and the in-process agent's `/exit` / headless-quit path both use it.
 /// One wedged actor therefore delays exit by the same amount everywhere; sessions are normally idle and the flush completes in milliseconds.
-///
-/// Known gap: a `SessionEnd` hook configured with a longer `timeout` than this is still cut off at the grace.
-/// Aligning the two needs the hook registry's configured timeouts at flush time, which this layer does not see.
+/// Known gap: a `SessionEnd` hook configured with a longer `timeout` than this is still cut off at the grace. Aligning the two needs the hook registry's configured timeouts at flush time, which this layer does not see.
 pub const SESSION_FLUSH_GRACE: Duration = Duration::from_secs(10);
 
 /// Authoritative Agent-wide drain state. Session rows are actor round-trips;
@@ -413,7 +410,6 @@ impl AgentActivity {
     }
 
     /// Lock the session list, dropping entries whose actor has exited.
-    ///
     /// Purging happens only here, so in modes with no periodic reader (no auto-update checker) a dead entry lingers until the next register.
     /// The leak is bounded and tiny: a sender handle and two `Arc`s per entry.
     fn lock_live_sessions(&self) -> std::sync::MutexGuard<'_, Vec<SessionActivityEntry>> {
@@ -584,7 +580,11 @@ mod tests {
         // Simulated actor: exits (drops rx) when it receives Shutdown.
         let actor = spawn_actor(rx, Duration::ZERO);
 
-        assert!(activity.flush_all_sessions_checked(Duration::from_secs(5)).await);
+        assert!(
+            activity
+                .flush_all_sessions_checked(Duration::from_secs(5))
+                .await
+        );
         assert!(actor.await.unwrap(), "actor should have received Shutdown");
     }
 
@@ -660,7 +660,11 @@ mod tests {
         let (_rx, _prompt_id, _pending) = register_raw(&activity, "s1");
 
         let start = tokio::time::Instant::now();
-        assert!(!activity.flush_all_sessions_checked(Duration::from_secs(2)).await);
+        assert!(
+            !activity
+                .flush_all_sessions_checked(Duration::from_secs(2))
+                .await
+        );
         assert!(
             start.elapsed() >= Duration::from_secs(2),
             "flush should wait out the grace period"

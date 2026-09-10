@@ -1072,6 +1072,7 @@ fn queue_entry_source(id: &str) -> QueueEntrySource {
         PromptOrigin::TaskCompleted { .. }
         | PromptOrigin::SubagentCompleted { .. }
         | PromptOrigin::ParentAgentMessage { .. }
+        | PromptOrigin::ParentHumanMessage { .. }
         | PromptOrigin::WorkflowCompleted { .. }
         | PromptOrigin::NotificationDrain
         | PromptOrigin::GoalSummary
@@ -2266,6 +2267,23 @@ pub(crate) fn mcp_inventory_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_messages_are_internal_queue_entries() {
+        assert_eq!(queue_entry_source("user-42"), QueueEntrySource::Human);
+        assert_eq!(
+            queue_entry_source("parent-message-42"),
+            QueueEntrySource::Internal
+        );
+        assert_eq!(
+            queue_entry_source("parent-agent-message-42"),
+            QueueEntrySource::Internal
+        );
+        assert_eq!(
+            queue_entry_source("scheduler-fired-42"),
+            QueueEntrySource::Scheduler
+        );
+    }
 
     #[test]
     fn queue_conflict_projects_authoritative_version_and_snapshot() {

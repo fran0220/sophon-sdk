@@ -230,6 +230,7 @@ pub struct ScheduledTask {
     pub recurring: bool,
     #[serde(default)]
     pub durable: bool,
+    /// SDK foreground routing preference; native scheduler fires still run in children.
     #[serde(default)]
     pub foreground: bool,
     pub created_at: DateTime<Utc>,
@@ -239,10 +240,9 @@ pub struct ScheduledTask {
     pub last_subagent_id: Option<String>,
     #[serde(default)]
     pub iterations_since_fresh: u32,
-    /// Set when the prompt is patched: the next fire starts a fresh
-    /// transcript instead of resuming the old task's. The anchor itself is
-    /// kept until then so the in-flight guard can still see a running
-    /// iteration.
+    /// Set when the prompt is patched: the next fire starts a fresh transcript instead of resuming
+    /// the old task's. The anchor itself is kept until then so the in-flight guard can still see a
+    /// running iteration.
     #[serde(default)]
     pub chain_reset_pending: bool,
 }
@@ -308,10 +308,9 @@ impl ScheduledTask {
         anchor + chrono::Duration::seconds(self.interval_secs as i64)
     }
 
-    /// Next moment the actor must wake for this task: the sooner of the next fire and the
-    /// auto-expiry deadline. Sleeping purely on `next_fire_at` would let a task whose interval
-    /// stretches past `expires_at` outlive the TTL (an 8-day interval must still expire at day
-    /// 7, not when its first fire comes due).
+    /// Next moment the actor must wake for this task: the sooner of the next fire and the auto-expiry deadline. Sleeping
+    /// purely on `next_fire_at` would let a task whose interval stretches past `expires_at` outlive the TTL (an 8-day
+    /// interval must still expire at day 7, not when its first fire comes due).
     pub fn next_wake_at(&self) -> DateTime<Utc> {
         match self.expires_at {
             Some(expires_at) => self.next_fire_at().min(expires_at),
@@ -501,6 +500,7 @@ mod tests {
     fn new_recurring_task_has_ttl_expiry() {
         let task = ScheduledTask::new(300, "check deploy".into(), true, false);
         assert!(task.expires_at.is_some());
+        assert!(!task.foreground);
         let expiry = task.expires_at.unwrap();
         let diff = expiry - task.created_at;
         assert_eq!(diff.num_days(), RECURRING_TASK_TTL_DAYS);
@@ -554,6 +554,12 @@ mod tests {
                        "lastFiredAt":null,"expiresAt":null}"#;
         let task: ScheduledTask = serde_json::from_str(json).unwrap();
         assert!(task.recurring && !task.durable);
+        assert!(!task.foreground);
+        let mut task = task;
+        task.foreground = true;
+        let restored: ScheduledTask =
+            serde_json::from_value(serde_json::to_value(task).unwrap()).unwrap();
+        assert!(restored.foreground);
     }
 
     #[test]

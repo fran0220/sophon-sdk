@@ -138,9 +138,17 @@ only those nonexistent/unused imports so the upstream shell test target
 compiles; the test and production implementation are unchanged.
 The 1.0.16 image payload regression uses `if let` instead of a single-arm
 `match` to satisfy the repository's Clippy policy without changing its assertion.
+At 1.0.24, four image-strip tests drive completion concurrently while holding
+the rewrite gate, then await it with a deadline after releasing the gate.
+Upstream now awaits strip persistence inline; the old tests deadlock by awaiting
+completion while holding its required mutex. Production ordering and all
+persistence/rewind assertions remain intact. The session-list benchmark also
+removes duplicate `agent_id`/`attempt_id` initializer fields from the snapshot.
 
 Approved files (digest: `public-snapshot-repairs.sha256`):
 
+- `crates/codegen/xai-grok-shell/benches/session_list.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/image_strip_tests.rs`
 - `crates/codegen/xai-grok-shell/src/upload/memory_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs`
 
@@ -231,6 +239,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_end.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_task.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs`
@@ -252,6 +261,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/tools/tool_context.rs`
 - `crates/codegen/xai-grok-subagent-resolution/src/overrides.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`
@@ -274,7 +284,7 @@ diff for its exact file set, so either boundary detects drift.
 
 1. Import the complete public snapshot and update
    `UPSTREAM_GROK_BUILD_COMMIT` and `SOURCE_REV`.
-2. Reconcile only the six groups above with the new upstream paths.
+2. Reconcile only the seven groups above with the new upstream paths.
 3. Run the focused provider, hermetic-discovery, Windows compile, actor
    management, and SDK checks.
 4. Regenerate each digest independently using the corresponding exact array

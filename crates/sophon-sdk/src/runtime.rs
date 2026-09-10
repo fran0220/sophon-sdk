@@ -790,8 +790,14 @@ async fn start_worker(
     let (gateway_tx, gateway_rx) = mpsc::unbounded_channel();
     let gateway = AcpGatewaySender::new(gateway_tx);
     let agent = Rc::new(
-        MvpAgent::new(gateway.clone(), &grok_config, auth_manager, Some(models))
-            .map_err(|error| Error::Start(error.to_string()))?,
+        MvpAgent::new(
+            gateway.clone(),
+            &grok_config,
+            auth_manager,
+            Some(models),
+            None,
+        )
+        .map_err(|error| Error::Start(error.to_string()))?,
     );
     let (exit_callbacks, retired) = watch::channel(false);
     let client = EmbeddedClient {
@@ -811,7 +817,13 @@ async fn start_worker(
     let initialized = agent
         .initialize(
             acp::InitializeRequest::new(acp::ProtocolVersion::V1)
-                .client_capabilities(acp::ClientCapabilities::new().terminal(false))
+                .client_capabilities(
+                    acp::ClientCapabilities::new().terminal(false).meta(
+                        serde_json::json!({ "x.ai/userMessageEcho": true })
+                            .as_object()
+                            .cloned(),
+                    ),
+                )
                 .meta(
                     serde_json::json!({
                         "startupHints": { "nonInteractive": true },

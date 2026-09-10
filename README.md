@@ -56,19 +56,20 @@ actor-authoritative typed management: native FIFO CAS, Agent-wide
 admission/quiesce, scheduler/tasks, rewind, health, credential-free effective
 configuration, hooks/MCP and subagent observation. Stable management no longer
 requires downstream `x.ai/*` JSON; the raw extension seam remains for new,
-experimental and uncommon operations. The upstream tree is pinned by
+experimental and uncommon operations. A seventh protects portable conversation
+capture and import. The upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`72a61251fcffb464bcc687aeb5a998e5a98ec0c9` (crate metadata 1.0.16, `SOURCE_REV`
-`a549186d9d39311f2d3ee4208db62af8c65aa476`). This is an independent
+`37949780c144e37df692e3d669051a21fec24f20` (crate metadata 1.0.24, `SOURCE_REV`
+`c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`). This is an independent
 redistribution, not an official xAI SDK.
 
-The synchronized source includes the complete 1.0.16 public snapshot. New
-runtime improvements include safe-point parent-to-child steering, startup-ready
-subagent messaging, workflow liveness, background session initialization,
-MCP OAuth deadlock repair and protocol updates, serialized model/effort options,
-and loop/workflow context preservation during compaction. SDK admission, queue
-versions, authored prompts and provider isolation remain intact. Hermetic
-embeddings exclude ambient system policies and detached connection prewarming.
+The synchronized source includes the complete 1.0.24 public snapshot. Runtime
+improvements include cancellable MCP initialization ownership, reactivated
+subagent attempts, durable task snapshots, unified model behavior resolution,
+opt-in Memory V2, and tool safety fixes. SDK admission, queue versions,
+foreground scheduling, portable conversations, authored prompts and provider
+isolation remain intact. Hermetic embeddings exclude ambient system policies,
+first-party managed-policy fetching and detached connection prewarming.
 TUI-only features remain available to the upstream application but are
 deliberately not mirrored by the SDK. See the
 [SDK boundary and usage guide](crates/sophon-sdk/README.md).

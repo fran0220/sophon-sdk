@@ -8,10 +8,10 @@ official xAI SDK.
 
 Current source identity:
 
-- public product source baseline: 1.0.16
-- public Grok Build commit: `72a61251fcffb464bcc687aeb5a998e5a98ec0c9`
-- public crate metadata: 1.0.16
-- embedded monorepo revision: `a549186d9d39311f2d3ee4208db62af8c65aa476`
+- public product source baseline: 1.0.24
+- public Grok Build commit: `37949780c144e37df692e3d669051a21fec24f20`
+- public crate metadata: 1.0.24
+- embedded monorepo revision: `c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`
 
 ## Use it
 
@@ -602,6 +602,27 @@ The SDK then overlays only its explicit model/media routes and headless embeddin
 mode. Set `GROK_HOME` before starting an Agent to give the embedding its own
 upstream data directory rather than the default `~/.grok`.
 
+## What the 1.0.24 source sync contributes
+
+The complete snapshot adds cancellable MCP generations with guarded state
+publication, reactivated subagent attempts, durable background-task snapshots,
+unified model behavior resolution, opt-in Memory V2, and Git/ripgrep safety
+fixes. Authentication now lives in upstream `xai-grok-login`; the SDK continues
+to supply its explicit provider catalog without CLI bootstrap prefetch.
+
+The SDK retains its existing public API. Foreground recurring tasks continue
+through the admitted SDK ingress even though upstream removed that task option;
+native sessions retain upstream child execution. Parent-forwarded human messages
+remain internal queue entries rather than editable direct-user submissions.
+The embedding explicitly opts into native user-message echo so live history
+records still follow the acknowledged snapshot boundary exactly once.
+MCP startup ownership is cancelled before final teardown, and new managed-policy
+fetch entry points obey hermetic mode. Portable format v1 remains a conversation
+transfer, not a clone of live orchestration or filesystem rewind custody.
+
+New upstream daemon and TUI features are not added to the SDK public surface.
+Binary release labels (including 1.0.25) do not change the pinned source identity.
+
 ## What the 1.0.16 source sync contributes
 
 The complete public snapshot adds safe-point parent-to-child steering and
@@ -644,12 +665,16 @@ then adapts only this facade for public API changes.
 
 ```sh
 crates/sophon-sdk/scripts/check-sdk-boundary.sh
-CARGO_INCREMENTAL=0 cargo clippy --locked -p xai-prompt-queue -p xai-grok-tools -p xai-grok-shell -p sophon-sdk --all-targets -- -D warnings
+CARGO_INCREMENTAL=0 cargo clippy --locked -p xai-prompt-queue -p xai-grok-tools -p xai-grok-shell -p sophon-sdk --all-targets --features xai-grok-shell/test-support -- -D warnings
 CARGO_INCREMENTAL=0 cargo test --locked -p xai-prompt-queue
 CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-tools
-CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-shell
+env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0 cargo test --locked -p xai-grok-shell --features test-support
 CARGO_INCREMENTAL=0 cargo test --locked -p sophon-sdk
 ```
+
+The upstream shell integration harness needs `test-support`. Known upstream
+test/lint failures and the exact validated scope are recorded in
+[`UPSTREAM_DIVERGENCE.md`](UPSTREAM_DIVERGENCE.md).
 
 The crate is consumed from this repository because Grok Build's workspace
 crates are not independently published to crates.io. Official npm packages and

@@ -69,6 +69,8 @@ windows_portability=(
 )
 
 public_snapshot_repairs=(
+  crates/codegen/xai-grok-shell/benches/session_list.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_tests/image_strip_tests.rs
   crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs
 )
@@ -108,6 +110,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_end.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_report_slot_tests.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_task.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs
@@ -129,6 +132,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/tools/tool_context.rs
   crates/codegen/xai-grok-subagent-resolution/src/overrides.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs
