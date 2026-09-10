@@ -665,33 +665,35 @@ pub(crate) fn format_subagent_snapshot(
                 raw_output_bytes,
             })
         }
-        SubagentSnapshotStatus::Running {
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            error_count,
-        } => {
+        SubagentSnapshotStatus::Running { progress } => {
             let started = format_epoch_ms_as_rfc3339(snap.started_at_epoch_ms);
-            let tools_str = if tools_used.is_empty() {
-                "none yet".to_string()
+            let progress_text = if let Some(p) = progress {
+                let tools_str = if p.tools_used.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    p.tools_used.join(", ")
+                };
+                format!(
+                    "Progress: turn {}, {} tool calls, {}K/{}K tokens ({}% context)\n\
+                     Tools used: {tools_str}\n\
+                     Errors: {}",
+                    p.turn_count,
+                    p.tool_call_count,
+                    p.tokens_used / 1000,
+                    p.context_window_tokens / 1000,
+                    p.context_usage_pct,
+                    p.error_count,
+                )
             } else {
-                tools_used.join(", ")
+                "Progress: unavailable".to_string()
             };
-            let tokens_k = tokens_used / 1000;
-            let capacity_k = context_window_tokens / 1000;
             // Measure body only — wait-hint is harness advisory, not task output.
             let body = format!(
                 "Subagent is still running.\n\
                  Type: {}\n\
                  Description: {}\n\
                  Elapsed: {:.1}s\n\
-                 Progress: turn {turn_count}, {tool_call_count} tool calls, \
-                 {tokens_k}K/{capacity_k}K tokens ({context_usage_pct}% context)\n\
-                 Tools used: {tools_str}\n\
-                 Errors: {error_count}",
+                 {progress_text}",
                 snap.subagent_type,
                 snap.description,
                 snap.duration_ms as f64 / 1000.0,
@@ -1078,6 +1080,7 @@ mod tests {
         BackgroundHandle, KillOutcome, TaskSnapshot, TerminalBackend, TerminalRunRequest,
         TerminalRunResult,
     };
+    use crate::implementations::grok_build::task::coordinator::SubagentProgress;
     use crate::types::resources::Resources;
     use crate::types::tool_metadata::ToolMetadata;
     use crate::types::tool_metadata::test_ctx;
@@ -2146,6 +2149,30 @@ mod tests {
     }
 
     #[test]
+    fn format_running_subagent_without_signals_reports_unavailable() {
+        let snap = SubagentSnapshot {
+            subagent_id: "sub-no-signals".into(),
+            description: "inspect".into(),
+            subagent_type: "explore".into(),
+            persona: None,
+            status: SubagentSnapshotStatus::Running { progress: None },
+            started_at_epoch_ms: 1_700_000_000_000,
+            duration_ms: 500,
+        };
+        let TaskOutputOutput::Result(result) =
+            format_subagent_snapshot(&snap, WaitHint::NotRequested)
+        else {
+            panic!("expected running result");
+        };
+        assert_eq!(result.status, "running");
+        assert!(result.ended.is_none());
+        assert!(result.output.contains("Progress: unavailable"));
+        assert!(!result.output.contains("turn 0"));
+        assert!(!result.output.contains("Errors: 0"));
+        assert!(!result.output.contains("none yet"));
+    }
+
+    #[test]
     fn format_running_subagent_includes_progress_fields() {
         let snap = SubagentSnapshot {
             subagent_id: "sub-abc".to_string(),
@@ -2153,17 +2180,19 @@ mod tests {
             subagent_type: "explore".to_string(),
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 3,
-                tool_call_count: 12,
-                tokens_used: 45_000,
-                context_window_tokens: 128_000,
-                context_usage_pct: 35,
-                tools_used: vec![
-                    "bash".to_string(),
-                    "read_file".to_string(),
-                    "grep".to_string(),
-                ],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 3,
+                    tool_call_count: 12,
+                    tokens_used: 45_000,
+                    context_window_tokens: 128_000,
+                    context_usage_pct: 35,
+                    tools_used: vec![
+                        "bash".to_string(),
+                        "read_file".to_string(),
+                        "grep".to_string(),
+                    ],
+                    error_count: 0,
+                }),
             },
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 12_500,
@@ -2222,13 +2251,15 @@ mod tests {
             subagent_type: "explore".to_string(),
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 1,
-                tool_call_count: 2,
-                tokens_used: 3_000,
-                context_window_tokens: 128_000,
-                context_usage_pct: 2,
-                tools_used: vec!["bash".to_string()],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 1,
+                    tool_call_count: 2,
+                    tokens_used: 3_000,
+                    context_window_tokens: 128_000,
+                    context_usage_pct: 2,
+                    tools_used: vec!["bash".to_string()],
+                    error_count: 0,
+                }),
             },
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 1_000,
@@ -2280,13 +2311,15 @@ mod tests {
             subagent_type: "general-purpose".to_string(),
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 0,
-                tool_call_count: 0,
-                tokens_used: 0,
-                context_window_tokens: 128_000,
-                context_usage_pct: 0,
-                tools_used: vec![],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 0,
+                    tool_call_count: 0,
+                    tokens_used: 0,
+                    context_window_tokens: 128_000,
+                    context_usage_pct: 0,
+                    tools_used: vec![],
+                    error_count: 0,
+                }),
             },
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 500,
@@ -2476,13 +2509,15 @@ mod tests {
                     description: "exploring".to_string(),
                     subagent_type: "general-purpose".to_string(),
                     status: SubagentSnapshotStatus::Running {
-                        turn_count: 2,
-                        tool_call_count: 5,
-                        tokens_used: 10_000,
-                        context_window_tokens: 128_000,
-                        context_usage_pct: 8,
-                        tools_used: vec!["grep".to_string()],
-                        error_count: 0,
+                        progress: Some(SubagentProgress {
+                            turn_count: 2,
+                            tool_call_count: 5,
+                            tokens_used: 10_000,
+                            context_window_tokens: 128_000,
+                            context_usage_pct: 8,
+                            tools_used: vec!["grep".to_string()],
+                            error_count: 0,
+                        }),
                     },
                     started_at_epoch_ms: 1_700_000_000_000,
                     duration_ms: 3000,
@@ -2617,13 +2652,15 @@ mod tests {
                     description: "exploring".to_string(),
                     subagent_type: "general-purpose".to_string(),
                     status: SubagentSnapshotStatus::Running {
-                        turn_count: 2,
-                        tool_call_count: 5,
-                        tokens_used: 10_000,
-                        context_window_tokens: 128_000,
-                        context_usage_pct: 8,
-                        tools_used: vec!["grep".to_string()],
-                        error_count: 0,
+                        progress: Some(SubagentProgress {
+                            turn_count: 2,
+                            tool_call_count: 5,
+                            tokens_used: 10_000,
+                            context_window_tokens: 128_000,
+                            context_usage_pct: 8,
+                            tools_used: vec!["grep".to_string()],
+                            error_count: 0,
+                        }),
                     },
                     started_at_epoch_ms: 1_700_000_000_000,
                     duration_ms: 3000,

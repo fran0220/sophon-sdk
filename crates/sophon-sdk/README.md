@@ -106,6 +106,18 @@ maintaining parallel compatibility registries:
   attempt of the same child. Message does neither. Start/resume await native
   results, possibly a foreground-budget handoff rather than completion; retain
   the request ID to query concurrently. An absent attempt ID is not fabricated.
+- `SubagentSnapshot` exposes optional `turn_count`, `tool_call_count`,
+  `tokens_used`, `context_window_tokens`, `context_usage_pct`, `tools_used`,
+  `error_count`, and `fork_parent_prompt_id`. Running measurements and attempt
+  identity come from the same native inspection. Completed snapshots normalize
+  native `turns`/`toolCalls` into the two count fields; they have no terminal
+  context/tool-name/error measurements. Initializing/failed/cancelled counts
+  remain `None`. `tokens_used` is current context occupancy, **not spend**.
+  `RunningSubagent`'s seven progress fields are also optional: missing signals
+  remain `None`, while measured zeros and an observed empty tool list remain
+  `Some(0)`/`Some(vec![])`. Do not default these values to zero for display.
+  This Git revision changes earlier 0.5.0 progress field types; pin the revision,
+  not just the package version.
 - Use `session.mcp()` for `list(cache)`, `auth_status`, `trigger_auth`, `setup`,
   `set_enabled`, `set_tool_enabled`, `upsert`, `delete`, `read_resource`, and
   `wait_ready`. Mutations acknowledge native application, **not readiness**.

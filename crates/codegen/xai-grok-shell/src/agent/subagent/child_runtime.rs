@@ -25,24 +25,20 @@ pub(crate) struct ShellChildRuntime {
 }
 
 impl ChildControl for ShellChildRuntime {
-    type ProgressFuture = LocalBoxFuture<SubagentProgress>;
+    type ProgressFuture = LocalBoxFuture<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
         let signals = self.child_signals.clone();
         Box::pin(async move {
-            signals
-                .snapshot()
-                .await
-                .map(|snapshot| SubagentProgress {
-                    turn_count: snapshot.turn_count,
-                    tool_call_count: snapshot.tool_call_count,
-                    tokens_used: snapshot.context_tokens_used,
-                    context_window_tokens: snapshot.context_window_tokens,
-                    context_usage_pct: snapshot.context_window_usage,
-                    tools_used: snapshot.tools_used,
-                    error_count: snapshot.error_count,
-                })
-                .unwrap_or_default()
+            signals.snapshot().await.map(|snapshot| SubagentProgress {
+                turn_count: snapshot.turn_count,
+                tool_call_count: snapshot.tool_call_count,
+                tokens_used: snapshot.context_tokens_used,
+                context_window_tokens: snapshot.context_window_tokens,
+                context_usage_pct: snapshot.context_window_usage,
+                tools_used: snapshot.tools_used,
+                error_count: snapshot.error_count,
+            })
         })
     }
 

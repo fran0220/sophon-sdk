@@ -124,7 +124,8 @@ fn typed_subagent_lifecycle_is_owned_attempt_authoritative_and_fenced() {
             );
             assert_eq!(child.subagent_type, snapshot.subagent_type);
             assert_eq!(child.started_at_epoch_ms, snapshot.started_at_epoch_ms);
-            assert!(child.context_usage_pct <= 100);
+            assert_eq!(snapshot.handle(), Some(current.clone()));
+            assert!(child.context_usage_pct.is_some_and(|pct| pct <= 100));
             assert!(
                 bounded(foreign.subagents().list_running())
                     .await

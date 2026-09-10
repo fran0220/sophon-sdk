@@ -595,20 +595,8 @@ pub enum SubagentSnapshotStatus {
     /// Child session is still running. Fields are populated from the child
     /// session's `SessionSignals` snapshot at query time (pull-based).
     Running {
-        /// Number of completed turns so far.
-        turn_count: u32,
-        /// Total tool calls executed so far.
-        tool_call_count: u32,
-        /// Current tokens used in the context window.
-        tokens_used: u64,
-        /// Total context window capacity (tokens).
-        context_window_tokens: u64,
-        /// Context window usage as a percentage (0–100).
-        context_usage_pct: u8,
-        /// Distinct tool names called so far (e.g. `["bash", "read_file"]`).
-        tools_used: Vec<String>,
-        /// Number of errors encountered so far.
-        error_count: u32,
+        /// None when no signal snapshot is available. Some preserves measured zeros.
+        progress: Option<super::coordinator::SubagentProgress>,
     },
     /// Child session completed successfully.
     Completed {
@@ -1441,13 +1429,7 @@ mod tests {
     #[test]
     fn is_terminal_returns_false_for_running() {
         let status = super::SubagentSnapshotStatus::Running {
-            turn_count: 0,
-            tool_call_count: 0,
-            tokens_used: 0,
-            context_window_tokens: 0,
-            context_usage_pct: 0,
-            tools_used: vec![],
-            error_count: 0,
+            progress: Some(Default::default()),
         };
         assert!(!status.is_terminal());
     }

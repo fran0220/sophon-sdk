@@ -148,13 +148,13 @@ struct SubagentLiveSnapshotDto {
     description: String,
     started_at_epoch_ms: u64,
     duration_ms: u64,
-    turn_count: u32,
-    tool_call_count: u32,
-    tokens_used: u64,
-    context_window_tokens: u64,
-    context_usage_pct: u8,
-    tools_used: Vec<String>,
-    error_count: u32,
+    turn_count: Option<u32>,
+    tool_call_count: Option<u32>,
+    tokens_used: Option<u64>,
+    context_window_tokens: Option<u64>,
+    context_usage_pct: Option<u8>,
+    tools_used: Option<Vec<String>>,
+    error_count: Option<u32>,
 }
 
 impl From<SubagentInspection> for SubagentLiveSnapshotDto {
@@ -166,16 +166,7 @@ impl From<SubagentInspection> for SubagentLiveSnapshotDto {
             child_session_id,
             ..
         } = inspection;
-        let SubagentSnapshotStatus::Running {
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            error_count,
-        } = snapshot.status
-        else {
+        let SubagentSnapshotStatus::Running { progress } = snapshot.status else {
             unreachable!("list_running returns only active children");
         };
         Self {
@@ -187,13 +178,13 @@ impl From<SubagentInspection> for SubagentLiveSnapshotDto {
             description: snapshot.description,
             started_at_epoch_ms: snapshot.started_at_epoch_ms,
             duration_ms: snapshot.duration_ms,
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            error_count,
+            turn_count: progress.as_ref().map(|p| p.turn_count),
+            tool_call_count: progress.as_ref().map(|p| p.tool_call_count),
+            tokens_used: progress.as_ref().map(|p| p.tokens_used),
+            context_window_tokens: progress.as_ref().map(|p| p.context_window_tokens),
+            context_usage_pct: progress.as_ref().map(|p| p.context_usage_pct),
+            error_count: progress.as_ref().map(|p| p.error_count),
+            tools_used: progress.map(|p| p.tools_used),
         }
     }
 }
@@ -306,23 +297,15 @@ impl SubagentSnapshotDto {
             SubagentSnapshotStatus::Initializing => {
                 dto.status = "initializing".into();
             }
-            SubagentSnapshotStatus::Running {
-                turn_count,
-                tool_call_count,
-                tokens_used,
-                context_window_tokens,
-                context_usage_pct,
-                tools_used,
-                error_count,
-            } => {
+            SubagentSnapshotStatus::Running { progress } => {
                 dto.status = "running".into();
-                dto.turn_count = Some(turn_count);
-                dto.tool_call_count = Some(tool_call_count);
-                dto.tokens_used = Some(tokens_used);
-                dto.context_window_tokens = Some(context_window_tokens);
-                dto.context_usage_pct = Some(context_usage_pct);
-                dto.tools_used = Some(tools_used);
-                dto.error_count = Some(error_count);
+                dto.turn_count = progress.as_ref().map(|p| p.turn_count);
+                dto.tool_call_count = progress.as_ref().map(|p| p.tool_call_count);
+                dto.tokens_used = progress.as_ref().map(|p| p.tokens_used);
+                dto.context_window_tokens = progress.as_ref().map(|p| p.context_window_tokens);
+                dto.context_usage_pct = progress.as_ref().map(|p| p.context_usage_pct);
+                dto.error_count = progress.as_ref().map(|p| p.error_count);
+                dto.tools_used = progress.map(|p| p.tools_used);
             }
             SubagentSnapshotStatus::Completed {
                 output,
@@ -600,6 +583,7 @@ struct ManagedSubagentTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_grok_tools::implementations::grok_build::task::coordinator::SubagentProgress;
 
     #[test]
     fn delete_scheduled_task_request_deserializes_camel_case() {
@@ -642,13 +626,13 @@ mod tests {
             description: "find files".into(),
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 5000,
-            turn_count: 2,
-            tool_call_count: 7,
-            tokens_used: 30_000,
-            context_window_tokens: 256_000,
-            context_usage_pct: 23,
-            tools_used: vec!["bash".into(), "grep".into()],
-            error_count: 1,
+            turn_count: Some(2),
+            tool_call_count: Some(7),
+            tokens_used: Some(30_000),
+            context_window_tokens: Some(256_000),
+            context_usage_pct: Some(23),
+            tools_used: Some(vec!["bash".into(), "grep".into()]),
+            error_count: Some(1),
         };
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json["subagentId"], "sub-1");
@@ -679,13 +663,15 @@ mod tests {
                 duration_ms: 200,
                 persona: None,
                 status: SubagentSnapshotStatus::Running {
-                    turn_count: 1,
-                    tool_call_count: 3,
-                    tokens_used: 500,
-                    context_window_tokens: 1000,
-                    context_usage_pct: 50,
-                    tools_used: vec!["read_file".into()],
-                    error_count: 0,
+                    progress: Some(SubagentProgress {
+                        turn_count: 1,
+                        tool_call_count: 3,
+                        tokens_used: 500,
+                        context_window_tokens: 1000,
+                        context_usage_pct: 50,
+                        tools_used: vec!["read_file".into()],
+                        error_count: 0,
+                    }),
                 },
             },
             parent_session_id: "p".into(),
@@ -698,8 +684,8 @@ mod tests {
         assert_eq!(dto.attempt_id.as_deref(), Some("attempt-s"));
         assert_eq!(dto.parent_session_id, "p");
         assert_eq!(dto.child_session_id, "c");
-        assert_eq!(dto.context_usage_pct, 50);
-        assert_eq!(dto.tools_used, vec!["read_file"]);
+        assert_eq!(dto.context_usage_pct, Some(50));
+        assert_eq!(dto.tools_used, Some(vec!["read_file".into()]));
     }
 
     #[test]
@@ -712,6 +698,63 @@ mod tests {
     // ── SubagentSnapshotDto serialization tests ────────────────────────
 
     #[test]
+    fn missing_progress_is_running_and_measured_zero_is_not_missing() {
+        for progress in [None, Some(SubagentProgress::default())] {
+            let measured = progress.is_some();
+            let snapshot = SubagentSnapshot {
+                subagent_id: "logical-child".into(),
+                subagent_type: "explore".into(),
+                description: "inspect".into(),
+                started_at_epoch_ms: 123,
+                duration_ms: 456,
+                persona: None,
+                status: SubagentSnapshotStatus::Running { progress },
+            };
+            assert!(snapshot.is_running());
+            let live = SubagentLiveSnapshotDto::from(SubagentInspection {
+                attempt_id: Some("observed-attempt".into()),
+                snapshot: snapshot.clone(),
+                parent_session_id: "parent".into(),
+                child_session_id: "child-session".into(),
+                fork_parent_prompt_id: None,
+                resumed_from: None,
+            });
+            let live = serde_json::to_value(live).unwrap();
+            assert_eq!(live["attemptId"], "observed-attempt");
+            let query = serde_json::to_value(SubagentSnapshotDto::from_snapshot(
+                snapshot,
+                "parent".into(),
+                "child-session".into(),
+                Default::default(),
+            ))
+            .unwrap();
+            assert_eq!(query["status"], "running");
+            for key in [
+                "turnCount",
+                "toolCallCount",
+                "tokensUsed",
+                "contextWindowTokens",
+                "contextUsagePct",
+                "errorCount",
+                "toolsUsed",
+            ] {
+                if measured {
+                    let expected = if key == "toolsUsed" {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!(0)
+                    };
+                    assert_eq!(query[key], expected);
+                    assert_eq!(live[key], expected);
+                } else {
+                    assert!(query.get(key).is_none(), "query {key}");
+                    assert!(live[key].is_null(), "list {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_dto_running_serializes_with_progress_fields() {
         let snap = SubagentSnapshot {
             subagent_id: "sub-1".into(),
@@ -721,13 +764,15 @@ mod tests {
             duration_ms: 5000,
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 3,
-                tool_call_count: 12,
-                tokens_used: 45_000,
-                context_window_tokens: 256_000,
-                context_usage_pct: 35,
-                tools_used: vec!["bash".into(), "grep".into()],
-                error_count: 1,
+                progress: Some(SubagentProgress {
+                    turn_count: 3,
+                    tool_call_count: 12,
+                    tokens_used: 45_000,
+                    context_window_tokens: 256_000,
+                    context_usage_pct: 35,
+                    tools_used: vec!["bash".into(), "grep".into()],
+                    error_count: 1,
+                }),
             },
         };
         let dto = SubagentSnapshotDto::from_snapshot(
@@ -853,13 +898,15 @@ mod tests {
             duration_ms: 5000,
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 2,
-                tool_call_count: 5,
-                tokens_used: 20_000,
-                context_window_tokens: 256_000,
-                context_usage_pct: 15,
-                tools_used: vec!["bash".into()],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 2,
+                    tool_call_count: 5,
+                    tokens_used: 20_000,
+                    context_window_tokens: 256_000,
+                    context_usage_pct: 15,
+                    tools_used: vec!["bash".into()],
+                    error_count: 0,
+                }),
             },
         };
         let resp = GetSubagentResponse {
@@ -953,13 +1000,15 @@ mod tests {
             duration_ms: 3000,
             persona: None,
             status: SubagentSnapshotStatus::Running {
-                turn_count: 1,
-                tool_call_count: 2,
-                tokens_used: 10_000,
-                context_window_tokens: 256_000,
-                context_usage_pct: 8,
-                tools_used: vec![],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 1,
+                    tool_call_count: 2,
+                    tokens_used: 10_000,
+                    context_window_tokens: 256_000,
+                    context_usage_pct: 8,
+                    tools_used: vec![],
+                    error_count: 0,
+                }),
             },
         };
         let provenance = SubagentProvenance {

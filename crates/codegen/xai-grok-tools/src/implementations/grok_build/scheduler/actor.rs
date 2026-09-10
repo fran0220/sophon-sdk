@@ -1271,6 +1271,7 @@ mod tests {
     use crate::implementations::grok_build::scheduler::types::{
         ScheduledTask, SchedulerHandle, scheduler_tool_error,
     };
+    use crate::implementations::grok_build::task::coordinator::SubagentProgress;
     use crate::notification::{AcknowledgedToolNotification, ToolNotification};
     use crate::types::resources::{Resources, WebCitationCounter};
     use std::sync::Arc;
@@ -2689,13 +2690,15 @@ mod tests {
             &mut subagent_rx,
             &first_id,
             SubagentSnapshotStatus::Running {
-                turn_count: 1,
-                tool_call_count: 2,
-                tokens_used: 0,
-                context_window_tokens: 0,
-                context_usage_pct: 0,
-                tools_used: vec![],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 1,
+                    tool_call_count: 2,
+                    tokens_used: 0,
+                    context_window_tokens: 0,
+                    context_usage_pct: 0,
+                    tools_used: vec![],
+                    error_count: 0,
+                }),
             },
         )
         .await;
@@ -2816,13 +2819,15 @@ mod tests {
                 description: "loop: watch ci".into(),
                 subagent_type: "general-purpose".into(),
                 status: SubagentSnapshotStatus::Running {
-                    turn_count: 1,
-                    tool_call_count: 1,
-                    tokens_used: 0,
-                    context_window_tokens: 0,
-                    context_usage_pct: 0,
-                    tools_used: vec![],
-                    error_count: 0,
+                    progress: Some(SubagentProgress {
+                        turn_count: 1,
+                        tool_call_count: 1,
+                        tokens_used: 0,
+                        context_window_tokens: 0,
+                        context_usage_pct: 0,
+                        tools_used: vec![],
+                        error_count: 0,
+                    }),
                 },
                 started_at_epoch_ms: 0,
                 duration_ms: 100,

@@ -37,10 +37,10 @@ struct BackendWithoutActiveMessages;
 struct BackendTestControl;
 
 impl super::super::coordinator::ChildControl for BackendTestControl {
-    type ProgressFuture = std::future::Ready<super::super::coordinator::SubagentProgress>;
+    type ProgressFuture = std::future::Ready<Option<super::super::coordinator::SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
-        std::future::ready(super::super::coordinator::SubagentProgress::default())
+        std::future::ready(None)
     }
 
     fn cancel(&self) {}

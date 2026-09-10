@@ -1624,13 +1624,10 @@ async fn live_reconcile_skips_live_coordinator_child() {
                         inspection(
                             id,
                             SubagentSnapshotStatus::Running {
-                                turn_count: 1,
-                                tool_call_count: 0,
-                                tokens_used: 0,
-                                context_window_tokens: 0,
-                                context_usage_pct: 0,
-                                tools_used: Vec::new(),
-                                error_count: 0,
+                                progress: Some(xai_grok_tools::implementations::grok_build::task::coordinator::SubagentProgress {
+                                    turn_count: 1,
+                                    ..Default::default()
+                                }),
                             },
                         ),
                     ),

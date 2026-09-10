@@ -29,10 +29,10 @@ pub(in crate::implementations::grok_build::task::coordinator) struct TestControl
 }
 
 impl ChildControl for TestControl {
-    type ProgressFuture = std::future::Ready<SubagentProgress>;
+    type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
-        std::future::ready(SubagentProgress::default())
+        std::future::ready(None)
     }
 
     fn send_active_message(

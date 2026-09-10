@@ -208,6 +208,17 @@ and no ambient embedding route fallback. Legacy/disabled modes and native
 tuning are explicit SDK inputs. Durable task snapshots are last-wins display
 projections with live/replay provenance, never process-custody evidence.
 
+Subagent progress preserves absence at its native source: `ChildControl`
+returns `Option<SubagentProgress>`, and `Running` retains that optional sample.
+Closed/unavailable signal actors no longer fabricate zeros. Both native query
+and list-running DTOs project optional measurements from the captured attempt;
+task output reports unavailable progress without changing liveness. Existing
+fixtures explicitly wrap their measured samples; control-only fakes return None.
+The SDK preserves parent prompt provenance and normalizes running versus
+completed counts. Completed/failed/cancelled snapshots do not invent terminal
+context occupancy, tool names or error counts. Package version remains 0.5.0;
+the README documents the Git-revision-dependent breaking optional fields.
+
 SDK correctness repairs retain legacy queue-edit behavior while making failed
 typed entry-version mutations side-effect-free. Targeted cancellation checks
 front identity atomically with the finalization claim; unknown-session mode
@@ -236,6 +247,8 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/attempt_runner.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs`
@@ -287,16 +300,20 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/send_subagent_message_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/active_message.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/backend.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/backend_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/query.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task_output/mod.rs`
 - `crates/codegen/xai-grok-tools/src/lib.rs`
 - `crates/codegen/xai-grok-tools/src/management/admission.rs`
 - `crates/codegen/xai-grok-tools/src/management/mod.rs`
@@ -349,6 +366,34 @@ crates/sophon-sdk/scripts/check-sdk-boundary.sh
 
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
+
+## Optional subagent progress validation (2026-09-10, Linux x86_64)
+
+- `cargo test --locked -p sophon-sdk --tests`: 37 unit and 18 integration
+  tests pass, including query/list attempt identity and stale-attempt fencing.
+  `cargo test --locked -p sophon-sdk --doc`: all five README examples pass.
+- `cargo test --locked -p xai-grok-tools --lib -- --test-threads=4`:
+  3,241 pass, 2 ignored. The new coordinator regression preserves optional
+  measurements with captured attempt/session/prompt identity; task output
+  distinguishes missing signals from measured zero.
+- The combined SDK/tools/shell `--lib` run with shell `test-support` and
+  filter `subagent` passes 5 SDK, 447 shell, and 58 tools tests. The shell
+  `extensions::task::tests` filter separately passes 22 tests (overlapping
+  coverage). The signal actor regression verifies real zero, asymmetric
+  counts and a closed actor; DTO tests verify missing versus measured fields.
+- `cargo clippy --locked -p sophon-sdk -p xai-grok-shell -p xai-grok-tools
+  --lib -- -D warnings` passes. The pre-existing build-script warning about
+  an unreachable Clippy-configured method remains; nothing was suppressed.
+- `scripts/check-sdk-boundary.sh` passes all seven digests, untouched-path
+  verification, no TUI dependencies, and 3,695 public signature checks.
+  Changed Rust files pass rustfmt; `git diff --check` passes.
+
+Commands used the environment recorded below: `GROK_AUTH` unset, 32 MiB Rust
+thread stacks, incremental/debug info disabled, and process-local Git fixture
+defaults. This is local-fixture verification, not live provider or Windows/macOS
+execution. The entire shell suite and native TUI were not rerun. No terminal
+token spend or context usage is added; completed counts remain the only native
+terminal measurements available through this snapshot.
 
 ## SDK 0.5.0 validation (2026-09-10, Linux x86_64)
 

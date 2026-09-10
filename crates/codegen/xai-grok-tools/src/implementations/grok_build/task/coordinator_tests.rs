@@ -11,6 +11,77 @@ use crate::implementations::grok_build::task::types::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn progress_reply_preserves_captured_attempt_and_missing_measurement() {
+    use super::super::coordinator_state::{
+        ProgressFuture, ProgressTarget, RunningSeed, running_inspection,
+    };
+
+    for progress in [
+        None,
+        Some(SubagentProgress::default()),
+        Some(SubagentProgress {
+            turn_count: 3,
+            tool_call_count: 17,
+            tokens_used: 1234,
+            context_window_tokens: 10000,
+            context_usage_pct: 12,
+            tools_used: vec!["bash".into()],
+            error_count: 2,
+        }),
+    ] {
+        let expected = progress.clone();
+        let (respond_to, _rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let future = ProgressFuture {
+            future: Box::pin(async move { progress_rx.await.unwrap() }),
+            seed: Some(RunningSeed {
+                attempt_id: Some("attempt-before-await".into()),
+                subagent_id: "logical-child".into(),
+                description: "old description".into(),
+                subagent_type: "explore".into(),
+                started_at_epoch_ms: 123,
+                duration_ms: 456,
+                persona: None,
+                parent_session_id: "parent".into(),
+                child_session_id: "old-session".into(),
+                fork_parent_prompt_id: Some("old-prompt".into()),
+                resumed_from: None,
+            }),
+            target: Some(ProgressTarget::Inspect(respond_to)),
+        };
+        progress_tx.send(progress).unwrap();
+        let (seed, _, progress) = future.await;
+        let inspection = running_inspection(seed, progress);
+        assert_eq!(
+            inspection.attempt_id.as_deref(),
+            Some("attempt-before-await")
+        );
+        assert_eq!(inspection.child_session_id, "old-session");
+        assert_eq!(
+            inspection.fork_parent_prompt_id.as_deref(),
+            Some("old-prompt")
+        );
+        assert!(inspection.snapshot.is_running());
+        let SubagentSnapshotStatus::Running { progress } = inspection.snapshot.status else {
+            panic!("unavailable progress must not change lifecycle");
+        };
+        match (progress, expected) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.turn_count, expected.turn_count);
+                assert_eq!(actual.tool_call_count, expected.tool_call_count);
+                assert_eq!(actual.tokens_used, expected.tokens_used);
+                assert_eq!(actual.context_window_tokens, expected.context_window_tokens);
+                assert_eq!(actual.context_usage_pct, expected.context_usage_pct);
+                assert_eq!(actual.tools_used, expected.tools_used);
+                assert_eq!(actual.error_count, expected.error_count);
+            }
+            _ => panic!("measurement availability changed"),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AdmissionGate {
     entered: mpsc::UnboundedSender<()>,
@@ -25,10 +96,10 @@ struct TestControl {
 }
 
 impl ChildControl for TestControl {
-    type ProgressFuture = std::future::Ready<SubagentProgress>;
+    type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
-        std::future::ready(SubagentProgress {
+        std::future::ready(Some(SubagentProgress {
             turn_count: 2,
             tool_call_count: 3,
             tokens_used: 100,
@@ -36,7 +107,7 @@ impl ChildControl for TestControl {
             context_usage_pct: 10,
             tools_used: vec!["read_file".to_owned()],
             error_count: 0,
-        })
+        }))
     }
 
     fn send_active_message(

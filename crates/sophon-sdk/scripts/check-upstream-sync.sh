@@ -94,6 +94,8 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/attempt_runner.rs
+  crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime.rs
+  crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime_tests.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs
@@ -145,16 +147,20 @@ typed_management=(
   crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/send_subagent_message_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/active_message.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/backend.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/task/backend_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/query.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/task_output/mod.rs
   crates/codegen/xai-grok-tools/src/lib.rs
   crates/codegen/xai-grok-tools/src/management/admission.rs
   crates/codegen/xai-grok-tools/src/management/mod.rs

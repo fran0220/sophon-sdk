@@ -26,9 +26,13 @@ pub type SendBoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub struct SubagentProgress {
     pub turn_count: u32,
     pub tool_call_count: u32,
+    /// Current context occupancy, not cumulative token spend.
     pub tokens_used: u64,
+    /// Total context window capacity in tokens.
     pub context_window_tokens: u64,
+    /// Context window usage as a percentage (0–100).
     pub context_usage_pct: u8,
+    /// Distinct tool names recorded by the child's signals.
     pub tools_used: Vec<String>,
     pub error_count: u32,
 }
@@ -56,8 +60,9 @@ pub const ACTIVE_MESSAGE_FINALIZATION_TIMEOUT: std::time::Duration =
 
 /// Runtime handle retained while a child is active.
 pub trait ChildControl: 'static {
-    type ProgressFuture: Future<Output = SubagentProgress> + 'static;
+    type ProgressFuture: Future<Output = Option<SubagentProgress>> + 'static;
 
+    /// None when live signals are unavailable; a measured zero is Some.
     fn progress(&self) -> Self::ProgressFuture;
 
     /// Admit a coordinator-authorized message to this child. `Admitted` is valid only when
@@ -563,9 +568,9 @@ pub(super) struct ProgressFuture<F> {
 
 impl<F> Future for ProgressFuture<F>
 where
-    F: Future<Output = SubagentProgress>,
+    F: Future<Output = Option<SubagentProgress>>,
 {
-    type Output = (RunningSeed, ProgressTarget, SubagentProgress);
+    type Output = (RunningSeed, ProgressTarget, Option<SubagentProgress>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -813,7 +818,7 @@ pub(super) fn running_seed<C>(child: &ActiveChild<C>) -> RunningSeed {
 
 pub(super) fn running_inspection(
     seed: RunningSeed,
-    progress: SubagentProgress,
+    progress: Option<SubagentProgress>,
 ) -> SubagentInspection {
     SubagentInspection {
         attempt_id: seed.attempt_id,
@@ -821,15 +826,7 @@ pub(super) fn running_inspection(
             subagent_id: seed.subagent_id,
             description: seed.description,
             subagent_type: seed.subagent_type,
-            status: SubagentSnapshotStatus::Running {
-                turn_count: progress.turn_count,
-                tool_call_count: progress.tool_call_count,
-                tokens_used: progress.tokens_used,
-                context_window_tokens: progress.context_window_tokens,
-                context_usage_pct: progress.context_usage_pct,
-                tools_used: progress.tools_used,
-                error_count: progress.error_count,
-            },
+            status: SubagentSnapshotStatus::Running { progress },
             started_at_epoch_ms: seed.started_at_epoch_ms,
             duration_ms: seed.duration_ms,
             persona: seed.persona,

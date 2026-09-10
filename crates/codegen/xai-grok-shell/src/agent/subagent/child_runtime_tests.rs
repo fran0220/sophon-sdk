@@ -19,13 +19,67 @@ async fn await_with_timeout<T>(future: impl Future<Output = T>) -> T {
         .expect("child-runtime test wait timed out")
 }
 
+#[tokio::test]
+async fn progress_preserves_missing_zero_and_measured_signals() {
+    let (signals, actor) = crate::session::signals::SessionSignalsActor::new();
+    let (child_cmd_tx, _rx) = mpsc::unbounded_channel();
+    let (receipt_sink, _receipts) = mpsc::channel(1);
+    let runtime = ShellChildRuntime {
+        message_delivery: crate::session::message_delivery::MessageDeliveryHandle::new(
+            child_cmd_tx.clone(),
+            "child".into(),
+        ),
+        child_cmd_tx,
+        active_message_target_session_id: "child".into(),
+        child_signals: signals.clone(),
+        _child_thread: None,
+        receipt_sink,
+        force_queue_envelope: false,
+        active_message_parent_session_id: "parent".into(),
+        active_message_parent_prompt_index: Default::default(),
+    };
+    let actor_task = tokio::spawn(actor.run());
+    let zero = await_with_timeout(runtime.progress()).await.unwrap();
+    assert_eq!(
+        (zero.turn_count, zero.tool_call_count, zero.tokens_used),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (
+            zero.context_window_tokens,
+            zero.context_usage_pct,
+            zero.error_count
+        ),
+        (0, 0, 0)
+    );
+    assert!(zero.tools_used.is_empty());
+    signals.increment_turn();
+    for _ in 0..3 {
+        signals.record_tool_call("bash");
+    }
+    signals.record_error();
+    let measured = await_with_timeout(runtime.progress()).await.unwrap();
+    assert_eq!(
+        (
+            measured.turn_count,
+            measured.tool_call_count,
+            measured.error_count
+        ),
+        (1, 3, 1)
+    );
+    assert_eq!(measured.tools_used, vec!["bash"]);
+    actor_task.abort();
+    assert!(actor_task.await.unwrap_err().is_cancelled());
+    assert!(await_with_timeout(runtime.progress()).await.is_none());
+}
+
 struct SnapshotProbeControl {
     runtime: ShellChildRuntime,
     live_prompt_index: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ChildControl for SnapshotProbeControl {
-    type ProgressFuture = LocalBoxFuture<SubagentProgress>;
+    type ProgressFuture = LocalBoxFuture<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
         self.runtime.progress()

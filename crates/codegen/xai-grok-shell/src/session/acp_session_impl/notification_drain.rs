@@ -840,13 +840,10 @@ mod live_orphan_hook_tests {
                 description: "task".to_string(),
                 subagent_type: "explore".to_string(),
                 status: SubagentSnapshotStatus::Running {
-                    turn_count: 1,
-                    tool_call_count: 0,
-                    tokens_used: 0,
-                    context_window_tokens: 0,
-                    context_usage_pct: 0,
-                    tools_used: Vec::new(),
-                    error_count: 0,
+                    progress: Some(xai_grok_tools::implementations::grok_build::task::coordinator::SubagentProgress {
+                        turn_count: 1,
+                        ..Default::default()
+                    }),
                 },
                 started_at_epoch_ms: 0,
                 duration_ms: 50,

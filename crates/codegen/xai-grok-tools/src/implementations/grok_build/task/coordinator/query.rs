@@ -214,7 +214,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         &mut self,
         seed: RunningSeed,
         target: ProgressTarget,
-        progress: SubagentProgress,
+        progress: Option<SubagentProgress>,
     ) {
         let still_active = self.active.contains_key(&seed.subagent_id);
         if !still_active {

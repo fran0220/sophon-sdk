@@ -24,10 +24,10 @@ async fn completes<T>(future: impl std::future::Future<Output = T>) -> T {
 struct ToolTestControl;
 
 impl ChildControl for ToolTestControl {
-    type ProgressFuture = std::future::Ready<SubagentProgress>;
+    type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
-        std::future::ready(SubagentProgress::default())
+        std::future::ready(None)
     }
 
     fn cancel(&self) {}

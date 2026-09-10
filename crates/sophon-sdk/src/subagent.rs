@@ -132,6 +132,18 @@ pub struct SubagentSnapshot {
     pub output: Option<String>,
     pub error: Option<String>,
     pub resumed_from: Option<SubagentId>,
+    /// Native parent prompt that supplied fork context, when recorded.
+    pub fork_parent_prompt_id: Option<String>,
+    /// Live counts while running; native final counts when completed.
+    /// None for unavailable signals, initializing, failed, or cancelled children.
+    pub turn_count: Option<u32>,
+    pub tool_call_count: Option<u32>,
+    /// Current context occupancy, not cumulative token spend. Running only.
+    pub tokens_used: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub context_usage_pct: Option<u8>,
+    pub tools_used: Option<Vec<String>>,
+    pub error_count: Option<u32>,
 }
 
 impl SubagentSnapshot {
@@ -160,13 +172,15 @@ pub struct RunningSubagent {
     pub description: String,
     pub started_at_epoch_ms: u64,
     pub duration_ms: u64,
-    pub turn_count: u32,
-    pub tool_call_count: u32,
-    pub tokens_used: u64,
-    pub context_window_tokens: u64,
-    pub context_usage_pct: u8,
-    pub tools_used: Vec<String>,
-    pub error_count: u32,
+    /// None when the observed attempt has no available signal snapshot.
+    pub turn_count: Option<u32>,
+    pub tool_call_count: Option<u32>,
+    /// Current context occupancy, not cumulative token spend.
+    pub tokens_used: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub context_usage_pct: Option<u8>,
+    pub tools_used: Option<Vec<String>>,
+    pub error_count: Option<u32>,
 }
 
 impl RunningSubagent {
@@ -302,24 +316,7 @@ impl Subagents {
 
     pub async fn query(&self, id: &SubagentId) -> Result<Option<SubagentSnapshot>, SubagentError> {
         let wire: Option<QueryWire> = self.call("query", json!({"subagentId": id})).await?;
-        Ok(wire.map(|wire| {
-            let snapshot = wire.snapshot;
-            SubagentSnapshot {
-                id: snapshot.subagent_id,
-                attempt_id: wire.attempt_id,
-                parent_session_id: SessionId(snapshot.parent_session_id),
-                child_session_id: (!snapshot.child_session_id.is_empty())
-                    .then_some(SessionId(snapshot.child_session_id)),
-                subagent_type: snapshot.subagent_type,
-                description: snapshot.description,
-                state: snapshot.status,
-                started_at_epoch_ms: snapshot.started_at_epoch_ms,
-                duration_ms: snapshot.duration_ms,
-                output: snapshot.output,
-                error: snapshot.failure_error.or(snapshot.cancel_reason),
-                resumed_from: snapshot.resumed_from,
-            }
-        }))
+        Ok(wire.map(SubagentSnapshot::from))
     }
 
     /// Admit text to exactly this active attempt. Does not resume or reactivate.
@@ -428,6 +425,41 @@ struct QueryWire {
     snapshot: SnapshotWire,
 }
 
+impl From<QueryWire> for SubagentSnapshot {
+    fn from(wire: QueryWire) -> Self {
+        let snapshot = wire.snapshot;
+        let (turn_count, tool_call_count) = match snapshot.status {
+            SubagentState::Running => (snapshot.turn_count, snapshot.tool_call_count),
+            SubagentState::Completed => (snapshot.turns, snapshot.tool_calls),
+            _ => (None, None),
+        };
+        let running = snapshot.status == SubagentState::Running;
+        Self {
+            id: snapshot.subagent_id,
+            attempt_id: wire.attempt_id,
+            parent_session_id: SessionId(snapshot.parent_session_id),
+            child_session_id: (!snapshot.child_session_id.is_empty())
+                .then_some(SessionId(snapshot.child_session_id)),
+            subagent_type: snapshot.subagent_type,
+            description: snapshot.description,
+            state: snapshot.status,
+            started_at_epoch_ms: snapshot.started_at_epoch_ms,
+            duration_ms: snapshot.duration_ms,
+            output: snapshot.output,
+            error: snapshot.failure_error.or(snapshot.cancel_reason),
+            resumed_from: snapshot.resumed_from,
+            fork_parent_prompt_id: snapshot.fork_parent_prompt_id,
+            turn_count,
+            tool_call_count,
+            tokens_used: running.then_some(snapshot.tokens_used).flatten(),
+            context_window_tokens: running.then_some(snapshot.context_window_tokens).flatten(),
+            context_usage_pct: running.then_some(snapshot.context_usage_pct).flatten(),
+            tools_used: running.then_some(snapshot.tools_used).flatten(),
+            error_count: running.then_some(snapshot.error_count).flatten(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotWire {
@@ -443,11 +475,131 @@ struct SnapshotWire {
     failure_error: Option<String>,
     cancel_reason: Option<String>,
     resumed_from: Option<SubagentId>,
+    fork_parent_prompt_id: Option<String>,
+    turn_count: Option<u32>,
+    tool_call_count: Option<u32>,
+    turns: Option<u32>,
+    tool_calls: Option<u32>,
+    tokens_used: Option<u64>,
+    context_window_tokens: Option<u64>,
+    context_usage_pct: Option<u8>,
+    tools_used: Option<Vec<String>>,
+    error_count: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_snapshot(state: &str, fields: Value) -> SubagentSnapshot {
+        let mut snapshot = json!({
+            "subagentId": "logical-child", "parentSessionId": "parent",
+            "childSessionId": "child-session", "subagentType": "explore",
+            "description": "inspect", "status": state,
+            "startedAtEpochMs": 100, "durationMs": 200,
+            "forkParentPromptId": "prompt-17", "resumedFrom": "source-child"
+        });
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let wire = decode::<QueryWire>(json!({"result": {
+            "attemptId": "attempt-observed", "snapshot": snapshot
+        }}))
+        .unwrap();
+        wire.into()
+    }
+
+    #[test]
+    fn query_preserves_same_attempt_progress_and_provenance() {
+        let snapshot = query_snapshot(
+            "running",
+            json!({
+                "turnCount": 3, "toolCallCount": 11, "turns": 91, "toolCalls": 97,
+                "tokensUsed": 1234, "contextWindowTokens": 10000,
+                "contextUsagePct": 12, "toolsUsed": ["read_file", "bash"], "errorCount": 2
+            }),
+        );
+        assert_eq!(snapshot.turn_count, Some(3));
+        assert_eq!(snapshot.tool_call_count, Some(11));
+        assert_eq!(snapshot.tokens_used, Some(1234));
+        assert_eq!(snapshot.context_window_tokens, Some(10000));
+        assert_eq!(snapshot.context_usage_pct, Some(12));
+        assert_eq!(
+            snapshot.tools_used,
+            Some(vec!["read_file".into(), "bash".into()])
+        );
+        assert_eq!(snapshot.error_count, Some(2));
+        assert_eq!(snapshot.fork_parent_prompt_id.as_deref(), Some("prompt-17"));
+        assert_eq!(snapshot.resumed_from, Some(SubagentId::new("source-child")));
+        assert_eq!(
+            snapshot.handle(),
+            Some(SubagentHandle {
+                id: SubagentId::new("logical-child"),
+                attempt_id: AttemptId::new("attempt-observed"),
+            })
+        );
+    }
+
+    #[test]
+    fn query_distinguishes_measured_zero_missing_and_terminal_counts() {
+        let measured = query_snapshot(
+            "running",
+            json!({
+                "turnCount": 0, "toolCallCount": 0, "tokensUsed": 0,
+                "contextWindowTokens": 0, "contextUsagePct": 0, "toolsUsed": [], "errorCount": 0
+            }),
+        );
+        assert_eq!(measured.turn_count, Some(0));
+        assert_eq!(measured.tool_call_count, Some(0));
+        assert_eq!(measured.tokens_used, Some(0));
+        assert_eq!(measured.context_window_tokens, Some(0));
+        assert_eq!(measured.context_usage_pct, Some(0));
+        assert_eq!(measured.tools_used, Some(vec![]));
+        assert_eq!(measured.error_count, Some(0));
+        for state in [
+            "running",
+            "initializing",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
+            let missing = query_snapshot(state, json!({}));
+            assert_eq!((missing.turn_count, missing.tool_call_count), (None, None));
+            assert!(missing.tokens_used.is_none());
+            assert!(missing.context_window_tokens.is_none());
+            assert!(missing.context_usage_pct.is_none());
+            assert!(missing.tools_used.is_none());
+            assert!(missing.error_count.is_none());
+        }
+        // Deliberately conflicting wire keys: only the state's native counts apply.
+        for state in ["completed", "initializing", "failed", "cancelled"] {
+            let snapshot = query_snapshot(
+                state,
+                json!({
+                    "turns": 4, "toolCalls": 19, "turnCount": 91, "toolCallCount": 97,
+                    "tokensUsed": 500, "contextWindowTokens": 1000,
+                    "contextUsagePct": 50, "toolsUsed": ["bash"], "errorCount": 3
+                }),
+            );
+            let expected = if state == "completed" {
+                (Some(4), Some(19))
+            } else {
+                (None, None)
+            };
+            assert_eq!((snapshot.turn_count, snapshot.tool_call_count), expected);
+            assert!(snapshot.tokens_used.is_none());
+            assert!(snapshot.context_window_tokens.is_none());
+            assert!(snapshot.context_usage_pct.is_none());
+            assert!(snapshot.tools_used.is_none());
+            assert!(snapshot.error_count.is_none());
+        }
+        let completed_zero = query_snapshot("completed", json!({"turns": 0, "toolCalls": 0}));
+        assert_eq!(
+            (completed_zero.turn_count, completed_zero.tool_call_count),
+            (Some(0), Some(0))
+        );
+    }
 
     #[test]
     fn owned_query_can_return_no_child() {
