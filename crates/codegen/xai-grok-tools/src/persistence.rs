@@ -364,22 +364,37 @@ impl ResourcesPersistence {
     #[cfg(windows)]
     fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
         use std::os::windows::ffi::OsStrExt;
+        use std::path::{Component, Prefix};
+
         let path = std::path::absolute(path)?;
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if wide.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "path contains NUL",
             ));
         }
-        let unc = wide.starts_with(&[92, 92]);
-        let mut result = if unc { r"\\?\UNC\" } else { r"\\?\" }
-            .encode_utf16()
-            .collect::<Vec<_>>();
-        if unc {
-            wide.drain(..2);
-        }
-        result.extend(wide);
+        let mut result = match path.components().next() {
+            // Canonicalization already returns a verbatim path. Device namespaces
+            // likewise must not be mistaken for ordinary UNC shares or prefixed again.
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Verbatim(_)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::VerbatimUNC(_, _)
+                | Prefix::DeviceNS(_) => wide,
+                Prefix::UNC(_, _) => r"\\?\UNC\"
+                    .encode_utf16()
+                    .chain(wide.into_iter().skip(2))
+                    .collect(),
+                Prefix::Disk(_) => r"\\?\".encode_utf16().chain(wide).collect(),
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "absolute Windows path has no prefix",
+                ));
+            }
+        };
         result.push(0);
         Ok(result)
     }
@@ -645,6 +660,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(target).unwrap(), "new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extended_path_preserves_namespaces() {
+        for (input, expected) in [
+            (r"C:\state.json", r"\\?\C:\state.json"),
+            (
+                r"\\server\share\state.json",
+                r"\\?\UNC\server\share\state.json",
+            ),
+            (r"\\?\C:\state.json", r"\\?\C:\state.json"),
+            (
+                r"\\?\UNC\server\share\state.json",
+                r"\\?\UNC\server\share\state.json",
+            ),
+            (
+                r"\\?\Volume{example}\state.json",
+                r"\\?\Volume{example}\state.json",
+            ),
+            (r"\\.\pipe\example", r"\\.\pipe\example"),
+        ] {
+            let mut expected = expected.encode_utf16().collect::<Vec<_>>();
+            expected.push(0);
+            assert_eq!(
+                ResourcesPersistence::windows_extended_path(Path::new(input)).unwrap(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_durable_write_supports_canonicalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(matches!(
+            parent.components().next(),
+            Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+        let target = parent.join("state.json");
+        let persistence = ResourcesPersistence::new(target.clone());
+
+        // Exercise both initial publication and replacement through MoveFileExW.
+        for counter in [1, 2] {
+            let snapshot = serde_json::json!({"state": {"counter": counter}});
+            persistence.save_and_flush(snapshot.clone()).await.unwrap();
+            let content = std::fs::read_to_string(&target).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&content).unwrap(),
+                snapshot
+            );
+            assert!(!target.with_extension("json.tmp").exists());
+        }
     }
 
     /// A bare filename would land in the server's own directory, shared by every session.
