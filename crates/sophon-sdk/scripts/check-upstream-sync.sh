@@ -13,6 +13,8 @@ provider_routing=(
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/memory_control.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/recap.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/idle_resume_tests.rs
@@ -66,17 +68,15 @@ windows_portability=(
   crates/codegen/xai-grok-shell-terminal/Cargo.toml
   crates/codegen/xai-grok-shell-terminal/src/streaming_local_terminal.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
+  crates/codegen/xai-grok-tools/src/persistence.rs
 )
 
 public_snapshot_repairs=(
   crates/codegen/xai-grok-shell/benches/session_list.rs
-  crates/codegen/xai-grok-shell/src/session/acp_session_tests/image_strip_tests.rs
-  crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs
 )
 
 goal_reliability=(
-  crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal_support.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/goal/goal_planner_e2e_tests.rs
@@ -97,6 +97,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime_tests.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs
+  crates/codegen/xai-grok-shell/src/agent/subagent/isolated_spawn_e2e.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs
   crates/codegen/xai-grok-shell/src/agent/subagent/spawn.rs
@@ -134,6 +135,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_types.rs
   crates/codegen/xai-grok-shell/src/session/agent_rebuild.rs
+  crates/codegen/xai-grok-shell/src/session/agent_rebuild_tests.rs
   crates/codegen/xai-grok-shell/src/session/commands.rs
   crates/codegen/xai-grok-shell/src/session/compaction.rs
   crates/codegen/xai-grok-shell/src/session/handle.rs
@@ -154,6 +156,7 @@ typed_management=(
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs
+  crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/agent_targets.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/query.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs
   crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs
@@ -166,6 +169,7 @@ typed_management=(
   crates/codegen/xai-grok-tools/src/management/mod.rs
   crates/codegen/xai-grok-tools/src/notification/types.rs
   crates/codegen/xai-grok-tools/src/registry/types.rs
+  crates/codegen/xai-grok-tools/tests/test_subagent_soak.rs
   crates/codegen/xai-grok-workspace/src/session/tool_config.rs
   crates/codegen/xai-prompt-queue/Cargo.toml
   crates/codegen/xai-prompt-queue/src/lib.rs

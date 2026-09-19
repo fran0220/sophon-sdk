@@ -52,8 +52,8 @@ fn drain_gateway_debug(
     out
 }
 
-/// Give background work a bounded LocalSet scheduling window before absence assertions.
-/// Strip persistence itself is awaited by the terminal event handler.
+/// Several callers assert that a notification never arrives; that needs a window, not a completion signal.
+/// Yield to the LocalSet for a wall-clock bound.
 async fn settle() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
@@ -109,31 +109,6 @@ fn completed_event(request_id: &RequestId) -> SamplingEvent {
         }),
         metrics: InferenceLatencyStats::default(),
     }
-}
-
-/// Drive completion concurrently while the caller holds the strip rewrite gate.
-async fn spawn_blocked_completion(
-    actor: &Arc<SessionActor>,
-    request_id: &RequestId,
-) -> tokio::task::JoinHandle<()> {
-    let actor = Arc::clone(actor);
-    let event = completed_event(request_id);
-    let completion = tokio::task::spawn_local(async move {
-        actor.handle_sampling_event(event).await;
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !completion.is_finished(),
-        "Completed must await strip persistence while the rewrite gate is held"
-    );
-    completion
-}
-
-async fn await_completion(completion: tokio::task::JoinHandle<()>) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), completion)
-        .await
-        .expect("completion must finish after the rewrite gate is released")
-        .expect("completion task succeeds");
 }
 
 fn failed_info() -> xai_grok_sampler::SamplingErrorInfo {
@@ -336,11 +311,26 @@ async fn timed_out_strip_survives_new_turn_until_late_completed() {
         .await;
 }
 
-/// Rewind can commit while `Completed` waits for persistence to acquire rewrite ownership.
-/// The completion handler must acquire rewrite ownership before claiming URLs.
+/// Deliver `Completed` the way the sampler drainer does: on its own local task, so the caller can hold
+/// the strip gate and observe the persist blocked on it without deadlocking the single-threaded runtime.
+fn deliver_completed(
+    actor: &Arc<SessionActor>,
+    request_id: &RequestId,
+) -> tokio::task::JoinHandle<()> {
+    let actor = Arc::clone(actor);
+    let request_id = request_id.clone();
+    tokio::task::spawn_local(async move {
+        actor
+            .handle_sampling_event(completed_event(&request_id))
+            .await;
+    })
+}
+
+/// Rewind can commit after `Completed` arrives but before its persist acquires the strip gate.
+/// The persist must acquire rewrite ownership before claiming URLs.
 /// A waiting successful rewind then clears queued work while preserving the restored image and emitting no stale note.
 #[tokio::test(flavor = "current_thread")]
-async fn rewind_cancels_queued_image_strip_before_it_runs() {
+async fn rewind_cancels_detached_image_strip_before_it_runs() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -351,7 +341,7 @@ async fn rewind_cancels_queued_image_strip_before_it_runs() {
                 Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
             seed_image(&actor, PERSIST_GATE_IMAGE_URI).await;
 
-            let timed_out = RequestId::from("req-rewind-queued-strip");
+            let timed_out = RequestId::from("req-rewind-detached-strip");
             own_request(&actor, &timed_out);
             actor
                 .handle_sampling_event(images_stripped(
@@ -377,7 +367,7 @@ async fn rewind_cancels_queued_image_strip_before_it_runs() {
                 .expect("snapshot available");
             snapshot.prompt_index = 2;
             snapshot.prompt_texts = vec!["image turn".into(), "later turn".into()];
-            let ConversationItem::User(image_turn) = &mut snapshot.conversation[0] else {
+            let Some(ConversationItem::User(image_turn)) = snapshot.conversation.first_mut() else {
                 panic!("seeded image must be a user turn");
             };
             image_turn.prompt_index = Some(0);
@@ -399,14 +389,15 @@ async fn rewind_cancels_queued_image_strip_before_it_runs() {
             let _ = actor.chat_state_handle.get_conversation().await;
 
             let strip_blocker = actor.image_strip_rewrite_barrier.lock_strip().await;
-            let completion = spawn_blocked_completion(&actor, &timed_out).await;
+            let completed = deliver_completed(&actor, &timed_out);
+            tokio::task::yield_now().await;
             assert!(
                 actor
                     .pending_image_strip
                     .lock()
                     .get(&timed_out)
                     .is_some_and(|strip| !strip.applying && !strip.urls.is_empty()),
-                "Completed must not claim URLs before persistence owns the gate"
+                "Completed must not claim URLs before its persist owns the gate"
             );
 
             let rewind_actor = Arc::clone(&actor);
@@ -430,13 +421,12 @@ async fn rewind_cancels_queued_image_strip_before_it_runs() {
             );
             drop(strip_blocker);
 
-            let rewind = tokio::time::timeout(std::time::Duration::from_secs(5), rewind)
+            let rewind = rewind
                 .await
-                .expect("rewind must finish after the rewrite gate is released")
                 .expect("rewind task completes")
                 .expect("rewind succeeds");
             assert!(rewind.success, "rewind should commit: {rewind:?}");
-            await_completion(completion).await;
+            completed.await.expect("Completed handler finishes");
 
             let conv = actor.chat_state_handle.get_conversation().await;
             assert!(
@@ -446,7 +436,7 @@ async fn rewind_cancels_queued_image_strip_before_it_runs() {
             assert!(actor.pending_image_strip.lock().is_empty());
             assert!(
                 !drain_gateway_debug(&mut gateway_rx).contains("removed from the conversation"),
-                "cancelled queued persistence must not emit a stale durable-removal note"
+                "cancelled detached persistence must not emit a stale durable-removal note"
             );
         })
         .await;
@@ -487,7 +477,8 @@ async fn rejected_rewind_preserves_queued_image_strip() {
             });
             tokio::task::yield_now().await;
 
-            let completion = spawn_blocked_completion(&actor, &request_id).await;
+            let completed = deliver_completed(&actor, &request_id);
+            tokio::task::yield_now().await;
             assert!(
                 actor
                     .pending_image_strip
@@ -498,21 +489,17 @@ async fn rejected_rewind_preserves_queued_image_strip() {
             );
             drop(strip_blocker);
 
-            let rewind = tokio::time::timeout(std::time::Duration::from_secs(5), rewind)
+            let rewind = rewind
                 .await
-                .expect("rewind must finish after the rewrite gate is released")
                 .expect("rewind task completes")
                 .expect("rewind returns a response");
             assert!(
                 !rewind.success,
                 "invalid rewind must be rejected: {rewind:?}"
             );
-            await_completion(completion).await;
+            completed.await.expect("Completed handler finishes");
 
-            let conv = wait_for_conversation(&actor, |conv| {
-                !conversation_has_image(conv, PERSIST_GATE_IMAGE_URI)
-            })
-            .await;
+            let conv = actor.chat_state_handle.get_conversation().await;
             assert!(
                 !conversation_has_image(&conv, PERSIST_GATE_IMAGE_URI),
                 "strip must resume after rejected rewind: {conv:?}"
@@ -589,7 +576,8 @@ async fn failed_compaction_replay_preserves_queued_image_strip() {
                 .await;
 
             let strip_blocker = actor.image_strip_rewrite_barrier.lock_strip().await;
-            let completion = spawn_blocked_completion(&actor, &request_id).await;
+            let completed = deliver_completed(&actor, &request_id);
+            tokio::task::yield_now().await;
             let rewind_actor = Arc::clone(&actor);
             let rewind = tokio::task::spawn_local(async move {
                 rewind_actor
@@ -611,18 +599,14 @@ async fn failed_compaction_replay_preserves_queued_image_strip() {
             );
             drop(strip_blocker);
 
-            let rewind = tokio::time::timeout(std::time::Duration::from_secs(5), rewind)
+            let rewind = rewind
                 .await
-                .expect("rewind must finish after the rewrite gate is released")
                 .expect("rewind task completes")
                 .expect("rewind returns a response");
             assert!(!rewind.success, "missing checkpoint must reject rewind");
-            await_completion(completion).await;
+            completed.await.expect("Completed handler finishes");
 
-            let conv = wait_for_conversation(&actor, |conv| {
-                !conversation_has_image(conv, PERSIST_GATE_IMAGE_URI)
-            })
-            .await;
+            let conv = actor.chat_state_handle.get_conversation().await;
             let _ = std::fs::remove_dir_all(&session_dir);
             assert!(
                 !conversation_has_image(&conv, PERSIST_GATE_IMAGE_URI),
@@ -634,7 +618,7 @@ async fn failed_compaction_replay_preserves_queued_image_strip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn pending_strip_bound_preserves_queued_and_new_url_entries() {
+async fn pending_strip_bound_preserves_detached_and_new_url_entries() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -656,7 +640,8 @@ async fn pending_strip_bound_preserves_queued_and_new_url_entries() {
                 .await;
 
             let strip_blocker = actor.image_strip_rewrite_barrier.lock_strip().await;
-            let completion = spawn_blocked_completion(&actor, &applying_id).await;
+            let completed = deliver_completed(&actor, &applying_id);
+            tokio::task::yield_now().await;
             {
                 let mut pending = actor.pending_image_strip.lock();
                 for index in 0..16 {
@@ -685,7 +670,7 @@ async fn pending_strip_bound_preserves_queued_and_new_url_entries() {
                     pending
                         .get(&applying_id)
                         .is_some_and(|strip| !strip.applying && !strip.urls.is_empty()),
-                    "bound enforcement must retain queued work waiting for the rewrite gate"
+                    "bound enforcement must retain detached work waiting for the rewrite gate"
                 );
                 assert!(
                     pending
@@ -696,15 +681,12 @@ async fn pending_strip_bound_preserves_queued_and_new_url_entries() {
                 assert_eq!(16, pending.len());
             }
             drop(strip_blocker);
-            await_completion(completion).await;
+            completed.await.expect("Completed handler finishes");
 
-            let conv = wait_for_conversation(&actor, |conv| {
-                !conversation_has_image(conv, PERSIST_GATE_IMAGE_URI)
-            })
-            .await;
+            let conv = actor.chat_state_handle.get_conversation().await;
             assert!(
                 !conversation_has_image(&conv, PERSIST_GATE_IMAGE_URI),
-                "retained queued write must finish after acquiring the gate: {conv:?}"
+                "retained write must finish after acquiring the gate: {conv:?}"
             );
             assert!(!actor.pending_image_strip.lock().contains_key(&applying_id));
         })

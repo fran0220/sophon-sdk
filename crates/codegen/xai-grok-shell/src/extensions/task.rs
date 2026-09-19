@@ -611,8 +611,8 @@ mod tests {
             deleted: true,
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        assert_eq!(json["taskId"], "task-42");
-        assert_eq!(json["deleted"], true);
+        assert_eq!(json.get("taskId"), Some(&serde_json::json!("task-42")));
+        assert_eq!(json.get("deleted"), Some(&serde_json::json!(true)));
     }
 
     #[test]
@@ -635,20 +635,38 @@ mod tests {
             error_count: Some(1),
         };
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["subagentId"], "sub-1");
-        assert_eq!(json["attemptId"], "attempt-1");
-        assert_eq!(json["parentSessionId"], "parent-1");
-        assert_eq!(json["childSessionId"], "child-1");
-        assert_eq!(json["subagentType"], "explore");
-        assert_eq!(json["startedAtEpochMs"], 1_700_000_000_000_u64);
-        assert_eq!(json["durationMs"], 5000);
-        assert_eq!(json["turnCount"], 2);
-        assert_eq!(json["toolCallCount"], 7);
-        assert_eq!(json["tokensUsed"], 30_000);
-        assert_eq!(json["contextWindowTokens"], 256_000);
-        assert_eq!(json["contextUsagePct"], 23);
-        assert_eq!(json["toolsUsed"], serde_json::json!(["bash", "grep"]));
-        assert_eq!(json["errorCount"], 1);
+        assert_eq!(json.get("attemptId"), Some(&serde_json::json!("attempt-1")));
+        assert_eq!(json.get("subagentId"), Some(&serde_json::json!("sub-1")));
+        assert_eq!(
+            json.get("parentSessionId"),
+            Some(&serde_json::json!("parent-1"))
+        );
+        assert_eq!(
+            json.get("childSessionId"),
+            Some(&serde_json::json!("child-1"))
+        );
+        assert_eq!(
+            json.get("subagentType"),
+            Some(&serde_json::json!("explore"))
+        );
+        assert_eq!(
+            json.get("startedAtEpochMs"),
+            Some(&serde_json::json!(1_700_000_000_000_u64))
+        );
+        assert_eq!(json.get("durationMs"), Some(&serde_json::json!(5000)));
+        assert_eq!(json.get("turnCount"), Some(&serde_json::json!(2)));
+        assert_eq!(json.get("toolCallCount"), Some(&serde_json::json!(7)));
+        assert_eq!(json.get("tokensUsed"), Some(&serde_json::json!(30_000)));
+        assert_eq!(
+            json.get("contextWindowTokens"),
+            Some(&serde_json::json!(256_000))
+        );
+        assert_eq!(json.get("contextUsagePct"), Some(&serde_json::json!(23)));
+        assert_eq!(
+            json.get("toolsUsed"),
+            Some(&serde_json::json!(["bash", "grep"]))
+        );
+        assert_eq!(json.get("errorCount"), Some(&serde_json::json!(1)));
     }
 
     #[test]
@@ -692,7 +710,7 @@ mod tests {
     fn list_running_response_serializes_with_subagents_array() {
         let resp = ListRunningSubagentsResponse { subagents: vec![] };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        assert_eq!(json["subagents"], serde_json::json!([]));
+        assert_eq!(json.get("subagents"), Some(&serde_json::json!([])));
     }
 
     // ── SubagentSnapshotDto serialization tests ────────────────────────
@@ -782,14 +800,20 @@ mod tests {
             Default::default(),
         );
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["parentSessionId"], "parent-1");
-        assert_eq!(json["childSessionId"], "child-1");
-        assert_eq!(json["status"], "running");
-        assert_eq!(json["turnCount"], 3);
-        assert_eq!(json["toolCallCount"], 12);
-        assert_eq!(json["tokensUsed"], 45_000);
-        assert_eq!(json["contextUsagePct"], 35);
-        assert_eq!(json["errorCount"], 1);
+        assert_eq!(
+            json.get("parentSessionId"),
+            Some(&serde_json::json!("parent-1"))
+        );
+        assert_eq!(
+            json.get("childSessionId"),
+            Some(&serde_json::json!("child-1"))
+        );
+        assert_eq!(json.get("status"), Some(&serde_json::json!("running")));
+        assert_eq!(json.get("turnCount"), Some(&serde_json::json!(3)));
+        assert_eq!(json.get("toolCallCount"), Some(&serde_json::json!(12)));
+        assert_eq!(json.get("tokensUsed"), Some(&serde_json::json!(45_000)));
+        assert_eq!(json.get("contextUsagePct"), Some(&serde_json::json!(35)));
+        assert_eq!(json.get("errorCount"), Some(&serde_json::json!(1)));
         // Completed-only fields should be absent
         assert!(json.get("output").is_none());
         assert!(json.get("failureError").is_none());
@@ -814,10 +838,13 @@ mod tests {
         let dto =
             SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["status"], "completed");
-        assert_eq!(json["output"], "Done, refactored 3 files.");
-        assert_eq!(json["toolCalls"], 8);
-        assert_eq!(json["turns"], 2);
+        assert_eq!(json.get("status"), Some(&serde_json::json!("completed")));
+        assert_eq!(
+            json.get("output"),
+            Some(&serde_json::json!("Done, refactored 3 files."))
+        );
+        assert_eq!(json.get("toolCalls"), Some(&serde_json::json!(8)));
+        assert_eq!(json.get("turns"), Some(&serde_json::json!(2)));
         // Running-only fields should be absent
         assert!(json.get("turnCount").is_none());
         assert!(json.get("tokensUsed").is_none());
@@ -839,8 +866,11 @@ mod tests {
         let dto =
             SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["status"], "failed");
-        assert_eq!(json["failureError"], "sampling error");
+        assert_eq!(json.get("status"), Some(&serde_json::json!("failed")));
+        assert_eq!(
+            json.get("failureError"),
+            Some(&serde_json::json!("sampling error"))
+        );
     }
 
     #[test]
@@ -859,8 +889,11 @@ mod tests {
         let dto =
             SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["status"], "cancelled");
-        assert_eq!(json["cancelReason"], "user cancelled");
+        assert_eq!(json.get("status"), Some(&serde_json::json!("cancelled")));
+        assert_eq!(
+            json.get("cancelReason"),
+            Some(&serde_json::json!("user cancelled"))
+        );
     }
 
     #[test]
@@ -877,7 +910,7 @@ mod tests {
         let dto =
             SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["status"], "cancelled");
+        assert_eq!(json.get("status"), Some(&serde_json::json!("cancelled")));
         assert!(json.get("cancelReason").is_none());
     }
 
@@ -885,7 +918,7 @@ mod tests {
     fn get_subagent_response_null_snapshot() {
         let resp = GetSubagentResponse { snapshot: None };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        assert!(json["snapshot"].is_null());
+        assert!(json.get("snapshot").is_none_or(|v| v.is_null()));
     }
 
     #[test]
@@ -918,12 +951,17 @@ mod tests {
             )),
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        let s = &json["snapshot"];
-        assert_eq!(s["status"], "running");
-        assert_eq!(s["subagentId"], "sub-run");
-        assert_eq!(s["parentSessionId"], "parent-1");
-        assert_eq!(s["childSessionId"], "child-1");
-        assert_eq!(s["turnCount"], 2);
+        let Some(s) = json.get("snapshot") else {
+            panic!("expected snapshot: {json}");
+        };
+        assert_eq!(s.get("status"), Some(&serde_json::json!("running")));
+        assert_eq!(s.get("subagentId"), Some(&serde_json::json!("sub-run")));
+        assert_eq!(
+            s.get("parentSessionId"),
+            Some(&serde_json::json!("parent-1"))
+        );
+        assert_eq!(s.get("childSessionId"), Some(&serde_json::json!("child-1")));
+        assert_eq!(s.get("turnCount"), Some(&serde_json::json!(2)));
         // Completed-only fields must be absent
         assert!(s.get("output").is_none());
         assert!(s.get("turns").is_none());
@@ -954,11 +992,16 @@ mod tests {
             )),
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        let s = &json["snapshot"];
-        assert_eq!(s["status"], "completed");
-        assert_eq!(s["output"], "Refactored 3 files.");
-        assert_eq!(s["toolCalls"], 7);
-        assert_eq!(s["turns"], 2);
+        let Some(s) = json.get("snapshot") else {
+            panic!("expected snapshot: {json}");
+        };
+        assert_eq!(s.get("status"), Some(&serde_json::json!("completed")));
+        assert_eq!(
+            s.get("output"),
+            Some(&serde_json::json!("Refactored 3 files."))
+        );
+        assert_eq!(s.get("toolCalls"), Some(&serde_json::json!(7)));
+        assert_eq!(s.get("turns"), Some(&serde_json::json!(2)));
         // Running-only fields must be absent
         assert!(s.get("turnCount").is_none());
         assert!(s.get("tokensUsed").is_none());
@@ -1022,8 +1065,14 @@ mod tests {
             provenance,
         );
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json["resumedFrom"], "source-agent-id");
-        assert_eq!(json["forkParentPromptId"], "prompt-5");
+        assert_eq!(
+            json.get("resumedFrom"),
+            Some(&serde_json::json!("source-agent-id"))
+        );
+        assert_eq!(
+            json.get("forkParentPromptId"),
+            Some(&serde_json::json!("prompt-5"))
+        );
     }
 
     // ── x.ai/subagent/cancel outcome wire DTO ──────────────────────────
@@ -1063,10 +1112,16 @@ mod tests {
             }),
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        assert_eq!(json["subagentId"], "sa-1");
-        assert_eq!(json["cancelled"], false);
-        assert_eq!(json["outcome"]["kind"], "already_finished");
-        assert_eq!(json["outcome"]["status"], "failed");
+        assert_eq!(json.get("subagentId"), Some(&serde_json::json!("sa-1")));
+        assert_eq!(json.get("cancelled"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            json.pointer("/outcome/kind"),
+            Some(&serde_json::json!("already_finished"))
+        );
+        assert_eq!(
+            json.pointer("/outcome/status"),
+            Some(&serde_json::json!("failed"))
+        );
     }
 
     /// Wire-compat: a payload from an older shell (no `outcome`) still deserializes.

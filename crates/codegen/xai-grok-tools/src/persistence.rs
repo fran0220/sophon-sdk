@@ -507,7 +507,11 @@ mod tests {
         // Final state is intact and reflects the last write.
         let content = std::fs::read_to_string(&state_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(parsed["state"]["grok_build.WebCitation"].is_object());
+        assert!(
+            parsed
+                .pointer("/state/grok_build.WebCitation")
+                .is_some_and(|v| v.is_object())
+        );
     }
 
     #[tokio::test]
@@ -532,7 +536,11 @@ mod tests {
         let content = std::fs::read_to_string(&state_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         // Should have "state" category with "grok_build.WebCitation" key
-        assert!(parsed["state"]["grok_build.WebCitation"].is_object());
+        assert!(
+            parsed
+                .pointer("/state/grok_build.WebCitation")
+                .is_some_and(|v| v.is_object())
+        );
     }
 
     #[tokio::test]
@@ -560,7 +568,10 @@ mod tests {
 
         let content = std::fs::read_to_string(state_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["state"]["grok_build.WebCitation"]["counter"], 2);
+        assert_eq!(
+            parsed.pointer("/state/grok_build.WebCitation/counter"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[tokio::test]
@@ -584,7 +595,10 @@ mod tests {
 
         let content = std::fs::read_to_string(state_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["state"]["grok_build.WebCitation"]["counter"], 7);
+        assert_eq!(
+            parsed.pointer("/state/grok_build.WebCitation/counter"),
+            Some(&serde_json::json!(7))
+        );
     }
 
     #[tokio::test]
@@ -615,7 +629,10 @@ mod tests {
 
         let content = std::fs::read_to_string(state_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["state"]["grok_build.WebCitation"]["counter"], 2);
+        assert_eq!(
+            parsed.pointer("/state/grok_build.WebCitation/counter"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[tokio::test]

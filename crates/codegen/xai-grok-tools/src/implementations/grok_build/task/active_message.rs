@@ -11,8 +11,7 @@ pub const MAX_ACTIVE_AGENT_MESSAGE_BYTES: usize = 32 * 1024;
 
 pub use xai_message_delivery_core::AgentAddress;
 
-/// How a caller names the owned child. The variant is the principal:
-/// a child id is agent ingress, an address is human ingress.
+/// Coordinator target vocabulary; sender authority remains server-bound outside this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveMessageTarget {
     ChildId(String),
@@ -22,15 +21,18 @@ pub enum ActiveMessageTarget {
         subagent_id: String,
         attempt_id: String,
     },
+    Parent,
+    Agent {
+        agent_id: xai_message_delivery_core::AgentId,
+    },
 }
 
-impl ActiveMessageTarget {
-    pub fn source(&self) -> ActiveAgentMessageSource {
-        match self {
-            Self::ChildId(_) => ActiveAgentMessageSource::Agent,
-            Self::Address(_) | Self::HumanAttempt { .. } => ActiveAgentMessageSource::Human,
-        }
-    }
+/// Coordinator-classified relationship between sender and resolved target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveMessageRoute {
+    ParentToOwnedDescendant,
+    DescendantToParent,
+    Peer,
 }
 
 /// Closed delivery operation. No bool below the model adapter.
@@ -38,6 +40,7 @@ impl ActiveMessageTarget {
 pub enum ActiveAgentMessageOperation {
     Queue,
     Steer,
+    Interject,
 }
 
 impl From<ActiveAgentMessageOperation> for xai_message_delivery_core::Operation {
@@ -45,6 +48,9 @@ impl From<ActiveAgentMessageOperation> for xai_message_delivery_core::Operation 
         match operation {
             ActiveAgentMessageOperation::Queue => xai_message_delivery_core::Operation::Queue,
             ActiveAgentMessageOperation::Steer => xai_message_delivery_core::Operation::Steer,
+            ActiveAgentMessageOperation::Interject => {
+                xai_message_delivery_core::Operation::Interject
+            }
         }
     }
 }
@@ -56,7 +62,6 @@ pub enum ActiveAgentMessageSource {
     Human,
 }
 
-/// Bounded caller request for the internal active-descendant route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveAgentMessageRequest {
     target: ActiveMessageTarget,
@@ -115,7 +120,7 @@ impl ActiveAgentMessageRequest {
         Self::try_from_parts(ActiveMessageTarget::Address(address), text, operation)
     }
 
-    fn try_from_parts(
+    pub(crate) fn try_from_parts(
         target: ActiveMessageTarget,
         text: impl Into<Arc<str>>,
         operation: ActiveAgentMessageOperation,
@@ -164,10 +169,6 @@ impl ActiveAgentMessageRequest {
     pub fn operation(&self) -> ActiveAgentMessageOperation {
         self.operation
     }
-
-    pub fn source(&self) -> ActiveAgentMessageSource {
-        self.target.source()
-    }
 }
 
 /// Server-authored message admitted by one active child runtime.
@@ -184,6 +185,7 @@ pub struct ActiveAgentMessageDelivery {
     message: ActiveAgentMessage,
     operation: ActiveAgentMessageOperation,
     source: ActiveAgentMessageSource,
+    route: ActiveMessageRoute,
     admission_lease: Arc<ActiveMessageAdmissionLease>,
 }
 
@@ -192,12 +194,14 @@ impl ActiveAgentMessageDelivery {
         message: ActiveAgentMessage,
         operation: ActiveAgentMessageOperation,
         source: ActiveAgentMessageSource,
+        route: ActiveMessageRoute,
         admission_lease: Arc<ActiveMessageAdmissionLease>,
     ) -> Self {
         Self {
             message,
             operation,
             source,
+            route,
             admission_lease,
         }
     }
@@ -212,6 +216,10 @@ impl ActiveAgentMessageDelivery {
 
     pub fn source(&self) -> ActiveAgentMessageSource {
         self.source
+    }
+
+    pub fn route(&self) -> ActiveMessageRoute {
+        self.route
     }
 
     /// Run synchronous protected-row insertion only while admission is open.
@@ -347,7 +355,16 @@ impl ActiveMessageAdmissionLease {
     }
 }
 
-/// Closed result of the internal active-descendant route.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveAgentMessageQuotaKind {
+    SenderTargetInFlight,
+    AttemptOutbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ActiveAgentMessageOutcome {
@@ -358,6 +375,10 @@ pub enum ActiveAgentMessageOutcome {
     NotActiveOrFinalizing,
     Saturated {
         max_in_flight: usize,
+    },
+    QuotaExceeded {
+        kind: ActiveAgentMessageQuotaKind,
+        limit: usize,
     },
     /// A claimed or committed admission could not be resolved conclusively.
     AdmissionUncertain,
@@ -371,12 +392,26 @@ pub enum ActiveAgentMessageOutcome {
     ChannelClosed,
 }
 
+/// Sole server-bound principal for an active-message request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveMessageSenderContext {
+    RootSession {
+        session_id: Arc<str>,
+    },
+    GrantedChild {
+        holder: super::agent_message_sender::AgentMessageHolder,
+    },
+    HumanRoot {
+        session_id: Arc<str>,
+    },
+}
+
 /// Coordinator command envelope with server-bound sender identity.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentActiveMessageRequest {
     pub request: ActiveAgentMessageRequest,
-    pub parent_session_id: String,
+    pub sender_context: ActiveMessageSenderContext,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<ActiveAgentMessageOutcome>,
 }

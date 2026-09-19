@@ -33,9 +33,9 @@ pub use client::{
 pub use config::{
     AgentConfig, MediaConfig, MediaProviderConfig, MemoryConfig, MemoryDreamSettings,
     MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings, MemoryInitialInjectionSettings,
-    MemoryMode, MemorySearchSettings, MemorySessionSettings, MemoryWatcherSettings, MmrSettings,
-    ModelBehaviorConfig, ModelConfig, ModelRetryConfig, PermissionPolicy, ProviderConfig,
-    ProviderProtocol, PruningSettings, TemporalDecaySettings,
+    MemoryMode, MemorySearchSettings, MemorySessionSettings, MemoryV2Rollout, MemoryV2Settings,
+    MemoryWatcherSettings, MmrSettings, ModelBehaviorConfig, ModelConfig, ModelRetryConfig,
+    PermissionPolicy, ProviderConfig, ProviderProtocol, PruningSettings, TemporalDecaySettings,
 };
 pub use event::{
     Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
@@ -182,7 +182,7 @@ pub struct SourceProvenance {
 
 pub fn source_provenance() -> SourceProvenance {
     SourceProvenance {
-        upstream_release: "1.0.24",
+        upstream_release: "1.0.35",
         upstream_grok_build_commit: include_str!("../../../UPSTREAM_GROK_BUILD_COMMIT").trim(),
         upstream_source_rev: include_str!("../../../SOURCE_REV").trim(),
         facade_version: env!("CARGO_PKG_VERSION"),
@@ -196,14 +196,14 @@ mod tests {
     #[test]
     fn provenance_matches_the_pinned_upstream_snapshot() {
         let provenance = source_provenance();
-        assert_eq!(provenance.upstream_release, "1.0.24");
+        assert_eq!(provenance.upstream_release, "1.0.35");
         assert_eq!(
             provenance.upstream_grok_build_commit,
-            "37949780c144e37df692e3d669051a21fec24f20"
+            "a28ee2b2063426e8816e380ccea528b9de95e5da"
         );
         assert_eq!(
             provenance.upstream_source_rev,
-            "c4ea71cfdbcdb21e32e41bc25a0043d7d4836714"
+            "e8563f8f182296ebb53cadb3e1eab7615d76408e"
         );
         assert_eq!(provenance.facade_version, env!("CARGO_PKG_VERSION"));
     }

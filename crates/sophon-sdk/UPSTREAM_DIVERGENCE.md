@@ -36,6 +36,8 @@ used only when the selected route is session-owned.
 - Image understanding uses the complete auxiliary-model resolver.
 - Authored and explicitly replaced system prompts survive model/effort changes
   and attach-time restoration; upstream effort selection remains authoritative.
+  Native V2 memory publication and model-label artifact updates also preserve
+  the explicit prompt instead of replacing it with a rendered template.
 - Native image generation, image editing, and video generation can use the
   runtime-only `ImagineProviderConfig`; those clients do not install the active
   session key provider when explicit media credentials are present.
@@ -50,6 +52,8 @@ upstream-owned. Approved files (digest: `provider-routing.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/memory_control.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/recap.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/idle_resume_tests.rs`
@@ -122,6 +126,9 @@ digests therefore detect changes to that shared boundary.
 The portability patch replaces `/dev/stdout`/`/dev/null` protoc dependency
 scanning with temporary files, keeps `process-wrap` on the Windows-compatible
 9.0.0 type boundary, and retains compile-regression coverage.
+Durable tool-state publication preserves existing verbatim/device namespaces
+and converts ordinary drive/UNC paths exactly once. This pre-existing main
+branch repair is now included in the Windows digest.
 
 Approved files (digest: `windows-portability.sha256`):
 
@@ -129,6 +136,7 @@ Approved files (digest: `windows-portability.sha256`):
 - `crates/codegen/xai-grok-shell-terminal/Cargo.toml`
 - `crates/codegen/xai-grok-shell-terminal/src/streaming_local_terminal.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs`
+- `crates/codegen/xai-grok-tools/src/persistence.rs`
 
 ## Public snapshot test repair
 
@@ -144,12 +152,12 @@ Upstream now awaits strip persistence inline; the old tests deadlock by awaiting
 completion while holding its required mutex. Production ordering and all
 persistence/rewind assertions remain intact. The session-list benchmark also
 removes duplicate `agent_id`/`attempt_id` initializer fields from the snapshot.
+At 1.0.35, upstream supplies the image-strip concurrency repair and removes
+the stale memory imports, so those files no longer require an overlay.
 
 Approved files (digest: `public-snapshot-repairs.sha256`):
 
 - `crates/codegen/xai-grok-shell/benches/session_list.rs`
-- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/image_strip_tests.rs`
-- `crates/codegen/xai-grok-shell/src/upload/memory_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs`
 
 ## Goal reliability
@@ -165,9 +173,12 @@ Goal planning keeps its fail-closed contract on every host:
   canonical paused message instead of running ordinary inference under a Goal
   that is no longer active, matching the existing `/goal resume` behavior.
 
+At 1.0.35 the last behavior is provided by upstream's
+`planner_pause_short_circuit_message`; the duplicate SDK implementation is
+removed. Windows publication and diagnostic changes remain.
+
 Approved files (digest: `goal-reliability.sha256`):
 
-- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal_support.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/goal/goal_planner_e2e_tests.rs`
@@ -250,6 +261,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/isolated_spawn_e2e.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/spawn.rs`
@@ -287,6 +299,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_types.rs`
 - `crates/codegen/xai-grok-shell/src/session/agent_rebuild.rs`
+- `crates/codegen/xai-grok-shell/src/session/agent_rebuild_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/commands.rs`
 - `crates/codegen/xai-grok-shell/src/session/compaction.rs`
 - `crates/codegen/xai-grok-shell/src/session/handle.rs`
@@ -307,6 +320,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/agent_targets.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/query.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs`
@@ -319,6 +333,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-tools/src/management/mod.rs`
 - `crates/codegen/xai-grok-tools/src/notification/types.rs`
 - `crates/codegen/xai-grok-tools/src/registry/types.rs`
+- `crates/codegen/xai-grok-tools/tests/test_subagent_soak.rs`
 - `crates/codegen/xai-grok-workspace/src/session/tool_config.rs`
 - `crates/codegen/xai-prompt-queue/Cargo.toml`
 - `crates/codegen/xai-prompt-queue/src/lib.rs`

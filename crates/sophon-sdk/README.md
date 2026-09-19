@@ -8,11 +8,11 @@ official xAI SDK.
 
 Current source identity:
 
-- SDK facade version: **0.5.0** (breaking management/configuration upgrade)
-- public product source baseline: 1.0.24
-- public Grok Build commit: `37949780c144e37df692e3d669051a21fec24f20`
-- public crate metadata: 1.0.24
-- embedded monorepo revision: `c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`
+- SDK facade version: **0.6.0** (Memory V2 configuration upgrade)
+- public product source baseline: 1.0.35
+- public Grok Build commit: `a28ee2b2063426e8816e380ccea528b9de95e5da`
+- public crate metadata: 1.0.35
+- embedded monorepo revision: `e8563f8f182296ebb53cadb3e1eab7615d76408e`
 
 ## Use it
 
@@ -92,6 +92,32 @@ suggestions. Each can be routed independently with
 `web_search_model` and must name an OpenAI Responses route because Grok Build's
 search implementation calls the Responses API with its `web_search` tool.
 Leaving it unset does not disable the separately configured web-fetch tool.
+
+### 0.6.0 Memory V2 migration
+
+Upstream now selects V2 through a separate `[memory_v2]` table, not
+`[memory].mode`. The SDK maps `MemoryMode` to that native configuration and
+continues to default to V2 with embeddings disabled. `MemoryConfig` adds `v2`;
+struct literals must supply it or use `..Default::default()`.
+`MemoryMode` overrides `v2.enabled`, so `Disabled` cannot accidentally enable
+memory and `Legacy` cannot inherit a remote V2 selection.
+
+`MemoryV2Settings` and `MemoryV2Rollout` expose native capture, automatic/manual
+Dream, write controls, rollout stages and retention settings. V2 capture and
+Dream can perform background inference on the selected session provider even
+though embeddings are disabled. Set `v2.capture_enabled` and
+`v2.automatic_dream_enabled` to `Some(false)` to opt out of those workers,
+or use `MemoryMode::Disabled` to disable memory altogether. Checked final exit
+stops capture and Dream workers before flushing session persistence.
+
+The sync also includes MCP protocol/handshake and structured-result fixes,
+native parent/peer subagent messages, prompt offloading, and safer checkpoint
+retention. `mcp::Inventory::session_mcp_resolved` carries the native handshake
+completion fact: `Some(true)` with a missing enabled server client means a failed
+handshake rather than continuing initialization; it is not a health guarantee.
+The SDK's existing management, provider and portability APIs remain;
+exact attempt fencing and authored system prompts are retained. New TUI/daemon
+features are not mirrored into the facade.
 
 ### 0.5.0 configuration and management migration
 

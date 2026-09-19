@@ -171,6 +171,10 @@ pub struct ReadResourceRequest {
 #[derive(Clone, Deserialize)]
 pub struct Inventory {
     pub servers: Vec<Server>,
+    /// Whether the native session handshake pass has completed, not whether
+    /// every server is healthy. `None` means no session resolution fact.
+    #[serde(rename = "sessionMcpResolved")]
+    pub session_mcp_resolved: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -488,6 +492,14 @@ mod tests {
     fn native_envelopes_distinguish_rejection_payload_and_invalid_response() {
         let inventory: Inventory = decode(json!({"result": {"servers": []}})).unwrap();
         assert!(inventory.servers.is_empty());
+        assert_eq!(inventory.session_mcp_resolved, None);
+        for resolved in [false, true] {
+            let inventory: Inventory = decode(json!({"result": {
+                "servers": [], "sessionMcpResolved": resolved
+            }}))
+            .unwrap();
+            assert_eq!(inventory.session_mcp_resolved, Some(resolved));
+        }
         let auth: AuthResult = decode(json!({
             "result": {"status": "failed", "error": "secret-diagnostic"},
             "error": null

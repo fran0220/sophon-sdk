@@ -139,7 +139,7 @@ impl MessageDeliveryHandle {
         &self,
         envelope: DeliveryEnvelope<
             AgentSource,
-            OwnedActiveDescendantGrant,
+            CoordinatorAgentDeliveryGrant,
             Arc<str>,
             AgentDeliveryIdentity,
         >,
@@ -148,6 +148,8 @@ impl MessageDeliveryHandle {
     ) -> ActiveMessageAdmission {
         let (operation, content, identity, grant) = envelope.into_parts();
         let delivery = grant.delivery;
+        let _target_agent_id = grant.target_agent_id;
+        let _target_generation = grant.target_generation;
         if grant.target_session_id != self.target_session_id {
             return ActiveMessageAdmission::Rejected;
         }
@@ -160,7 +162,7 @@ impl MessageDeliveryHandle {
             return ActiveMessageAdmission::Rejected;
         }
         if operation != Operation::from(delivery.operation())
-            || authorize_operation(OperationSet::QUEUE_AND_STEER, operation).is_err()
+            || authorize_operation(OperationSet::QUEUE_STEER_AND_INTERJECT, operation).is_err()
         {
             return ActiveMessageAdmission::Unsupported;
         }
@@ -184,15 +186,25 @@ impl MessageDeliveryHandle {
     }
 }
 
-pub(crate) struct OwnedActiveDescendantGrant {
+pub(crate) struct CoordinatorAgentDeliveryGrant {
     target_session_id: String,
+    target_agent_id: xai_message_delivery_core::AgentId,
+    target_generation:
+        xai_grok_tools::implementations::grok_build::task::root_control::AgentMessageGeneration,
     delivery: ActiveAgentMessageDelivery,
 }
 
-impl OwnedActiveDescendantGrant {
-    pub(crate) fn new(target_session_id: String, delivery: ActiveAgentMessageDelivery) -> Self {
-        Self {
+impl CoordinatorAgentDeliveryGrant {
+    pub(crate) fn new(
+        target_session_id: String,
+        target_agent_id: xai_message_delivery_core::AgentId,
+        target_generation: xai_grok_tools::implementations::grok_build::task::root_control::AgentMessageGeneration,
+        delivery: ActiveAgentMessageDelivery,
+    ) -> Self {
+        CoordinatorAgentDeliveryGrant {
             target_session_id,
+            target_agent_id,
+            target_generation,
             delivery,
         }
     }

@@ -10,10 +10,6 @@ use crate::config::{AgentConfig, MemoryConfig, MemoryMode, ModelConfig};
 fn memory_settings(config: &MemoryConfig) -> MemorySettings {
     MemorySettings {
         enabled: Some(config.enabled()),
-        mode: Some(match config.mode {
-            MemoryMode::Legacy => xai_grok_config_types::MemoryMode::Legacy,
-            MemoryMode::Disabled | MemoryMode::V2 => xai_grok_config_types::MemoryMode::V2,
-        }),
         // Empty model is the native explicit "no embeddings" value. In
         // particular, do not fall back to remote memory_embedding_model.
         embedding: Some(MemoryEmbeddingSettings {
@@ -43,6 +39,15 @@ pub(crate) fn apply_raw_config(config: &AgentConfig, raw: &mut toml::Value) -> R
             .map_err(|_| Error::invalid_config("unable to encode memory settings"))
     };
     table.insert("memory".into(), serialize(memory_settings(&config.memory))?);
+    let mut v2 = config.memory.v2.clone();
+    // Keep Disabled pinned to V2 with the global enable bit off, as before.
+    // Never inherit an ambient or remote implementation selection.
+    v2.enabled = Some(config.memory.mode != MemoryMode::Legacy);
+    table.insert(
+        "memory_v2".into(),
+        toml::Value::try_from(v2)
+            .map_err(|_| Error::invalid_config("unable to encode memory v2 settings"))?,
+    );
     let compaction = table
         .entry("compaction")
         .or_insert_with(|| toml::Value::Table(Default::default()))
@@ -160,6 +165,26 @@ mod tests {
     }
 
     #[test]
+    fn v2_controls_use_native_resolution_and_mode_owns_enablement() {
+        let mut config = config();
+        config.memory.v2.enabled = Some(false);
+        config.memory.v2.capture_enabled = Some(false);
+        config.memory.v2.automatic_dream_enabled = Some(false);
+        config.memory.v2.job_retention_days = Some(7);
+        let effective = resolve(&config).memory_config.unwrap();
+        assert!(effective.enabled && effective.mode.is_v2());
+        assert!(!effective.v2.capture_enabled);
+        assert!(!effective.v2.automatic_dream_enabled);
+        assert!(effective.v2.manual_dream_enabled);
+        assert_eq!(effective.v2.job_retention_days, 7);
+        config.memory.mode = MemoryMode::Legacy;
+        config.memory.v2.enabled = Some(true);
+        assert!(resolve(&config).memory_config.unwrap().mode.is_legacy());
+        config.memory.mode = MemoryMode::Disabled;
+        assert!(!resolve(&config).memory_config.unwrap().enabled);
+    }
+
+    #[test]
     fn models_keep_distinct_native_overrides_without_changing_routes() {
         let native = resolve(&config());
         let mut first = ModelEntry::fallback("first", &native.endpoints);
@@ -218,22 +243,38 @@ mod tests {
 
     #[test]
     fn raw_memory_overlay_preserves_other_tables_and_blocks_embedding_fallback() {
-        let mut raw: toml::Value = toml::from_str("[provider]\nmarker = 'untouched'\n[compaction]\nmarker = 42\n[memory.embedding]\nmodel = 'ambient'").unwrap();
-        apply_raw_config(&config(), &mut raw).unwrap();
-        assert_eq!(raw["provider"]["marker"].as_str(), Some("untouched"));
-        assert_eq!(raw["compaction"]["marker"].as_integer(), Some(42));
-        let memory: MemorySettings = raw["memory"].clone().try_into().unwrap();
         let remote = xai_grok_config_types::RemoteSettings {
             memory_embedding_model: Some("remote-embedding".into()),
+            memory_v2: Some(xai_grok_config_types::MemoryV2Settings {
+                enabled: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let effective = xai_grok_config_types::MemoryConfig::resolve_settings(
-            Some(true),
-            &memory,
-            &Default::default(),
-            &Default::default(),
-            Some(&remote),
-        );
-        assert!(effective.embedding.model.is_none());
+        for mode in [MemoryMode::V2, MemoryMode::Legacy, MemoryMode::Disabled] {
+            let config = config().memory_mode(mode);
+            let mut raw: toml::Value = toml::from_str("[provider]\nmarker = 'untouched'\n[compaction]\nmarker = 42\n[memory.embedding]\nmodel = 'ambient'\n[memory_v2]\nenabled = false\ncapture_enabled = false").unwrap();
+            apply_raw_config(&config, &mut raw).unwrap();
+            assert_eq!(raw["provider"]["marker"].as_str(), Some("untouched"));
+            assert_eq!(raw["compaction"]["marker"].as_integer(), Some(42));
+            let memory: MemorySettings = raw["memory"].clone().try_into().unwrap();
+            let v2: xai_grok_config_types::MemoryV2Settings =
+                raw["memory_v2"].clone().try_into().unwrap();
+            assert!(
+                v2.capture_enabled.is_none(),
+                "ambient tuning must be replaced"
+            );
+            let effective = xai_grok_config_types::MemoryConfig::resolve_settings(
+                Some(config.memory.enabled()),
+                &memory,
+                &v2,
+                &Default::default(),
+                &Default::default(),
+                Some(&remote),
+            );
+            assert!(effective.embedding.model.is_none());
+            assert_eq!(effective.enabled, mode != MemoryMode::Disabled);
+            assert_eq!(effective.mode.is_legacy(), mode == MemoryMode::Legacy);
+        }
     }
 }

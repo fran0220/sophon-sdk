@@ -295,8 +295,8 @@ fn validate_headers(headers: &BTreeMap<String, String>, owner: &str) -> Result<(
 /// not exposed: memory must not discover a separate ambient provider.
 pub use xai_grok_config_types::{
     MemoryDreamSettings, MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings,
-    MemoryInitialInjectionSettings, MemorySearchSettings, MemorySessionSettings,
-    MemoryWatcherSettings, MmrSettings, PruningSettings, TemporalDecaySettings,
+    MemoryInitialInjectionSettings, MemorySearchSettings, MemorySessionSettings, MemoryV2Rollout,
+    MemoryV2Settings, MemoryWatcherSettings, MmrSettings, PruningSettings, TemporalDecaySettings,
 };
 
 /// Persistent memory implementation. SDK sessions default to enabled Memory V2.
@@ -313,6 +313,9 @@ pub enum MemoryMode {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryConfig {
     pub mode: MemoryMode,
+    /// Native capture, Dream, rollout and retention controls. `mode` owns
+    /// enablement and overrides `v2.enabled`.
+    pub v2: MemoryV2Settings,
     pub index: MemoryIndexSettings,
     pub search: MemorySearchSettings,
     pub initial_injection: MemoryInitialInjectionSettings,

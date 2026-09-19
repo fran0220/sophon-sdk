@@ -42,18 +42,19 @@ async fn reasoning_option_advances_config_clock_without_rewriting_explicit_head_
                 .models_manager
                 .insert_test_entry("effort-model", entry);
             actor
-                .handle_set_session_model(
-                    xai_grok_sampler::SamplerConfig {
+                .handle_set_session_model(crate::session::SessionModelSwitch {
+                    sampling_config: xai_grok_sampler::SamplerConfig {
                         model: "effort-model".into(),
                         base_url: "https://provider.example/v1".into(),
                         ..Default::default()
                     },
-                    false,
-                    false,
-                    true,
-                    true,
-                    85,
-                )
+                    use_concise: false,
+                    is_family_switch: false,
+                    apply_prompt_override: true,
+                    skip_prompt_rewrite: true,
+                    auto_compact_threshold_percent: 85,
+                    system_prompt_label: String::new(),
+                })
                 .await
                 .unwrap();
             actor
@@ -101,7 +102,15 @@ async fn attach_restore_retains_original_rules_and_explicit_override_wins() {
                     ..Default::default()
                 };
                 let model = actor
-                    .handle_set_session_model(cfg, false, false, true, true, 75)
+                    .handle_set_session_model(crate::session::SessionModelSwitch {
+                        sampling_config: cfg,
+                        use_concise: false,
+                        is_family_switch: false,
+                        apply_prompt_override: true,
+                        skip_prompt_rewrite: true,
+                        auto_compact_threshold_percent: 75,
+                        system_prompt_label: String::new(),
+                    })
                     .await
                     .unwrap();
                 assert_eq!(model.0.as_ref(), "routing-slug");
@@ -147,8 +156,8 @@ async fn handle_replace_system_prompt_replaces_head_and_preserves_turns() {
             let conv = actor.chat_state_handle.get_conversation().await;
             assert_eq!(head_text(&conv).as_deref(), Some("client override"));
             assert_eq!(conv.len(), 3, "must not wipe user/assistant turns");
-            assert!(matches!(conv[1], ConversationItem::User(_)));
-            assert!(matches!(conv[2], ConversationItem::Assistant(_)));
+            assert!(matches!(conv.get(1), Some(ConversationItem::User(_))));
+            assert!(matches!(conv.get(2), Some(ConversationItem::Assistant(_))));
         })
         .await;
 }

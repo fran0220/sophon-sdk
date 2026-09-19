@@ -898,13 +898,17 @@ impl ToolRegistryBuilder {
         }
         let mut kind_to_name: HashMap<ToolKind, String> = HashMap::new();
         for tool_config in &config.tools {
-            let entry = &self.tools[&tool_config.id];
+            let Some(entry) = self.tools.get(&tool_config.id) else {
+                continue;
+            };
             let client_name = tool_config.resolve_client_name(&entry.id);
             kind_to_name.entry(entry.kind).or_insert(client_name);
         }
         let mut kind_params: HashMap<ToolKind, HashMap<String, String>> = HashMap::new();
         for tool_config in &config.tools {
-            let entry = &self.tools[&tool_config.id];
+            let Some(entry) = self.tools.get(&tool_config.id) else {
+                continue;
+            };
             let map = kind_params.entry(entry.kind).or_default();
             if let Some(props) = entry
                 .input_schema
@@ -2419,9 +2423,17 @@ mod tests {
             Some(&bash),
         )
         .unwrap();
-        assert_eq!(merged["bash_mode"], true);
-        assert_eq!(merged[TOOL_META_KEY]["kind"], "execute");
-        assert_eq!(merged[TOOL_META_KEY]["input"]["command"], "ls");
+        assert_eq!(merged.get("bash_mode"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            merged.get(TOOL_META_KEY).and_then(|v| v.get("kind")),
+            Some(&serde_json::json!("execute"))
+        );
+        assert_eq!(
+            merged
+                .get(TOOL_META_KEY)
+                .and_then(|v| v.pointer("/input/command")),
+            Some(&serde_json::json!("ls"))
+        );
         let unchanged = merge_tool_meta(
             &toolset,
             Some(serde_json::json!({"backend": true})),
@@ -2429,7 +2441,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(unchanged["backend"], true);
+        assert_eq!(unchanged.get("backend"), Some(&serde_json::json!(true)));
         assert!(unchanged.get(TOOL_META_KEY).is_none());
     }
     /// The wire (`ToolMetadata::is_read_only`) and doom-loop (`Tool::capabilities().is_read_only`)
@@ -2560,15 +2572,19 @@ mod tests {
             "old_string should be renamed to find"
         );
         assert!(!props.contains_key("old_string"));
-        let new_desc = props["new_string"]["description"]
-            .as_str()
+        let new_desc = props
+            .get("new_string")
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
             .unwrap_or_default();
         assert!(
             new_desc.contains("find") && !new_desc.contains("old_string"),
             "new_string description should reference the renamed param: {new_desc}"
         );
-        let replace_all_desc = props["replace_all"]["description"]
-            .as_str()
+        let replace_all_desc = props
+            .get("replace_all")
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
             .unwrap_or_default();
         assert!(
             replace_all_desc.contains("find") && !replace_all_desc.contains("old_string"),
@@ -2595,8 +2611,11 @@ mod tests {
                 .expect("run_terminal_cmd definition not found")
                 .clone();
             let desc = bash.function.description.clone().unwrap_or_default();
-            let field_desc = bash.function.parameters["properties"]["is_background"]["description"]
-                .as_str()
+            let field_desc = bash
+                .function
+                .parameters
+                .pointer("/properties/is_background/description")
+                .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
             (desc, field_desc)
@@ -2925,7 +2944,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1);
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(error.tool, "GrokBuild:run_terminal_cmd");
         assert_eq!(
             error.field_path.as_deref(),
@@ -2956,7 +2977,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1);
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(error.field_path.as_deref(), Some("params.hash_len"));
         assert_eq!(error.category.as_deref(), Some("params_constraint"));
         assert_eq!(error.expected.as_deref(), Some("1..=4"));
@@ -3386,7 +3409,11 @@ mod tests {
                 })
             })
             .collect();
-        contracts.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        contracts.sort_by(|a, b| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("name").and_then(|v| v.as_str()))
+        });
         let expected: serde_json::Value = serde_json::from_str(
                 r##"
         [
@@ -3901,15 +3928,16 @@ mod tests {
             let timeout = defs
                 .iter()
                 .find(|d| d.function.name == name)
-                .map(|d| &d.function.parameters["properties"]["timeout_ms"])
+                .and_then(|d| d.function.parameters.pointer("/properties/timeout_ms"))
                 .unwrap_or_else(|| panic!("`{name}` should expose timeout_ms"));
             assert!(
                 timeout.get("maximum").is_some(),
                 "`{name}`.timeout_ms must carry the resolved wait ceiling: {timeout}"
             );
             assert!(
-                !timeout["description"]
-                    .as_str()
+                !timeout
+                    .get("description")
+                    .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .contains("{max_"),
                 "`{name}`.timeout_ms has an unresolved placeholder: {timeout}"
@@ -3938,7 +3966,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1, "expected exactly one validation error");
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(
             error.field_path.as_deref(),
             Some("params.auto_background_on_timeout")
@@ -4044,7 +4074,9 @@ mod tests {
             1,
             "expected one bash requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one bash requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:run_terminal_cmd");
         assert_eq!(error.category.as_deref(), Some("requirements"));
         assert_eq!(
@@ -4083,7 +4115,9 @@ mod tests {
             1,
             "expected one task requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one task requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:task");
         assert!(error.message.contains("GrokBuild:get_task_output"));
         assert!(error.message.contains("GrokBuild:kill_task"));
@@ -4110,7 +4144,9 @@ mod tests {
             1,
             "expected one get_task_output requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one get_task_output requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:get_task_output");
         assert!(error.message.contains("background-capable bash tool"));
         assert!(error.message.contains("OpenCode:bash"));
@@ -4708,7 +4744,10 @@ mod tests {
                 .get::<crate::types::resources::AvailableSkills>()
                 .unwrap();
             assert_eq!(skills.0.len(), 1);
-            assert_eq!(skills.0[0].name, "boot-skill");
+            assert_eq!(
+                skills.0.first().map(|s| s.name.as_str()),
+                Some("boot-skill")
+            );
         }
         {
             let mut res = toolset.resources.lock().await;
@@ -4766,8 +4805,9 @@ mod tests {
         );
         assert!(schema.get("$schema").is_some(), "$schema must be retained");
         assert!(
-            schema["properties"]
-                .as_object()
+            schema
+                .get("properties")
+                .and_then(|v| v.as_object())
                 .is_some_and(|p| !p.is_empty()),
             "per-property schema must be retained: {schema}"
         );

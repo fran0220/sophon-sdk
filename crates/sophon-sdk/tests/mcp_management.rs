@@ -139,6 +139,7 @@ fn local_mcp_crud_auth_toggle_resource_and_readiness() {
             );
             assert!(home.path().join("config.toml").exists());
             let inventory = mcp.list(true).await.unwrap();
+            assert_eq!(inventory.session_mcp_resolved, Some(true));
             let local = inventory
                 .servers
                 .iter()

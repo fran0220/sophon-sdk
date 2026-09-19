@@ -59,11 +59,17 @@ requires downstream `x.ai/*` JSON; the raw extension seam remains for new,
 experimental and uncommon operations. A seventh protects portable conversation
 capture and import. The upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`37949780c144e37df692e3d669051a21fec24f20` (crate metadata 1.0.24, `SOURCE_REV`
-`c4ea71cfdbcdb21e32e41bc25a0043d7d4836714`). This is an independent
+`a28ee2b2063426e8816e380ccea528b9de95e5da` (crate metadata 1.0.35, `SOURCE_REV`
+`e8563f8f182296ebb53cadb3e1eab7615d76408e`). This is an independent
 redistribution, not an official xAI SDK.
 
-The synchronized source includes the complete 1.0.24 public snapshot. Runtime
+The synchronized source includes the complete 1.0.35 public snapshot. SDK 0.6.0
+adapts the independent Memory V2 configuration and exposes native capture,
+Dream, rollout and retention controls. The update includes MCP handshake and
+structured-result fixes, parent/peer subagent messaging, prompt offloading,
+and compaction checkpoint retention. Explicit system prompts, attempt fencing,
+queue CAS and checked shutdown remain protected by the SDK overlay.
+Earlier runtime
 improvements include cancellable MCP initialization ownership, reactivated
 subagent attempts, durable task snapshots, unified model behavior resolution,
 opt-in Memory V2, and tool safety fixes. SDK 0.5.0 replaces legacy management
