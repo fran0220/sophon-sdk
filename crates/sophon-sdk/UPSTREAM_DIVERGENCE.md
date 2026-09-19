@@ -382,6 +382,62 @@ crates/sophon-sdk/scripts/check-sdk-boundary.sh
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
 
+## SDK 0.6.0 / 1.0.35 validation (2026-09-19, Linux x86_64)
+
+Imported the complete public snapshot `a28ee2b2063426e8816e380ccea528b9de95e5da`
+as a merge ancestor, with monorepo `SOURCE_REV`
+`e8563f8f182296ebb53cadb3e1eab7615d76408e`. SDK 0.6.0 maps the independent
+`memory_v2` settings, exposes native V2 controls and MCP handshake resolution,
+and retains provider isolation, exact attempt identity, actor CAS, final exit
+and portable format v1. Upstream now supplies Goal planner short-circuiting and
+the image-strip test repair; their duplicate implementations are removed.
+
+- `cargo test --locked -p sophon-sdk --tests`: 38 unit and 18 integration tests
+  pass. These exercise three provider protocols, final exit, portability,
+  native scheduled children, subagent lifecycle/attempt fencing, MCP CRUD,
+  handshake resolution/readiness, workflow authority and durable task snapshots.
+  New memory checks cover conflicting V2 enablement, ambient table replacement,
+  remote V2 selection, disabled/legacy modes and embedding-route exclusion.
+- `cargo test --locked -p sophon-sdk --doc`: all five README examples pass.
+- `cargo test --locked -p xai-grok-tools -p xai-prompt-queue --lib --
+  --test-threads=4`: 3,302 tools tests pass (2 ignored), and all 15 queue tests
+  pass. The new human-attempt regression checks parent ownership, human
+  provenance, stale/successor identities and rejection of pending targets.
+- Shell library: 6,954 pass, 1 fails, 5 ignored with four test threads. The sole
+  failure is the previously documented
+  `parse_list_req_forces_kind_under_process_chat_mode_only` empty-kind assertion.
+  Its file remains byte-for-byte upstream. No assertion was weakened. Native
+  memory prompt publication, Goal, queue CAS, shutdown and portability
+  regressions pass. Both external-auth integration binaries also pass.
+- The combined SDK/tools/shell/prompt-queue `--lib --tests --no-run` build with
+  `xai-grok-shell/test-support` succeeds. The shell library and auth tests above
+  were then executed directly from those Cargo-built binaries; other shell
+  integration binaries were compiled but not all executed.
+- Production `cargo clippy --locked -p sophon-sdk -p xai-grok-shell
+  -p xai-grok-tools -p xai-prompt-queue --lib -- -D warnings` passes.
+  Upstream's new indexing lint required explicit Map/Object access in the SDK
+  prompt-index and portable-conversation patches. Required-file validation and
+  output schemas are unchanged; no lint was suppressed. The existing build-script
+  warning for an unresolved configured disallowed method remains.
+  All SDK unit/integration tests were rerun successfully after these lint repairs.
+- `scripts/check-sdk-boundary.sh` passes after the final digest refresh:
+  all seven groups and untouched upstream paths verified, no TUI dependencies,
+  and 3,750 SDK public rustdoc signatures without ACP/TUI type links.
+- Pager and PTY harness build. Native `welcome.yaml` and
+  `slash_resize_storm.yaml` report `passed` with no bugs, including a 40-column,
+  6-row terminal. Captures were inspected. SVG rasterization used a monospace
+  font sized for the capture's fixed 8-pixel cells; no native UI code was changed
+  for the captures. Pager remains outside the SDK dependency closure.
+- All 170 Rust files differing from upstream pass `rustfmt --check` with
+  `skip_children=true`. `git diff <new-upstream-pin> --check` passes. The complete
+  snapshot import preserves upstream's pre-existing trailing blank lines in
+  changelogs and one pager test rather than introducing unrelated source drift.
+
+Builds used `env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Native Git fixtures used
+process-local `commit.gpgsign=false` and `init.defaultBranch=main`. These are
+Linux/local-mock checks, not Windows/macOS execution or live-provider validation.
+
 ## Optional subagent progress validation (2026-09-10, Linux x86_64)
 
 - `cargo test --locked -p sophon-sdk --tests`: 37 unit and 18 integration

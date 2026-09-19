@@ -1727,7 +1727,9 @@ impl acp::Agent for MvpAgent {
                                     completion_kind: None,
                                 });
                 if let Some(index) = prompt_index {
-                    response_meta["promptIndex"] = serde_json::json!(index);
+                    response_meta.as_object_mut()
+                        .expect("prompt response metadata is an object")
+                        .insert("promptIndex".into(), serde_json::json!(index));
                 }
                 Ok(acp::PromptResponse::new(stop_reason).meta(response_meta.as_object().cloned()))
             }

@@ -238,8 +238,12 @@ impl PortableSession {
                 "capture revision mismatch".into(),
             ));
         }
-        let summary_value: Value =
-            serde_json::from_str(&self.files[st::SUMMARY_FILE]).map_err(malformed)?;
+        let summary_value: Value = serde_json::from_str(
+            self.files
+                .get(st::SUMMARY_FILE)
+                .expect("required file checked above"),
+        )
+        .map_err(malformed)?;
         if summary_value.as_object().is_none_or(|object| {
             object
                 .keys()
@@ -265,10 +269,11 @@ impl PortableSession {
                 "summary identity/custody mismatch".into(),
             ));
         }
-        for line in self.files[st::CHAT_HISTORY_FILE]
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-        {
+        let chat_history = self
+            .files
+            .get(st::CHAT_HISTORY_FILE)
+            .expect("required file checked above");
+        for line in chat_history.lines().filter(|line| !line.trim().is_empty()) {
             use crate::sampling::{ContentPart, ConversationItem};
             let item: ConversationItem = serde_json::from_str(line).map_err(malformed)?;
             let parts = match &item {
@@ -293,7 +298,7 @@ impl PortableSession {
                 }
             }
         }
-        if self.files[st::CHAT_HISTORY_FILE]
+        if chat_history
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count()
@@ -303,7 +308,10 @@ impl PortableSession {
                 "native conversation/summary count mismatch".into(),
             ));
         }
-        for line in self.files[st::UPDATES_FILE]
+        for line in self
+            .files
+            .get(st::UPDATES_FILE)
+            .expect("required file checked above")
             .lines()
             .filter(|line| !line.trim().is_empty())
         {
@@ -494,11 +502,11 @@ fn read_capture(dir: &Path, info: &Info, sync: bool) -> Result<PortableSession, 
             "pending cwd relocation".into(),
         ));
     }
-    value
+    let object = value
         .as_object_mut()
-        .ok_or_else(|| malformed("summary object required"))?
-        .retain(|key, _| SUMMARY_FIELDS.contains(&key.as_str()));
-    value["info"] = serde_json::json!({"id": info.id, "cwd": ""});
+        .ok_or_else(|| malformed("summary object required"))?;
+    object.retain(|key, _| SUMMARY_FIELDS.contains(&key.as_str()));
+    object.insert("info".into(), serde_json::json!({"id": info.id, "cwd": ""}));
     *summary = serde_json::to_string(&value).map_err(malformed)?;
     // Empty, genuinely new sessions may not yet have append-only files.
     if native.num_chat_messages == 0 {
@@ -558,7 +566,13 @@ pub(crate) fn import(snapshot: &PortableSession, cwd: &Path) -> Result<String, P
         let mut content = original.clone();
         if name == st::SUMMARY_FILE {
             let mut summary: Value = serde_json::from_str(&content).map_err(malformed)?;
-            summary["info"] = serde_json::json!({"id": snapshot.session_id, "cwd": cwd});
+            summary
+                .as_object_mut()
+                .ok_or_else(|| malformed("summary object required"))?
+                .insert(
+                    "info".into(),
+                    serde_json::json!({"id": snapshot.session_id, "cwd": cwd}),
+                );
             content = serde_json::to_string(&summary).map_err(malformed)?;
         }
         st::write_bytes_atomic(&stage.path().join(name), content.as_bytes())?;
