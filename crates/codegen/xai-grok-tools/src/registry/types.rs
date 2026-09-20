@@ -4042,6 +4042,44 @@ mod tests {
         ]);
         assert!(errors.is_empty(), "{errors:?}");
     }
+
+    #[tokio::test]
+    async fn scheduler_invalid_persistence_aborts_native_finalize_before_startup() {
+        use crate::implementations::grok_build::scheduler::types::ScheduledTask;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("resources_state.json");
+        let mut task =
+            serde_json::to_value(ScheduledTask::new(137, "must not run".into(), true, true))
+                .unwrap();
+        task.as_object_mut().unwrap().remove("nextRunAt");
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"state":{"grok_build.Scheduler":{"tasks":[task]}}}),
+        )
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        for _ in 0..2 {
+            let (notifications, mut receiver) =
+                crate::notification::ToolNotificationHandle::channel();
+            let mut context = test_session_context(&tmp);
+            context.notification_handle = notifications;
+            let result = ToolRegistryBuilder::new().finalize(
+                ToolServerConfig {
+                    tools: Vec::new(),
+                    behavior_preset: None,
+                },
+                context,
+            );
+            let errors = match result {
+                Err(errors) => errors,
+                Ok(_) => panic!("invalid persisted scheduler must abort native finalization"),
+            };
+            assert!(format!("{errors:?}").contains("nextRunAt"));
+            tokio::task::yield_now().await;
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     /// Verify that the task tool description renders correctly with the default
     /// grok-build agent config (all tools present) and that the new examples
     /// section is included with no unresolved template placeholders.
