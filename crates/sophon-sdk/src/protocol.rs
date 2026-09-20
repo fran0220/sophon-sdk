@@ -289,6 +289,8 @@ pub enum RuntimeEvent {
 #[serde(rename_all = "camelCase")]
 pub struct CallbackContext {
     pub session_id: String,
+    /// Session that registered this concrete tool handler; stable across inheritance.
+    pub owner_session_id: String,
     pub prompt_id: Option<String>,
     pub tool_call_id: String,
     /// Actual invocation workspace on the runtime machine (including children).
@@ -424,6 +426,9 @@ pub enum Request {
     ReadArtifact {
         session_id: String,
         path: String,
+    },
+    SubagentNewId {
+        session_id: String,
     },
     SubagentStart {
         session_id: String,

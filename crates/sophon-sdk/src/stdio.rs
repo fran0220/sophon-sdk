@@ -267,6 +267,12 @@ impl Runtime {
                     json!({"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
                 )
             }
+            SubagentNewId { session_id } => {
+                self.session(&session_id).await?;
+                encode(crate::subagent::SubagentId::new(
+                    uuid::Uuid::now_v7().to_string(),
+                ))
+            }
             SubagentStart {
                 session_id,
                 request,

@@ -1081,7 +1081,10 @@ async fn command_loop(
                         toolset
                             .register_tool(
                                 name,
-                                crate::native_tools::RegisteredTool { tool },
+                                crate::native_tools::RegisteredTool {
+                                    tool,
+                                    owner_session_id: id.to_string(),
+                                },
                                 Some(schema),
                             )
                             .map_err(|error| Error::Operation(error.to_string()))?;

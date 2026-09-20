@@ -45,6 +45,7 @@ impl std::fmt::Debug for NativeTool {
 #[derive(Clone, Debug)]
 pub(crate) struct RegisteredTool {
     pub tool: NativeTool,
+    pub owner_session_id: String,
 }
 
 impl Tool for RegisteredTool {
@@ -68,6 +69,7 @@ impl Tool for RegisteredTool {
             .ok_or_else(|| ToolError::invalid_arguments("native invocation context is missing"))?;
         let context = CallbackContext {
             session_id: invocation.session_id.clone(),
+            owner_session_id: self.owner_session_id.clone(),
             prompt_id: invocation.prompt_id.clone(),
             tool_call_id: ctx.call_id.to_string(),
             cwd: invocation.cwd.to_string_lossy().into_owned(),

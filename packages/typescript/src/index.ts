@@ -280,6 +280,8 @@ export class Session {
 /** Native child coordinator, never an independent host Session loop. */
 export class Subagents {
   constructor(private readonly agent: Agent, private readonly sessionId: string) {}
+  /** Allocate a native UUIDv7 logical ID before admission, usable for cancelId. */
+  async newId(): Promise<string> { return await this.agent.request({ method: 'subagent_new_id', sessionId: this.sessionId }) as string }
   async start(request: SubagentStart): Promise<SubagentResult> { return await this.agent.request({ method: 'subagent_start', sessionId: this.sessionId, request }) as unknown as SubagentResult }
   async query(id: string): Promise<SubagentSnapshot | null> { return await this.agent.request({ method: 'subagent_query', sessionId: this.sessionId, id }) as unknown as SubagentSnapshot | null }
   /** Waits for native state, without adding a host queue or retrying execution. */
