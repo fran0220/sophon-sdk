@@ -64,6 +64,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             let _ = ingress.request.respond_to.send(outcome);
             return;
         }
+        if self.completed.get(&subagent_id).is_some_and(|child| {
+            self.id_is_cancelled(&child.request.parent_session_id, &subagent_id)
+        }) {
+            let _ = ingress
+                .request
+                .respond_to
+                .send(ActiveAgentMessageOutcome::NotActiveOrFinalizing);
+            return;
+        }
         if self.completed.get(&subagent_id).is_some_and(|completed| {
             !completed
                 .terminal_published

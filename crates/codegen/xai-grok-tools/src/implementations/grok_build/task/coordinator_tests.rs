@@ -4486,3 +4486,260 @@ async fn managed_reactivation_obeys_native_queue_admission() {
     assert_ne!(result.attempt_id.as_deref(), Some(previous.as_str()));
     harness.actor.abort();
 }
+
+#[tokio::test]
+async fn cancel_id_before_registration_fences_late_spawn_without_running_child() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = parent_backend(&harness);
+    let id = uuid::Uuid::new_v4().to_string();
+    // The old operation observes absence; it does not acknowledge a future fence.
+    assert_eq!(backend.cancel(&id).await, SubagentCancelOutcome::NotFound);
+    assert_eq!(
+        backend.cancel_id(&id).await.unwrap(),
+        SubagentCancelOutcome::NotFound
+    );
+    backend
+        .sender()
+        .send(SubagentEvent::OpenSpawnAdmission {
+            parent_session_id: "parent".into(),
+        })
+        .unwrap();
+    // A duplicate cancellation and a new turn cannot reopen this logical ID.
+    assert_eq!(
+        backend.cancel_id(&id).await.unwrap(),
+        SubagentCancelOutcome::NotFound
+    );
+    for _ in 0..2 {
+        let (registered, spawn) = spawn_noting_registration(backend.clone(), request(&id, true));
+        let result = spawn.await.unwrap().unwrap();
+        assert!(result.cancelled && !result.success);
+        assert!(result.attempt_id.is_none(), "no attempt may be published");
+        assert!(
+            registered.await.is_err(),
+            "no native registration acknowledgement"
+        );
+    }
+    assert!(
+        harness.requests.try_recv().is_err(),
+        "runner must never receive the child"
+    );
+    assert!(harness.started.try_recv().is_err());
+    assert!(backend.inspect(&id).await.is_none());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancel_id_during_admission_and_active_run_uses_existing_cancellation() {
+    for pending in [true, false] {
+        let mut harness = harness_with_options(
+            RunnerBehavior {
+                wait_before_start: pending,
+                wait_after_cancel: true,
+                ..Default::default()
+            },
+            CoordinatorConfig::default(),
+        );
+        let backend = parent_backend(&harness);
+        let id = uuid::Uuid::new_v4().to_string();
+        let spawn = tokio::spawn({
+            let backend = backend.clone();
+            let id = id.clone();
+            async move { backend.spawn(request(&id, false), None).await.unwrap() }
+        });
+        assert_eq!(harness.requests.recv().await.unwrap().id, id);
+        if !pending {
+            assert_eq!(harness.started.recv().await.unwrap(), id);
+        }
+        assert_eq!(
+            backend.cancel_id(&id).await.unwrap(),
+            SubagentCancelOutcome::Cancelled
+        );
+        assert!(
+            !spawn.is_finished(),
+            "fence acknowledgement is not a child-exit claim"
+        );
+        harness.finish.send(()).unwrap();
+        assert!(spawn.await.unwrap().cancelled);
+        if pending {
+            assert!(
+                harness.started.try_recv().is_err(),
+                "cancelled pending child cannot promote"
+            );
+        }
+        assert!(
+            backend
+                .spawn(request(&id, false), None)
+                .await
+                .unwrap()
+                .cancelled
+        );
+        harness.actor.abort();
+    }
+}
+
+#[tokio::test]
+async fn cancel_id_removes_queued_child_without_affecting_running_peer() {
+    let mut harness = harness_with_config(
+        false,
+        CoordinatorConfig {
+            limits: SubagentLimits {
+                max_concurrent: 1,
+                behavior: LimitBehavior::Queue,
+            },
+            ..Default::default()
+        },
+    );
+    let backend = parent_backend(&harness);
+    let blocker_id = uuid::Uuid::new_v4().to_string();
+    let (_, blocker) = spawn_noting_registration(backend.clone(), request(&blocker_id, true));
+    assert_eq!(harness.started.recv().await.unwrap(), blocker_id);
+    let id = uuid::Uuid::new_v4().to_string();
+    let (registered, queued) = spawn_noting_registration(backend.clone(), request(&id, true));
+    registered.await.unwrap();
+    assert_eq!(
+        backend.cancel_id(&id).await.unwrap(),
+        SubagentCancelOutcome::Cancelled
+    );
+    assert!(queued.await.unwrap().unwrap().cancelled);
+    assert!(
+        backend
+            .query(&blocker_id, false, None)
+            .await
+            .unwrap()
+            .is_running()
+    );
+    harness.finish.send(()).unwrap();
+    assert!(blocker.await.unwrap().unwrap().success);
+    while let Ok(request) = harness.requests.try_recv() {
+        assert_ne!(request.id, id);
+    }
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancel_id_scope_and_ownership_do_not_cancel_another_parent() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = parent_backend(&harness);
+    let foreign = session_backend(&harness, "foreign");
+    let id = uuid::Uuid::new_v4().to_string();
+    backend.cancel_id(&id).await.unwrap();
+    let (_, spawn) = spawn_noting_registration(foreign.clone(), request(&id, true));
+    assert_eq!(harness.started.recv().await.unwrap(), id);
+    // Existing fence remains idempotent even when another parent uses that text.
+    assert_eq!(
+        backend.cancel_id(&id).await.unwrap(),
+        SubagentCancelOutcome::NotFound
+    );
+    let stranger = session_backend(&harness, "stranger");
+    assert!(
+        stranger
+            .cancel_id(&id)
+            .await
+            .unwrap_err()
+            .contains("another parent")
+    );
+    assert!(foreign.query(&id, false, None).await.unwrap().is_running());
+    harness.finish.send(()).unwrap();
+    assert!(spawn.await.unwrap().unwrap().success);
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancel_id_capacity_never_evicts_an_acknowledged_fence() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = parent_backend(&harness);
+    let first = uuid::Uuid::from_u128(1).to_string();
+    for index in 1..=MAX_CANCELLED_IDS {
+        backend
+            .cancel_id(&uuid::Uuid::from_u128(index as u128).to_string())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        backend.cancel_id(&first).await.unwrap(),
+        SubagentCancelOutcome::NotFound
+    );
+    let extra = uuid::Uuid::from_u128(MAX_CANCELLED_IDS as u128 + 1).to_string();
+    assert!(
+        backend
+            .cancel_id(&extra)
+            .await
+            .unwrap_err()
+            .contains("capacity")
+    );
+    assert!(
+        backend
+            .spawn(request(&first, false), None)
+            .await
+            .unwrap()
+            .cancelled
+    );
+    assert!(harness.requests.try_recv().is_err());
+    let (_, spawn) = spawn_noting_registration(backend.clone(), request(&extra, true));
+    assert_eq!(harness.started.recv().await.unwrap(), extra);
+    harness.finish.send(()).unwrap();
+    assert!(
+        spawn.await.unwrap().unwrap().success,
+        "rejected fence must not pretend success"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancel_id_blocks_reactivation_and_completed_message_wake() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = parent_backend(&harness);
+    let id = uuid::Uuid::new_v4().to_string();
+    let (_, spawn) = spawn_noting_registration(backend.clone(), request(&id, true));
+    harness.started.recv().await.unwrap();
+    harness.finish.send(()).unwrap();
+    let completed = spawn.await.unwrap().unwrap();
+    assert!(matches!(
+        backend.cancel_id(&id).await.unwrap(),
+        SubagentCancelOutcome::AlreadyFinished { .. }
+    ));
+    let result = backend
+        .reactivate(request(&id, false), completed.attempt_id.unwrap())
+        .await
+        .unwrap();
+    assert!(result.cancelled && result.attempt_id.is_none());
+    assert_eq!(
+        backend
+            .send_active_message(ActiveAgentMessageRequest::try_new(&id, "wake").unwrap())
+            .await,
+        ActiveAgentMessageOutcome::NotActiveOrFinalizing
+    );
+    assert!(harness.started.try_recv().is_err());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn cancel_id_channel_failure_and_dropped_ack_are_not_success() {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let backend = ChannelBackend::for_session(sender.clone(), "parent");
+    assert!(ChannelBackend::new(sender).cancel_id(&id).await.is_err());
+    let cancellation = tokio::spawn({
+        let backend = backend.clone();
+        let id = id.clone();
+        async move { backend.cancel_id(&id).await }
+    });
+    let command = receiver.recv().await.unwrap();
+    assert!(matches!(command, SubagentEvent::CancelId { .. }));
+    drop(command); // Lost acknowledgement could mean the command ran; no fabricated NotFound.
+    assert!(
+        cancellation
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("uncertain")
+    );
+    drop(receiver);
+    assert!(
+        backend
+            .cancel_id(&id)
+            .await
+            .unwrap_err()
+            .contains("not acknowledged")
+    );
+}

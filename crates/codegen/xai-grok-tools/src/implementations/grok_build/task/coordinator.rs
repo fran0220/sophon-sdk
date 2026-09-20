@@ -99,6 +99,11 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     /// [`SubagentEvent::OpenSpawnAdmission`] (next turn) or teardown drain completes, so a detached
     /// late `TaskTool` spawn cannot outrun Stop / delete.
     spawn_blocked_sessions: HashSet<String>,
+    /// Exact (parent session, logical ID) cancellation fences. Never evict or
+    /// reopen these on a new turn/session teardown: delayed commands can still
+    /// arrive. Bounded admission fails explicitly at capacity; coordinator drop
+    /// releases the set. Completed-record eviction does not permit ID reuse.
+    cancelled_ids: HashSet<(String, String)>,
     usage_not_applied_prompts: HashSet<PromptScope>,
     pending_completions: Vec<BufferedCompletion>,
     runs: FuturesUnordered<
@@ -119,6 +124,8 @@ pub struct SubagentCoordinator<R: ChildRunner> {
 /// finishes, force-reopen the session's spawn admission after this long (with a
 /// warning) rather than blocking spawns for the process lifetime.
 const TEARDOWN_DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+const MAX_CANCELLED_IDS: usize = 4096;
 
 /// In-flight delete-path teardown drain: responders to resolve once the last
 /// child drains, and the backstop deadline that force-reopens admission.
@@ -289,6 +296,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             workflow_cancel_waiters: HashMap::new(),
             teardown_drains: HashMap::new(),
             spawn_blocked_sessions: HashSet::new(),
+            cancelled_ids: HashSet::new(),
             usage_not_applied_prompts: HashSet::new(),
             pending_completions: Vec::new(),
             runs: FuturesUnordered::new(),
@@ -403,6 +411,14 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 expected_attempt_id,
             } => {
                 self.handle_reactivate(spawn, &expected_attempt_id);
+            }
+            SubagentEvent::CancelId {
+                parent_session_id,
+                subagent_id,
+                respond_to,
+            } => {
+                let outcome = self.cancel_id(&parent_session_id, &subagent_id);
+                let _ = respond_to.send(outcome);
             }
             SubagentEvent::CancelAttempt {
                 parent_session_id,
@@ -1325,6 +1341,52 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         self.resolve_teardown_drain_waiters(&parent_session_id);
         self.start_queued_within_capacity();
+    }
+
+    fn id_is_cancelled(&self, parent: &str, id: &str) -> bool {
+        self.cancelled_ids
+            .contains(&(parent.to_owned(), id.to_owned()))
+    }
+
+    /// The fence insertion and existing-child cancellation are one actor turn.
+    /// Acknowledgement guarantees no later matching admission, not active exit.
+    fn cancel_id(&mut self, parent: &str, id: &str) -> Result<SubagentCancelOutcome, String> {
+        // Bound bytes as well as entries. IDs are exact strings, as in the spawn
+        // registry; callers must not change a UUID's spelling between commands.
+        if parent.is_empty() || parent.len() > 256 || uuid::Uuid::parse_str(id).is_err() {
+            return Err(
+                "cancellation fence requires a parent session (1..256 bytes) and UUID logical ID"
+                    .into(),
+            );
+        }
+        let owner = self
+            .pending
+            .get(id)
+            .map(|c| &c.request.parent_session_id)
+            .or_else(|| self.active.get(id).map(|c| &c.request.parent_session_id))
+            .or_else(|| self.completed.get(id).map(|c| &c.request.parent_session_id))
+            .or_else(|| {
+                self.queued
+                    .iter()
+                    .find(|c| c.request.id == id)
+                    .map(|c| &c.request.parent_session_id)
+            });
+        if owner.is_some_and(|owner| owner != parent) {
+            if self.id_is_cancelled(parent, id) {
+                return Ok(SubagentCancelOutcome::NotFound);
+            }
+            return Err("subagent logical ID belongs to another parent session".into());
+        }
+        let key = (parent.to_owned(), id.to_owned());
+        if !self.cancelled_ids.contains(&key) {
+            if self.cancelled_ids.len() >= MAX_CANCELLED_IDS {
+                return Err(
+                    "subagent cancellation fence capacity reached; no fence installed".into(),
+                );
+            }
+            self.cancelled_ids.insert(key);
+        }
+        Ok(self.cancel_one(id, Some(parent), true))
     }
 
     /// Compare and mutate without yielding: a stale caller can never cancel a successor.

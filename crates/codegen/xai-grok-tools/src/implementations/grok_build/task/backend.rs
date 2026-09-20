@@ -417,6 +417,26 @@ impl ChannelBackend {
         })
     }
 
+    /// Acknowledgement fences this exact logical ID and parent session until the
+    /// coordinator stops. NotFound is a prior-child observation, not fence failure.
+    /// A lost response is uncertain and must never be reported as success.
+    pub async fn cancel_id(&self, id: &str) -> Result<SubagentCancelOutcome, String> {
+        let parent_session_id = self
+            .parent_session_id()
+            .ok_or("cancellation fence requires a session-bound coordinator backend")?;
+        let (respond_to, response_rx) = oneshot::channel();
+        self.tx
+            .send(SubagentEvent::CancelId {
+                parent_session_id,
+                subagent_id: id.to_owned(),
+                respond_to,
+            })
+            .map_err(|_| "subagent coordinator closed; cancellation fence not acknowledged")?;
+        response_rx
+            .await
+            .map_err(|_| "subagent cancellation fence response dropped; outcome uncertain")?
+    }
+
     pub async fn cancel_attempt(
         &self,
         id: &str,

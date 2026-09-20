@@ -937,6 +937,14 @@ pub enum SubagentEvent {
         spawn: SubagentSpawnRequest,
         expected_attempt_id: String,
     },
+    /// Install a parent-scoped logical-ID fence for this coordinator's lifetime,
+    /// then cancel any matching child. Ok acknowledges the fence, not child exit;
+    /// the outcome describes the child (NotFound means it has not registered).
+    CancelId {
+        parent_session_id: String,
+        subagent_id: String,
+        respond_to: oneshot::Sender<Result<SubagentCancelOutcome, String>>,
+    },
     CancelAttempt {
         parent_session_id: String,
         subagent_id: String,

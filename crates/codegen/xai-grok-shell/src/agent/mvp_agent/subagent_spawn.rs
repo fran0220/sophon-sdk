@@ -55,6 +55,20 @@ impl MvpAgent {
             .inspect(id).await
     }
 
+    /// Fence a logical ID before it has an attempt or coordinator registration.
+    /// Success acknowledges native admission fencing, not completion of an active child.
+    pub async fn cancel_subagent_id(
+        &self,
+        parent: &str,
+        id: &str,
+    ) -> Result<
+        xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome,
+        String,
+    > {
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_coordinator_session(self.subagent_event_tx.clone(), parent)
+            .cancel_id(id).await
+    }
+
     pub async fn cancel_subagent_attempt(
         &self,
         parent: &str,

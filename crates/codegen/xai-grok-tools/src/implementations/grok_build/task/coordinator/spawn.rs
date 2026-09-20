@@ -23,6 +23,14 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         let reject = |result_tx: oneshot::Sender<SubagentResult>, message: &str| {
             let _ = result_tx.send(SubagentResult::failed(&id, &id, message));
         };
+        if self.id_is_cancelled(&request.parent_session_id, &id) {
+            let _ = result_tx.send(rejected_spawn_result(
+                &id,
+                "subagent logical ID is cancelled",
+                true,
+            ));
+            return;
+        }
         let Some(previous) = self.completed.get(&id).filter(|child| {
             child.request.parent_session_id == request.parent_session_id
                 && !child.request.owner.is_workflow()
@@ -130,6 +138,14 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             result_tx,
             mut registered_tx,
         } = command;
+        if self.id_is_cancelled(&request.parent_session_id, &request.id) {
+            let _ = result_tx.send(rejected_spawn_result(
+                &request.id,
+                "subagent logical ID is cancelled",
+                true,
+            ));
+            return;
+        }
         // Registration is a side channel: a background caller still gets its terminal result on
         // `result_tx`. The scheduler actor needs the signal to tell "admitted" from a pre-start
         // reject before it deletes a one-shot.
@@ -148,6 +164,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 return;
             }
         };
+        // A nested spawn can acquire its canonical root parent during reparenting.
+        if self.id_is_cancelled(&request.parent_session_id, &request.id) {
+            let _ = result_tx.send(rejected_spawn_result(
+                &request.id,
+                "subagent logical ID is cancelled",
+                true,
+            ));
+            return;
+        }
         // Late Task spawn after user Stop (detached TaskTool background).
         if !request.owner.is_workflow()
             && self

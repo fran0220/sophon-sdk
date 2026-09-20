@@ -75,6 +75,27 @@ pub struct CancelSubagentRequest {
     pub subagent_id: String,
 }
 
+/// Logical-ID fencing is a distinct, parent-scoped operation; the legacy cancel
+/// and exact-attempt cancel remain reusable lifecycle operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CancelSubagentIdRequest {
+    pub session_id: String,
+    pub subagent_id: String,
+}
+
+/// Success means the exact ID cannot be admitted again under this parent until
+/// the coordinator stops. `outcome` describes the existing child, not the fence:
+/// NotFound means cancellation arrived before registration. Cancelled requests
+/// cancellation of a live child; it does not assert the child has already exited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelSubagentIdResponse {
+    pub subagent_id: String,
+    pub fenced: bool,
+    pub outcome: SubagentCancelOutcomeDto,
+}
+
 /// Wire mirror of the coordinator's [`SubagentCancelOutcome`], `kind`-tagged so a client can branch and read the already-finished `status`.
 /// It is sent alongside the legacy `cancelled` bool: a new pager prefers this, an old one ignores it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +503,19 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                     serde_json::json!({ "attemptId": attempt_id, "snapshot": dto })
                 });
             respond(Ok::<_, String>(snapshot))
+        }
+        "x.ai/subagent/cancel_id" => {
+            let req: CancelSubagentIdRequest = parse(args)?;
+            respond(
+                agent
+                    .cancel_subagent_id(&req.session_id, &req.subagent_id)
+                    .await
+                    .map(|outcome| CancelSubagentIdResponse {
+                        subagent_id: req.subagent_id,
+                        fenced: true,
+                        outcome: outcome.into(),
+                    }),
+            )
         }
         "x.ai/subagent/cancel_attempt" => {
             let req: ManagedSubagentTarget = parse(args)?;
