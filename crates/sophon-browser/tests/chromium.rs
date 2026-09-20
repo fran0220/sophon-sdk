@@ -133,10 +133,10 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
                 }
                 let child = String::from_utf8_lossy(&request[..n]).starts_with("GET /frame ");
                 let body = if child {
-                    "<button onclick=\"this.textContent='Child clicked'\">Child button</button>"
+                    "<button style=\"margin-left:240px\" onclick=\"this.textContent='Child clicked'\">Child button</button>"
                 } else {
                     r#"<!doctype html><title>SDK browser fixture</title>
-<style>body{font:20px sans-serif;padding:30px}button,input{font:inherit;padding:12px}iframe{display:block;margin:60px;width:400px;height:150px}#animation{width:30px;height:30px;background:red;animation:move .8s infinite alternate}@keyframes move{to{transform:translateX(300px)}}</style>
+<style>body{font:20px sans-serif;padding:30px}button,input{font:inherit;padding:12px}iframe{display:block;margin:60px;width:400px;height:150px;transform:scale(1.5);transform-origin:top left}#animation{width:30px;height:30px;background:red;animation:move .8s infinite alternate}@keyframes move{to{transform:translateX(300px)}}</style>
 <h1>Native browser fixture</h1><label>Name <input aria-label="Name"></label>
 <button onclick="window.clicks=(window.clicks||0)+1;document.querySelector('#result').textContent='Clicked '+window.clicks;console.log('clicked-once')">Increment</button><p id="result">Ready</p><div id="animation"></div><iframe src="/frame"></iframe>
 <script>console.log('fixture-loaded');</script>"#

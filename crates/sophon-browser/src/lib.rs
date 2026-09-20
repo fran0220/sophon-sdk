@@ -548,9 +548,11 @@ impl BrowserService {
                     return Err(Error::StaleRef);
                 }
                 let node = cdp.call(session,"DOM.resolveNode",json!({"backendNodeId":reference.backend,"executionContextId":reference.context})).await.map_err(|_| Error::StaleRef)?;
+                let backend = reference.backend;
+                let expected_input_generation = reference.input_generation;
                 let object = string(&node["object"], "objectId")?;
                 let function = if action == "click" {
-                    "function(revision){if(!this.isConnected||globalThis.__sophonRevision.n!==revision)throw Error('stale');this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();let x=r.x+r.width/2,y=r.y+r.height/2,w=window;while(w!==w.top){const f=w.frameElement;if(!f)throw Error('cross-origin frame');const b=f.getBoundingClientRect();x+=b.x+f.clientLeft;y+=b.y+f.clientTop;w=w.parent}return {x,y,width:r.width,height:r.height}}"
+                    "function(revision){if(!this.isConnected||globalThis.__sophonRevision.n!==revision)throw Error('stale');this.scrollIntoView({block:'center',inline:'center'});return true}"
                 } else {
                     "function(revision){if(!this.isConnected||globalThis.__sophonRevision.n!==revision)throw Error('stale');this.focus();return this.getRootNode().activeElement===this}"
                 };
@@ -559,6 +561,9 @@ impl BrowserService {
                     .call(session, "Runtime.releaseObject", json!({"objectId":object}))
                     .await;
                 if located.get("exceptionDetails").is_some() {
+                    return Err(Error::StaleRef);
+                }
+                if expected_input_generation != cdp.input_generation.load(Ordering::Acquire) {
                     return Err(Error::StaleRef);
                 }
                 page.refs.clear();
@@ -573,14 +578,49 @@ impl BrowserService {
                     )
                     .await
                 } else {
-                    let point = &located["result"]["value"];
-                    if point["width"].as_f64().unwrap_or(0.0) <= 0.0
-                        || point["height"].as_f64().unwrap_or(0.0) <= 0.0
-                    {
-                        return Err(Error::Invalid("element has no clickable box".into()));
+                    // Chromium computes viewport coordinates across same-process
+                    // frames and CSS transforms; do not add frame offsets by hand.
+                    let layout = cdp
+                        .call(
+                            session,
+                            "DOM.getContentQuads",
+                            json!({"backendNodeId":backend}),
+                        )
+                        .await?;
+                    let quad = layout["quads"]
+                        .as_array()
+                        .and_then(|quads| quads.first())
+                        .and_then(Value::as_array)
+                        .filter(|quad| quad.len() == 8)
+                        .ok_or_else(|| Error::Invalid("element has no clickable quad".into()))?;
+                    let coords = quad
+                        .iter()
+                        .map(Value::as_f64)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Error::Protocol("invalid layout quad".into()))?;
+                    let area = (0..4)
+                        .map(|i| {
+                            coords[2 * i] * coords[(2 * ((i + 1) % 4)) + 1]
+                                - coords[2 * ((i + 1) % 4)] * coords[2 * i + 1]
+                        })
+                        .sum::<f64>()
+                        .abs()
+                        / 2.0;
+                    if area < 1.0 {
+                        return Err(Error::Invalid("element has no clickable area".into()));
+                    }
+                    let x = (0..4).map(|i| coords[2 * i]).sum::<f64>() / 4.0;
+                    let y = (0..4).map(|i| coords[2 * i + 1]).sum::<f64>() / 4.0;
+                    if expected_input_generation != cdp.input_generation.load(Ordering::Acquire) {
+                        return Err(Error::StaleRef);
                     }
                     for kind in ["mousePressed", "mouseReleased"] {
-                        cdp.call(session,"Input.dispatchMouseEvent",json!({"type":kind,"x":point["x"],"y":point["y"],"button":"left","clickCount":1})).await?;
+                        cdp.call(
+                            session,
+                            "Input.dispatchMouseEvent",
+                            json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1}),
+                        )
+                        .await?;
                     }
                     Ok(json!({"ok":true}))
                 }
