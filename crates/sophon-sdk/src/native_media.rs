@@ -6,6 +6,26 @@
 //! decoding and stops polling, but does NOT cancel a remote paid job. Video
 //! receipts in `.native-media` survive cancellation; an `outcome_unknown`
 //! receipt means submission may have succeeded and must not be blindly retried.
+//!
+//! Configure each route with the provider's exact model and a versioned base URL
+//! (for example a gateway URL ending in `/v1`). `image-generation` uses
+//! `/images/generations` or ordered multipart `/images/edits`; `audio-tts` uses
+//! `/audio/speech`; `openai-video` uses `/videos`, `/videos/{id}`, and
+//! `/videos/{id}/content`. The Imagine `/videos/generations` protocol is not
+//! supported. Unknown endpoint declarations fail deserialization.
+//!
+//! Tool arguments use snake_case; configuration uses camelCase. Image references
+//! carry `{path, revision}` with a lowercase SHA-256 digest. Returned artifacts
+//! contain `{path, mimeType, bytes, revision}` with a workspace-relative path;
+//! `reviewRequired` is not a claim of visual or semantic quality. PNG, MP3 and MP4
+//! must contain decoded frames/samples, not merely a matching content type.
+//!
+//! HTTP operations are bounded to 120 seconds and decoding to 60 seconds.
+//! `generate_video.poll_seconds` bounds only subsequent polling (0 by default,
+//! maximum 120), not submission or downloading completed content. Resume using
+//! `task_id` instead of `prompt`; this service cannot automatically recover a job
+//! when cancellation happened before its ID was received. Request bodies,
+//! provider errors, credentials, and remote URLs are never included in receipts.
 
 use crate::{Error, protocol::ToolSpec};
 use base64::Engine;
@@ -15,7 +35,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -140,6 +160,8 @@ impl NativeMediaService {
         decoder_available().await?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|_| fail("Cannot create media HTTP client"))?;
@@ -183,7 +205,10 @@ impl NativeMediaService {
             }
             for reference in args.references {
                 let path = input_path(workspace, &reference.path)?;
-                let bytes = std::fs::read(path).map_err(|_| fail("Cannot read reference image"))?;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .and_then(|file| file.take(32 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+                    .map_err(|_| fail("Cannot read reference image"))?;
                 if bytes.len() > 32 * 1024 * 1024 || revision(&bytes) != reference.revision {
                     return Err(fail("Image reference exceeds limit or revision changed"));
                 }
@@ -290,15 +315,21 @@ impl NativeMediaService {
                 return Err(fail("Video response job ID mismatch"));
             }
             id = Some(returned_id.into());
+            let status = payload["status"].as_str().filter(|status| {
+                matches!(
+                    *status,
+                    "queued" | "in_progress" | "completed" | "failed" | "cancelled" | "expired"
+                )
+            });
             // Persist ID before validating status or fetching content, so any later
             // protocol/decode failure remains recoverable without another POST.
             write_receipt(
                 &receipt,
-                &json!({"task_id":returned_id,"status":payload["status"],"output_path":args.output_path,"model":route.model}),
+                &json!({"task_id":returned_id,"status":status.unwrap_or("unrecognized"),"output_path":args.output_path,"model":route.model}),
             )?;
-            let status = payload["status"]
-                .as_str()
-                .ok_or_else(|| fail("Video response missing status; job ID persisted"))?;
+            let status = status.ok_or_else(|| {
+                fail("Missing or unsupported OpenAI video status; job ID persisted")
+            })?;
             let mut result = json!({"task_id":returned_id,"status":status,"receipt":format!(".native-media/{}",receipt.file_name().unwrap().to_string_lossy())});
             match status {
                 "completed" => {
@@ -489,6 +520,9 @@ fn input_path(root: &Path, value: &str) -> Result<PathBuf, Error> {
     if !path.starts_with(root) {
         return Err(fail("Reference escapes workspace"));
     }
+    if !path.is_file() {
+        return Err(fail("Image reference must be a regular file"));
+    }
     Ok(path)
 }
 fn output_path(root: &Path, value: &str, extension: &str) -> Result<PathBuf, Error> {
@@ -573,6 +607,8 @@ async fn decode(bytes: &[u8], kind: &str) -> Result<(), Error> {
             "-v",
             "error",
             "-xerror",
+            "-progress",
+            "pipe:1",
             "-protocol_whitelist",
             "file,pipe",
             "-i",
@@ -585,14 +621,24 @@ async fn decode(bytes: &[u8], kind: &str) -> Result<(), Error> {
             "null",
             "-",
         ])
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let status = tokio::time::timeout(Duration::from_secs(60), command.status())
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
         .await
         .map_err(|_| fail("Media decode exceeded time limit"))?
         .map_err(|_| fail("Cannot execute media decoder"))?;
-    if !status.success() {
+    let counter = if kind == "mp3" {
+        "out_time_us="
+    } else {
+        "frame="
+    };
+    let decoded = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.strip_prefix(counter)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some_and(|value| value > 0)
+    });
+    if !output.status.success() || !decoded {
         return Err(fail("Media failed actual decoder validation"));
     }
     Ok(())

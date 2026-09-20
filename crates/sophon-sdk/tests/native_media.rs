@@ -127,6 +127,31 @@ fn body(request: &[u8]) -> Value {
 async fn image_json_and_ordered_multipart_use_explicit_route_and_publish_decoded_bytes() {
     let root = tempfile::tempdir().unwrap();
     let png = fixture(root.path(), "png");
+    let second_root = tempfile::tempdir().unwrap();
+    let second_path = second_root.path().join("second.png");
+    assert!(
+        Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=24x32:d=0.1",
+                "-frames:v",
+                "1",
+                "-threads",
+                "1"
+            ])
+            .arg(&second_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let second_png = std::fs::read(second_path).unwrap();
+    std::fs::write(root.path().join("second.png"), &second_png).unwrap();
+    let second_digest = format!("{:x}", Sha256::digest(&second_png));
     let response =
         json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(&png)}]});
     let (base, server) = server(vec![json_reply(response.clone()), json_reply(response)]);
@@ -143,7 +168,7 @@ async fn image_json_and_ordered_multipart_use_explicit_route_and_publish_decoded
     assert_eq!(std::fs::read(root.path().join("first.png")).unwrap(), png);
     let digest = format!("{:x}", Sha256::digest(&png));
     assert_eq!(result["revision"], digest);
-    service.execute("generate_image",json!({"prompt":"edit rectangle","output_path":"edited.png","references":[{"path":"fixture.png","revision":digest}]}),root.path()).await.unwrap();
+    service.execute("generate_image",json!({"prompt":"edit rectangle","output_path":"edited.png","references":[{"path":"second.png","revision":second_digest},{"path":"fixture.png","revision":digest}]}),root.path()).await.unwrap();
     let requests = server.join().unwrap();
     let first = String::from_utf8_lossy(&requests[0]);
     assert!(first.starts_with("POST /v1/images/generations "));
@@ -157,7 +182,18 @@ async fn image_json_and_ordered_multipart_use_explicit_route_and_publish_decoded
     assert!(second.starts_with("POST /v1/images/edits "));
     assert!(second.contains("multipart/form-data; boundary="));
     assert!(second.contains("name=\"image[]\"; filename=\"reference.png\""));
-    assert!(requests[1].windows(png.len()).any(|bytes| bytes == png));
+    let red_at = requests[1]
+        .windows(png.len())
+        .position(|bytes| bytes == png)
+        .unwrap();
+    let blue_at = requests[1]
+        .windows(second_png.len())
+        .position(|bytes| bytes == second_png)
+        .unwrap();
+    assert!(
+        blue_at < red_at,
+        "reference order must not be reversed or sorted by path"
+    );
 }
 
 #[tokio::test]
@@ -342,4 +378,229 @@ async fn video_polling_is_bounded_and_cancellation_retains_remote_job() {
     assert!(receipts.iter().any(|v| v.contains("job_cancel")));
     assert!(!root.path().join("cancel.mp4").exists());
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn video_rejects_mismatched_job_and_corrupt_completed_content_without_losing_id() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![
+        json_reply(json!({"id":"wrong_job","status":"completed"})),
+        json_reply(json!({"id":"correct_job","status":"completed"})),
+        Reply {
+            status: 200,
+            bytes: b"\0\0\0\x18ftypisomthis-is-not-a-video".to_vec(),
+        },
+    ]);
+    let service = service(&base);
+    for _ in 0..2 {
+        assert!(
+            service
+                .execute(
+                    "generate_video",
+                    json!({"task_id":"correct_job","output_path":"corrupt.mp4"}),
+                    root.path()
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(!root.path().join("corrupt.mp4").exists());
+    let receipts = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].contains("correct_job"));
+    assert!(!receipts[0].contains("wrong_job"));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| request.starts_with(b"GET ")));
+}
+
+#[tokio::test]
+async fn cancellation_during_submission_leaves_uncertainty_receipt_and_no_duplicate_post() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let service = service(&base);
+    let call = service.execute(
+        "generate_video",
+        json!({"prompt":"paid request","output_path":"unknown.mp4"}),
+        root.path(),
+    );
+    let mut call = Box::pin(call);
+    let (mut socket, _) = tokio::select! {
+        accepted = listener.accept() => accepted.unwrap(),
+        result = &mut call => panic!("submission returned before HTTP accept: {result:?}"),
+    };
+    use tokio::io::AsyncReadExt;
+    let mut bytes = [0; 4096];
+    let received = tokio::select! {
+        bytes = socket.read(&mut bytes) => bytes.unwrap(),
+        result = &mut call => panic!("submission returned before HTTP request: {result:?}"),
+    };
+    assert!(bytes[..received].starts_with(b"POST /v1/videos "));
+    // No response: dropping the in-flight execution must leave an uncertainty
+    // receipt, and cannot issue a second paid request.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), call)
+            .await
+            .is_err()
+    );
+    let receipts = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let value: Value = serde_json::from_slice(&std::fs::read(receipts[0].path()).unwrap()).unwrap();
+    assert_eq!(value["status"], "outcome_unknown");
+    assert!(value.get("task_id").is_none());
+    assert!(!root.path().join("unknown.mp4").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_symlinks_existing_outputs_and_endpoint_mismatch_fail_before_submit() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+    std::fs::write(root.path().join("existing.png"), b"preserve").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let service = service(&base);
+    for path in ["escape/out.png", "existing.png"] {
+        assert!(
+            service
+                .execute(
+                    "generate_image",
+                    json!({"prompt":"x","output_path":path}),
+                    root.path()
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.path().join("existing.png")).unwrap(),
+        b"preserve"
+    );
+    assert!(!outside.path().join("out.png").exists());
+    let wrong = NativeMediaService::new(NativeMediaConfig {
+        image: Some(MediaRoute {
+            endpoint: MediaEndpoint::OpenaiVideo,
+            model: "declared".into(),
+            base_url: base,
+            bearer_token: None,
+            headers: BTreeMap::new(),
+        }),
+        ..Default::default()
+    });
+    assert!(
+        wrong
+            .execute(
+                "generate_image",
+                json!({"prompt":"x","output_path":"out.png"}),
+                root.path()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn malformed_status_preserves_job_id_without_persisting_provider_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![json_reply(
+        json!({"id":"recoverable_job","status":{"error":"fixture-secret"}}),
+    )]);
+    let error = service(&base)
+        .execute(
+            "generate_video",
+            json!({"prompt":"x","output_path":"bad.mp4"}),
+            root.path(),
+        )
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("fixture-secret"));
+    let receipts = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let text = std::fs::read_to_string(receipts[0].path()).unwrap();
+    assert!(!text.contains("fixture-secret"));
+    let receipt: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(receipt["task_id"], "recoverable_job");
+    assert_eq!(receipt["status"], "unrecognized");
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn image_rejects_remote_url_and_corrupt_png_instead_of_publishing_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![
+        json_reply(json!({"data":[{"url":"http://127.0.0.1/private"}]})),
+        json_reply(
+            json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nnot an image")}]}),
+        ),
+    ]);
+    for path in ["url.png", "corrupt.png"] {
+        assert!(
+            service(&base)
+                .execute(
+                    "generate_image",
+                    json!({"prompt":"x","output_path":path}),
+                    root.path()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join(path).exists());
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with(b"POST /v1/images/generations "))
+    );
+}
+
+#[tokio::test]
+async fn polling_reuses_the_submitted_job_and_decodes_completed_content() {
+    let root = tempfile::tempdir().unwrap();
+    let mp4 = fixture(root.path(), "mp4");
+    let (base, server) = server(vec![
+        json_reply(json!({"id":"polled_job","status":"queued"})),
+        json_reply(json!({"id":"polled_job","status":"completed"})),
+        Reply {
+            status: 200,
+            bytes: mp4.clone(),
+        },
+    ]);
+    let result = service(&base)
+        .execute(
+            "generate_video",
+            json!({"prompt":"x","output_path":"polled.mp4","poll_seconds":3}),
+            root.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["task_id"], "polled_job");
+    assert_eq!(result["status"], "completed");
+    assert_eq!(std::fs::read(root.path().join("polled.mp4")).unwrap(), mp4);
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with(b"POST /v1/videos "));
+    assert!(requests[1].starts_with(b"GET /v1/videos/polled_job "));
+    assert!(requests[2].starts_with(b"GET /v1/videos/polled_job/content "));
 }
