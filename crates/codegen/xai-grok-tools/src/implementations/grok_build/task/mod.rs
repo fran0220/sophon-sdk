@@ -606,7 +606,9 @@ impl xai_tool_runtime::Tool for TaskTool {
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
                 agent_admission: None,
-                scheduled_invocation: None,
+                scheduled_invocation: ctx
+                    .get::<crate::registry::types::NativeInvocationContext>()
+                    .and_then(|native| native.scheduled_invocation.clone()),
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
@@ -907,15 +909,34 @@ mod tests {
         resources.insert(SessionIdResource("child-session".to_string()));
         resources.insert(CurrentPromptIdResource("prompt-nested".to_string()));
 
+        let invocation = types::ScheduledInvocation {
+            session_id: "scheduler-owner".into(),
+            task_id: "scheduled-task".into(),
+            occurrence: chrono::DateTime::parse_from_rfc3339("2026-09-20T10:30:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let expected = invocation.clone();
         let drain = tokio::spawn(async move {
             if let Some(SubagentEvent::Spawn(mut req)) = rx.recv().await {
+                assert_eq!(req.runtime_overrides.scheduled_invocation, Some(expected));
+                assert_eq!(req.parent_session_id, "child-session");
                 req.notify_registered();
             }
         });
 
+        let mut context = test_ctx(resources.into_shared());
+        context
+            .extensions
+            .insert(crate::registry::types::NativeInvocationContext {
+                session_id: "child-session".into(),
+                prompt_id: Some("prompt-nested".into()),
+                cwd: "/child".into(),
+                scheduled_invocation: Some(invocation),
+            });
         let result = xai_tool_runtime::Tool::run(
             &TaskTool,
-            test_ctx(resources.into_shared()),
+            context,
             TaskToolInput {
                 description: "nested ok".into(),
                 prompt: "should be allowed at max_depth=2".into(),
@@ -935,7 +956,10 @@ mod tests {
             result.is_ok(),
             "expected Ok at depth 1 with max 2: {result:?}"
         );
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), drain).await;
+        tokio::time::timeout(std::time::Duration::from_millis(500), drain)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

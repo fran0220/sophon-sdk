@@ -1686,6 +1686,8 @@ pub(crate) async fn run_shell_child(
         toolset: child_toolset,
         ..
     } = child_init;
+    child_toolset
+        .set_native_scheduled_invocation(request.runtime_overrides.scheduled_invocation.clone());
     session::bind_installed_toolset(
         &ctx.workspace_ops,
         &child_handle.info.id,

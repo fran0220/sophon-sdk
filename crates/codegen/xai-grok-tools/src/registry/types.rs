@@ -407,12 +407,16 @@ pub struct NativeInvocationContext {
     pub session_id: String,
     pub prompt_id: Option<String>,
     pub cwd: std::path::PathBuf,
+    pub scheduled_invocation:
+        Option<crate::implementations::grok_build::task::types::ScheduledInvocation>,
 }
 
 struct NativeInvocationSource {
     session_id: String,
     current_prompt_id: Arc<std::sync::Mutex<Option<String>>>,
     cwd: std::path::PathBuf,
+    scheduled_invocation:
+        Option<crate::implementations::grok_build::task::types::ScheduledInvocation>,
 }
 
 /// Toolset produced by `ToolRegistryBuilder::finalize()`. The tools vector is wrapped in `parking_lot::RwLock` to allow
@@ -1309,7 +1313,28 @@ impl FinalizedToolset {
             session_id,
             current_prompt_id,
             cwd,
+            scheduled_invocation: None,
         });
+    }
+
+    /// Bind the actual scheduler occurrence before the child's first dispatch.
+    pub fn set_native_scheduled_invocation(
+        &self,
+        invocation: Option<crate::implementations::grok_build::task::types::ScheduledInvocation>,
+    ) {
+        if let Some(source) = self.native_invocation.write().as_mut() {
+            source.scheduled_invocation = invocation;
+        }
+    }
+
+    pub fn native_scheduled_invocation(
+        &self,
+    ) -> Option<crate::implementations::grok_build::task::types::ScheduledInvocation> {
+        self.native_invocation
+            .read()
+            .as_ref()?
+            .scheduled_invocation
+            .clone()
     }
 
     fn native_invocation_context(
@@ -1326,6 +1351,7 @@ impl FinalizedToolset {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             cwd: cwd.unwrap_or(&source.cwd).clone(),
+            scheduled_invocation: source.scheduled_invocation.clone(),
         })
     }
     pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
@@ -3282,6 +3308,26 @@ mod tests {
         let child = Arc::new(FinalizedToolset::empty_for_test());
         let prompt = Arc::new(std::sync::Mutex::new(Some("c1".into())));
         child.set_native_invocation_context("child".into(), prompt.clone(), "/child".into());
+        let occurrence = crate::implementations::grok_build::task::types::ScheduledInvocation {
+            session_id: "schedule-owner".into(),
+            task_id: "schedule-task".into(),
+            occurrence: chrono::DateTime::parse_from_rfc3339("2026-09-20T11:45:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        child.set_native_scheduled_invocation(Some(occurrence.clone()));
+        let captured = child.native_invocation_context(None).unwrap();
+        assert_eq!(captured.scheduled_invocation, Some(occurrence.clone()));
+        assert_eq!(captured.session_id, "child");
+        child.set_native_scheduled_invocation(None);
+        assert_eq!(captured.scheduled_invocation, Some(occurrence));
+        assert_eq!(
+            child
+                .native_invocation_context(None)
+                .unwrap()
+                .scheduled_invocation,
+            None
+        );
         child
             .inherit_runtime_tools(&parent, |name| !name.starts_with("external__"))
             .unwrap();
