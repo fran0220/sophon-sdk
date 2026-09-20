@@ -8,6 +8,67 @@ use super::super::{
 };
 use super::*;
 
+#[test]
+fn strict_auxiliary_roles_are_independent_and_cli_is_unchanged() {
+    let manager = test_manager();
+    assert!(
+        manager
+            .auxiliary_config(AuxiliaryOperation::Compaction)
+            .is_none()
+    );
+    {
+        let mut cfg = manager.inner.cfg.write();
+        cfg.strict_auxiliary_routes = true;
+        cfg.session_summary_model = Some("title".into());
+        cfg.compaction_model = Some("compact".into());
+        cfg.image_description_model = Some("vision".into());
+    }
+    for (id, wire) in [
+        ("title", "title-wire"),
+        ("compact", "compact-wire"),
+        ("vision", "vision-wire"),
+    ] {
+        let mut entry = ModelEntry::fallback(wire, &config::EndpointsConfig::default());
+        entry.info.base_url = format!("https://{id}.example/v1");
+        entry.api_key = Some(format!("{id}-key"));
+        manager.insert_test_entry(id, entry);
+    }
+    for (role, wire, url) in [
+        (
+            AuxiliaryOperation::Summary,
+            "title-wire",
+            "https://title.example/v1",
+        ),
+        (
+            AuxiliaryOperation::Compaction,
+            "compact-wire",
+            "https://compact.example/v1",
+        ),
+        (
+            AuxiliaryOperation::ImageDescription,
+            "vision-wire",
+            "https://vision.example/v1",
+        ),
+    ] {
+        let config = manager.auxiliary_config(role).unwrap().unwrap();
+        assert_eq!(config.model, wire);
+        assert_eq!(config.base_url, url);
+    }
+    manager.inner.cfg.write().compaction_model = None;
+    assert!(
+        manager
+            .auxiliary_config(AuxiliaryOperation::Compaction)
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        manager
+            .auxiliary_config(AuxiliaryOperation::Summary)
+            .unwrap()
+            .is_ok()
+    );
+}
+
 fn test_manager() -> ModelsManager {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

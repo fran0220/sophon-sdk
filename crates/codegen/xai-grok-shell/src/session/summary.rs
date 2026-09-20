@@ -20,7 +20,7 @@ enum State {
 }
 
 pub(crate) struct SummaryConfig {
-    pub(crate) sampling_client: OaiCompatClient,
+    pub(crate) sampling_client: Option<OaiCompatClient>,
     pub(crate) model: String,
     /// Channel back to the persistence actor for sequential storage writes.
     /// Weak: a strong sender here would keep the actor's own channel and task alive.
@@ -57,7 +57,10 @@ impl SummaryGenerator {
                 // Transition to Done so subsequent ContentChunk messages don't spawn duplicate title generation tasks
                 self.state = State::Done;
 
-                let sampling_client = self.config.sampling_client.clone();
+                let Some(sampling_client) = self.config.sampling_client.clone() else {
+                    tracing::debug!("session title inference disabled: no auxiliary client");
+                    return;
+                };
                 let model = self.config.model.clone();
                 let persistence_tx = self.config.persistence_tx.clone();
 
@@ -219,7 +222,7 @@ mod tests {
         let sampling_client =
             OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
         let mut generator = SummaryGenerator::new(SummaryConfig {
-            sampling_client,
+            sampling_client: Some(sampling_client),
             model: String::new(),
             persistence_tx: tx.downgrade(),
         });
@@ -230,5 +233,19 @@ mod tests {
         assert!(generator.is_idle());
         generator.reset();
         assert!(generator.is_idle());
+    }
+
+    #[test]
+    fn strict_auxiliary_absent_title_never_spawns_a_task() {
+        // No Tokio runtime: any accidental inference spawn fails this test.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut generator = SummaryGenerator::new(SummaryConfig {
+            sampling_client: None,
+            model: String::new(),
+            persistence_tx: tx.downgrade(),
+        });
+        generator.update("a normal main prompt".into());
+        assert!(!generator.is_idle());
+        assert!(rx.try_recv().is_err());
     }
 }

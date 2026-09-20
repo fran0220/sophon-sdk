@@ -135,8 +135,12 @@ impl SessionActor {
     /// Agent `RefCell` borrows are only taken for synchronous snapshots (never held across `.await`).
     /// A long-lived borrow would race with turn/compact/cancel and panic on double-borrow.
     async fn two_pass_sample(&self, history: Vec<ConversationItem>) -> Option<CompactOutput> {
-        let sampling_config = self.reconstruct_full_config().await;
-        let client = match self.prepare_chat_completion(false).await {
+        let (client, sampling_config) = match self
+            .prepare_auxiliary_completion(
+                crate::agent::remote_config::AuxiliaryOperation::Compaction,
+            )
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "two_pass: failed to prepare sampling client");
@@ -594,6 +598,12 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        if let Some(result) = self
+            .models_manager
+            .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::Compaction)
+        {
+            result?;
+        }
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
@@ -933,11 +943,17 @@ impl SessionActor {
             xai_grok_telemetry::events::CompactionTrigger::Manual => "manual",
             xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
         };
-        let sampling_config = self.chat_state_handle.get_sampling_config().await;
-        let context_window = sampling_config
+        let active_config = self.chat_state_handle.get_sampling_config().await;
+        let (sampling_client, sampling_config) = self
+            .prepare_auxiliary_completion(
+                crate::agent::remote_config::AuxiliaryOperation::Compaction,
+            )
+            .await?;
+        let context_window = active_config
             .as_ref()
             .map(|c| c.context_window.get())
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+            .min(sampling_config.context_window);
         {
             let span = tracing::Span::current();
             let trigger_pct = if context_window == 0 {
@@ -952,11 +968,8 @@ impl SessionActor {
             );
             span.record("compaction_trigger", trigger_str);
         }
-        let summary_strips_reasoning = sampling_config
-            .as_ref()
-            .map(|c| c.api_backend == ApiBackend::Messages)
-            .unwrap_or(false);
-        let model_id = sampling_config.map(|c| c.model).unwrap_or_default();
+        let summary_strips_reasoning = sampling_config.api_backend == ApiBackend::Messages;
+        let model_id = sampling_config.model.clone();
         let compaction = xai_grok_telemetry::events::CompactionScope::begin(
             xai_grok_telemetry::events::CompactionBeginParams {
                 trigger,
@@ -1067,8 +1080,6 @@ impl SessionActor {
                 "{COMPACTION_FAILED_GUARD_PREFIX}no system message in simplified conversation"
             )));
         }
-        let sampling_config = self.reconstruct_full_config().await;
-        let sampling_client = self.prepare_chat_completion(false).await?;
         let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
             .prepare_tool_definitions()
@@ -2112,7 +2123,7 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         self.signals_handle()
             .update_context_usage(estimated_total, cw);
-        if self.compaction.is_suppressed() {
+        if self.compaction.is_suppressed() && !self.models_manager.strict_auxiliary_routes() {
             return None;
         }
         if self
@@ -2152,7 +2163,7 @@ impl SessionActor {
     }
     /// Returns `Some` when tool call outputs have pushed the estimated token count past the context window, so pre-emptive compaction is needed.
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
-        if self.compaction.is_suppressed() {
+        if self.compaction.is_suppressed() && !self.models_manager.strict_auxiliary_routes() {
             return None;
         }
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
@@ -2218,6 +2229,9 @@ impl SessionActor {
             if Self::is_auth_compact_error(&e) {
                 return Err(self.surface_compact_auth_failure(e).await);
             }
+            if self.models_manager.strict_auxiliary_routes() {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -2253,6 +2267,12 @@ impl SessionActor {
         trigger_info: AutoCompactTriggerInfo,
         lossy_input: bool,
     ) -> Result<(), acp::Error> {
+        if let Some(result) = self
+            .models_manager
+            .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::Compaction)
+        {
+            result?;
+        }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         let _compaction_phase = self.turn_phases.begin_compaction();

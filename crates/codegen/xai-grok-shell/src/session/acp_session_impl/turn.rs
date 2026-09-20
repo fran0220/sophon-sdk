@@ -2824,7 +2824,8 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none() && !turn_parked.is_parked() {
                 self.refresh_token_if_expired().await;
             }
-            if self.tool_context.task_output_token_budget.is_none()
+            if (self.tool_context.task_output_token_budget.is_none()
+                || self.models_manager.strict_auxiliary_routes())
                 && !turn_parked.is_parked()
                 && !salvage.awaiting_continuation()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
@@ -2833,6 +2834,9 @@ impl SessionActor {
                 tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
                 if Self::is_auth_compact_error(&e) {
                     return Err(self.surface_compact_auth_failure(e).await);
+                }
+                if self.models_manager.strict_auxiliary_routes() {
+                    return Err(e);
                 }
             }
             let backend_search_active = self.backend_search_active();
@@ -3794,13 +3798,17 @@ impl SessionActor {
                 return Ok(TurnOutcome::MaxTurnsReached { limit });
             }
             tool_turn_count = next_turn;
-            if self.tool_context.task_output_token_budget.is_none()
+            if (self.tool_context.task_output_token_budget.is_none()
+                || self.models_manager.strict_auxiliary_routes())
                 && let Some(trigger_info) = self.check_preflight_overflow().await
             {
                 if let Err(e) = self.run_compact_only(trigger_info, false).await {
                     tracing::error!(error = %e, "Preflight overflow compaction failed");
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
+                    }
+                    if self.models_manager.strict_auxiliary_routes() {
+                        return Err(e);
                     }
                 }
                 continue;

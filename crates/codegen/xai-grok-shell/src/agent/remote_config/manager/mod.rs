@@ -24,6 +24,13 @@ pub struct ModelsManager {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AuxiliaryOperation {
+    Summary,
+    Compaction,
+    ImageDescription,
+}
+
 /// Progress of the first real-catalog load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogProgress {
@@ -393,6 +400,60 @@ impl ModelsManager {
 
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
+    }
+
+    pub(crate) fn strict_auxiliary_routes(&self) -> bool {
+        self.inner.cfg.read().strict_auxiliary_routes
+    }
+
+    /// `None` preserves CLI routing. Strict Runtime routes never synthesize a
+    /// catalog entry or borrow the active model's endpoint and credentials.
+    pub(crate) fn auxiliary_config(
+        &self,
+        operation: AuxiliaryOperation,
+    ) -> Option<Result<SamplingConfig, acp::Error>> {
+        let cfg = self.inner.cfg.read();
+        if !cfg.strict_auxiliary_routes {
+            return None;
+        }
+        let route = match operation {
+            AuxiliaryOperation::Summary => &cfg.session_summary_model,
+            AuxiliaryOperation::Compaction => &cfg.compaction_model,
+            AuxiliaryOperation::ImageDescription => &cfg.image_description_model,
+        };
+        let unavailable = |reason: &str| {
+            acp::Error::invalid_request().data(serde_json::json!({
+                "kind": "auxiliary_route_unavailable",
+                "operation": format!("{operation:?}"),
+                "route": route,
+                "reason": reason,
+            }))
+        };
+        Some((|| {
+            let id = route
+                .as_deref()
+                .ok_or_else(|| unavailable("route is disabled"))?;
+            let models = self.models();
+            let entry = config::find_model_by_id(&models, id)
+                .ok_or_else(|| unavailable("route is not in the model catalog"))?;
+            let auth = self.inner.auth_manager.current_or_expired();
+            let credentials = config::resolve_credentials_enforced(
+                entry,
+                auth.as_ref().map(|a| a.key.as_str()),
+                cfg.grok_com_config.api_key_auth_disabled(),
+            );
+            if credentials.api_key.is_none() {
+                return Err(unavailable("route credentials are unavailable"));
+            }
+            Ok(sampling_config_for_model(
+                entry,
+                credentials,
+                cfg.endpoints.alpha_test_key.clone(),
+                cfg.client_version.clone(),
+                None,
+                None,
+            ))
+        })())
     }
 
     /// Does the current credential grant access to OAuth-only models?

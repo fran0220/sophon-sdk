@@ -71,6 +71,15 @@ impl SessionActor {
             auto_compact_threshold_percent,
             system_prompt_label,
         } = switch;
+        if self.models_manager.strict_auxiliary_routes()
+            && is_family_switch
+            && self.state.lock().await.running_task.is_none()
+            && self.history_has_model_minted_items().await
+        {
+            self.models_manager
+                .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::Compaction)
+                .transpose()?;
+        }
         if let Some(current) = self.chat_state_handle.get_sampling_config().await
             && let Some(id) = current.conversation_group_id
         {
@@ -225,6 +234,9 @@ impl SessionActor {
             };
             tracing::info!("Family-switch compact: -> {}", sampling_config.model);
             if let Err(e) = self.run_compact_only(trigger_info, true).await {
+                if self.models_manager.strict_auxiliary_routes() {
+                    return Err(e);
+                }
                 tracing::error!(error = %e, "Family-switch compaction failed; switching anyway");
             }
         }

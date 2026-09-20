@@ -1,4 +1,185 @@
 use super::super::support::*;
+
+#[tokio::test(flavor = "current_thread")]
+async fn strict_auxiliary_missing_routes_never_request_primary() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let (url, requests) = spawn_capturing_status_body_server(400, "{}").await;
+            let mut active = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            active.base_url = url;
+            actor.chat_state_handle.update_sampling_config(active);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("compact me"),
+            ]);
+            for route in [None, Some("not-in-catalog".to_owned())] {
+                actor
+                    .models_manager
+                    .apply_config(crate::agent::config::Config {
+                        strict_auxiliary_routes: true,
+                        compaction_model: route.clone(),
+                        session_summary_model: route.clone(),
+                        image_description_model: route,
+                        ..Default::default()
+                    });
+                let manual = actor.run_compact(None).await.unwrap_err();
+                let automatic = actor
+                    .run_compact_only(
+                        AutoCompactTriggerInfo {
+                            tokens_used: 180_000,
+                            context_window: 200_000,
+                            percentage: 90,
+                            reason_override: None,
+                        },
+                        false,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    manual.data.as_ref().unwrap()["kind"],
+                    "auxiliary_route_unavailable"
+                );
+                assert_eq!(
+                    automatic.data.as_ref().unwrap()["kind"],
+                    "auxiliary_route_unavailable"
+                );
+                assert!(
+                    actor
+                        .two_pass_sample(vec![ConversationItem::user("hello")])
+                        .await
+                        .is_none()
+                );
+                assert!(actor.prepare_side_call().await.is_err());
+                assert!(
+                    actor
+                        .transcribe_user_images("describe".into(), &[])
+                        .await
+                        .is_err()
+                );
+            }
+            actor.chat_state_handle.record_token_usage(250_000);
+            actor
+                .compaction
+                .auto_compact_suppressed
+                .store(crate::session::compaction_config::SUPPRESS_AUTH, Relaxed);
+            assert!(actor.check_auto_compact_needed().await.is_some());
+            assert!(actor.check_preflight_overflow().await.is_some());
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "disabled helpers must not request the primary endpoint"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn strict_auxiliary_compaction_uses_helper_not_primary() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let (main_url, main_requests) = spawn_capturing_status_body_server(401, "{}").await;
+            let (helper_url, helper_requests) = spawn_capturing_status_body_server(401, "{}").await;
+            let mut active = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            active.base_url = main_url;
+            active.model = "primary-wire-model".into();
+            actor.chat_state_handle.update_sampling_config(active);
+            let config = crate::agent::config::Config {
+                strict_auxiliary_routes: true,
+                compaction_model: Some("helper-key".into()),
+                session_summary_model: Some("helper-key".into()),
+                image_description_model: Some("helper-key".into()),
+                ..Default::default()
+            };
+            let mut entry =
+                crate::agent::config::ModelEntry::fallback("helper-wire-model", &config.endpoints);
+            entry.info.base_url = helper_url;
+            entry.api_key = Some("helper-test-key".into());
+            actor.models_manager.apply_config(config);
+            actor.models_manager.insert_test_entry("helper-key", entry);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("hello"),
+                ConversationItem::assistant("hi"),
+                ConversationItem::user("compact"),
+            ]);
+            assert!(actor.run_compact(None).await.is_err());
+            assert!(
+                actor
+                    .run_compact_only(
+                        AutoCompactTriggerInfo {
+                            tokens_used: 180_000,
+                            context_window: 200_000,
+                            percentage: 90,
+                            reason_override: None,
+                        },
+                        false
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                actor
+                    .two_pass_sample(vec![
+                        ConversationItem::system("sys"),
+                        ConversationItem::user("compact")
+                    ])
+                    .await
+                    .is_none()
+            );
+            let summary = actor.prepare_side_call().await.unwrap();
+            assert_eq!(summary.model, "helper-wire-model");
+            crate::session::helpers::session_summary::generate_session_summary(
+                "title me".into(),
+                summary.client,
+                &summary.model,
+            )
+            .await;
+            let (image_client, image_config) = actor
+                .prepare_auxiliary_completion(
+                    crate::agent::remote_config::AuxiliaryOperation::ImageDescription,
+                )
+                .await
+                .unwrap();
+            assert_eq!(image_config.model, "helper-wire-model");
+            assert_eq!(image_config.api_key.as_deref(), Some("helper-test-key"));
+            assert!(
+                actor
+                    .image_describe_cache
+                    .get_or_describe(
+                        image_client,
+                        &image_config.model,
+                        b"image bytes",
+                        "image/png",
+                        None,
+                        "describe",
+                        crate::session::image_describe::ImageDescribeSource::UserAttachment,
+                        "",
+                    )
+                    .await
+                    .is_err()
+            );
+            let requests = helper_requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                5,
+                "manual, automatic, two-pass, title, and image each request the helper once"
+            );
+            for body in requests.iter() {
+                let request: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(request["model"], "helper-wire-model");
+            }
+            assert!(main_requests.lock().unwrap().is_empty());
+        })
+        .await;
+}
+
 fn at<T>(xs: &[T], i: usize) -> &T {
     let Some(x) = xs.get(i) else {
         panic!("expected index {i}, len {}", xs.len());

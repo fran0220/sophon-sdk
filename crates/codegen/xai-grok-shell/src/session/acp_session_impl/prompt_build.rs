@@ -871,6 +871,10 @@ impl SessionActor {
         original_user_message: String,
         images: &[agent_client_protocol::ImageContent],
     ) -> Result<String, acp::Error> {
+        let strict_config = self
+            .models_manager
+            .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::ImageDescription)
+            .transpose()?;
         let prior = self.chat_state_handle.get_conversation().await;
         let outline = crate::session::image_describe::build_conversation_outline(&prior);
         let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
@@ -895,9 +899,13 @@ impl SessionActor {
             &xai_chat_state::compaction_utils::extract_user_query(&original_user_message),
         );
         let active_session_config = self.reconstruct_full_config().await;
-        let resolved_describe = self
-            .resolve_aux_sampler_config(&self.image_description_model)
-            .await;
+        let resolved_describe = match strict_config {
+            Some(config) => Some(config),
+            None => {
+                self.resolve_aux_sampler_config(&self.image_description_model)
+                    .await
+            }
+        };
         let (describe_model, sampler_config) =
             crate::agent::config::finalize_image_describe_sampler_config(
                 resolved_describe,

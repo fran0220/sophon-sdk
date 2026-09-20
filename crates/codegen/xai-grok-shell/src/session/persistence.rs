@@ -2754,7 +2754,7 @@ const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 /// What the actor is handed once and holds for the life of the session.
 pub(crate) struct SessionDeps {
-    pub(crate) sampling_client: OaiCompatClient,
+    pub(crate) sampling_client: Option<OaiCompatClient>,
     pub(crate) storage_mode: StorageMode,
     pub(crate) auth_manager: Option<Arc<xai_grok_login::AuthManager>>,
     pub(crate) relay_sync: Option<crate::relay::RelaySync>,
@@ -2863,10 +2863,11 @@ pub(crate) async fn new_with_explicit_dir(
     info: &Info,
     target_dir: PathBuf,
     model_id: acp::ModelId,
-    sampling_client: OaiCompatClient,
+    sampling_client: impl Into<Option<OaiCompatClient>>,
     session_summary_model: String,
     open: ExplicitSessionOpen,
 ) -> io::Result<PersistenceHandle> {
+    let sampling_client = sampling_client.into();
     let storage = JsonlStorageAdapter::with_explicit_session_dir(target_dir);
 
     let is_wake = matches!(open, ExplicitSessionOpen::Wake);

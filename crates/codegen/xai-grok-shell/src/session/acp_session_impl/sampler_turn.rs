@@ -934,6 +934,34 @@ impl SessionActor {
         );
     }
 
+    /// Prepare a routed helper, preserving legacy CLI behavior when not strict.
+    pub(crate) async fn prepare_auxiliary_completion(
+        &self,
+        operation: crate::agent::remote_config::AuxiliaryOperation,
+    ) -> Result<
+        (
+            xai_grok_sampler::SamplingClient,
+            xai_grok_sampler::SamplerConfig,
+        ),
+        acp::Error,
+    > {
+        if let Some(result) = self.models_manager.auxiliary_config(operation) {
+            let mut config = result?;
+            let active = self.reconstruct_full_config().await;
+            crate::agent::config::stamp_session_local_sampler_fields(
+                &mut config,
+                &active,
+                self.client_identifier.clone(),
+                Some(self.max_retries),
+            );
+            let client = xai_grok_sampler::SamplingClient::new(config.clone())
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            return Ok((client, config));
+        }
+        let client = self.prepare_chat_completion(false).await?;
+        Ok((client, self.reconstruct_full_config().await))
+    }
+
     /// Resolve a standalone aux-model `SamplerConfig` for `slug` via the shared catalog routing, gathering the session-local auth context once.
     /// The routing is Tier-1 catalog creds / Tier-2 xAI-proxy via session token / `XAI_API_KEY` / deployment key.
     /// Shared by image-describe and the classifier so the gather can't drift.

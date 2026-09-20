@@ -136,6 +136,23 @@ impl SessionActor {
     /// Recap-style side-calls preserve reasoning so their conversation prefix stays byte-identical to the parent turn.
     /// Messages strips reasoning only when the matching effort cannot emit a top-level thinking configuration.
     pub(crate) async fn prepare_side_call(&self) -> Result<SideCallSetup, acp::Error> {
+        if self.models_manager.strict_auxiliary_routes() {
+            let (client, config) = self
+                .prepare_auxiliary_completion(
+                    crate::agent::remote_config::AuxiliaryOperation::Summary,
+                )
+                .await?;
+            return Ok(SideCallSetup {
+                strip_reasoning: should_strip_side_call_reasoning(
+                    client.api_backend(),
+                    config.reasoning_effort,
+                ),
+                context_window: config.context_window,
+                model: config.model,
+                reasoning_effort: config.reasoning_effort,
+                client,
+            });
+        }
         let client = self.prepare_chat_completion(false).await?;
         // One config read serves the window, model, and reasoning effort.
         let sampling_config = self.chat_state_handle.get_sampling_config().await;

@@ -110,7 +110,27 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
-    ) -> Result<(OaiCompatClient, String), acp::Error> {
+    ) -> Result<(Option<OaiCompatClient>, String), acp::Error> {
+        if let Some(result) = self.models_manager.auxiliary_config(
+            crate::agent::remote_config::AuxiliaryOperation::Summary,
+        ) {
+            let result = result.and_then(|mut config| {
+                crate::agent::config::stamp_session_local_sampler_fields(
+                    &mut config,
+                    primary,
+                    primary.client_identifier.clone(),
+                    primary.max_retries,
+                );
+                let model = config.model.clone();
+                OaiCompatClient::new(config)
+                    .map(|client| (Some(client), model))
+                    .map_err(map_sampling_err_to_acp)
+            });
+            return Ok(result.unwrap_or_else(|error| {
+                tracing::warn!(%error, "session title inference unavailable; main session remains usable");
+                (None, String::new())
+            }));
+        }
         let slug = self.resolve_session_summary_model();
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
@@ -148,7 +168,7 @@ impl MvpAgent {
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
-        Ok((client, model))
+        Ok((Some(client), model))
     }
     fn has_proxy_credentials(&self) -> bool {
         self.cfg.borrow().endpoints.deployment_key.is_some()

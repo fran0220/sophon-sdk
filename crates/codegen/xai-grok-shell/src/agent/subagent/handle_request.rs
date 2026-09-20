@@ -1113,12 +1113,39 @@ pub(crate) async fn run_shell_child(
     };
     let turn_number = wake_persistence.turn_number(completion_data.turn_number);
     completion_data.turn_number = Some(turn_number);
+    let (summary_client, summary_model) = match ctx
+        .models_manager
+        .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::Summary)
+    {
+        Some(result) => {
+            let routed = result.and_then(|mut config| {
+                crate::agent::config::stamp_session_local_sampler_fields(
+                    &mut config,
+                    &effective_sampling_config,
+                    effective_sampling_config.client_identifier.clone(),
+                    effective_sampling_config.max_retries,
+                );
+                let model = config.model.clone();
+                crate::sampling::Client::new(config)
+                    .map(|client| (Some(client), model))
+                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+            });
+            routed.unwrap_or_else(|error| {
+                tracing::warn!(%error, "child title inference unavailable");
+                (None, String::new())
+            })
+        }
+        None => (
+            Some(sampling_client),
+            effective_sampling_config.model.clone(),
+        ),
+    };
     let persistence = match session::persistence::new_with_explicit_dir(
         &child_session_info,
         persistence_dir,
         effective_model_id.clone(),
-        sampling_client,
-        effective_sampling_config.model.clone(),
+        summary_client,
+        summary_model,
         if is_wake {
             crate::session::persistence::ExplicitSessionOpen::Wake
         } else {

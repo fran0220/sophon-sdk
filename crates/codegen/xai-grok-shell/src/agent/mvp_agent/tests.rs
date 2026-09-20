@@ -4145,6 +4145,27 @@ async fn summary_fallback_keeps_the_active_provider_model() {
     assert_eq!(model, "active-wire-model");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn strict_auxiliary_missing_title_does_not_fail_session_setup() {
+    let agent = build_minimal_agent_for_tests();
+    agent
+        .models_manager
+        .apply_config(crate::agent::config::Config {
+            strict_auxiliary_routes: true,
+            session_summary_model: None,
+            ..Default::default()
+        });
+    let primary = xai_grok_sampler::SamplerConfig {
+        model: "main-wire".into(),
+        base_url: "https://main.example/v1".into(),
+        api_key: Some("main-key".into()),
+        ..Default::default()
+    };
+    let (client, model) = agent.build_summary_client(&primary).unwrap();
+    assert!(client.is_none());
+    assert!(model.is_empty());
+}
+
 /// The imagine tools bypass cli-chat-proxy (direct API calls).
 /// The server can only scope the coding data-retention opt-out (`/privacy opt-out`) to Build traffic via the `x-grok-client-identifier` header.
 /// If this header is dropped, opted-out users' imagine prompts are logged/retained server-side.

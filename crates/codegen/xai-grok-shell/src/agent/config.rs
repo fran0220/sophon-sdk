@@ -1495,6 +1495,12 @@ pub struct Config {
     /// Resolved to the compiled default (`default_session_summary_model`) when unset; see `ModelOverrideConfig::resolve`.
     #[serde(skip)]
     pub session_summary_model: Option<String>,
+    /// Runtime opt-in: auxiliary operations require an explicit catalog route.
+    #[serde(skip)]
+    pub strict_auxiliary_routes: bool,
+    /// Dedicated compaction route in strict mode; `None` makes inference unavailable.
+    #[serde(skip)]
+    pub compaction_model: Option<String>,
     /// Image describe model (`grok-4.6` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
@@ -1751,6 +1757,8 @@ impl Default for Config {
             requirements: Requirements::default(),
             web_search_model: crate::models::default_web_search_model().to_owned(),
             session_summary_model: None,
+            strict_auxiliary_routes: false,
+            compaction_model: None,
             image_description_model: None,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         };
@@ -4778,7 +4786,7 @@ pub(crate) fn enforce_disable_api_key_auth(
 }
 /// Resolve credentials for an auxiliary sampling path (web search, image description) with the first-party API-key kill switch applied.
 /// These paths then honor `disable_api_key_auth` exactly like the main chat path.
-fn resolve_credentials_enforced(
+pub(crate) fn resolve_credentials_enforced(
     entry: &ModelEntry,
     session_key: Option<&str>,
     disable_api_key_auth: bool,
