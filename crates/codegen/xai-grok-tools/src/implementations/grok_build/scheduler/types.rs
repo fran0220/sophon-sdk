@@ -222,6 +222,23 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
     xai_tool_runtime::ToolError::custom(code, error.to_string())
 }
 
+/// Dispatch acknowledgement, not the child task's execution result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SchedulerDispatchStatus {
+    Unconfirmed,
+    Accepted,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SchedulerDispatch {
+    pub occurrence: DateTime<Utc>,
+    pub status: SchedulerDispatchStatus,
+    pub subagent_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduledTask {
@@ -233,6 +250,8 @@ pub struct ScheduledTask {
     /// after downtime. A required nullable field, never defaulted on old data.
     #[serde(deserialize_with = "Option::deserialize")]
     pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub last_dispatch: Option<SchedulerDispatch>,
     pub interval_secs: u64,
     pub prompt: String,
     #[serde(default = "default_recurring")]
@@ -315,6 +334,7 @@ impl ScheduledTask {
             recurring: cadence.recurring(),
             cadence,
             next_run_at,
+            last_dispatch: None,
             prompt,
             durable,
             created_at: now,
@@ -380,6 +400,7 @@ impl ScheduledTask {
                 }
             },
             next_run_at: Some(created_at + chrono::Duration::seconds(interval_secs as i64)),
+            last_dispatch: None,
             interval_secs,
             prompt,
             recurring,

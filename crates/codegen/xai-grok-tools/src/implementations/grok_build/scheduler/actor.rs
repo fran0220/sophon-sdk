@@ -24,8 +24,8 @@ use crate::types::tool::ToolKind;
 
 use super::types::{
     LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerCadence,
-    SchedulerClock, SchedulerCommand, SchedulerError, SchedulerMutationResult, SchedulerSnapshot,
-    SchedulerState, SchedulerVersion,
+    SchedulerClock, SchedulerCommand, SchedulerDispatch, SchedulerDispatchStatus, SchedulerError,
+    SchedulerMutationResult, SchedulerSnapshot, SchedulerState, SchedulerVersion,
 };
 
 const MAX_SCHEDULED_TASKS: usize = 50;
@@ -36,6 +36,7 @@ const SPAWN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum LoopFireOutcome {
     Spawned(String),
+    Unconfirmed(String),
     Skipped,
 }
 
@@ -503,6 +504,11 @@ impl SchedulerActor {
             return;
         };
         task.next_run_at = task.cadence.next_after(now);
+        task.last_dispatch = Some(SchedulerDispatch {
+            occurrence: previous_occurrence,
+            status: SchedulerDispatchStatus::Unconfirmed,
+            subagent_id: None,
+        });
         let next_fire_at = task.next_occurrence().map(|at| at.to_rfc3339());
 
         drop(res);
@@ -548,29 +554,52 @@ impl SchedulerActor {
             }
         };
 
-        if matches!(&outcome, LoopFireOutcome::Skipped) {
-            if should_remove {
-                // No spawn was accepted. Make a one-shot retryable, but only
-                // after that fact is persisted; ambiguous registrations are
-                // classified Spawned by fire_as_loop_subagent instead.
-                {
-                    let mut res = self.resources.lock().await;
-                    if let Some(task) = res
-                        .get_or_default::<State<SchedulerState>>()
-                        .tasks
-                        .iter_mut()
-                        .find(|task| task.id == task_id)
-                    {
-                        task.next_run_at = Some(previous_occurrence);
+        {
+            let mut res = self.resources.lock().await;
+            if let Some(task) = res
+                .get_or_default::<State<SchedulerState>>()
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+            {
+                let (status, subagent_id) = match &outcome {
+                    LoopFireOutcome::Spawned(id) => {
+                        task.last_fired_at = Some(now);
+                        (SchedulerDispatchStatus::Accepted, Some(id.clone()))
                     }
-                }
-                if let Err(error) = self.persist_resources().await {
-                    tracing::error!(%task_id, %error, "Could not persist rejected one-shot; stopping scheduler");
-                    self.cancel_token.cancel();
-                    return;
-                }
+                    LoopFireOutcome::Unconfirmed(id) => {
+                        (SchedulerDispatchStatus::Unconfirmed, Some(id.clone()))
+                    }
+                    LoopFireOutcome::Skipped => {
+                        if should_remove {
+                            task.next_run_at = Some(previous_occurrence);
+                        }
+                        (SchedulerDispatchStatus::Skipped, None)
+                    }
+                };
+                task.last_dispatch = Some(SchedulerDispatch {
+                    occurrence: previous_occurrence,
+                    status,
+                    subagent_id,
+                });
             }
-            let version = self.clock.snapshot();
+        }
+        if let Err(error) = self.persist_resources().await {
+            tracing::error!(%task_id, %error, "Could not persist scheduler dispatch outcome; stopping scheduler");
+            self.cancel_token.cancel();
+            // A confirmed registration is still a truthful fire, even when the
+            // outcome write fails. The earlier claim remains non-replayable.
+            if !matches!(outcome, LoopFireOutcome::Spawned(_)) {
+                return;
+            }
+        }
+
+        if !matches!(&outcome, LoopFireOutcome::Spawned(_)) {
+            let version = if matches!(outcome, LoopFireOutcome::Unconfirmed(_)) {
+                reservation.commit_next(&mut self.clock).version
+            } else {
+                self.clock.snapshot()
+            };
             let payload = {
                 let res = self.resources.lock().await;
                 res.get::<State<SchedulerState>>()
@@ -585,23 +614,10 @@ impl SchedulerActor {
         }
 
         match outcome {
-            LoopFireOutcome::Skipped => unreachable!("skipped outcome returned above"),
+            LoopFireOutcome::Skipped | LoopFireOutcome::Unconfirmed(_) => {
+                unreachable!("unconfirmed/skipped outcome returned above")
+            }
             LoopFireOutcome::Spawned(id) => {
-                {
-                    let mut res = self.resources.lock().await;
-                    if let Some(task) = res
-                        .get_or_default::<State<SchedulerState>>()
-                        .tasks
-                        .iter_mut()
-                        .find(|task| task.id == task_id)
-                    {
-                        task.last_fired_at = Some(now);
-                    }
-                }
-                if let Err(error) = self.persist_resources().await {
-                    tracing::error!(%task_id, %error, "Could not persist accepted scheduler outcome; stopping scheduler");
-                    self.cancel_token.cancel();
-                }
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover(transition, Some(&task_id), commit.rollover);
                 let fire_version = commit.version;
@@ -628,14 +644,13 @@ impl SchedulerActor {
                 let state = res.get_or_default::<State<SchedulerState>>();
                 state.tasks.retain(|t| t.id != task_id);
             }
-            // Flush the absence before announcing. The handoff above can await long enough for a
-            // debounce to write `last_fired_at` while the task is still present, which on restart
-            // leaves the one-shot overdue and free to fire a second time.
+            // Flush absence before announcing removal. The persisted claim
+            // already prevents replay if this final cleanup write fails.
             if let Err(error) = self.persist_resources().await {
                 tracing::warn!(
                     task_id = %task_id,
                     %error,
-                    "Completed one-shot's absence was not persisted; a restart may fire it again"
+                    "Consumed one-shot's absence was not persisted; restart retains its exhausted cursor"
                 );
             }
             let removal = reservation.commit_next(&mut self.clock);
@@ -899,7 +914,7 @@ impl SchedulerActor {
             biased;
             // The envelope is already outside this actor. Cancellation cannot
             // prove that it did not run, so never reopen this occurrence.
-            _ = self.cancel_token.cancelled() => return LoopFireOutcome::Spawned(subagent_id),
+            _ = self.cancel_token.cancelled() => return LoopFireOutcome::Unconfirmed(subagent_id),
             registered = registered_rx => {
                 if registered.is_err() {
                     self.restore_fire_anchor(
@@ -916,14 +931,14 @@ impl SchedulerActor {
                     return LoopFireOutcome::Skipped;
                 }
             }
-            // Registration is synchronous inside the coordinator, so a timeout means it is wedged
-            // rather than that the child was refused. Treating that as a fire is the safe half: a
-            // one-shot that ran is never resurrected to run twice.
+            // A timeout is neither refusal nor proof of execution. Keep the
+            // occurrence consumed and inspectable, without claiming a fire.
             _ = tokio::time::sleep(SPAWN_REGISTRATION_TIMEOUT) => {
                 tracing::warn!(
                     task_id = %task_id,
-                    "Timed out waiting for the subagent to register; treating the fire as started"
+                    "Timed out waiting for the subagent to register; dispatch remains unconfirmed"
                 );
+                return LoopFireOutcome::Unconfirmed(subagent_id);
             }
         }
 
@@ -975,7 +990,13 @@ impl SchedulerActor {
             state
                 .tasks
                 .iter()
-                .filter(|task| task.recurring || task.pending_fire_at(now).is_some())
+                .filter(|task| {
+                    task.recurring
+                        || task.pending_fire_at(now).is_some()
+                        || task.last_dispatch.as_ref().is_some_and(|dispatch| {
+                            dispatch.status == SchedulerDispatchStatus::Unconfirmed
+                        })
+                })
                 .map(|task| task_created_payload(task, version))
                 .collect()
         };
@@ -1590,12 +1611,72 @@ mod tests {
             serde_json::from_value(json_at(&snapshot, &["state", "grok_build.Scheduler"]).clone())
                 .unwrap();
         assert_eq!(first_task(&claimed.tasks).next_run_at, None);
+        assert_eq!(
+            first_task(&claimed.tasks)
+                .last_dispatch
+                .as_ref()
+                .unwrap()
+                .status,
+            SchedulerDispatchStatus::Unconfirmed
+        );
+        assert!(first_task(&claimed.tasks).last_fired_at.is_none());
         // Simulate loss of the process before persistence acknowledgement/spawn.
         drop(fire);
         drop(acknowledgement);
         let (mut restarted, mut notifications) = make_boundary_actor(claimed.tasks, 0);
         restarted.fire_next_task().await;
         assert!(notifications.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_registration_never_claims_fired_or_completed() {
+        for cancel_after_send in [false, true] {
+            let (mut actor, mut notifications) =
+                make_boundary_actor(vec![due_one_shot("ambiguous")], 0);
+            let cancel = actor.cancel_token.clone();
+            let (events, mut requests) = mpsc::unbounded_channel();
+            actor
+                .resources
+                .lock()
+                .await
+                .insert(SubagentEventSender(events));
+            let observer = tokio::spawn(async move {
+                let SubagentEvent::Spawn(spawn) = next_event(&mut requests).await else {
+                    panic!("expected spawn")
+                };
+                if cancel_after_send {
+                    cancel.cancel();
+                }
+                // Hold registration without acknowledging. Sending an envelope
+                // is not evidence that the coordinator accepted or executed it.
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                spawn
+            });
+            actor.fire_next_task().await;
+            let _unacknowledged_spawn = observer.await.unwrap();
+            let snapshot = actor.scheduler_snapshot().await;
+            let task = first_task(&snapshot.tasks);
+            assert!(task.last_fired_at.is_none());
+            assert_eq!(task.next_run_at, None);
+            assert_eq!(
+                task.last_dispatch.as_ref().unwrap().status,
+                SchedulerDispatchStatus::Unconfirmed
+            );
+            while let Ok(notification) = notifications.try_recv() {
+                assert!(matches!(
+                    notification,
+                    ToolNotification::ScheduledTaskCreated(_)
+                ));
+            }
+            let (mut restarted, mut announcements) = make_boundary_actor(snapshot.tasks, 0);
+            restarted.announce_existing_tasks().await;
+            assert!(matches!(
+                next_event(&mut announcements).await,
+                ToolNotification::ScheduledTaskCreated(_)
+            ));
+            restarted.fire_next_task().await;
+            assert!(announcements.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

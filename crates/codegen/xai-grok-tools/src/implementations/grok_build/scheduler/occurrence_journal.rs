@@ -165,95 +165,66 @@ impl OccurrenceJournal {
     }
 }
 
-/// JSON-only because Resources persistence stores this state as `serde_json::Value`.
+/// Current persisted schema only; malformed receipts are never dropped or normalized.
+fn deserialize_current<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OccurrenceJournal, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Current {
+        entries: Vec<OneShotOccurrence>,
+        #[serde(default)]
+        quarantined_task_ids: Vec<String>,
+        #[serde(default)]
+        block_all_one_shots: bool,
+        #[serde(default)]
+        overflowed: bool,
+    }
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(serde::de::Error::custom(
+            "scheduler occurrence journal must be a current-schema object",
+        ));
+    }
+    let current: Current = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    if current.entries.len() > MAX_PENDING_ONE_SHOTS
+        || current.quarantined_task_ids.len() > MAX_QUARANTINED_TASK_IDS
+        || (current.overflowed && !current.block_all_one_shots)
+        || current
+            .quarantined_task_ids
+            .iter()
+            .enumerate()
+            .any(|(index, id)| {
+                id.is_empty()
+                    || id.len() > MAX_TASK_ID_BYTES
+                    || current.quarantined_task_ids[..index].contains(id)
+            })
+    {
+        return Err(serde::de::Error::custom(
+            "unsupported or malformed scheduler occurrence journal",
+        ));
+    }
+    for occurrence in &current.entries {
+        occurrence
+            .task
+            .validate()
+            .map_err(serde::de::Error::custom)?;
+    }
+    Ok(OccurrenceJournal {
+        entries: current.entries,
+        quarantined_task_ids: current.quarantined_task_ids,
+        block_all_one_shots: current.block_all_one_shots,
+        overflowed: current.overflowed,
+    })
+}
+
 impl<'de> Deserialize<'de> for OccurrenceJournal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        Ok(Self::decode_json(value))
+        deserialize_current(deserializer)
     }
-}
-
-impl OccurrenceJournal {
-    fn decode_json(value: serde_json::Value) -> Self {
-        let (entries, task_ids, block_all, overflowed, is_malformed) = match value {
-            serde_json::Value::Array(entries) => (entries, Vec::new(), false, false, false),
-            serde_json::Value::Object(mut object) => {
-                let (entries, bad_entries) = parse_json_array(object.remove("entries"));
-                let (task_values, bad_task_ids) =
-                    parse_json_array(object.remove("quarantinedTaskIds"));
-                let bad_task_element = task_values.iter().any(|value| !value.is_string());
-                let task_ids: Vec<String> = task_values
-                    .into_iter()
-                    .filter_map(|value| value.as_str().map(str::to_owned))
-                    .collect();
-                let (block_all, bad_block) = parse_json_bool(object.remove("blockAllOneShots"));
-                let (overflowed, bad_overflow) = parse_json_bool(object.remove("overflowed"));
-                (
-                    entries,
-                    task_ids,
-                    block_all,
-                    overflowed,
-                    bad_entries || bad_task_ids || bad_task_element || bad_block || bad_overflow,
-                )
-            }
-            _ => (Vec::new(), Vec::new(), true, false, true),
-        };
-        let mut journal = Self {
-            block_all_one_shots: block_all || overflowed || is_malformed,
-            overflowed,
-            ..Self::default()
-        };
-        for task_id in task_ids {
-            journal.quarantine_task_id(task_id);
-        }
-        if entries.len() > MAX_PENDING_ONE_SHOTS {
-            journal.block_all_one_shots = true;
-            journal.overflowed = true;
-        }
-        for value in entries.into_iter().take(MAX_PENDING_ONE_SHOTS) {
-            match serde_json::from_value(value.clone()) {
-                Ok(occurrence) => journal.entries.push(occurrence),
-                Err(_) => match quarantined_task_id(&value) {
-                    Some(task_id) => journal.quarantine_task_id(task_id),
-                    None => journal.block_all_one_shots = true,
-                },
-            }
-        }
-        journal
-    }
-
-    fn quarantine_task_id(&mut self, task_id: String) {
-        if task_id.is_empty() || task_id.len() > MAX_TASK_ID_BYTES {
-            self.block_all_one_shots = true;
-        } else if !self.quarantined_task_ids.contains(&task_id) {
-            if self.quarantined_task_ids.len() == MAX_QUARANTINED_TASK_IDS {
-                self.block_all_one_shots = true;
-            } else {
-                self.quarantined_task_ids.push(task_id);
-            }
-        }
-    }
-}
-
-fn parse_json_array(value: Option<serde_json::Value>) -> (Vec<serde_json::Value>, bool) {
-    value.map_or((Vec::new(), false), |value| match value {
-        serde_json::Value::Array(values) => (values, false),
-        _ => (Vec::new(), true),
-    })
-}
-
-fn parse_json_bool(value: Option<serde_json::Value>) -> (bool, bool) {
-    value.map_or((false, false), |value| match value {
-        serde_json::Value::Bool(value) => (value, false),
-        _ => (true, true),
-    })
-}
-
-fn quarantined_task_id(value: &serde_json::Value) -> Option<String> {
-    value.get("task")?.get("id")?.as_str().map(str::to_owned)
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
