@@ -148,6 +148,21 @@ same-origin frames, console/network metadata, screenshots, live frame
 backpressure, recording duration, profile locking/persistence, artifacts,
 cancellation, and shutdown. Set `SOPHON_BROWSER_EVIDENCE_DIR` to export its fixture
 screenshot/video for review. Verified on Linux x86-64 with Chromium 153; this is
-not macOS/Windows evidence or full Origin Stage/audio parity. Runtime native-tool
-registration and the TS transport must additionally be tested by their owning
-integration suite.
+not macOS/Windows evidence or full Origin Stage/audio parity.
+
+The separate Runtime roundtrip uses the official TS client, a compiled native
+Runtime, real Chromium, and a local deterministic inference fixture. It asserts
+that the model receives the native browser definition and actual snapshot result,
+without invoking a TS tool callback or MCP service. It also checks live frame
+delivery, native text input, artifact retrieval and checked Runtime exit:
+
+```sh
+npm --prefix packages/typescript ci
+npm --prefix packages/typescript run build
+cargo build --locked -p sophon-sdk --bin sophon-runtime
+SOPHON_RUNTIME="$PWD/target/debug/sophon-runtime" SOPHON_CHROMIUM=/usr/bin/chromium \
+  node crates/sophon-browser/tests/runtime.mjs
+```
+
+This is a transport/native-registration test, not a live-provider model quality
+test. It uses disposable Runtime/profile directories and no production credentials.

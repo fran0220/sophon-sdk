@@ -1,0 +1,101 @@
+// Actual official TypeScript client -> native Runtime -> Chromium integration.
+// Requires built packages/typescript/dist and SOPHON_RUNTIME; never simulates CDP.
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Agent } from '../../../packages/typescript/dist/index.js'
+
+assert.ok(process.env.SOPHON_RUNTIME, 'SOPHON_RUNTIME must point to a built native Runtime')
+const root = await mkdtemp(join(tmpdir(), 'sophon-browser-runtime-'))
+let tabId
+let nativeDefinition = false
+let nativeResult = false
+let modelCalls = 0
+let hostToolCallbacks = 0
+const toolResults = []
+const server = createServer(async (request, response) => {
+  if (request.method !== 'POST') {
+    response.writeHead(200, { 'content-type': 'text/html' })
+    response.end('<!doctype html><title>Native Runtime fixture</title><style>@keyframes m{to{transform:translateX(100px)}}#box{background:red;width:20px;height:20px;animation:m .4s infinite alternate}</style><h1>Native Runtime fixture</h1><input aria-label="Runtime input"><div id="box"></div>')
+    return
+  }
+  let body = ''
+  for await (const chunk of request) body += chunk
+  const payload = JSON.parse(body)
+  toolResults.push(...(payload.messages ?? []).filter(message => message.role === 'tool').map(message => message.content))
+  const browser = payload.tools?.find(tool => tool.function?.name === 'browser')
+  const result = payload.messages?.find(message => message.role === 'tool' && JSON.stringify(message.content).includes('Native Runtime fixture'))
+  if (result) nativeResult = true
+  const delta = browser && !nativeDefinition
+    ? { role: 'assistant', tool_calls: [{ index: 0, id: 'native-browser-proof', type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action: 'snapshot', tab_id: tabId }) } }] }
+    : { role: 'assistant', content: 'Native browser verification complete.' }
+  if (browser) nativeDefinition = true
+  modelCalls++
+  const chunk = (delta, finish_reason) => ({ id: 'local-fixture', object: 'chat.completion.chunk', created: 1234567890, model: 'fixture', choices: [{ index: 0, delta, finish_reason }] })
+  response.writeHead(200, { 'content-type': 'text/event-stream' })
+  response.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, delta.tool_calls ? 'tool_calls' : 'stop'))}\n\ndata: ${JSON.stringify({ id: 'local-fixture', object: 'chat.completion.chunk', created: 1234567890, model: 'fixture', choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } })}\n\ndata: [DONE]\n\n`)
+})
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+const url = `http://127.0.0.1:${server.address().port}`
+await mkdir(join(root, 'home'))
+await writeFile(join(root, 'home/config.toml'), '[features]\nsession_recap = false\n')
+await writeFile(join(root, 'home/managed_config.toml'), 'plugin_auto_update = false\n')
+let agent
+let exited = false
+try {
+  agent = await Agent.spawn({
+    executable: process.env.SOPHON_RUNTIME,
+    env: { ...process.env, GROK_HOME: join(root, 'home'), GROK_AUTH: '', GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_FEEDBACK_ENABLED: 'false', GROK_TURN_SUMMARY: 'false' },
+    config: {
+      models: [{ id: 'fixture', provider: { protocol: 'openai_chat', baseUrl: url, apiKey: 'local-fixture-no-secret', model: 'fixture', headers: {}, queryParams: {} }, contextWindow: 32768, maxCompletionTokens: 1024 }],
+      defaultModel: 'fixture', webSearchModel: null, sessionSummaryModel: null, imageDescriptionModel: null, media: null,
+      browser: { executable: process.env.SOPHON_CHROMIUM ?? '/usr/bin/chromium', dataDir: join(root, 'identity'), artifactDir: join(root, 'evidence'), headless: true, noSandbox: true },
+    },
+    onCallback: async ({ method }) => {
+      if (method.startsWith('tool/')) hostToolCallbacks++
+      throw new Error(`Unexpected client callback ${method}`)
+    },
+  })
+  const capabilities = await agent.browser({ action: 'capabilities' })
+  assert.equal(capabilities.streaming, true)
+  assert.equal(capabilities.audio, false)
+  tabId = (await agent.browser({ action: 'new_tab', url })).tab_id
+  await agent.browser({ action: 'wait', tab_id: tabId, milliseconds: 250 })
+  const snapshot = await agent.browser({ action: 'snapshot', tab_id: tabId })
+  const input = snapshot.nodes.find(node => node.role === 'textbox' && node.name === 'Runtime input')
+  assert.ok(input?.ref)
+  await agent.browser({ action: 'type', tab_id: tabId, ref: input.ref, text: 'Across native Runtime' })
+  const probe = await agent.browser({ action: 'evaluate', tab_id: tabId, expression: 'document.querySelector("input").value' })
+  assert.equal(probe.value, 'Across native Runtime')
+  const framePromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { unsubscribe(); reject(new Error('No native live frame within 5 seconds')) }, 5000)
+    const unsubscribe = agent.subscribeBrowserFrames(frame => {
+      if (frame.tab_id !== tabId) return
+      clearTimeout(timer)
+      unsubscribe()
+      resolve(frame)
+    })
+  })
+  await agent.browser({ action: 'stream_start', tab_id: tabId })
+  const frame = await framePromise
+  assert.equal(frame.mime_type, 'image/jpeg')
+  assert.deepEqual([...Buffer.from(frame.base64, 'base64').subarray(0, 2)], [255, 216])
+  const image = await agent.browser({ action: 'screenshot', tab_id: tabId })
+  const artifact = await agent.browser({ action: 'artifact', artifact_id: image.artifact_id })
+  assert.equal(Buffer.from(artifact.base64, 'base64').subarray(1, 4).toString(), 'PNG')
+  const session = await agent.createSession({ workspace: { id: 'browser-proof', cwd: root }, model: 'fixture', metadata: {}, mcpServers: [], tools: [] })
+  await session.prompt({ turnId: 'native-browser-roundtrip', blocks: [{ type: 'text', text: 'Verify native browser fixture using the browser tool.' }], metadata: {} })
+  assert.equal(nativeDefinition, true, 'model must receive native browser definition')
+  assert.equal(nativeResult, true, `model must receive actual Chromium snapshot result: ${JSON.stringify(toolResults)}`)
+  assert.equal(hostToolCallbacks, 0, 'first-party browser must not route to a TS callback')
+  await agent.browser({ action: 'stream_stop', tab_id: tabId })
+  await agent.finalExit()
+  exited = true
+  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, modelCalls, realChromium: true, liveFrame: true, screenshot: true, checkedRuntimeExit: true }))
+} finally {
+  if (agent && !exited) await agent.finalExit().catch(() => {})
+  await new Promise(resolve => server.close(resolve))
+  await rm(root, { recursive: true, force: true })
+}
