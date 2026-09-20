@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 toml = { workspace = true }
+ts-rs = { workspace = true, features = ["serde-json-impl"] }
 url = { workspace = true }
 uuid = { workspace = true }
 xai-acp-lib = { workspace = true }
