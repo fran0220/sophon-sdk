@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -17,10 +17,11 @@ pub(crate) struct Cdp {
     tx: mpsc::Sender<(Value, Reply)>,
     task: JoinHandle<()>,
     pub events: Arc<Mutex<VecDeque<Value>>>,
+    pub tabs: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Cdp {
-    pub async fn connect(url: &str) -> Result<Self, Error> {
+    pub async fn connect(url: &str, frames: broadcast::Sender<Value>) -> Result<Self, Error> {
         let (socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
@@ -28,9 +29,12 @@ impl Cdp {
         let (tx, mut rx) = mpsc::channel::<(Value, Reply)>(32);
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let log = events.clone();
+        let tabs = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+        let tab_ids = tabs.clone();
         let task = tokio::spawn(async move {
             let mut pending: HashMap<u64, Reply> = HashMap::new();
             let mut next = 0u64;
+            let mut sequence = 0u64;
             loop {
                 pending.retain(|_, reply| !reply.is_closed());
                 tokio::select! {
@@ -53,6 +57,17 @@ impl Cdp {
                                 } else { Ok(value["result"].clone()) };
                                 let _ = reply.send(result);
                             }
+                        } else if value["method"] == "Page.screencastFrame" {
+                            // Frame traffic never shares the control-response queue or event log.
+                            // ACK even with no subscribers; slow consumers receive Lagged explicitly.
+                            next += 1;
+                            let ack = json!({"id":next,"sessionId":value["sessionId"],"method":"Page.screencastFrameAck","params":{"sessionId":value["params"]["sessionId"]}});
+                            if writer.send(Message::Text(ack.to_string().into())).await.is_err() { break; }
+                            let tab = value["sessionId"].as_str().and_then(|session|tab_ids.lock().expect("tab lock").get(session).cloned());
+                            if let Some(tab) = tab {
+                                sequence += 1;
+                                let _ = frames.send(json!({"tab_id":tab,"sequence":sequence,"mime_type":"image/jpeg","base64":value["params"]["data"],"metadata":value["params"]["metadata"]}));
+                            }
                         } else if value.get("method").is_some() {
                             let mut log = log.lock().expect("event lock");
                             if log.len() == 512 { log.pop_front(); }
@@ -67,7 +82,12 @@ impl Cdp {
                 )));
             }
         });
-        Ok(Self { tx, task, events })
+        Ok(Self {
+            tx,
+            task,
+            events,
+            tabs,
+        })
     }
 
     pub async fn call(

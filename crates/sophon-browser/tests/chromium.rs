@@ -1,0 +1,348 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use serde_json::{Value, json};
+use sophon_browser::{BrowserConfig, BrowserService, Error};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn config(root: &std::path::Path) -> BrowserConfig {
+    BrowserConfig {
+        executable: PathBuf::from(
+            std::env::var("SOPHON_CHROMIUM").unwrap_or_else(|_| "/usr/bin/chromium".into()),
+        ),
+        data_dir: root.join("identity"),
+        artifact_dir: root.join("evidence"),
+        headless: true,
+        no_sandbox: true,
+    }
+}
+
+async fn call(browser: &BrowserService, action: &str, mut args: Value) -> Value {
+    args["action"] = json!(action);
+    browser
+        .execute("browser", args)
+        .await
+        .unwrap_or_else(|e| panic!("{action}: {e}"))
+}
+
+async fn evaluate(browser: &BrowserService, tab: &str, expression: &str) -> Value {
+    call(
+        browser,
+        "evaluate",
+        json!({"tab_id":tab,"expression":expression}),
+    )
+    .await["value"]
+        .clone()
+}
+
+fn reference(snapshot: &Value, role: &str, name: &str) -> String {
+    snapshot["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["role"] == role && n["name"] == name)
+        .unwrap_or_else(|| panic!("missing {role} {name}: {snapshot}"))["ref"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+#[tokio::test]
+async fn capabilities_do_not_launch_and_close_is_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.executable = "missing-chromium".into();
+    let browser = BrowserService::new(cfg);
+    assert_eq!(
+        call(&browser, "capabilities", json!({})).await["audio"],
+        false
+    );
+    assert!(!root.path().join("identity").exists());
+    assert!(matches!(
+        browser.execute("browser", json!({"action":"audio"})).await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        browser
+            .execute(
+                "browser",
+                json!({"action":"artifact","artifact_id":"../../secret"})
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    browser.close().await.unwrap();
+    assert!(matches!(
+        browser
+            .execute("browser", json!({"action":"capabilities"}))
+            .await,
+        Err(Error::Closed)
+    ));
+}
+
+/// Requires a real Chromium and ffmpeg/ffprobe. No successful skip when absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires real Chromium and ffmpeg; run with --ignored"]
+async fn real_chromium_tools_stream_record_and_cleanup() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let child = String::from_utf8_lossy(&request[..n]).starts_with("GET /frame ");
+                let body = if child {
+                    "<button onclick=\"this.textContent='Child clicked'\">Child button</button>"
+                } else {
+                    r#"<!doctype html><title>SDK browser fixture</title>
+<style>body{font:20px sans-serif;padding:30px}button,input{font:inherit;padding:12px}iframe{display:block;margin:60px;width:400px;height:150px}#animation{width:30px;height:30px;background:red;animation:move .8s infinite alternate}@keyframes move{to{transform:translateX(300px)}}</style>
+<h1>Native browser fixture</h1><label>Name <input aria-label="Name"></label>
+<button onclick="window.clicks=(window.clicks||0)+1;document.querySelector('#result').textContent='Clicked '+window.clicks;console.log('clicked-once')">Increment</button><p id="result">Ready</p><div id="animation"></div><iframe src="/frame"></iframe>
+<script>console.log('fixture-loaded');</script>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let browser = Arc::new(BrowserService::new(config(root.path())));
+    let tab = call(&browser, "new_tab", json!({})).await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &browser,
+        "navigate",
+        json!({"tab_id":tab,"url":format!("http://{address}/")}),
+    )
+    .await;
+    for _ in 0..50 {
+        if evaluate(&browser, &tab, "document.readyState").await == "complete" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
+    let input = reference(&snap, "textbox", "Name");
+    call(
+        &browser,
+        "type",
+        json!({"tab_id":tab,"ref":input,"text":"Native 42"}),
+    )
+    .await;
+    assert_eq!(
+        evaluate(&browser, &tab, "document.querySelector('input').value").await,
+        "Native 42"
+    );
+    let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
+    let old = reference(&snap, "button", "Increment");
+    let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
+    assert!(matches!(
+        browser
+            .execute("browser", json!({"action":"click","tab_id":tab,"ref":old}))
+            .await,
+        Err(Error::StaleRef)
+    ));
+    let button = reference(&snap, "button", "Increment");
+    call(&browser, "click", json!({"tab_id":tab,"ref":button})).await;
+    assert_eq!(evaluate(&browser, &tab, "window.clicks").await, 1);
+    assert!(matches!(
+        browser
+            .execute(
+                "browser",
+                json!({"action":"click","tab_id":tab,"ref":button})
+            )
+            .await,
+        Err(Error::StaleRef)
+    ));
+    let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
+    let stale = reference(&snap, "button", "Increment");
+    // External mutation, not another browser tool, must invalidate the snapshot.
+    let mut frames = browser.subscribe_frames();
+    call(&browser, "stream_start", json!({"tab_id":tab})).await;
+    let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame["tab_id"], tab);
+    assert!(
+        base64::engine::general_purpose::STANDARD
+            .decode(frame["base64"].as_str().unwrap())
+            .unwrap()
+            .starts_with(&[255, 216])
+    );
+    // Host input is independent of agent tools and invalidates refs.
+    call(
+        &browser,
+        "input",
+        json!({"tab_id":tab,"kind":"text","params":{"text":"!"}}),
+    )
+    .await;
+    assert!(matches!(
+        browser
+            .execute(
+                "browser",
+                json!({"action":"click","tab_id":tab,"ref":stale})
+            )
+            .await,
+        Err(Error::StaleRef)
+    ));
+    let mut slow = browser.subscribe_frames();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(matches!(
+        slow.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+    ));
+    assert_eq!(evaluate(&browser, &tab, "6*7").await, 42); // Control replies survived frame pressure.
+    let tree = call(&browser, "frames", json!({"tab_id":tab})).await;
+    let child = tree["frameTree"]["childFrames"][0]["frame"]["id"]
+        .as_str()
+        .unwrap();
+    let child_snap = call(&browser, "snapshot", json!({"tab_id":tab,"frame_id":child})).await;
+    let child_button = reference(&child_snap, "button", "Child button");
+    call(&browser, "click", json!({"tab_id":tab,"ref":child_button})).await;
+    assert_eq!(
+        evaluate(
+            &browser,
+            &tab,
+            "document.querySelector('iframe').contentDocument.querySelector('button').textContent"
+        )
+        .await,
+        "Child clicked"
+    );
+    let image = call(&browser, "screenshot", json!({"tab_id":tab})).await;
+    let artifact = call(
+        &browser,
+        "artifact",
+        json!({"artifact_id":image["artifact_id"]}),
+    )
+    .await;
+    assert!(
+        base64::engine::general_purpose::STANDARD
+            .decode(artifact["base64"].as_str().unwrap())
+            .unwrap()
+            .starts_with(b"\x89PNG")
+    );
+    let events = call(&browser, "events", json!({"tab_id":tab})).await;
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["method"] == "Runtime.consoleAPICalled")
+    );
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["method"] == "Network.responseReceived")
+    );
+    assert!(matches!(browser.execute("browser",json!({"action":"evaluate","tab_id":tab,"expression":"throw new Error('expected-probe-error')"})).await,Err(Error::Protocol(_))));
+    call(&browser, "record_start", json!({"tab_id":tab})).await;
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let video = call(&browser, "record_stop", json!({"tab_id":tab})).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let video_path = root
+        .path()
+        .join("evidence")
+        .join(format!("{}.mp4", video["artifact_id"].as_str().unwrap()));
+    let probe = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&video_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(probe.status.success());
+    let duration: f64 = String::from_utf8(probe.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        (duration - 1.6).abs() < 0.3,
+        "video duration {duration}, elapsed including encoding {elapsed}"
+    );
+    // Persist account identity and artifacts across checked shutdown/relaunch.
+    evaluate(
+        &browser,
+        &tab,
+        "localStorage.setItem('identity-test','retained')",
+    )
+    .await;
+    call(&browser, "record_start", json!({"tab_id":tab})).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let pending_browser = browser.clone();
+    let pending_tab = tab.clone();
+    let pending = tokio::spawn(async move {
+        pending_browser
+            .execute(
+                "browser",
+                json!({"action":"wait","tab_id":pending_tab,"milliseconds":10000}),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    browser.close().await.unwrap();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Closed)));
+    assert!(
+        std::fs::read_dir(root.path().join("evidence"))
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("recording-"))
+    );
+    let reopened = BrowserService::new(config(root.path()));
+    assert_eq!(
+        call(
+            &reopened,
+            "artifact",
+            json!({"artifact_id":image["artifact_id"]})
+        )
+        .await["mime_type"],
+        "image/png"
+    );
+    let tab = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://{address}/")}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        evaluate(&reopened, &tab, "localStorage.getItem('identity-test')").await,
+        "retained"
+    );
+    call(&reopened, "stream_start", json!({"tab_id":tab})).await;
+    call(&reopened, "close_tab", json!({"tab_id":tab})).await;
+    assert!(
+        reopened
+            .execute("browser", json!({"action":"screenshot","tab_id":tab}))
+            .await
+            .is_err()
+    );
+    reopened.close().await.unwrap();
+    server.abort();
+}

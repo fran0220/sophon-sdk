@@ -1,20 +1,24 @@
 //! Runtime-local, Electron-independent browser execution. No CLI, MCP or agent loop.
 mod cdp;
+mod recording;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
 use cdp::Cdp;
+use recording::Recording;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, broadcast};
 use uuid::Uuid;
+use xai_tty_utils::{ProcessGroup, ProcessScope};
 
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
@@ -22,6 +26,8 @@ pub struct BrowserConfig {
     /// Dedicated account/Runtime directory, shared across Games. Never delete on
     /// Game removal and never point at a user's default Chrome profile.
     pub data_dir: PathBuf,
+    /// Durable Runtime-owned artifact store, independent of browser identity.
+    pub artifact_dir: PathBuf,
     pub headless: bool,
     /// Explicit opt-in for isolated containers only. Never enabled implicitly.
     pub no_sandbox: bool,
@@ -79,11 +85,14 @@ struct ElementRef {
 struct Page {
     session: String,
     refs: HashMap<String, ElementRef>,
+    streaming: bool,
 }
 struct Running {
     child: Child,
+    group: Option<Arc<ProcessGroup>>,
     cdp: Option<Cdp>,
     pages: HashMap<String, Page>,
+    recording: Option<Recording>,
     _profile_lock: File,
 }
 
@@ -91,29 +100,37 @@ struct Running {
 /// Call `close().await` for checked process cleanup; Drop is only a kill fallback.
 pub struct BrowserService {
     config: BrowserConfig,
+    process_scope: ProcessScope,
     running: Mutex<Option<Running>>,
     closed: AtomicBool,
     closing: Notify,
-    artifacts: Mutex<HashMap<String, Vec<u8>>>,
+    frames: broadcast::Sender<Value>,
 }
 
 impl BrowserService {
     pub fn new(config: BrowserConfig) -> Self {
         Self {
             config,
+            process_scope: ProcessScope::new(),
             running: Mutex::new(None),
             closed: AtomicBool::new(false),
             closing: Notify::new(),
-            artifacts: Mutex::new(HashMap::new()),
+            frames: broadcast::channel(8).0,
         }
+    }
+
+    /// Live JPEG frames only, separate from reliable control responses. A slow
+    /// receiver gets `Lagged` and should resume with the newest available frame.
+    pub fn subscribe_frames(&self) -> broadcast::Receiver<Value> {
+        self.frames.subscribe()
     }
 
     pub fn tool_specs() -> Vec<BrowserToolSpec> {
         vec![BrowserToolSpec {
             name: "browser".into(),
-            description: "Use the Runtime-owned browser. Snapshot gives revision-scoped refs; refresh after page changes. Never retry a timed-out interaction automatically. Screenshots return artifact IDs; audio/video/streaming are unsupported.".into(),
+            description: "Use the Runtime-owned browser. Snapshot gives revision-scoped refs; refresh after page changes. Never retry a timed-out interaction automatically. Screenshots and silent video recordings return durable artifact IDs. Audio unsupported.".into(),
             input_schema: json!({"type":"object","required":["action"],"properties":{
-                "action":{"type":"string","enum":["capabilities","tabs","new_tab","close_tab","navigate","frames","snapshot","click","type","key","scroll","wait","screenshot","events"]},
+                "action":{"type":"string","enum":["capabilities","tabs","new_tab","close_tab","navigate","frames","snapshot","click","type","key","scroll","wait","screenshot","events","record_start","record_stop"]},
                 "tab_id":{"type":"string"},"frame_id":{"type":"string"},"url":{"type":"string"},"ref":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"milliseconds":{"type":"integer","minimum":0,"maximum":10000}
             },"additionalProperties":false}),
         }]
@@ -140,29 +157,28 @@ impl BrowserService {
         let action = string(&args, "action")?;
         if action == "capabilities" {
             return Ok(
-                json!({"engine":"chromium-cdp","persistent_profile":true,"semantic_snapshots":true,"frame_snapshots":true,"screenshots":true,"input":true,"console":true,"network_metadata":true,"streaming":false,"audio":false,"recording":false,"cross_origin_frame_snapshots":false}),
+                json!({"engine":"chromium-cdp","persistent_profile":true,"semantic_snapshots":true,"frame_snapshots":true,"screenshots":true,"input":true,"console":true,"network_metadata":true,"streaming":true,"audio":false,"recording":"requires_ffmpeg","cross_origin_frame_snapshots":false}),
             );
         }
         if matches!(action, "stream" | "audio" | "record" | "recording") {
             return Err(Error::Unsupported(action.into()));
         }
         if action == "artifact" {
-            let artifacts = self.artifacts.lock().await;
-            let bytes = artifacts
-                .get(string(&args, "artifact_id")?)
-                .ok_or_else(|| Error::Invalid("unknown artifact".into()))?;
+            let id = string(&args, "artifact_id")?;
+            let (path, mime) = self.artifact_path(id).await?;
+            if tokio::fs::metadata(&path).await?.len() > 64 * 1024 * 1024 {
+                return Err(Error::Invalid(
+                    "artifact exceeds 64 MiB inline transfer limit".into(),
+                ));
+            }
+            let bytes = tokio::fs::read(path).await?;
             return Ok(
-                json!({"mime_type":"image/png","base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                json!({"mime_type":mime,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
             );
         }
         if action == "release_artifact" {
-            let removed = self
-                .artifacts
-                .lock()
-                .await
-                .remove(string(&args, "artifact_id")?)
-                .is_some();
-            return Ok(json!({"released":removed}));
+            // Durable evidence is retained. Clients only release their own references.
+            return Ok(json!({"released":true,"retained":true}));
         }
         let mut guard = self.running.lock().await;
         if self.closed.load(Ordering::Acquire) {
@@ -186,8 +202,9 @@ impl BrowserService {
             }
             "close_tab" => {
                 let tab = string(&args,"tab_id")?;
+                if running.recording.as_ref().is_some_and(|r|r.tab==tab) { return Err(Error::Invalid("stop recording before closing its tab".into())); }
                 let result = connection.call(None,"Target.closeTarget",json!({"targetId":tab})).await?;
-                running.pages.remove(tab);
+                if let Some(page) = running.pages.remove(tab) { connection.tabs.lock().expect("tab lock").remove(&page.session); }
                 return Ok(result);
             }
             _ => {}
@@ -202,6 +219,11 @@ impl BrowserService {
                 )
                 .await?;
             let session = string(&attached, "sessionId")?.to_owned();
+            connection
+                .tabs
+                .lock()
+                .expect("tab lock")
+                .insert(session.clone(), tab.into());
             for method in [
                 "Page.enable",
                 "Runtime.enable",
@@ -215,6 +237,7 @@ impl BrowserService {
                 Page {
                     session,
                     refs: HashMap::new(),
+                    streaming: false,
                 },
             );
         }
@@ -222,6 +245,64 @@ impl BrowserService {
         let cdp = connection;
         let session = Some(page.session.as_str());
         match action {
+            "stream_start" => {
+                if !page.streaming {
+                    page.streaming = true;
+                    cdp.call(session,"Page.startScreencast",json!({"format":"jpeg","quality":80,"maxWidth":1920,"maxHeight":1080,"everyNthFrame":1})).await?;
+                }
+                Ok(json!({"streaming":true,"audio":false}))
+            }
+            "stream_stop" => {
+                if running.recording.as_ref().is_some_and(|r| r.tab == tab) {
+                    return Err(Error::Invalid(
+                        "stop recording before stopping stream".into(),
+                    ));
+                }
+                cdp.call(session, "Page.stopScreencast", json!({})).await?;
+                page.streaming = false;
+                Ok(json!({"streaming":false}))
+            }
+            "record_start" => {
+                if running.recording.is_some() {
+                    return Err(Error::Invalid("recording already active".into()));
+                }
+                running.recording = Some(
+                    Recording::start(
+                        tab.into(),
+                        self.config.artifact_dir.clone(),
+                        self.subscribe_frames(),
+                        self.process_scope.clone(),
+                    )
+                    .await?,
+                );
+                if !page.streaming {
+                    page.streaming = true;
+                    cdp.call(session,"Page.startScreencast",json!({"format":"jpeg","quality":80,"maxWidth":1920,"maxHeight":1080,"everyNthFrame":1})).await?;
+                }
+                Ok(
+                    json!({"recording_id":running.recording.as_ref().expect("recording").id,"audio":false}),
+                )
+            }
+            "record_stop" => {
+                let recording = running
+                    .recording
+                    .as_mut()
+                    .filter(|r| r.tab == tab)
+                    .ok_or_else(|| Error::Invalid("no recording for tab".into()))?;
+                let id = recording.id.clone();
+                let result = recording.finish().await;
+                running.recording.take();
+                result?;
+                Ok(json!({"artifact_id":id,"mime_type":"video/mp4","audio":false}))
+            }
+            "evaluate" => {
+                page.refs.clear();
+                let result = cdp.call(session,"Runtime.evaluate",json!({"expression":string(&args,"expression")?,"returnByValue":true,"awaitPromise":true})).await?;
+                if let Some(exception) = result.get("exceptionDetails") {
+                    return Err(Error::Protocol(exception.to_string()));
+                }
+                Ok(result["result"].clone())
+            }
             "navigate" => {
                 let url = string(&args, "url")?;
                 validate_url(url)?;
@@ -305,7 +386,7 @@ impl BrowserService {
                 let node = cdp.call(session,"DOM.resolveNode",json!({"backendNodeId":reference.backend,"executionContextId":reference.context})).await.map_err(|_| Error::StaleRef)?;
                 let object = string(&node["object"], "objectId")?;
                 let function = if action == "click" {
-                    "function(){if(!this.isConnected)throw Error('detached');this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:r.width,height:r.height}}"
+                    "function(){if(!this.isConnected)throw Error('detached');this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();let x=r.x+r.width/2,y=r.y+r.height/2,w=window;while(w!==w.top){const f=w.frameElement;if(!f)throw Error('cross-origin frame');const b=f.getBoundingClientRect();x+=b.x+f.clientLeft;y+=b.y+f.clientTop;w=w.parent}return {x,y,width:r.width,height:r.height}}"
                 } else {
                     "function(){if(!this.isConnected)throw Error('detached');this.focus();return document.activeElement===this}"
                 };
@@ -390,13 +471,8 @@ impl BrowserService {
                     .map_err(|e| Error::Protocol(e.to_string()))?;
                 let id = Uuid::new_v4().to_string();
                 let len = bytes.len();
-                let mut artifacts = self.artifacts.lock().await;
-                if artifacts.len() >= 32 {
-                    return Err(Error::Invalid(
-                        "artifact capacity reached; release artifacts before capturing more".into(),
-                    ));
-                }
-                artifacts.insert(id.clone(), bytes);
+                tokio::fs::create_dir_all(&self.config.artifact_dir).await?;
+                tokio::fs::write(self.config.artifact_dir.join(format!("{id}.png")), bytes).await?;
                 Ok(json!({"artifact_id":id,"mime_type":"image/png","bytes":len}))
             }
             "events" => {
@@ -471,17 +547,19 @@ impl BrowserService {
         if self.config.no_sandbox {
             command.arg("--no-sandbox");
         }
-        let child = command
+        command
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        let (child, group) = self.process_scope.spawn(command)?;
         Ok(Running {
             child,
+            group: Some(group),
             cdp: None,
             pages: HashMap::new(),
+            recording: None,
             _profile_lock: lock,
         })
     }
@@ -497,10 +575,15 @@ impl BrowserService {
                 }
                 if let Ok(contents) = tokio::fs::read_to_string(&port_file).await {
                     let mut lines = contents.lines();
-                    if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
-                        if port.parse::<u16>().is_ok() && path.starts_with("/devtools/browser/") {
-                            return Cdp::connect(&format!("ws://127.0.0.1:{port}{path}")).await;
-                        }
+                    if let (Some(port), Some(path)) = (lines.next(), lines.next())
+                        && port.parse::<u16>().is_ok()
+                        && path.starts_with("/devtools/browser/")
+                    {
+                        return Cdp::connect(
+                            &format!("ws://127.0.0.1:{port}{path}"),
+                            self.frames.clone(),
+                        )
+                        .await;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -515,6 +598,10 @@ impl BrowserService {
         self.closing.notify_waiters();
         let mut guard = self.running.lock().await;
         if let Some(running) = guard.as_mut() {
+            if let Some(recording) = running.recording.as_mut() {
+                recording.cancel().await?;
+            }
+            running.recording.take();
             if let Some(cdp) = running.cdp.as_mut() {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -527,17 +614,37 @@ impl BrowserService {
                     status?;
                 }
                 Err(_) => {
-                    running.child.kill().await?;
+                    if let Some(group) = &running.group {
+                        group.kill()?;
+                    }
                     running.child.wait().await?;
                 }
             }
+            running.group.take();
             if let Some(cdp) = running.cdp.as_mut() {
                 cdp.stop().await;
             }
         }
         guard.take();
-        self.artifacts.lock().await.clear();
         Ok(())
+    }
+
+    async fn artifact_path(&self, id: &str) -> Result<(PathBuf, &'static str), Error> {
+        let id =
+            Uuid::parse_str(id).map_err(|_| Error::Invalid("artifact ID must be UUID".into()))?;
+        for (extension, mime) in [("png", "image/png"), ("mp4", "video/mp4")] {
+            let path = self.config.artifact_dir.join(format!("{id}.{extension}"));
+            if tokio::fs::try_exists(&path).await? {
+                return Ok((path, mime));
+            }
+        }
+        Err(Error::Invalid("unknown artifact".into()))
+    }
+}
+
+impl Drop for BrowserService {
+    fn drop(&mut self) {
+        self.process_scope.kill_all();
     }
 }
 
