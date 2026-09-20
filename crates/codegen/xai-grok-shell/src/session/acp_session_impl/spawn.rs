@@ -1472,6 +1472,11 @@ pub(crate) async fn spawn_session_actor(
     .map(|p| p.to_string_lossy().to_string())
     .unwrap_or_else(|| session_info.cwd.clone());
     let current_prompt_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+    agent.tool_bridge().toolset().set_native_invocation_context(
+        session_info.id.to_string(),
+        current_prompt_id.clone(),
+        std::path::PathBuf::from(&session_info.cwd),
+    );
     let pending_interactions: crate::session::pending_interaction::PendingInteractions =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let permissions_for_handle = permissions.clone();

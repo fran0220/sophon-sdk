@@ -362,6 +362,14 @@ impl SessionActor {
             .unwrap_or_else(|| new_agent.system_prompt().to_string());
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();
+        new_agent
+            .tool_bridge()
+            .toolset()
+            .set_native_invocation_context(
+                self.session_info.id.to_string(),
+                self.current_prompt_id.clone(),
+                self.tool_context.cwd.as_path().to_path_buf(),
+            );
         self.abort_and_clear_prefire().await;
         *self.agent.borrow_mut() = new_agent;
         *self.active_agent_type.lock() = Some(new_agent_name.clone());

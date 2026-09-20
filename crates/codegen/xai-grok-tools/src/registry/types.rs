@@ -362,6 +362,7 @@ struct ReminderEntry {
     reminder: Box<dyn Reminder + Send + Sync>,
 }
 /// A tool ready for dispatch, with pre-built client-facing definition.
+#[derive(Clone)]
 struct FinalizedTool {
     namespace: String,
     id: String,
@@ -394,7 +395,26 @@ struct FinalizedTool {
     /// `"legacy-0.4.10"`). `None` for unmanaged tools and dynamically
     /// registered (MCP) tools.
     contract_version: Option<String>,
+    /// Rebind the same concrete runtime instance into a replacement registry.
+    /// Built-ins are reconstructed from their definition instead.
+    register_runtime_instance:
+        Option<Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>>,
 }
+/// Identity captured by native dispatch, never by an embedding tool's closure.
+/// Child toolsets bind their own source even when sharing concrete tool instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeInvocationContext {
+    pub session_id: String,
+    pub prompt_id: Option<String>,
+    pub cwd: std::path::PathBuf,
+}
+
+struct NativeInvocationSource {
+    session_id: String,
+    current_prompt_id: Arc<std::sync::Mutex<Option<String>>>,
+    cwd: std::path::PathBuf,
+}
+
 /// Toolset produced by `ToolRegistryBuilder::finalize()`. The tools vector is wrapped in `parking_lot::RwLock` to allow
 /// concurrent read access (tool dispatch) with rare write access (MCP tool registration). The read guard is held only
 /// for microsecond lookups — never across `.await`.
@@ -413,6 +433,7 @@ pub struct FinalizedToolset {
     renderer: Arc<TemplateRenderer>,
     /// Tag name for system-reminder wrappers in tool result text.
     system_reminder_tag: &'static str,
+    native_invocation: parking_lot::RwLock<Option<NativeInvocationSource>>,
     /// Per-user feature-flag bag stamped on every dispatch ctx by
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
@@ -1130,6 +1151,7 @@ impl ToolRegistryBuilder {
                 reverse_params,
                 parse_input: Arc::from(entry.parse_input),
                 contract_version,
+                register_runtime_instance: None,
             });
         }
         let native_tool_names: std::collections::HashSet<String> = tools
@@ -1207,6 +1229,7 @@ impl ToolRegistryBuilder {
             local_registry,
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
+            native_invocation: Default::default(),
             workspace_viewer_ctx,
         })
     }
@@ -1267,8 +1290,41 @@ impl FinalizedToolset {
                 std::collections::HashMap::new(),
             )),
             system_reminder_tag: "system-reminder",
+            native_invocation: Default::default(),
             workspace_viewer_ctx: None,
         }
+    }
+    /// Bind this registry to its native session before exposing it to callers.
+    /// A rebuilt bridge must rebind to the same session; a child must bind to
+    /// its own session. Runtime-tool inheritance intentionally does not copy it.
+    pub fn set_native_invocation_context(
+        &self,
+        session_id: String,
+        current_prompt_id: Arc<std::sync::Mutex<Option<String>>>,
+        cwd: std::path::PathBuf,
+    ) {
+        *self.native_invocation.write() = Some(NativeInvocationSource {
+            session_id,
+            current_prompt_id,
+            cwd,
+        });
+    }
+
+    fn native_invocation_context(
+        &self,
+        cwd: Option<&std::path::PathBuf>,
+    ) -> Option<NativeInvocationContext> {
+        let source = self.native_invocation.read();
+        let source = source.as_ref()?;
+        Some(NativeInvocationContext {
+            session_id: source.session_id.clone(),
+            prompt_id: source
+                .current_prompt_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            cwd: cwd.unwrap_or(&source.cwd).clone(),
+        })
     }
     pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
         &self.local_registry
@@ -1433,6 +1489,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        if let Some(native) = parent_ctx.get::<NativeInvocationContext>() {
+            ctx.extensions.insert_arc(native);
+        }
         if let Some(cancellation) = parent_ctx.get::<xai_tool_runtime::Cancellation>() {
             ctx.extensions.insert((*cancellation).clone());
         }
@@ -1611,6 +1670,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        if let Some(native) = self.native_invocation_context(cwd_override.as_ref()) {
+            ctx.extensions.insert(native);
+        }
         ctx.extensions.insert(
             crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
         );
@@ -1742,7 +1804,8 @@ impl FinalizedToolset {
         let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
         let input_schema = input_schema_override.unwrap_or_else(generate_schema_cached::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
-        self.local_registry.register(tool);
+        let tool = Arc::new(tool);
+        self.local_registry.register_arc(Arc::clone(&tool));
         tools.push(FinalizedTool {
             namespace: ToolNamespace::MCP.to_string(),
             id: name.clone(),
@@ -1769,7 +1832,52 @@ impl FinalizedToolset {
                 }))
             }),
             contract_version: None,
+            register_runtime_instance: Some(Arc::new(move |registry| {
+                registry.register_arc(Arc::clone(&tool));
+            })),
         });
+        Ok(())
+    }
+    /// Copy selected runtime registrations into a detached replacement toolset.
+    /// The caller selects ownership (for example, excluding replaced external
+    /// MCP namespaces). Schemas and concrete instances are preserved together.
+    /// Any name/id collision rejects the entire copy before modifying `self`.
+    /// Callbacks must read invocation context rather than capture parent identity
+    /// if the destination belongs to a child session.
+    pub fn inherit_runtime_tools(
+        &self,
+        source: &Self,
+        include: impl Fn(&str) -> bool,
+    ) -> Result<(), xai_tool_runtime::ToolError> {
+        let inherited: Vec<_> = source
+            .tools
+            .read()
+            .iter()
+            .filter(|tool| tool.register_runtime_instance.is_some() && include(&tool.client_name))
+            .cloned()
+            .collect();
+        let mut tools = self.tools.write();
+        let mut registry_ids = std::collections::HashSet::new();
+        for inherited_tool in &inherited {
+            if !registry_ids.insert(&inherited_tool.registry_id)
+                || tools.iter().any(|tool| {
+                    tool.client_name == inherited_tool.client_name
+                        || tool.registry_id == inherited_tool.registry_id
+                })
+            {
+                return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                    "Runtime tool conflicts with replacement registry: {}",
+                    inherited_tool.client_name
+                )));
+            }
+        }
+        for tool in inherited {
+            (tool
+                .register_runtime_instance
+                .as_ref()
+                .expect("filtered runtime registration"))(&self.local_registry);
+            tools.push(tool);
+        }
         Ok(())
     }
     pub fn unregister_tools_by_prefix(&self, prefix: &str) -> usize {
@@ -3100,6 +3208,154 @@ mod tests {
             Ok("ok".into())
         }
     }
+    #[derive(Debug, Default)]
+    struct NativeContextProbe(std::sync::atomic::AtomicUsize);
+    impl crate::types::tool_metadata::ToolMetadata for NativeContextProbe {
+        fn kind(&self) -> ToolKind {
+            ToolKind::Other
+        }
+        fn tool_namespace(&self) -> ToolNamespace {
+            ToolNamespace::MCP
+        }
+        fn description_template(&self) -> &str {
+            "Inspect native invocation identity"
+        }
+    }
+    impl xai_tool_runtime::Tool for NativeContextProbe {
+        type Args = serde_json::Value;
+        type Output = String;
+        fn id(&self) -> xai_tool_protocol::ToolId {
+            xai_tool_protocol::ToolId::new("native_context_probe").unwrap()
+        }
+        fn description(
+            &self,
+            _: &xai_tool_runtime::ListToolsContext,
+        ) -> xai_tool_types::ToolDescription {
+            xai_tool_types::ToolDescription::new("native_context_probe", "Probe")
+        }
+        async fn run(
+            &self,
+            ctx: xai_tool_runtime::ToolCallContext,
+            _: serde_json::Value,
+        ) -> Result<String, xai_tool_runtime::ToolError> {
+            let native = ctx
+                .get::<NativeInvocationContext>()
+                .expect("native dispatch identity");
+            let count = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(format!(
+                "{count}:{}:{}:{}",
+                native.session_id,
+                native.prompt_id.as_deref().unwrap_or("none"),
+                native.cwd.display()
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_runtime_inheritance_keeps_instance_but_uses_child_identity() {
+        let parent = Arc::new(FinalizedToolset::empty_for_test());
+        parent
+            .register_tool("probe".into(), NativeContextProbe::default(), None)
+            .unwrap();
+        parent
+            .register_tool(
+                "external__tool".into(),
+                FakeMcpTool {
+                    description: "external".into(),
+                },
+                None,
+            )
+            .unwrap();
+        parent.set_native_invocation_context(
+            "parent".into(),
+            Arc::new(std::sync::Mutex::new(Some("p1".into()))),
+            "/parent".into(),
+        );
+        let first = parent
+            .call("probe", serde_json::json!({}), "first", None)
+            .await
+            .unwrap();
+        assert_eq!(first.prompt_text, "0:parent:p1:/parent");
+
+        let child = Arc::new(FinalizedToolset::empty_for_test());
+        let prompt = Arc::new(std::sync::Mutex::new(Some("c1".into())));
+        child.set_native_invocation_context("child".into(), prompt.clone(), "/child".into());
+        child
+            .inherit_runtime_tools(&parent, |name| !name.starts_with("external__"))
+            .unwrap();
+        // Remove the old registration: the inherited concrete instance remains alive.
+        assert!(parent.unregister_tool_by_name("probe"));
+        let second = child
+            .call("probe", serde_json::json!({}), "second", None)
+            .await
+            .unwrap();
+        assert_eq!(second.prompt_text, "1:child:c1:/child");
+        *prompt.lock().unwrap() = Some("c2".into());
+        let third = child
+            .call(
+                "probe",
+                serde_json::json!({}),
+                "third",
+                Some("/override".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.prompt_text, "2:child:c2:/override");
+        // Inner use_tool dispatch forwards the already captured invocation,
+        // rather than reading a later prompt ID from the source slot.
+        let mut inner_ctx = xai_tool_runtime::ToolCallContext::default();
+        inner_ctx
+            .extensions
+            .insert(child.native_invocation_context(None).unwrap());
+        *prompt.lock().unwrap() = Some("next-prompt".into());
+        let inner = child
+            .call_raw("probe", serde_json::json!({}), inner_ctx)
+            .await
+            .unwrap();
+        assert_eq!(inner.to_prompt_format(), "3:child:c2:/child");
+        assert!(
+            child
+                .call("external__tool", serde_json::json!({}), "excluded", None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_runtime_inheritance_collision_does_not_partially_install() {
+        let source = FinalizedToolset::empty_for_test();
+        source
+            .register_tool("probe".into(), NativeContextProbe::default(), None)
+            .unwrap();
+        source
+            .register_tool(
+                "external".into(),
+                FakeMcpTool {
+                    description: "source".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let target = FinalizedToolset::empty_for_test();
+        target
+            .register_tool(
+                "collision".into(),
+                FakeMcpTool {
+                    description: "target".into(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(target.inherit_runtime_tools(&source, |_| true).is_err());
+        assert_eq!(target.tools.read().len(), 1);
+        assert!(
+            target
+                .local_registry
+                .find(&xai_tool_protocol::ToolId::new("native_context_probe").unwrap())
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn call_sets_effective_tool_name_for_use_tool_dispatch() {
         let tmp = TempDir::new().unwrap();
