@@ -142,6 +142,7 @@ blake3 = "1"
 bytes = { version = "1", features = ["serde"] }
 camino = "1.1.10"
 chrono = "0.4"
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = { version = "4" }
 colored_json = "5"
