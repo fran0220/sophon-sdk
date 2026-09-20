@@ -7,6 +7,7 @@ async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "9
 resolver = "2"
 members = [
     "crates/sophon-sdk",
+    "crates/sophon-browser",
     "crates/build/xai-proto-build",
     "crates/codegen/ptyctl",
     "crates/codegen/ptyctl-cli",
