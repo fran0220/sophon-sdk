@@ -1692,14 +1692,10 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
         grok.cli_agents.push(definition);
     }
     grok.web_search_model = config.web_search_model.clone().unwrap_or_default();
-    grok.session_summary_model = config
-        .session_summary_model
-        .clone()
-        .or_else(|| config.default_model.clone());
-    grok.image_description_model = config
-        .image_description_model
-        .clone()
-        .or_else(|| config.default_model.clone());
+    grok.strict_auxiliary_routes = true;
+    grok.session_summary_model = config.session_summary_model.clone();
+    grok.compaction_model = config.compaction_model.clone();
+    grok.image_description_model = config.image_description_model.clone();
     grok.prompt_suggest_model_pin = PromptSuggestModelPin::Pinned(
         config
             .prompt_suggestion_model
@@ -3156,12 +3152,14 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_agent_work_defaults_to_the_sdk_model_without_disabling_web_fetch() {
+    fn unpublished_auxiliary_routes_stay_unavailable_without_disabling_web_fetch() {
         let (grok, _) = grok_config(&config()).expect("Grok config");
         assert_eq!(grok.web_search_model, "");
         assert!(!grok.disable_web_search);
-        assert_eq!(grok.session_summary_model.as_deref(), Some("default"));
-        assert_eq!(grok.image_description_model.as_deref(), Some("default"));
+        assert!(grok.strict_auxiliary_routes);
+        assert_eq!(grok.session_summary_model, None);
+        assert_eq!(grok.compaction_model, None);
+        assert_eq!(grok.image_description_model, None);
         assert_eq!(
             grok.prompt_suggest_model_pin,
             PromptSuggestModelPin::Pinned("default".into())
@@ -3183,11 +3181,13 @@ mod tests {
             ))
             .web_search_model("search")
             .session_summary_model("search")
+            .compaction_model("default")
             .image_description_model("search")
             .prompt_suggestion_model("search");
         let (grok, models) = grok_config(&config).expect("Grok config");
         assert_eq!(grok.web_search_model, "search");
         assert_eq!(grok.session_summary_model.as_deref(), Some("search"));
+        assert_eq!(grok.compaction_model.as_deref(), Some("default"));
         assert_eq!(grok.image_description_model.as_deref(), Some("search"));
         assert_eq!(
             grok.prompt_suggest_model_pin,

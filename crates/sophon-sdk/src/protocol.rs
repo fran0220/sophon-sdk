@@ -51,6 +51,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub session_summary_model: Option<String>,
     #[serde(default)]
+    pub compaction_model: Option<String>,
+    #[serde(default)]
     pub image_description_model: Option<String>,
     #[serde(default)]
     pub browser: Option<BrowserConfig>,

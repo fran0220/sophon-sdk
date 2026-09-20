@@ -554,6 +554,7 @@ fn agent_config(config: p::RuntimeConfig, callbacks: Arc<Callbacks>) -> Result<A
     native.models = models;
     native.web_search_model = config.web_search_model;
     native.session_summary_model = config.session_summary_model;
+    native.compaction_model = config.compaction_model;
     native.image_description_model = config.image_description_model;
     native.subagents = config.subagents;
     Ok(native)

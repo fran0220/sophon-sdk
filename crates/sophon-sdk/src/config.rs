@@ -530,6 +530,7 @@ pub struct AgentConfig {
     pub default_model: Option<String>,
     pub web_search_model: Option<String>,
     pub session_summary_model: Option<String>,
+    pub compaction_model: Option<String>,
     pub image_description_model: Option<String>,
     pub prompt_suggestion_model: Option<String>,
     pub permission_policy: PermissionPolicy,
@@ -546,6 +547,7 @@ impl fmt::Debug for AgentConfig {
             .field("default_model", &self.default_model)
             .field("web_search_model", &self.web_search_model)
             .field("session_summary_model", &self.session_summary_model)
+            .field("compaction_model", &self.compaction_model)
             .field("image_description_model", &self.image_description_model)
             .field("prompt_suggestion_model", &self.prompt_suggestion_model)
             .field("permission_policy", &self.permission_policy)
@@ -564,6 +566,7 @@ impl AgentConfig {
             default_model,
             web_search_model: None,
             session_summary_model: None,
+            compaction_model: None,
             image_description_model: None,
             prompt_suggestion_model: None,
             permission_policy: PermissionPolicy::DenyAll,
@@ -590,9 +593,15 @@ impl AgentConfig {
         self
     }
 
-    /// Route automatic titles, turn summaries, and compaction summaries.
+    /// Route automatic titles and turn summaries; independent of compaction.
     pub fn session_summary_model(mut self, model: impl Into<String>) -> Self {
         self.session_summary_model = Some(model.into());
+        self
+    }
+
+    /// Route manual and automatic compaction. None makes compaction unavailable.
+    pub fn compaction_model(mut self, model: impl Into<String>) -> Self {
+        self.compaction_model = Some(model.into());
         self
     }
 
@@ -686,6 +695,7 @@ impl AgentConfig {
         for (capability, model) in [
             ("web search", &self.web_search_model),
             ("session summary", &self.session_summary_model),
+            ("compaction", &self.compaction_model),
             ("image description", &self.image_description_model),
             ("prompt suggestion", &self.prompt_suggestion_model),
         ] {
