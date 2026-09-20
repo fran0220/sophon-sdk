@@ -302,7 +302,21 @@ impl Resources {
     /// Load registered resources from a previously serialized JSON structure. Expects the same
     /// shape as `serialize()` output: `{ "params": { ... }, "state": { ... } }`. Unknown keys are
     /// silently ignored. Missing keys leave the resource at its current value (or absent).
-    pub fn load_from(&mut self, data: HashMap<String, HashMap<String, serde_json::Value>>) {
+    pub fn load_from(
+        &mut self,
+        data: HashMap<String, HashMap<String, serde_json::Value>>,
+    ) -> Result<(), serde_json::Error> {
+        // Scheduler state is current-only. Validate before loading ANY resource:
+        // silently defaulting a malformed row would permit a later save to erase
+        // its occurrence cursor and replay work. Absence is a fresh session.
+        if let Some(scheduler) = data
+            .get("state")
+            .and_then(|state| state.get("grok_build.Scheduler"))
+        {
+            serde_json::from_value::<
+                crate::implementations::grok_build::scheduler::types::SchedulerState,
+            >(scheduler.clone())?;
+        }
         for entry in &self.entries {
             let category_key = entry.category.as_ref();
             if let Some(cat_map) = data.get(category_key)
@@ -311,6 +325,7 @@ impl Resources {
                 (entry.deserialize_fn)(val.clone(), &mut self.data);
             }
         }
+        Ok(())
     }
     /// Get a registered resource's value as JSON, by category and key.
     ///
@@ -868,7 +883,7 @@ mod tests {
         res2.register_state::<TodoData>();
         let parsed: HashMap<String, HashMap<String, serde_json::Value>> =
             serde_json::from_str(&json_str).unwrap();
-        res2.load_from(parsed);
+        res2.load_from(parsed).unwrap();
         let params = res2.get::<Params<EditConfig>>().unwrap();
         assert!(params.0.skip_read_before_edit);
         assert_eq!(params.0.max_file_size, Some(1024));
@@ -914,7 +929,7 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("state".to_string(), state_map);
         data.insert("params".to_string(), params_map);
-        res.load_from(data);
+        res.load_from(data).unwrap();
         let history = res.get::<State<ReadHistory>>().unwrap();
         assert_eq!(history.0.files_read, vec!["loaded.rs".to_string()]);
         let config = res.get::<Params<EditConfig>>().unwrap();
@@ -936,7 +951,7 @@ mod tests {
         );
         let mut data = HashMap::new();
         data.insert("state".to_string(), state_map);
-        res.load_from(data);
+        res.load_from(data).unwrap();
         let history = res.get::<State<ReadHistory>>().unwrap();
         assert_eq!(history.0.files_read, vec!["ok.rs".to_string()]);
     }

@@ -888,7 +888,9 @@ impl SchedulerActor {
         // child may be reported as fired, or a one-shot would be deleted for a run that never happened.
         tokio::select! {
             biased;
-            _ = self.cancel_token.cancelled() => return LoopFireOutcome::Skipped,
+            // The envelope is already outside this actor. Cancellation cannot
+            // prove that it did not run, so never reopen this occurrence.
+            _ = self.cancel_token.cancelled() => return LoopFireOutcome::Spawned(subagent_id),
             registered = registered_rx => {
                 if registered.is_err() {
                     self.restore_fire_anchor(
@@ -964,7 +966,7 @@ impl SchedulerActor {
             state
                 .tasks
                 .iter()
-                .filter(|task| task.pending_fire_at(now).is_some())
+                .filter(|task| task.recurring || task.pending_fire_at(now).is_some())
                 .map(|task| task_created_payload(task, version))
                 .collect()
         };
@@ -999,7 +1001,7 @@ impl SchedulerActor {
         if let Some(pending) = &self.pending_removal {
             return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
         }
-        task.cadence.validate()?;
+        task.validate()?;
         let mut res = self.resources.lock().await;
         let state = res.get_or_default::<State<SchedulerState>>();
         if state.tasks.len() >= MAX_SCHEDULED_TASKS {
@@ -1463,10 +1465,208 @@ mod tests {
     }
 
     fn due_one_shot(id: &str) -> ScheduledTask {
-        let mut task = ScheduledTask::new(1, id.into(), false, false);
+        let mut task = ScheduledTask::with_fire_immediately(1, id.into(), false, false, true);
         task.id = id.into();
         task.created_at = Utc::now() - chrono::Duration::seconds(10);
         task
+    }
+
+    #[tokio::test]
+    async fn anchored_resume_catches_up_once_and_persists_before_native_spawn() {
+        let now = Utc::now();
+        let anchor = now - chrono::Duration::seconds(10_001);
+        let task = ScheduledTask::from_cadence(
+            SchedulerCadence::Interval {
+                every_secs: 137,
+                anchor,
+            },
+            "inspect pipeline".into(),
+            true,
+        )
+        .unwrap();
+        let (mut actor, mut notifications) = make_boundary_actor(vec![task], 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources_state.json");
+        actor.resources_persistence =
+            Arc::new(crate::persistence::ResourcesPersistence::new(path.clone()));
+        let (events, mut requests) = mpsc::unbounded_channel();
+        actor
+            .resources
+            .lock()
+            .await
+            .insert(SubagentEventSender(events));
+        let observer = tokio::spawn(async move {
+            let SubagentEvent::Spawn(mut spawn) = next_event(&mut requests).await else {
+                panic!("native spawn expected")
+            };
+            let snapshot: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let state: SchedulerState = serde_json::from_value(
+                json_at(&snapshot, &["state", "grok_build.Scheduler"]).clone(),
+            )
+            .unwrap();
+            let task = first_task(&state.tasks);
+            // 10001 = 73*137; next occurrence must be anchor + 74*137,
+            // rather than resume time + interval or each of 73 missed runs.
+            assert_eq!(
+                task.next_run_at,
+                Some(anchor + chrono::Duration::seconds(10_138))
+            );
+            assert!(
+                task.last_fired_at.is_none(),
+                "consumption precedes accepted execution"
+            );
+            assert!(spawn.request.parent_prompt_id.is_none());
+            assert_eq!(spawn.request.owner, SubagentOwner::Task);
+            spawn.registered_tx.take().unwrap().send(()).unwrap();
+            (requests, state)
+        });
+        actor.fire_next_task().await;
+        let (mut requests, claimed_state) = observer.await.unwrap();
+        assert!(matches!(
+            next_event(&mut notifications).await,
+            ToolNotification::ScheduledTaskFired(_)
+        ));
+        actor.fire_next_task().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "poll cannot duplicate the occurrence"
+        );
+        let (mut restarted, mut restarted_notifications) =
+            make_boundary_actor(claimed_state.tasks, 0);
+        restarted.fire_next_task().await;
+        assert!(
+            restarted_notifications.try_recv().is_err(),
+            "crash after claim cannot replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_once_never_replays_after_restart() {
+        let task = ScheduledTask::from_cadence(
+            SchedulerCadence::Once {
+                at: Utc::now() - chrono::Duration::days(2),
+            },
+            "once".into(),
+            true,
+        )
+        .unwrap();
+        let (mut actor, _) = make_boundary_actor(vec![task], 0);
+        let (persistence, mut saves) = crate::persistence::ResourcesPersistence::controlled();
+        actor.resources_persistence = Arc::new(persistence);
+        let (events, mut requests) = mpsc::unbounded_channel();
+        actor
+            .resources
+            .lock()
+            .await
+            .insert(SubagentEventSender(events));
+        let mut fire = Box::pin(actor.fire_next_task());
+        let (snapshot, acknowledgement) = tokio::select! {
+            _ = &mut fire => panic!("must await consumption persistence"),
+            save = next_event(&mut saves) => save,
+        };
+        assert!(
+            requests.try_recv().is_err(),
+            "no spawn before durable consumption"
+        );
+        let claimed: SchedulerState =
+            serde_json::from_value(json_at(&snapshot, &["state", "grok_build.Scheduler"]).clone())
+                .unwrap();
+        assert_eq!(first_task(&claimed.tasks).next_run_at, None);
+        // Simulate loss of the process before persistence acknowledgement/spawn.
+        drop(fire);
+        drop(acknowledgement);
+        let (mut restarted, mut notifications) = make_boundary_actor(claimed.tasks, 0);
+        restarted.fire_next_task().await;
+        assert!(notifications.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cadence_update_validates_atomically_and_preserves_conflict_and_disk() {
+        let task = ScheduledTask::new(137, "original".into(), true, true);
+        let id = task.id.clone();
+        let (mut actor, mut notifications) = make_boundary_actor(vec![task.clone()], 0);
+        let before = serde_json::to_value(&task).unwrap();
+        let invalid = SchedulerCadence::Daily {
+            time: "25:00".into(),
+            time_zone: "America/New_York".into(),
+            weekdays: None,
+        };
+        assert!(
+            actor
+                .update_task(
+                    id.clone(),
+                    Some("must not change".into()),
+                    None,
+                    Some(invalid)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(first_task(&actor.scheduler_snapshot().await.tasks)).unwrap(),
+            before
+        );
+        assert!(notifications.try_recv().is_err());
+        let original_version = actor.clock.snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources_state.json");
+        actor.resources_persistence =
+            Arc::new(crate::persistence::ResourcesPersistence::new(path.clone()));
+        let cadence = SchedulerCadence::Daily {
+            time: "09:17".into(),
+            time_zone: "Asia/Shanghai".into(),
+            weekdays: Some(vec![2, 6]),
+        };
+        let (updated, _) = actor
+            .update_task(
+                id.clone(),
+                Some("new prompt".into()),
+                None,
+                Some(cadence.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.created_at, task.created_at);
+        assert_eq!(updated.cadence, cadence);
+        assert!(updated.next_run_at.unwrap() > Utc::now());
+        let bytes = std::fs::read(&path).unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        actor
+            .handle_command(SchedulerCommand::UpdateManaged {
+                operation_id: "stale".into(),
+                request_fingerprint: "stale".into(),
+                expected: original_version,
+                id: id.clone(),
+                prompt: Some("stale prompt".into()),
+                cadence: None,
+                reply,
+            })
+            .await;
+        assert!(matches!(
+            response.await.unwrap().unwrap(),
+            SchedulerMutationResult::Conflict { .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        actor.resources_persistence = Arc::new(crate::persistence::ResourcesPersistence::new(
+            dir.path().join("missing/resources.json"),
+        ));
+        assert!(matches!(
+            actor
+                .update_task(id, Some("failed write".into()), None, None)
+                .await,
+            Err(SchedulerError::Persistence(_))
+        ));
+        assert_eq!(
+            first_task(&actor.scheduler_snapshot().await.tasks).prompt,
+            "new prompt"
+        );
+        let disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let restored: SchedulerState =
+            serde_json::from_value(json_at(&disk, &["state", "grok_build.Scheduler"]).clone())
+                .unwrap();
+        assert_eq!(first_task(&restored.tasks).cadence, cadence);
+        assert_eq!(first_task(&restored.tasks).next_run_at, updated.next_run_at);
     }
 
     fn auto_acknowledged_notifications() -> (
@@ -1728,8 +1928,8 @@ mod tests {
                 let task = &snapshot.tasks[0];
                 assert_eq!(task.interval_secs, 1);
                 assert_eq!(
-                    task.next_fire_at(),
-                    task.last_fired_at.unwrap() + chrono::Duration::seconds(1)
+                    task.next_run_at,
+                    task.cadence.next_after(task.last_fired_at.unwrap())
                 );
             } else {
                 assert!(snapshot.tasks.is_empty());
@@ -1777,7 +1977,8 @@ mod tests {
             assert_eq!(snapshot.tasks.len(), 1);
             let task = &snapshot.tasks[0];
             // Native refusal retains the retry cadence, but restores the chain anchor.
-            assert!(task.last_fired_at.is_some());
+            assert!(task.last_fired_at.is_none());
+            assert!(task.next_run_at.is_some());
             assert!(task.last_subagent_id.is_none());
             assert_eq!(task.iterations_since_fresh, 0);
             assert!(task.chain_reset_pending);
@@ -1915,7 +2116,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_boundary_rotates_generation_without_retrying() {
-        let mut task = ScheduledTask::new(1, "due one-shot".into(), false, false);
+        let mut task =
+            ScheduledTask::with_fire_immediately(1, "due one-shot".into(), false, false, true);
         task.created_at = Utc::now() - chrono::Duration::seconds(10);
         let (mut actor, mut notifications) = make_boundary_actor(vec![task], u64::MAX - 1);
         let old_generation = actor.clock.snapshot().generation();
@@ -2070,7 +2272,13 @@ mod tests {
         // "First process": a due, non-durable recurring task exists; persist
         // the resources the way the tool bridge does after a tool call.
         let persistence = Arc::new(crate::persistence::ResourcesPersistence::new(path.clone()));
-        let mut task = ScheduledTask::new(1, "babysit the pipeline".into(), true, false);
+        let mut task = ScheduledTask::with_fire_immediately(
+            1,
+            "babysit the pipeline".into(),
+            true,
+            false,
+            true,
+        );
         task.id = "loop-1".into();
         task.created_at = Utc::now() - chrono::Duration::seconds(10);
         let mut resources = Resources::new();
@@ -2086,7 +2294,9 @@ mod tests {
         resources.register_state::<SchedulerState>();
         wire_drained_subagents(&mut resources);
         assert!(
-            crate::persistence::ResourcesPersistence::new(path).load(&mut resources),
+            crate::persistence::ResourcesPersistence::new(path)
+                .load(&mut resources)
+                .unwrap(),
             "persisted scheduler state must load on restart"
         );
         let shared = Arc::new(Mutex::new(resources));
@@ -2160,7 +2370,8 @@ mod tests {
     async fn recurring_task_fires_repeatedly_without_external_clear() {
         let (handle, cancel, mut notif_rx) = make_test_actor();
 
-        let mut task = ScheduledTask::new(1, "recurring".into(), true, false);
+        let mut task =
+            ScheduledTask::with_fire_immediately(1, "recurring".into(), true, false, true);
         task.created_at = chrono::Utc::now() - chrono::Duration::seconds(10);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         handle
@@ -2297,7 +2508,8 @@ mod tests {
         wire_drained_subagents(&mut resources);
 
         let state = resources.get_or_default::<State<SchedulerState>>();
-        let mut task = ScheduledTask::new(1, "legacy one-shot".into(), false, false);
+        let mut task =
+            ScheduledTask::with_fire_immediately(1, "legacy one-shot".into(), false, false, true);
         task.id = "legacy-1".to_string();
         task.created_at = chrono::Utc::now() - chrono::Duration::seconds(60);
         state.tasks.push(task);
@@ -2320,7 +2532,7 @@ mod tests {
         tokio::spawn(actor.run());
 
         let mut kinds = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let notif = tokio::time::timeout(Duration::from_secs(2), notif_rx.recv())
                 .await
                 .expect("notification")
@@ -2335,7 +2547,7 @@ mod tests {
                 _ => "other",
             });
         }
-        assert_eq!(kinds, vec!["fired", "removed"]);
+        assert_eq!(kinds, vec!["created", "fired", "removed"]);
 
         let res = shared.lock().await;
         let remaining = res
@@ -2640,7 +2852,7 @@ mod tests {
     }
 
     async fn create_due_task(handle: &SchedulerHandle, prompt: &str) -> String {
-        let mut task = ScheduledTask::new(1, prompt.into(), true, false);
+        let mut task = ScheduledTask::with_fire_immediately(1, prompt.into(), true, false, true);
         task.created_at = chrono::Utc::now() - chrono::Duration::seconds(10);
         let task_id = task.id.clone();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2999,7 +3211,8 @@ mod tests {
         let (handle, cancel, _notif_rx, mut subagent_rx) = make_test_actor_with_subagents();
         // One-hour interval, backdated to fire exactly once: the assertion
         // window cannot be raced by a second fire re-pointing the anchor.
-        let mut task = ScheduledTask::new(3600, "watch ci".into(), true, false);
+        let mut task =
+            ScheduledTask::with_fire_immediately(3600, "watch ci".into(), true, false, true);
         task.created_at = chrono::Utc::now() - chrono::Duration::seconds(3610);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         handle
@@ -3118,7 +3331,8 @@ mod tests {
         );
 
         let state = resources.get_or_default::<State<SchedulerState>>();
-        let mut task = ScheduledTask::new(1, "one and done".into(), false, false);
+        let mut task =
+            ScheduledTask::with_fire_immediately(1, "one and done".into(), false, false, true);
         task.id = "one-shot-refused".to_string();
         task.created_at = Utc::now() - chrono::Duration::seconds(60);
         state.tasks.push(task);
@@ -3406,6 +3620,8 @@ mod tests {
             .await;
         assert!(!response.await.unwrap().unwrap());
 
+        // Create/update now also cross the persistence barrier.
+        std::fs::create_dir(&parent).unwrap();
         let mut replacement = ScheduledTask::new(300, "replacement".into(), true, true);
         replacement.id = "replacement".into();
         let (reply, response) = tokio::sync::oneshot::channel();
@@ -3577,16 +3793,18 @@ mod tests {
         assert_eq!(actor.clock.snapshot().revision(), 0);
         assert!(notifications.try_recv().is_err());
 
-        // The completed one-shot flushes its own absence before the removal is
-        // announced, so this fire waits on persistence too.
+        // Consumption, accepted outcome, and final absence each persist before
+        // their respective external effects.
         {
             let fire = actor.fire_next_task();
             tokio::pin!(fire);
-            let (_, persisted) = tokio::select! {
-                _ = fire.as_mut() => panic!("one-shot removal must wait for resource persistence"),
-                save = next_event(&mut saves) => save,
-            };
-            persisted.send(Ok(())).unwrap();
+            for _ in 0..3 {
+                let (_, persisted) = tokio::select! {
+                    _ = fire.as_mut() => panic!("one-shot must wait for resource persistence"),
+                    save = next_event(&mut saves) => save,
+                };
+                persisted.send(Ok(())).unwrap();
+            }
             tokio::time::timeout(Duration::from_secs(1), fire)
                 .await
                 .unwrap();

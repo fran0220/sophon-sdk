@@ -1081,7 +1081,9 @@ impl ToolRegistryBuilder {
             let dir = ctx.state_path.parent().unwrap_or(&ctx.state_path);
             ResourcesPersistence::new(dir.join("resources_state.json"))
         });
-        persistence.load(&mut resources);
+        persistence.load(&mut resources).map_err(|error| {
+            vec![RequirementError::new("scheduler", error.to_string()).with_category("persistence")]
+        })?;
         let preset_name = config.behavior_preset.as_deref().unwrap_or("current");
         let local_registry = self.shared_local_registry.take().unwrap_or_default();
         for tool_config in &config.tools {

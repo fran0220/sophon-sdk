@@ -223,7 +223,7 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduledTask {
     pub id: String,
     /// Required in current persistence; interval-only historical rows fail closed.
@@ -277,6 +277,27 @@ fn deserialize_cadence<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ScheduledTask {
+    pub fn validate(&self) -> Result<(), SchedulerError> {
+        self.cadence.validate()?;
+        if self.recurring != self.cadence.recurring()
+            || matches!(self.cadence, SchedulerCadence::Interval { every_secs, .. } if every_secs != self.interval_secs)
+        {
+            return Err(SchedulerError::InvalidInterval(
+                "task recurrence metadata disagrees with cadence".into(),
+            ));
+        }
+        if let Some(next) = self.next_run_at {
+            if let Some(before) = next.checked_sub_signed(chrono::Duration::nanoseconds(1)) {
+                if self.cadence.next_after(before) != Some(next) {
+                    return Err(SchedulerError::InvalidInterval(
+                        "nextRunAt is not an occurrence of the cadence".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_cadence(
         cadence: SchedulerCadence,
         prompt: String,
@@ -412,8 +433,9 @@ impl ScheduledTask {
 
 /// Persisted state for the scheduler, stored via Resources + ResourcesPersistence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerState {
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_tasks")]
     pub tasks: Vec<ScheduledTask>,
     #[serde(
         default,
@@ -421,6 +443,16 @@ pub struct SchedulerState {
         skip_serializing_if = "super::occurrence_journal::OccurrenceJournal::is_empty"
     )]
     pub(crate) occurrence_journal: super::occurrence_journal::OccurrenceJournal,
+}
+
+fn deserialize_tasks<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ScheduledTask>, D::Error> {
+    let tasks = Vec::<ScheduledTask>::deserialize(deserializer)?;
+    for task in &tasks {
+        task.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(tasks)
 }
 
 crate::register_resource!("grok_build", "Scheduler", SchedulerState);
@@ -597,11 +629,11 @@ mod tests {
     }
 
     #[test]
-    fn next_fire_at_uses_last_fired_at_when_present() {
+    fn next_fire_uses_persisted_cursor_not_poll_time() {
         let mut task = ScheduledTask::new(300, "test".into(), true, false);
+        let expected = task.next_fire_at();
         let fired = Utc::now();
         task.last_fired_at = Some(fired);
-        let expected = fired + chrono::Duration::seconds(300);
         assert_eq!(task.next_fire_at(), expected);
     }
 
@@ -625,12 +657,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_defaults_recurring_and_durable_fields() {
+    fn legacy_state_is_rejected_without_cadence_and_cursor() {
         let json = r#"{"id":"abc123","intervalSecs":300,"prompt":"check",
                        "createdAt":"2026-01-01T00:00:00Z",
                        "lastFiredAt":null,"expiresAt":null}"#;
-        let task: ScheduledTask = serde_json::from_str(json).unwrap();
-        assert!(task.recurring && !task.durable);
+        assert!(serde_json::from_str::<ScheduledTask>(json).is_err());
     }
 
     #[test]

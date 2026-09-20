@@ -613,7 +613,7 @@ mod tests {
             String,
             std::collections::HashMap<String, serde_json::Value>,
         > = serde_json::from_value(snapshot).unwrap();
-        resources2.load_from(data);
+        resources2.load_from(data).unwrap();
 
         // Verify state was restored
         let restored = resources2.get::<State<TodoState>>().unwrap();

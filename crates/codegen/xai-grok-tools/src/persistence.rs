@@ -96,35 +96,31 @@ impl ResourcesPersistence {
 
     /// Load existing Resources state from disk, if the file exists. Reads the JSON, parses it into the nested
     /// `HashMap<String, HashMap<String, Value>>` shape that `Resources::load_from()` expects, and applies it to the given
-    /// resources. Returns `true` if state was loaded, `false` if there is no path, no file, or a parse error.
-    pub fn load(&self, resources: &mut Resources) -> bool {
+    /// resources. Returns false only for a fresh session (no path/file). Invalid
+    /// persisted state is an error, never an invitation to overwrite it with defaults.
+    pub fn load(&self, resources: &mut Resources) -> io::Result<bool> {
         let Some(state_path) = self.state_path.as_ref() else {
-            return false;
+            return Ok(false);
         };
 
         let json = match std::fs::read_to_string(state_path) {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
         };
 
-        let top: serde_json::Value = match serde_json::from_str(&json) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to parse resources state from {state_path:?}: {e}");
-                return false;
-            }
-        };
-
-        let data = match Self::value_to_nested_map(top) {
-            Some(m) => m,
-            None => {
-                tracing::warn!("Resources state file {state_path:?} has unexpected shape");
-                return false;
-            }
-        };
-
-        resources.load_from(data);
-        true
+        let top: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let data = Self::value_to_nested_map(top).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resources state has unexpected shape",
+            )
+        })?;
+        resources
+            .load_from(data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(true)
     }
 
     /// Save the current Resources state (non-blocking).
@@ -436,7 +432,7 @@ mod tests {
         // Load into fresh resources (with same registrations)
         let mut restored = Resources::new();
         restored.register_state::<WebCitationCounter>();
-        assert!(persistence.load(&mut restored));
+        assert!(persistence.load(&mut restored).unwrap());
 
         // Verify WebCitationCounter roundtripped
         let counter = restored.get::<State<WebCitationCounter>>().unwrap();
@@ -450,18 +446,80 @@ mod tests {
 
         let persistence = ResourcesPersistence::new(state_path);
         let mut resources = Resources::new();
-        assert!(!persistence.load(&mut resources));
+        assert!(!persistence.load(&mut resources).unwrap());
     }
 
     #[tokio::test]
-    async fn resources_load_returns_false_on_corrupt_json() {
+    async fn resources_load_rejects_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("resources_state.json");
         std::fs::write(&state_path, "{ this is not valid json }").unwrap();
 
         let persistence = ResourcesPersistence::new(state_path);
         let mut resources = Resources::new();
-        assert!(!persistence.load(&mut resources));
+        assert_eq!(
+            persistence.load(&mut resources).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_restore_rejects_old_or_malformed_state_without_touching_disk() {
+        use crate::implementations::grok_build::scheduler::types::{ScheduledTask, SchedulerState};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources_state.json");
+        let valid =
+            serde_json::to_value(ScheduledTask::new(137, "check".into(), true, true)).unwrap();
+        let mut old = valid.clone();
+        old.as_object_mut().unwrap().remove("cadence");
+        let mut missing_cursor = valid.clone();
+        missing_cursor.as_object_mut().unwrap().remove("nextRunAt");
+        let mut invalid_zone = valid.clone();
+        invalid_zone["cadence"] = serde_json::json!({"kind":"daily","time":"09:17","timeZone":"Invalid/Zone","weekdays":null});
+        for scheduler in [
+            serde_json::json!({"tasks":[old]}),
+            serde_json::json!({"tasks":[missing_cursor]}),
+            serde_json::json!({"tasks":[invalid_zone]}),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            let bytes = serde_json::to_vec_pretty(&serde_json::json!({"state": {"grok_build.Scheduler":scheduler,"grok_build.WebCitation":{"counter":99}}})).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            for _ in 0..2 {
+                let persistence = ResourcesPersistence::new(path.clone());
+                let mut resources = Resources::new();
+                resources.register_state::<SchedulerState>();
+                resources.register_state::<WebCitationCounter>();
+                resources
+                    .get_or_default::<State<WebCitationCounter>>()
+                    .counter = 7;
+                assert_eq!(
+                    persistence.load(&mut resources).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert!(resources.get::<State<SchedulerState>>().is_none());
+                assert_eq!(
+                    resources
+                        .get::<State<WebCitationCounter>>()
+                        .unwrap()
+                        .counter,
+                    7
+                );
+                persistence.flush().await;
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+        std::fs::write(&path, b"{\"state\":{}}").unwrap();
+        let persistence = ResourcesPersistence::new(path);
+        let mut resources = Resources::new();
+        resources.register_state::<SchedulerState>();
+        assert!(persistence.load(&mut resources).unwrap());
+        assert!(
+            resources
+                .get_or_default::<State<SchedulerState>>()
+                .tasks
+                .is_empty()
+        );
     }
 
     /// Atomic-rename guarantee: a concurrent reader hammering the path while
@@ -757,6 +815,6 @@ mod tests {
             .unwrap();
 
         assert!(noop.state_path().is_none());
-        assert!(!noop.load(&mut Resources::new()));
+        assert!(!noop.load(&mut Resources::new()).unwrap());
     }
 }

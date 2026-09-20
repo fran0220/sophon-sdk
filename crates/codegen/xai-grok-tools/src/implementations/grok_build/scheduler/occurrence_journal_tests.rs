@@ -12,6 +12,17 @@ fn uuid(suffix: u64) -> uuid::Uuid {
 fn task(id: &str, recurring: bool, durable: bool) -> ScheduledTask {
     ScheduledTask {
         id: id.into(),
+        cadence: if recurring {
+            super::super::types::SchedulerCadence::Interval {
+                every_secs: 300,
+                anchor: Utc.timestamp_opt(1_700_000_300, 0).unwrap(),
+            }
+        } else {
+            super::super::types::SchedulerCadence::Once {
+                at: Utc.timestamp_opt(1_700_000_300, 0).unwrap(),
+            }
+        },
+        next_run_at: Some(Utc.timestamp_opt(1_700_000_300, 0).unwrap()),
         interval_secs: 300,
         prompt: format!("run {id}"),
         recurring,
@@ -289,7 +300,11 @@ async fn production_loader_preserves_tasks_and_quarantine_metadata() {
 
     let mut resources = Resources::new();
     resources.register_state::<SchedulerState>();
-    assert!(ResourcesPersistence::new(path.clone()).load(&mut resources));
+    assert!(
+        ResourcesPersistence::new(path.clone())
+            .load(&mut resources)
+            .unwrap()
+    );
     let state = resources.get::<State<SchedulerState>>().unwrap();
     let Some(first) = state.tasks.first() else {
         panic!("expected a loaded task: {:?}", state.tasks);
@@ -318,7 +333,11 @@ async fn production_loader_preserves_tasks_and_quarantine_metadata() {
         .unwrap();
         let mut resources = Resources::new();
         resources.register_state::<SchedulerState>();
-        assert!(ResourcesPersistence::new(path.clone()).load(&mut resources));
+        assert!(
+            ResourcesPersistence::new(path.clone())
+                .load(&mut resources)
+                .unwrap()
+        );
         let state = resources.get::<State<SchedulerState>>().unwrap();
         let Some(first) = state.tasks.first() else {
             panic!("expected a loaded task: {:?}", state.tasks);
