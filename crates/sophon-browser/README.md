@@ -59,7 +59,10 @@ an action. Same-origin iframe snapshots and input are supported. Cross-origin /
 out-of-process iframe automation is not advertised as supported. Browser frames
 are discovered afresh rather than treated as durable IDs across navigation.
 
-These **host hooks are intentionally absent from the agent tool schema**:
+These **host hooks are intentionally absent from the agent tool schema**. The
+Runtime host calls `execute_host(args)` for them; native agent registration must
+call `execute("browser", args)`, which enforces the declared action allowlist even
+when a model ignores its schema. Never register `execute_host` as an agent tool:
 
 - `viewport` with `{tab_id, width, height}` sets CSS viewport dimensions (1..4096)
   with device scale factor 1, returning `{width,height,device_scale_factor:1}`.

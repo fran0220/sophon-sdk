@@ -20,6 +20,25 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use uuid::Uuid;
 use xai_tty_utils::{ProcessGroup, ProcessScope};
 
+const AGENT_ACTIONS: &[&str] = &[
+    "capabilities",
+    "tabs",
+    "new_tab",
+    "close_tab",
+    "navigate",
+    "frames",
+    "snapshot",
+    "click",
+    "type",
+    "key",
+    "scroll",
+    "wait",
+    "screenshot",
+    "events",
+    "record_start",
+    "record_stop",
+];
+
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
     pub executable: PathBuf,
@@ -133,7 +152,7 @@ impl BrowserService {
             name: "browser".into(),
             description: "Use the Runtime-owned browser. Snapshot gives revision-scoped refs; refresh after page changes. Never retry a timed-out interaction automatically. Screenshots and silent video recordings return durable artifact IDs. Audio unsupported.".into(),
             input_schema: json!({"type":"object","required":["action"],"properties":{
-                "action":{"type":"string","enum":["capabilities","tabs","new_tab","close_tab","navigate","frames","snapshot","click","type","key","scroll","wait","screenshot","events","record_start","record_stop"]},
+                "action":{"type":"string","enum":AGENT_ACTIONS},
                 "tab_id":{"type":"string"},"frame_id":{"type":"string"},"url":{"type":"string"},"ref":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"milliseconds":{"type":"integer","minimum":0,"maximum":10000}
             },"additionalProperties":false}),
         }]
@@ -143,6 +162,18 @@ impl BrowserService {
         if name != "browser" {
             return Err(Error::Invalid(format!("unknown tool {name}")));
         }
+        let action = string(&args, "action")?;
+        if !AGENT_ACTIONS.contains(&action) {
+            return Err(Error::Unsupported(format!(
+                "unregistered agent action {action}"
+            )));
+        }
+        self.execute_host(args).await
+    }
+
+    /// Trusted Runtime host boundary for human input, Stage probes and explicit
+    /// Settings operations. Never register this entry point as an agent tool.
+    pub async fn execute_host(&self, args: Value) -> Result<Value, Error> {
         let closing = self.closing.notified();
         tokio::pin!(closing);
         closing.as_mut().enable();

@@ -21,10 +21,26 @@ fn config(root: &std::path::Path) -> BrowserConfig {
 
 async fn call(browser: &BrowserService, action: &str, mut args: Value) -> Value {
     args["action"] = json!(action);
-    browser
-        .execute("browser", args)
-        .await
-        .unwrap_or_else(|e| panic!("{action}: {e}"))
+    let result = if matches!(
+        action,
+        "evaluate"
+            | "artifact"
+            | "input"
+            | "viewport"
+            | "state"
+            | "back"
+            | "forward"
+            | "reload"
+            | "clear_site"
+            | "clear_profile"
+            | "stream_start"
+            | "stream_stop"
+    ) {
+        browser.execute_host(args).await
+    } else {
+        browser.execute("browser", args).await
+    };
+    result.unwrap_or_else(|e| panic!("{action}: {e}"))
 }
 
 async fn evaluate(browser: &BrowserService, tab: &str, expression: &str) -> Value {
@@ -64,12 +80,27 @@ async fn capabilities_do_not_launch_and_close_is_terminal() {
         browser.execute("browser", json!({"action":"audio"})).await,
         Err(Error::Unsupported(_))
     ));
+    for action in [
+        "clear_profile",
+        "clear_site",
+        "evaluate",
+        "input",
+        "artifact",
+        "stream_start",
+        "viewport",
+    ] {
+        assert!(
+            matches!(
+                browser.execute("browser", json!({"action":action})).await,
+                Err(Error::Unsupported(_))
+            ),
+            "host action {action} must not bypass agent schema"
+        );
+    }
+    assert!(!root.path().join("identity").exists());
     assert!(matches!(
         browser
-            .execute(
-                "browser",
-                json!({"action":"artifact","artifact_id":"../../secret"})
-            )
+            .execute_host(json!({"action":"artifact","artifact_id":"../../secret"}))
             .await,
         Err(Error::Invalid(_))
     ));
@@ -271,8 +302,7 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     tokio::time::timeout(
         Duration::from_millis(500),
-        browser.execute(
-            "browser",
+        browser.execute_host(
             json!({"action":"input","tab_id":tab,"kind":"text","params":{"text":"-live"}}),
         ),
     )
@@ -300,7 +330,7 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
     let pending_browser = browser.clone();
     let pending_tab = tab.clone();
     let cancelled = tokio::spawn(async move {
-        pending_browser.execute("browser",json!({"action":"evaluate","tab_id":pending_tab,"expression":"window.cancelledCount=(window.cancelledCount||0)+1;fetch('/issued');new Promise(r=>setTimeout(()=>r(1),10000))"})).await
+        pending_browser.execute_host(json!({"action":"evaluate","tab_id":pending_tab,"expression":"window.cancelledCount=(window.cancelledCount||0)+1;fetch('/issued');new Promise(r=>setTimeout(()=>r(1),10000))"})).await
     });
     tokio::time::timeout(Duration::from_secs(3), issued.notified())
         .await
@@ -352,7 +382,7 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
             .iter()
             .any(|e| e["method"] == "Network.responseReceived")
     );
-    assert!(matches!(browser.execute("browser",json!({"action":"evaluate","tab_id":tab,"expression":"throw new Error('expected-probe-error')"})).await,Err(Error::Protocol(_))));
+    assert!(matches!(browser.execute_host(json!({"action":"evaluate","tab_id":tab,"expression":"throw new Error('expected-probe-error')"})).await,Err(Error::Protocol(_))));
     call(&browser, "record_start", json!({"tab_id":tab})).await;
     let started = Instant::now();
     tokio::time::sleep(Duration::from_millis(1600)).await;
