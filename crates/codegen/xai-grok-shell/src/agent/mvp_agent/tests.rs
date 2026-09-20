@@ -6144,6 +6144,56 @@ fn sdk_041_cancel_target_metadata_and_rewind_compatibility() {
         assert!(cmd_rx.try_recv().is_err());
     });
 }
+#[test]
+fn native_config_candidate_rejects_before_any_session_command() {
+    use acp::Agent as _;
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("candidate-must-not-run-old-config");
+        let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        for candidate in [
+            serde_json::json!({
+                "instructions": "must replace bootstrap instructions",
+                "model": "different-published-model",
+                "skillDirectories": ["/different/skills"],
+                "externalMcpServers": [],
+                "subjectOptions": {},
+                "subagentBriefs": [],
+                "revision": "new-revision",
+            }),
+            serde_json::Value::Null,
+        ] {
+            let meta = serde_json::json!({
+                "promptId": "candidate-prompt",
+                "x.sophon/configCandidate": candidate,
+            });
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                agent.prompt(
+                    acp::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp::ContentBlock::from("do not execute")],
+                    )
+                    .meta(meta.as_object().cloned()),
+                ),
+            )
+            .await
+            .expect("candidate refusal cannot wait for actor/provider")
+            .unwrap_err();
+            assert_eq!(error.code, acp::Error::invalid_params().code);
+            assert_eq!(
+                error.data.unwrap()["code"],
+                "config_candidate_not_implemented"
+            );
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "no model mutation, FIFO intake, or provider dispatch is allowed"
+            );
+        }
+    });
+}
+
 /// Regression (post-cancel slot hang, first bad release 0.2.101; see `dispatch_lock`).
 /// SDK e2e shape: `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
 #[test]

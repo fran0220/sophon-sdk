@@ -996,6 +996,15 @@ impl acp::Agent for MvpAgent {
         mut arguments: acp::PromptRequest,
     ) -> Result<acp::PromptResponse, acp::Error> {
         use crate::session::plan_mode::PromptMode;
+        // Fail closed until the native FIFO owns staged candidate installation.
+        // Do not silently run this request with bootstrap/previous configuration.
+        // Replace this gate with actor admission, never a chain of live setters.
+        if arguments.meta.as_ref().is_some_and(|meta| meta.contains_key("x.sophon/configCandidate")) {
+            return Err(acp::Error::invalid_params().data(serde_json::json!({
+                "code": "config_candidate_not_implemented",
+                "message": "native atomic configuration admission is not implemented",
+            })));
+        }
         if let Some(meta) = arguments.meta.as_ref() {
             xai_grok_otel::link_current_span_to_meta(
                 &serde_json::Value::Object(meta.clone()),
