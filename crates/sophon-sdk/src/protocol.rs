@@ -368,7 +368,10 @@ pub enum Request {
 
 /// Regenerate declarations in one command; imports refer only to generated DTOs.
 pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
-    let config = ts_rs::Config::default().with_out_dir(path);
+    let config = ts_rs::Config::default()
+        .with_out_dir(path)
+        .with_large_int("number")
+        .with_import_extension(Some("js"));
     ClientFrame::export_all(&config)?;
     ServerFrame::export_all(&config)?;
     SessionDescriptor::export_all(&config)?;

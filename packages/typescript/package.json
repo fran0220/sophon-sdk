@@ -1,0 +1,21 @@
+{
+  "name": "@sophon/sdk",
+  "version": "0.7.0-alpha.1",
+  "description": "Official typed client for the private Sophon Runtime transport",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=22" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./stdio": { "types": "./dist/stdio.d.ts", "import": "./dist/stdio.js" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "generate": "cargo run --manifest-path ../../Cargo.toml -p sophon-sdk --bin sophon-runtime -- --generate-types src/generated",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.9.0" },
+  "repository": { "type": "git", "url": "https://github.com/fran0220/sophon-sdk.git", "directory": "packages/typescript" }
+}
