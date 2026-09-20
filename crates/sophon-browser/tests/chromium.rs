@@ -88,12 +88,18 @@ async fn capabilities_do_not_launch_and_close_is_terminal() {
 async fn real_chromium_tools_stream_record_and_cleanup() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let issued = Arc::new(tokio::sync::Notify::new());
+    let issued_server = issued.clone();
     let server = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
+            let issued = issued_server.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
                 let n = socket.read(&mut request).await.unwrap();
+                if String::from_utf8_lossy(&request[..n]).starts_with("GET /issued ") {
+                    issued.notify_one();
+                }
                 let child = String::from_utf8_lossy(&request[..n]).starts_with("GET /frame ");
                 let body = if child {
                     "<button onclick=\"this.textContent='Child clicked'\">Child button</button>"
@@ -119,6 +125,12 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         .as_str()
         .unwrap()
         .to_owned();
+    let competing = BrowserService::new(config(root.path()));
+    assert!(matches!(
+        competing.execute("browser", json!({"action":"tabs"})).await,
+        Err(Error::Invalid(_))
+    ));
+    competing.close().await.unwrap();
     call(
         &browser,
         "navigate",
@@ -131,6 +143,19 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    call(
+        &browser,
+        "viewport",
+        json!({"tab_id":tab,"width":1013,"height":677}),
+    )
+    .await;
+    assert_eq!(
+        evaluate(&browser, &tab, "[innerWidth,innerHeight]").await,
+        json!([1013, 677])
+    );
+    let state = call(&browser, "state", json!({"tab_id":tab})).await;
+    assert_eq!(state["title"], "SDK browser fixture");
+    assert_eq!(state["loading"], false);
     let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
     let input = reference(&snap, "textbox", "Name");
     call(
@@ -143,6 +168,17 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         evaluate(&browser, &tab, "document.querySelector('input').value").await,
         "Native 42"
     );
+    call(&browser, "key", json!({"tab_id":tab,"key":"Backspace"})).await;
+    assert_eq!(
+        evaluate(&browser, &tab, "document.querySelector('input').value").await,
+        "Native 4"
+    );
+    call(
+        &browser,
+        "scroll",
+        json!({"tab_id":tab,"delta_y":50,"delta_x":0}),
+    )
+    .await;
     let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
     let old = reference(&snap, "button", "Increment");
     let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
@@ -164,9 +200,27 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
             .await,
         Err(Error::StaleRef)
     ));
+    // External mutation, not another browser tool, must invalidate the snapshot.
+    evaluate(
+        &browser,
+        &tab,
+        "setTimeout(()=>document.querySelector('#result').textContent='External change',300)",
+    )
+    .await;
+    let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
+    let mutated = reference(&snap, "button", "Increment");
+    call(&browser, "wait", json!({"tab_id":tab,"milliseconds":350})).await;
+    assert!(matches!(
+        browser
+            .execute(
+                "browser",
+                json!({"action":"click","tab_id":tab,"ref":mutated})
+            )
+            .await,
+        Err(Error::StaleRef)
+    ));
     let snap = call(&browser, "snapshot", json!({"tab_id":tab})).await;
     let stale = reference(&snap, "button", "Increment");
-    // External mutation, not another browser tool, must invalidate the snapshot.
     let mut frames = browser.subscribe_frames();
     call(&browser, "stream_start", json!({"tab_id":tab})).await;
     let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
@@ -203,6 +257,26 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
     ));
     assert_eq!(evaluate(&browser, &tab, "6*7").await, 42); // Control replies survived frame pressure.
+    call(&browser, "stream_stop", json!({"tab_id":tab})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut stopped = browser.subscribe_frames();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), stopped.recv())
+            .await
+            .is_err()
+    );
+    call(&browser, "stream_start", json!({"tab_id":tab})).await;
+    let pending_browser = browser.clone();
+    let pending_tab = tab.clone();
+    let cancelled = tokio::spawn(async move {
+        pending_browser.execute("browser",json!({"action":"evaluate","tab_id":pending_tab,"expression":"window.cancelledCount=(window.cancelledCount||0)+1;fetch('/issued');new Promise(r=>setTimeout(()=>r(1),10000))"})).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), issued.notified())
+        .await
+        .unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert_eq!(evaluate(&browser, &tab, "window.cancelledCount").await, 1);
     let tree = call(&browser, "frames", json!({"tab_id":tab})).await;
     let child = tree["frameTree"]["childFrames"][0]["frame"]["id"]
         .as_str()
@@ -280,6 +354,44 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         (duration - 1.6).abs() < 0.3,
         "video duration {duration}, elapsed including encoding {elapsed}"
     );
+    println!("native recording duration: {duration:.3}s (requested 1.600s)");
+    if let Ok(directory) = std::env::var("SOPHON_BROWSER_EVIDENCE_DIR") {
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::copy(
+            root.path()
+                .join("evidence")
+                .join(format!("{}.png", image["artifact_id"].as_str().unwrap())),
+            PathBuf::from(&directory).join("native-browser.png"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::copy(
+            &video_path,
+            PathBuf::from(directory).join("native-browser.mp4"),
+        )
+        .await
+        .unwrap();
+    }
+    // A quiet page still records its held frame for the real elapsed duration.
+    evaluate(
+        &browser,
+        &tab,
+        "document.querySelector('#animation').remove()",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    call(&browser, "record_start", json!({"tab_id":tab})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let quiet = call(&browser, "record_stop", json!({"tab_id":tab})).await;
+    assert_eq!(
+        call(
+            &browser,
+            "artifact",
+            json!({"artifact_id":quiet["artifact_id"]})
+        )
+        .await["mime_type"],
+        "video/mp4"
+    );
     // Persist account identity and artifacts across checked shutdown/relaunch.
     evaluate(
         &browser,
@@ -342,6 +454,115 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
             .execute("browser", json!({"action":"screenshot","tab_id":tab}))
             .await
             .is_err()
+    );
+    let a = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://{address}/")}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://localhost:{}/",address.port())}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    evaluate(
+        &reopened,
+        &a,
+        "setInterval(()=>localStorage.setItem('identity-test','repopulated'),10)",
+    )
+    .await;
+    evaluate(&reopened, &b, "localStorage.setItem('other-origin','keep')").await;
+    call(
+        &reopened,
+        "navigate",
+        json!({"tab_id":b,"url":format!("http://localhost:{}/second",address.port())}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let back = call(&reopened, "back", json!({"tab_id":b})).await;
+    assert_eq!(back["url"], format!("http://localhost:{}/", address.port()));
+    assert_eq!(back["can_go_forward"], true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let forward = call(&reopened, "forward", json!({"tab_id":b})).await;
+    assert_eq!(
+        forward["url"],
+        format!("http://localhost:{}/second", address.port())
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    call(&reopened, "reload", json!({"tab_id":b})).await;
+    let clear = call(
+        &reopened,
+        "clear_site",
+        json!({"origin":format!("http://{address}")}),
+    )
+    .await;
+    assert_eq!(clear["closed_all_tabs"], true);
+    let a = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://{address}/")}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://localhost:{}/",address.port())}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        evaluate(&reopened, &a, "localStorage.getItem('identity-test')").await,
+        Value::Null
+    );
+    assert_eq!(
+        evaluate(&reopened, &b, "localStorage.getItem('other-origin')").await,
+        "keep"
+    );
+    evaluate(
+        &reopened,
+        &b,
+        "setInterval(()=>localStorage.setItem('other-origin','repopulated'),10)",
+    )
+    .await;
+    call(&reopened, "clear_profile", json!({})).await;
+    assert!(!root.path().join("identity/profile").exists());
+    let b = call(
+        &reopened,
+        "new_tab",
+        json!({"url":format!("http://localhost:{}/",address.port())}),
+    )
+    .await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        evaluate(&reopened, &b, "localStorage.getItem('other-origin')").await,
+        Value::Null
+    );
+    assert_eq!(
+        call(
+            &reopened,
+            "artifact",
+            json!({"artifact_id":image["artifact_id"]})
+        )
+        .await["mime_type"],
+        "image/png"
     );
     reopened.close().await.unwrap();
     server.abort();

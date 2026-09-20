@@ -30,6 +30,7 @@ impl Recording {
         root: PathBuf,
         mut frames: broadcast::Receiver<Value>,
         scope: ProcessScope,
+        mut initial: Option<Value>,
     ) -> Result<Self, Error> {
         let status = Command::new("ffmpeg")
             .arg("-version")
@@ -53,7 +54,8 @@ impl Recording {
         let cancellation = cancelled.clone();
         let directory = dir.clone();
         let target = tab.clone();
-        let output = root.join(format!("{id}.mp4"));
+        let published = root.join(format!("{id}.mp4"));
+        let output = directory.join("output.mp4");
         let task = tokio::spawn(async move {
             let start = Instant::now();
             let mut timestamps = Vec::new();
@@ -63,7 +65,7 @@ impl Recording {
                     biased;
                     _ = stop_task.notified() => break,
                     _ = tokio::time::sleep_until((start + Duration::from_secs(300)).into()) => return Err(Error::Invalid("recording exceeds 5 minute limit".into())),
-                    frame = frames.recv() => {
+                    frame = async { if let Some(frame) = initial.take() { Ok(frame) } else { frames.recv().await } } => {
                         let frame = match frame {
                             Ok(frame) => frame,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -140,6 +142,7 @@ impl Recording {
                 let _ = tokio::fs::remove_file(output).await;
                 return Err(Error::Protocol(format!("ffmpeg failed: {status}")));
             }
+            tokio::fs::rename(output, published).await?;
             Ok(())
         });
         Ok(Self {

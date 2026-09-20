@@ -18,6 +18,7 @@ pub(crate) struct Cdp {
     task: JoinHandle<()>,
     pub events: Arc<Mutex<VecDeque<Value>>>,
     pub tabs: Arc<Mutex<HashMap<String, String>>>,
+    pub latest_frames: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl Cdp {
@@ -31,6 +32,8 @@ impl Cdp {
         let log = events.clone();
         let tabs = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         let tab_ids = tabs.clone();
+        let latest_frames = Arc::new(Mutex::new(HashMap::new()));
+        let latest = latest_frames.clone();
         let task = tokio::spawn(async move {
             let mut pending: HashMap<u64, Reply> = HashMap::new();
             let mut next = 0u64;
@@ -66,12 +69,21 @@ impl Cdp {
                             let tab = value["sessionId"].as_str().and_then(|session|tab_ids.lock().expect("tab lock").get(session).cloned());
                             if let Some(tab) = tab {
                                 sequence += 1;
-                                let _ = frames.send(json!({"tab_id":tab,"sequence":sequence,"mime_type":"image/jpeg","base64":value["params"]["data"],"metadata":value["params"]["metadata"]}));
+                                let frame = json!({"tab_id":tab,"sequence":sequence,"mime_type":"image/jpeg","base64":value["params"]["data"],"metadata":value["params"]["metadata"]});
+                                latest.lock().expect("frame lock").insert(tab,frame.clone());
+                                let _ = frames.send(frame);
                             }
                         } else if value.get("method").is_some() {
+                            if value["method"] == "Target.detachedFromTarget"
+                                && let Some(session) = value["params"]["sessionId"].as_str()
+                                && let Some(tab) = tab_ids.lock().expect("tab lock").remove(session) {
+                                latest.lock().expect("frame lock").remove(&tab);
+                            }
                             let mut log = log.lock().expect("event lock");
                             if log.len() == 512 { log.pop_front(); }
-                            log.push_back(value);
+                            if text.len()>64*1024 {
+                                log.push_back(json!({"method":value["method"],"sessionId":value["sessionId"],"params":{"omitted":true,"reason":"event exceeds 64 KiB"}}));
+                            } else { log.push_back(value); }
                         }
                     }
                 }
@@ -87,6 +99,7 @@ impl Cdp {
             task,
             events,
             tabs,
+            latest_frames,
         })
     }
 

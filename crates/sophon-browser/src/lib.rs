@@ -187,6 +187,49 @@ impl BrowserService {
         if guard.is_none() {
             *guard = Some(self.launch().await?);
         }
+        if action == "clear_profile" {
+            stop_running(guard.as_mut().expect("launched")).await?;
+            // Keep the exclusive profile lock until every old context has exited
+            // and the identity directory is gone. Artifacts are not identity.
+            tokio::fs::remove_dir_all(self.config.data_dir.join("profile")).await?;
+            guard.take();
+            return Ok(json!({"cleared":true,"closed_all_tabs":true,"artifacts_retained":true}));
+        }
+        if action == "clear_site" {
+            let origin = site_origin(string(&args, "origin")?)?;
+            let old = guard.as_mut().expect("launched");
+            let lock = old._profile_lock.try_clone()?;
+            stop_running(old).await?;
+            // Restart with the same lock so old windows/workers cannot race the
+            // clear and repopulate storage. Other origins' saved data is kept.
+            *guard = Some(self.launch_with_lock(lock).await?);
+            let running = guard.as_mut().expect("restarted");
+            running.cdp = Some(self.connect(&mut running.child).await?);
+            let cdp = running.cdp.as_ref().expect("connected");
+            let target = cdp
+                .call(None, "Target.createTarget", json!({"url":"about:blank"}))
+                .await?;
+            let attached = cdp
+                .call(
+                    None,
+                    "Target.attachToTarget",
+                    json!({"targetId":target["targetId"],"flatten":true}),
+                )
+                .await?;
+            cdp.call(
+                Some(string(&attached, "sessionId")?),
+                "Storage.clearDataForOrigin",
+                json!({"origin":origin,"storageTypes":"all"}),
+            )
+            .await?;
+            cdp.call(
+                None,
+                "Target.closeTarget",
+                json!({"targetId":target["targetId"]}),
+            )
+            .await?;
+            return Ok(json!({"cleared":true,"origin":origin,"closed_all_tabs":true}));
+        }
         let running = guard.as_mut().expect("launched");
         if running.cdp.is_none() {
             running.cdp = Some(self.connect(&mut running.child).await?);
@@ -205,6 +248,7 @@ impl BrowserService {
                 if running.recording.as_ref().is_some_and(|r|r.tab==tab) { return Err(Error::Invalid("stop recording before closing its tab".into())); }
                 let result = connection.call(None,"Target.closeTarget",json!({"targetId":tab})).await?;
                 if let Some(page) = running.pages.remove(tab) { connection.tabs.lock().expect("tab lock").remove(&page.session); }
+                connection.latest_frames.lock().expect("frame lock").remove(tab);
                 return Ok(result);
             }
             _ => {}
@@ -245,6 +289,58 @@ impl BrowserService {
         let cdp = connection;
         let session = Some(page.session.as_str());
         match action {
+            "viewport" => {
+                let dimension = |key: &str| {
+                    args[key]
+                        .as_u64()
+                        .filter(|n| (1..=4096).contains(n))
+                        .ok_or_else(|| Error::Invalid(format!("{key} must be 1..4096")))
+                };
+                let width = dimension("width")?;
+                let height = dimension("height")?;
+                page.refs.clear();
+                cdp.call(
+                    session,
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({"width":width,"height":height,"deviceScaleFactor":1,"mobile":false}),
+                )
+                .await?;
+                Ok(json!({"width":width,"height":height,"device_scale_factor":1}))
+            }
+            "state" => page_state(cdp, session).await,
+            "back" | "forward" | "reload" => {
+                page.refs.clear();
+                let history = cdp
+                    .call(session, "Page.getNavigationHistory", json!({}))
+                    .await?;
+                let current = history["currentIndex"].as_i64().unwrap_or(0);
+                let index = current
+                    + match action {
+                        "back" => -1,
+                        "forward" => 1,
+                        _ => 0,
+                    };
+                let entries = history["entries"]
+                    .as_array()
+                    .ok_or_else(|| Error::Protocol("missing navigation history".into()))?;
+                let entry = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| entries.get(i))
+                    .ok_or_else(|| Error::Invalid(format!("cannot navigate {action}")))?;
+                if action == "reload" {
+                    cdp.call(session, "Page.reload", json!({})).await?;
+                } else {
+                    cdp.call(
+                        session,
+                        "Page.navigateToHistoryEntry",
+                        json!({"entryId":entry["id"]}),
+                    )
+                    .await?;
+                }
+                Ok(
+                    json!({"url":entry["url"],"title":entry["title"],"can_go_back":index>0,"can_go_forward":index+1<entries.len() as i64,"loading":true}),
+                )
+            }
             "stream_start" => {
                 if !page.streaming {
                     page.streaming = true;
@@ -266,12 +362,19 @@ impl BrowserService {
                 if running.recording.is_some() {
                     return Err(Error::Invalid("recording already active".into()));
                 }
+                let initial = cdp
+                    .latest_frames
+                    .lock()
+                    .expect("frame lock")
+                    .get(tab)
+                    .cloned();
                 running.recording = Some(
                     Recording::start(
                         tab.into(),
                         self.config.artifact_dir.clone(),
                         self.subscribe_frames(),
                         self.process_scope.clone(),
+                        initial,
                     )
                     .await?,
                 );
@@ -386,11 +489,11 @@ impl BrowserService {
                 let node = cdp.call(session,"DOM.resolveNode",json!({"backendNodeId":reference.backend,"executionContextId":reference.context})).await.map_err(|_| Error::StaleRef)?;
                 let object = string(&node["object"], "objectId")?;
                 let function = if action == "click" {
-                    "function(){if(!this.isConnected)throw Error('detached');this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();let x=r.x+r.width/2,y=r.y+r.height/2,w=window;while(w!==w.top){const f=w.frameElement;if(!f)throw Error('cross-origin frame');const b=f.getBoundingClientRect();x+=b.x+f.clientLeft;y+=b.y+f.clientTop;w=w.parent}return {x,y,width:r.width,height:r.height}}"
+                    "function(revision){if(!this.isConnected||globalThis.__sophonRevision.n!==revision)throw Error('stale');this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();let x=r.x+r.width/2,y=r.y+r.height/2,w=window;while(w!==w.top){const f=w.frameElement;if(!f)throw Error('cross-origin frame');const b=f.getBoundingClientRect();x+=b.x+f.clientLeft;y+=b.y+f.clientTop;w=w.parent}return {x,y,width:r.width,height:r.height}}"
                 } else {
-                    "function(){if(!this.isConnected)throw Error('detached');this.focus();return document.activeElement===this}"
+                    "function(revision){if(!this.isConnected||globalThis.__sophonRevision.n!==revision)throw Error('stale');this.focus();return this.getRootNode().activeElement===this}"
                 };
-                let located = cdp.call(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":function,"returnByValue":true})).await?;
+                let located = cdp.call(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":function,"arguments":[{"value":reference.revision}],"returnByValue":true})).await?;
                 let _ = cdp
                     .call(session, "Runtime.releaseObject", json!({"objectId":object}))
                     .await;
@@ -472,7 +575,10 @@ impl BrowserService {
                 let id = Uuid::new_v4().to_string();
                 let len = bytes.len();
                 tokio::fs::create_dir_all(&self.config.artifact_dir).await?;
-                tokio::fs::write(self.config.artifact_dir.join(format!("{id}.png")), bytes).await?;
+                let staging = self.config.artifact_dir.join(format!("{id}.partial"));
+                tokio::fs::write(&staging, bytes).await?;
+                tokio::fs::rename(staging, self.config.artifact_dir.join(format!("{id}.png")))
+                    .await?;
                 Ok(json!({"artifact_id":id,"mime_type":"image/png","bytes":len}))
             }
             "events" => {
@@ -522,6 +628,10 @@ impl BrowserService {
             .open(self.config.data_dir.join("profile.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| Error::Invalid("browser profile already in use".into()))?;
+        self.launch_with_lock(lock).await
+    }
+
+    async fn launch_with_lock(&self, lock: File) -> Result<Running, Error> {
         let profile = self.config.data_dir.join("profile");
         tokio::fs::create_dir_all(&profile).await?;
         let port_file = profile.join("DevToolsActivePort");
@@ -598,32 +708,7 @@ impl BrowserService {
         self.closing.notify_waiters();
         let mut guard = self.running.lock().await;
         if let Some(running) = guard.as_mut() {
-            if let Some(recording) = running.recording.as_mut() {
-                recording.cancel().await?;
-            }
-            running.recording.take();
-            if let Some(cdp) = running.cdp.as_mut() {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    cdp.call(None, "Browser.close", json!({})),
-                )
-                .await;
-            }
-            match tokio::time::timeout(Duration::from_secs(3), running.child.wait()).await {
-                Ok(status) => {
-                    status?;
-                }
-                Err(_) => {
-                    if let Some(group) = &running.group {
-                        group.kill()?;
-                    }
-                    running.child.wait().await?;
-                }
-            }
-            running.group.take();
-            if let Some(cdp) = running.cdp.as_mut() {
-                cdp.stop().await;
-            }
+            stop_running(running).await?;
         }
         guard.take();
         Ok(())
@@ -646,6 +731,73 @@ impl Drop for BrowserService {
     fn drop(&mut self) {
         self.process_scope.kill_all();
     }
+}
+
+async fn stop_running(running: &mut Running) -> Result<(), Error> {
+    if let Some(recording) = running.recording.as_mut() {
+        recording.cancel().await?;
+    }
+    running.recording.take();
+    if let Some(cdp) = running.cdp.as_mut() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            cdp.call(None, "Browser.close", json!({})),
+        )
+        .await;
+    }
+    match tokio::time::timeout(Duration::from_secs(3), running.child.wait()).await {
+        Ok(status) => {
+            status?;
+        }
+        Err(_) => {
+            if let Some(group) = &running.group {
+                group.kill()?;
+            }
+            running.child.wait().await?;
+        }
+    }
+    running.group.take();
+    if let Some(cdp) = running.cdp.as_mut() {
+        cdp.stop().await;
+    }
+    running.cdp.take();
+    Ok(())
+}
+
+async fn page_state(cdp: &Cdp, session: Option<&str>) -> Result<Value, Error> {
+    let history = cdp
+        .call(session, "Page.getNavigationHistory", json!({}))
+        .await?;
+    let state = cdp.call(session,"Runtime.evaluate",json!({"expression":"({url:location.href,title:document.title,loading:document.readyState!=='complete'})","returnByValue":true})).await?;
+    let mut state = state["result"]["value"].clone();
+    if !state.is_object() {
+        return Err(Error::Protocol(
+            "page state unavailable during navigation".into(),
+        ));
+    }
+    let current = history["currentIndex"].as_u64().unwrap_or(0);
+    let count = history["entries"].as_array().map_or(0, Vec::len) as u64;
+    state["can_go_back"] = json!(current > 0);
+    state["can_go_forward"] = json!(current + 1 < count);
+    Ok(state)
+}
+
+fn site_origin(value: &str) -> Result<String, Error> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| Error::Invalid("valid HTTP(S) origin required".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(Error::Invalid(
+            "origin must be HTTP(S) scheme/host/port only".into(),
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 async fn revision(cdp: &Cdp, session: Option<&str>, context: i64) -> Result<u64, Error> {

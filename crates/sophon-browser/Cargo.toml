@@ -16,6 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 uuid.workspace = true
+url.workspace = true
 xai-tty-utils.workspace = true
 
 [dev-dependencies]
