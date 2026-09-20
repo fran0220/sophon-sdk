@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+pub use super::cadence::SchedulerCadence;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerVersion {
@@ -224,6 +226,13 @@ pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolErro
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTask {
     pub id: String,
+    /// Required in current persistence; interval-only historical rows fail closed.
+    #[serde(deserialize_with = "deserialize_cadence")]
+    pub cadence: SchedulerCadence,
+    /// Persisted occurrence cursor. Consumed before spawn, including one catch-up
+    /// after downtime. A required nullable field, never defaulted on old data.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub next_run_at: Option<DateTime<Utc>>,
     pub interval_secs: u64,
     pub prompt: String,
     #[serde(default = "default_recurring")]
@@ -259,7 +268,65 @@ fn default_recurring() -> bool {
     true
 }
 
+fn deserialize_cadence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SchedulerCadence, D::Error> {
+    let cadence = SchedulerCadence::deserialize(deserializer)?;
+    cadence.validate().map_err(serde::de::Error::custom)?;
+    Ok(cadence)
+}
+
 impl ScheduledTask {
+    pub fn from_cadence(
+        cadence: SchedulerCadence,
+        prompt: String,
+        durable: bool,
+    ) -> Result<Self, SchedulerError> {
+        cadence.validate()?;
+        let now = Utc::now();
+        let next_run_at = Self::first_occurrence(&cadence, now);
+        Ok(Self {
+            id: uuid::Uuid::now_v7().to_string(),
+            interval_secs: match &cadence {
+                SchedulerCadence::Interval { every_secs, .. } => *every_secs,
+                _ => 0,
+            },
+            recurring: cadence.recurring(),
+            cadence,
+            next_run_at,
+            prompt,
+            durable,
+            created_at: now,
+            last_fired_at: None,
+            // Explicit schedules do not silently expire a week after creation.
+            expires_at: None,
+            last_subagent_id: None,
+            iterations_since_fresh: 0,
+            chain_reset_pending: false,
+        })
+    }
+
+    pub fn replace_cadence(&mut self, cadence: SchedulerCadence) -> Result<(), SchedulerError> {
+        cadence.validate()?;
+        self.interval_secs = match &cadence {
+            SchedulerCadence::Interval { every_secs, .. } => *every_secs,
+            _ => 0,
+        };
+        self.recurring = cadence.recurring();
+        self.next_run_at = Self::first_occurrence(&cadence, Utc::now());
+        self.cadence = cadence;
+        self.expires_at = None;
+        Ok(())
+    }
+
+    fn first_occurrence(cadence: &SchedulerCadence, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match cadence {
+            SchedulerCadence::Once { at } => Some(*at),
+            SchedulerCadence::Interval { anchor, .. } => Some(*anchor),
+            SchedulerCadence::Daily { .. } => cadence.next_after(now),
+        }
+    }
+
     pub fn new(interval_secs: u64, prompt: String, recurring: bool, durable: bool) -> Self {
         Self::with_fire_immediately(interval_secs, prompt, recurring, durable, false)
     }
@@ -281,6 +348,17 @@ impl ScheduledTask {
         };
         Self {
             id: uuid::Uuid::now_v7().to_string(),
+            cadence: if recurring {
+                SchedulerCadence::Interval {
+                    every_secs: interval_secs,
+                    anchor: created_at + chrono::Duration::seconds(interval_secs as i64),
+                }
+            } else {
+                SchedulerCadence::Once {
+                    at: created_at + chrono::Duration::seconds(interval_secs as i64),
+                }
+            },
+            next_run_at: Some(created_at + chrono::Duration::seconds(interval_secs as i64)),
             interval_secs,
             prompt,
             recurring,
@@ -298,10 +376,14 @@ impl ScheduledTask {
         }
     }
 
-    /// Next fire time, computed from `last_fired_at` (or `created_at` if never fired).
+    /// Internal wake sentinel for exhausted schedules; API callers should use
+    /// pending_fire_at so a completed one-shot is represented by null.
     pub fn next_fire_at(&self) -> DateTime<Utc> {
-        let anchor = self.last_fired_at.unwrap_or(self.created_at);
-        anchor + chrono::Duration::seconds(self.interval_secs as i64)
+        self.next_occurrence().unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
+    pub fn next_occurrence(&self) -> Option<DateTime<Utc>> {
+        self.next_run_at
     }
 
     /// Next moment the actor must wake for this task: the sooner of the next fire and the auto-expiry deadline. Sleeping
@@ -321,10 +403,10 @@ impl ScheduledTask {
 
     /// The next run still to come; `None` for an expired task or a one-shot that already ran.
     pub fn pending_fire_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if self.is_expired(now) || (!self.recurring && self.last_fired_at.is_some()) {
+        if self.is_expired(now) {
             return None;
         }
-        Some(self.next_fire_at())
+        self.next_occurrence()
     }
 }
 
@@ -402,7 +484,7 @@ pub enum SchedulerCommand {
         expected: SchedulerVersion,
         id: String,
         prompt: Option<String>,
-        interval_secs: Option<u64>,
+        cadence: Option<SchedulerCadence>,
         reply: oneshot::Sender<Result<SchedulerMutationResult<ScheduledTask>, SchedulerError>>,
     },
     DeleteManaged {
@@ -450,7 +532,7 @@ impl SchedulerHandle {
         expected: SchedulerVersion,
         id: String,
         prompt: Option<String>,
-        interval_secs: Option<u64>,
+        cadence: Option<SchedulerCadence>,
     ) -> Result<SchedulerMutationResult<ScheduledTask>, SchedulerError> {
         let (reply, response) = oneshot::channel();
         self.0
@@ -460,7 +542,7 @@ impl SchedulerHandle {
                 expected,
                 id,
                 prompt,
-                interval_secs,
+                cadence,
                 reply,
             })
             .map_err(|_| SchedulerError::Cancelled)?;

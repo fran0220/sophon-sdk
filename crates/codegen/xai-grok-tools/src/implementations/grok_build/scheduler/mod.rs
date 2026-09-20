@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod cadence;
 pub mod create;
 pub mod delete;
 pub mod interval;

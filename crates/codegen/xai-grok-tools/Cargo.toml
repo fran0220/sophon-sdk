@@ -89,6 +89,7 @@ tempfile = { workspace = true }
 which = { workspace = true }
 
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 futures-util = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-file-utils = { path = "../xai-file-utils" }

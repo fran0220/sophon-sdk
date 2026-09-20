@@ -22,11 +22,10 @@ use crate::types::resources::{NativeToolClientNames, SharedResources, State};
 use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::ToolKind;
 
-use super::interval::interval_to_human;
 use super::types::{
-    LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerClock,
-    SchedulerCommand, SchedulerError, SchedulerMutationResult, SchedulerSnapshot, SchedulerState,
-    SchedulerVersion,
+    LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerCadence,
+    SchedulerClock, SchedulerCommand, SchedulerError, SchedulerMutationResult, SchedulerSnapshot,
+    SchedulerState, SchedulerVersion,
 };
 
 const MAX_SCHEDULED_TASKS: usize = 50;
@@ -85,8 +84,8 @@ fn task_created_payload(task: &ScheduledTask, version: SchedulerVersion) -> Sche
     ScheduledTaskCreated {
         task_id: task.id.clone(),
         prompt: task.prompt.clone(),
-        human_schedule: interval_to_human(task.interval_secs),
-        next_fire_at: Some(task.next_fire_at().to_rfc3339()),
+        human_schedule: task.cadence.human_schedule(),
+        next_fire_at: task.pending_fire_at(Utc::now()).map(|at| at.to_rfc3339()),
         generation: version.generation(),
         revision: version.revision(),
     }
@@ -346,7 +345,7 @@ impl SchedulerActor {
         let is_expired = task.recurring && task.is_expired(now);
         let should_remove = !task.recurring;
         let prompt = task.prompt.clone();
-        let human_schedule = interval_to_human(task.interval_secs);
+        let human_schedule = task.cadence.human_schedule();
         let is_durable = task.durable;
         let last_subagent_id = task.last_subagent_id.clone();
         let iterations_since_fresh = task.iterations_since_fresh;
@@ -500,10 +499,19 @@ impl SchedulerActor {
         let Some(task) = state.tasks.get_mut(idx) else {
             return;
         };
-        task.last_fired_at = Some(now);
-        let next_fire_at = task.recurring.then(|| task.next_fire_at().to_rfc3339());
+        let previous_occurrence = task.next_run_at;
+        task.next_run_at = task.cadence.next_after(now);
+        let next_fire_at = task.next_occurrence().map(|at| at.to_rfc3339());
 
         drop(res);
+
+        // Persist consumption BEFORE the external spawn. A crash or ambiguous
+        // acknowledgement can lose an occurrence, but must never execute it twice.
+        if let Err(error) = self.persist_resources().await {
+            tracing::error!(%task_id, %error, "Could not persist scheduler consumption; stopping scheduler to avoid replay");
+            self.cancel_token.cancel();
+            return;
+        }
 
         tracing::info!(
             task_id = %task_id,
@@ -538,6 +546,27 @@ impl SchedulerActor {
         };
 
         if matches!(&outcome, LoopFireOutcome::Skipped) {
+            if should_remove {
+                // No spawn was accepted. Make a one-shot retryable, but only
+                // after that fact is persisted; ambiguous registrations are
+                // classified Spawned by fire_as_loop_subagent instead.
+                {
+                    let mut res = self.resources.lock().await;
+                    if let Some(task) = res
+                        .get_or_default::<State<SchedulerState>>()
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.id == task_id)
+                    {
+                        task.next_run_at = previous_occurrence;
+                    }
+                }
+                if let Err(error) = self.persist_resources().await {
+                    tracing::error!(%task_id, %error, "Could not persist rejected one-shot; stopping scheduler");
+                    self.cancel_token.cancel();
+                    return;
+                }
+            }
             let version = self.clock.snapshot();
             let payload = {
                 let res = self.resources.lock().await;
@@ -555,6 +584,21 @@ impl SchedulerActor {
         match outcome {
             LoopFireOutcome::Skipped => unreachable!("skipped outcome returned above"),
             LoopFireOutcome::Spawned(id) => {
+                {
+                    let mut res = self.resources.lock().await;
+                    if let Some(task) = res
+                        .get_or_default::<State<SchedulerState>>()
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.id == task_id)
+                    {
+                        task.last_fired_at = Some(now);
+                    }
+                }
+                if let Err(error) = self.persist_resources().await {
+                    tracing::error!(%task_id, %error, "Could not persist accepted scheduler outcome; stopping scheduler");
+                    self.cancel_token.cancel();
+                }
                 let commit = reservation.commit_next(&mut self.clock);
                 log_rollover(transition, Some(&task_id), commit.rollover);
                 let fire_version = commit.version;
@@ -920,7 +964,7 @@ impl SchedulerActor {
             state
                 .tasks
                 .iter()
-                .filter(|task| task.recurring || task.next_fire_at() > now)
+                .filter(|task| task.pending_fire_at(now).is_some())
                 .map(|task| task_created_payload(task, version))
                 .collect()
         };
@@ -955,6 +999,7 @@ impl SchedulerActor {
         if let Some(pending) = &self.pending_removal {
             return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
         }
+        task.cadence.validate()?;
         let mut res = self.resources.lock().await;
         let state = res.get_or_default::<State<SchedulerState>>();
         if state.tasks.len() >= MAX_SCHEDULED_TASKS {
@@ -962,6 +1007,16 @@ impl SchedulerActor {
         }
         let mut reservation = self.clock.prepare_transition(1);
         state.tasks.push(task.clone());
+        drop(res);
+        if let Err(error) = self.persist_resources().await {
+            self.resources
+                .lock()
+                .await
+                .get_or_default::<State<SchedulerState>>()
+                .tasks
+                .retain(|row| row.id != task.id);
+            return Err(error);
+        }
         let commit = reservation.commit_next(&mut self.clock);
         log_rollover("create", Some(&task.id), commit.rollover);
         self.notification_handle
@@ -974,6 +1029,7 @@ impl SchedulerActor {
         id: String,
         prompt: Option<String>,
         interval_secs: Option<u64>,
+        cadence: Option<SchedulerCadence>,
     ) -> Result<(ScheduledTask, SchedulerVersion), SchedulerError> {
         if let Some(pending) = &self.pending_removal {
             return Err(SchedulerError::RemovalPending(pending.task_id.clone()));
@@ -987,6 +1043,33 @@ impl SchedulerActor {
         let Some(task) = state.tasks.get_mut(index) else {
             return Err(SchedulerError::TaskNotFound(id));
         };
+        let before = task.clone();
+        // Validate the entire timing patch before touching even the prompt.
+        let cadence = match (cadence, interval_secs) {
+            (Some(cadence), _) => Some(cadence),
+            (None, Some(every_secs)) => {
+                let SchedulerCadence::Interval { anchor, .. } = task.cadence else {
+                    return Err(SchedulerError::InvalidInterval(
+                        "interval-only patch requires an interval task".into(),
+                    ));
+                };
+                Some(SchedulerCadence::Interval { every_secs, anchor })
+            }
+            (None, None) => None,
+        };
+        if let Some(cadence) = cadence {
+            let changed = cadence != task.cadence;
+            cadence.validate()?;
+            if changed {
+                task.replace_cadence(cadence)?;
+                // Legacy /loop interval edits retain phase and skip elapsed
+                // occurrences. Explicit cadence edits begin the new schedule.
+                if interval_secs.is_some() {
+                    task.next_run_at = task.cadence.next_after(Utc::now());
+                    task.expires_at = before.expires_at;
+                }
+            }
+        }
         if let Some(prompt) = prompt {
             if prompt != task.prompt {
                 task.chain_reset_pending = true;
@@ -994,15 +1077,21 @@ impl SchedulerActor {
             }
             task.prompt = prompt;
         }
-        if let Some(interval_secs) = interval_secs {
-            task.interval_secs = interval_secs;
-            if task.next_fire_at() <= Utc::now() {
-                task.last_fired_at = Some(Utc::now());
-            }
-        }
         let updated = task.clone();
         drop(res);
 
+        if let Err(error) = self.persist_resources().await {
+            let mut res = self.resources.lock().await;
+            if let Some(task) = res
+                .get_or_default::<State<SchedulerState>>()
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+            {
+                *task = before;
+            }
+            return Err(error);
+        }
         let commit = reservation.commit_next(&mut self.clock);
         log_rollover("update", Some(&id), commit.rollover);
         self.notification_handle
@@ -1092,7 +1181,7 @@ impl SchedulerActor {
                 reply,
             } => {
                 let _ = reply.send(
-                    self.update_task(id, prompt, interval_secs)
+                    self.update_task(id, prompt, interval_secs, None)
                         .await
                         .map(|(task, _)| task),
                 );
@@ -1163,7 +1252,7 @@ impl SchedulerActor {
                 expected,
                 id,
                 prompt,
-                interval_secs,
+                cadence,
                 reply,
             } => {
                 if let Some(receipt) = self.receipt(&operation_id).await {
@@ -1191,7 +1280,7 @@ impl SchedulerActor {
                         snapshot,
                     }));
                 } else {
-                    match self.update_task(id, prompt, interval_secs).await {
+                    match self.update_task(id, prompt, None, cadence).await {
                         Ok((value, version)) => {
                             self.record_receipt(
                                 operation_id.clone(),
