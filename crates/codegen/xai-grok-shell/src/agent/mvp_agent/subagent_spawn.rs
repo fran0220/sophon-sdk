@@ -508,6 +508,7 @@ impl MvpAgent {
             managed_mcp_state: self.managed_mcp_cache.clone(),
             parent_mcp_pool: None,
             parent_tool_definitions: None,
+            parent_toolset: None,
             parent_skills: None,
             parent_skills_config: self.cfg.borrow().skills.clone(),
             parent_compat: self.cfg.borrow().compat_resolved,

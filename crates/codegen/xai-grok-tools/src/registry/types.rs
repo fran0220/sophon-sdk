@@ -1821,6 +1821,33 @@ impl FinalizedToolset {
         T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
         T::Output: serde::Serialize,
     {
+        self.register_runtime_tool(name, tool, input_schema_override, true)
+    }
+
+    pub(crate) fn register_mcp_tool<T>(
+        &self,
+        name: String,
+        tool: T,
+        input_schema_override: Option<serde_json::Value>,
+    ) -> Result<(), xai_tool_runtime::ToolError>
+    where
+        T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
+        T::Output: serde::Serialize,
+    {
+        self.register_runtime_tool(name, tool, input_schema_override, false)
+    }
+
+    fn register_runtime_tool<T>(
+        &self,
+        name: String,
+        tool: T,
+        input_schema_override: Option<serde_json::Value>,
+        inherit_instance: bool,
+    ) -> Result<(), xai_tool_runtime::ToolError>
+    where
+        T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
+        T::Output: serde::Serialize,
+    {
         let mut tools = self.tools.write();
         if tools.iter().any(|t| t.client_name == name) {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -1860,15 +1887,18 @@ impl FinalizedToolset {
                 }))
             }),
             contract_version: None,
-            register_runtime_instance: Some(Arc::new(move |registry| {
-                registry.register_arc(Arc::clone(&tool));
-            })),
+            register_runtime_instance: inherit_instance.then(|| {
+                Arc::new(move |registry: &xai_computer_hub_sdk::LocalRegistry| {
+                    registry.register_arc(Arc::clone(&tool));
+                })
+                    as Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>
+            }),
         });
         Ok(())
     }
-    /// Copy selected runtime registrations into a detached replacement toolset.
-    /// The caller selects ownership (for example, excluding replaced external
-    /// MCP namespaces). Schemas and concrete instances are preserved together.
+    /// Copy selected native runtime registrations into a child or replacement toolset.
+    /// MCP clients are excluded and follow the native MCP inheritance policy.
+    /// Schemas and concrete instances are preserved together.
     /// Any name/id collision rejects the entire copy before modifying `self`.
     /// Callbacks must read invocation context rather than capture parent identity
     /// if the destination belongs to a child session.
@@ -3286,7 +3316,7 @@ mod tests {
             .register_tool("probe".into(), NativeContextProbe::default(), None)
             .unwrap();
         parent
-            .register_tool(
+            .register_mcp_tool(
                 "external__tool".into(),
                 FakeMcpTool {
                     description: "external".into(),
@@ -3328,9 +3358,15 @@ mod tests {
                 .scheduled_invocation,
             None
         );
-        child
-            .inherit_runtime_tools(&parent, |name| !name.starts_with("external__"))
-            .unwrap();
+        child.inherit_runtime_tools(&parent, |_| true).unwrap();
+        let no_tools = Arc::new(FinalizedToolset::empty_for_test());
+        no_tools.inherit_runtime_tools(&parent, |_| false).unwrap();
+        assert!(
+            no_tools
+                .call("probe", serde_json::json!({}), "denied", None)
+                .await
+                .is_err()
+        );
         // Remove the old registration: the inherited concrete instance remains alive.
         assert!(parent.unregister_tool_by_name("probe"));
         let second = child

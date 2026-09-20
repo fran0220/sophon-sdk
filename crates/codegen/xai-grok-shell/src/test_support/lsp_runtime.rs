@@ -113,6 +113,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         managed_mcp_proxy_base_url: String::new(),
         parent_mcp_pool: None,
         parent_tool_definitions: None,
+        parent_toolset: None,
         parent_skills: None,
         parent_skills_config: xai_grok_agent::prompt::skills::SkillsConfig::default(),
         parent_compat: xai_grok_tools::types::compat::CompatConfig::default(),

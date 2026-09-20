@@ -146,14 +146,30 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     "subagent.parent_snapshot",
                     parent_session_id = %parent_sid,
                 ));
-                let (pool, hooks, definitions) = tokio::join!(
+                let (pool, hooks, definitions, toolset) = tokio::join!(
                     handle.snapshot_mcp_pool(),
                     handle.snapshot_client_hooks(),
-                    handle.snapshot_tool_definitions()
+                    handle.snapshot_tool_definitions(),
+                    this.session_toolset(&handle.info.id)
                 );
+                let toolset = match toolset {
+                    Ok(toolset) => toolset,
+                    Err(error) => {
+                        return coordinator::ChildRunOutput {
+                            result: SubagentResult::failed(
+                                run.request.id.clone(),
+                                run.request.id,
+                                format!("Parent native tool snapshot unavailable: {error}"),
+                            ),
+                            completion_data: Default::default(),
+                            snapshot_ref: None,
+                        };
+                    }
+                };
                 ctx.parent_mcp_pool = pool;
                 ctx.client_hooks = hooks;
                 ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+                ctx.parent_toolset = Some(toolset);
             }
             if let Some(spawner) = spawner_session_id.as_deref() {
                 if this.is_resident(&acp::SessionId::new(spawner)) {

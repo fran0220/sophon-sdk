@@ -1516,6 +1516,13 @@ pub(crate) async fn run_shell_child(
     let spawn_phase_parent = session_bootstrap_span.span().clone();
     let bootstrap_started_at = std::time::Instant::now();
     let pins = ctx.compaction_pins_for_child(&definition.user_message_template);
+    let inherited_tools_allowlist = definition.session_tools_allowlist.clone();
+    let inherited_tools_denylist: Vec<_> = definition
+        .disallowed_tools
+        .iter()
+        .chain(definition.session_tools_denylist.iter().flatten())
+        .cloned()
+        .collect();
     let spawn_result = session::spawn_session_on_thread(
         child_session_info,
         gateway.clone(),
@@ -1713,6 +1720,29 @@ pub(crate) async fn run_shell_child(
         toolset: child_toolset,
         ..
     } = child_init;
+    if let Some(parent) = &ctx.parent_toolset {
+        if request.runtime_overrides.scheduled_invocation.is_none() {
+            request.runtime_overrides.scheduled_invocation = parent.native_scheduled_invocation();
+        }
+        if let Err(error) = child_toolset.inherit_runtime_tools(parent, |name| {
+            !inherited_tools_denylist.iter().any(|entry| entry == name)
+                && inherited_tools_allowlist
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.iter().any(|entry| entry == name))
+        }) {
+            let _ = child_handle.cmd_tx.send(session::SessionCommand::Shutdown(
+                session::ShutdownKind::Graceful,
+            ));
+            return child_run_output(
+                failure_result(
+                    &request,
+                    &format!("Native tool inheritance failed: {error}"),
+                ),
+                completion_data,
+                None,
+            );
+        }
+    }
     child_toolset
         .set_native_scheduled_invocation(request.runtime_overrides.scheduled_invocation.clone());
     session::bind_installed_toolset(

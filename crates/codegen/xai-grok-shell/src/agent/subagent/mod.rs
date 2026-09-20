@@ -358,6 +358,8 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     /// Exact parent tool schema for verbatim non-workflow forks.
     pub parent_tool_definitions: Option<Vec<xai_grok_sampling_types::ToolSpec>>,
+    /// Resident registry for concrete native handler and invocation-source inheritance.
+    pub parent_toolset: Option<Arc<xai_grok_tools::registry::types::FinalizedToolset>>,
     /// Pre-discovered skills from the parent session, captured at spawn time.
     pub parent_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     /// Parent's skills config for the child's SkillManager.

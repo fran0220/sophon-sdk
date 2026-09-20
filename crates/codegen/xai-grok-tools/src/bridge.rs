@@ -160,7 +160,8 @@ impl ToolBridge {
             + 'static,
         T::Output: serde::Serialize,
     {
-        self.registry.register_tool(mcp_name, tool, input_schema)?;
+        self.registry
+            .register_mcp_tool(mcp_name, tool, input_schema)?;
         Ok(())
     }
 
