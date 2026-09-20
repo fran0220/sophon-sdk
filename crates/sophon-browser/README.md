@@ -123,8 +123,10 @@ pending response receiver; already-issued browser effects may still occur.
 Cancellation is **not rollback**, and timeout/disconnect may mean unknown outcome.
 The Runtime must not automatically retry clicks, typing, navigation, evaluation,
 or recording commands. Per-CDP calls have a 20-second deadline; an entire action
-has a 60-second deadline. Operations serialize on the browser service. Live frame
-delivery continues independently while a tool is waiting.
+has a 60-second deadline. Agent operations serialize on the browser service.
+Human input to an attached tab and live frame delivery use the multiplexed CDP
+connection independently, so an agent wait or recording encode does not block
+interactive Stage input. Host input atomically invalidates snapshot refs.
 
 Always await `close()` at Runtime exit. It first rejects/cancels calls, then closes
 Chromium, escalating to the enrolled process tree if necessary, and waits for the

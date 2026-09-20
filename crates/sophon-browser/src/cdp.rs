@@ -1,5 +1,6 @@
 //! One multiplexed connection. Commands are sent once, never replayed.
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +16,8 @@ type Reply = oneshot::Sender<Result<Value, Error>>;
 
 pub(crate) struct Cdp {
     tx: mpsc::Sender<(Value, Reply)>,
-    task: JoinHandle<()>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    pub input_generation: AtomicU64,
     pub events: Arc<Mutex<VecDeque<Value>>>,
     pub tabs: Arc<Mutex<HashMap<String, String>>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Value>>>,
@@ -96,7 +98,8 @@ impl Cdp {
         });
         Ok(Self {
             tx,
-            task,
+            task: Mutex::new(Some(task)),
+            input_generation: AtomicU64::new(0),
             events,
             tabs,
             latest_frames,
@@ -125,14 +128,19 @@ impl Cdp {
         .map_err(|_| Error::Timeout)?
     }
 
-    pub async fn stop(&mut self) {
-        self.task.abort();
-        let _ = (&mut self.task).await;
+    pub async fn stop(&self) {
+        let task = self.task.lock().expect("task lock").take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for Cdp {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.get_mut().expect("task lock").take() {
+            task.abort();
+        }
     }
 }

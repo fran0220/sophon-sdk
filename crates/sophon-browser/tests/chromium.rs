@@ -257,6 +257,37 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
         Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
     ));
     assert_eq!(evaluate(&browser, &tab, "6*7").await, 42); // Control replies survived frame pressure.
+    evaluate(&browser, &tab, "document.querySelector('input').focus()").await;
+    let waiting_browser = browser.clone();
+    let waiting_tab = tab.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_browser
+            .execute(
+                "browser",
+                json!({"action":"wait","tab_id":waiting_tab,"milliseconds":10000}),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        browser.execute(
+            "browser",
+            json!({"action":"input","tab_id":tab,"kind":"text","params":{"text":"-live"}}),
+        ),
+    )
+    .await
+    .expect("human input must not wait behind agent delay")
+    .unwrap();
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert!(
+        evaluate(&browser, &tab, "document.querySelector('input').value")
+            .await
+            .as_str()
+            .unwrap()
+            .ends_with("-live")
+    );
     call(&browser, "stream_stop", json!({"tab_id":tab})).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut stopped = browser.subscribe_frames();

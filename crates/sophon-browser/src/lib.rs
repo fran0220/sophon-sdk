@@ -81,6 +81,7 @@ struct ElementRef {
     backend: i64,
     context: i64,
     revision: u64,
+    input_generation: u64,
 }
 struct Page {
     session: String,
@@ -90,7 +91,7 @@ struct Page {
 struct Running {
     child: Child,
     group: Option<Arc<ProcessGroup>>,
-    cdp: Option<Cdp>,
+    cdp: Option<Arc<Cdp>>,
     pages: HashMap<String, Page>,
     recording: Option<Recording>,
     _profile_lock: File,
@@ -102,6 +103,7 @@ pub struct BrowserService {
     config: BrowserConfig,
     process_scope: ProcessScope,
     running: Mutex<Option<Running>>,
+    connection: std::sync::RwLock<Option<Arc<Cdp>>>,
     closed: AtomicBool,
     closing: Notify,
     frames: broadcast::Sender<Value>,
@@ -113,6 +115,7 @@ impl BrowserService {
             config,
             process_scope: ProcessScope::new(),
             running: Mutex::new(None),
+            connection: std::sync::RwLock::new(None),
             closed: AtomicBool::new(false),
             closing: Notify::new(),
             frames: broadcast::channel(8).0,
@@ -180,6 +183,24 @@ impl BrowserService {
             // Durable evidence is retained. Clients only release their own references.
             return Ok(json!({"released":true,"retained":true}));
         }
+        // Human input must not queue behind an agent wait, long probe or video
+        // encoding. Only first attachment/startup goes through the lifecycle lock.
+        if action == "input" {
+            let cdp = self.connection.read().expect("connection lock").clone();
+            if let Some(cdp) = cdp {
+                let tab = string(&args, "tab_id")?;
+                let session = cdp
+                    .tabs
+                    .lock()
+                    .expect("tab lock")
+                    .iter()
+                    .find(|(_, id)| id.as_str() == tab)
+                    .map(|(session, _)| session.clone());
+                if let Some(session) = session {
+                    return host_input(&cdp, Some(&session), &args).await;
+                }
+            }
+        }
         let mut guard = self.running.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
@@ -188,6 +209,7 @@ impl BrowserService {
             *guard = Some(self.launch().await?);
         }
         if action == "clear_profile" {
+            self.connection.write().expect("connection lock").take();
             stop_running(guard.as_mut().expect("launched")).await?;
             // Keep the exclusive profile lock until every old context has exited
             // and the identity directory is gone. Artifacts are not identity.
@@ -199,6 +221,7 @@ impl BrowserService {
             let origin = site_origin(string(&args, "origin")?)?;
             let old = guard.as_mut().expect("launched");
             let lock = old._profile_lock.try_clone()?;
+            self.connection.write().expect("connection lock").take();
             stop_running(old).await?;
             // Restart with the same lock so old windows/workers cannot race the
             // clear and repopulate storage. Other origins' saved data is kept.
@@ -421,6 +444,7 @@ impl BrowserService {
             "frames" => cdp.call(session, "Page.getFrameTree", json!({})).await,
             "snapshot" => {
                 page.refs.clear();
+                let input_generation = cdp.input_generation.load(Ordering::Acquire);
                 let frame = if let Some(frame) = args["frame_id"].as_str() {
                     frame.to_owned()
                 } else {
@@ -460,13 +484,16 @@ impl BrowserService {
                                 backend,
                                 context,
                                 revision,
+                                input_generation,
                             },
                         );
                         item["ref"] = json!(id);
                     }
                     nodes.push(item);
                 }
-                if revision != self::revision(cdp, session, context).await? {
+                if revision != self::revision(cdp, session, context).await?
+                    || input_generation != cdp.input_generation.load(Ordering::Acquire)
+                {
                     page.refs.clear();
                     return Err(Error::StaleRef);
                 }
@@ -479,6 +506,9 @@ impl BrowserService {
                     .refs
                     .get(string(&args, "ref")?)
                     .ok_or(Error::StaleRef)?;
+                if reference.input_generation != cdp.input_generation.load(Ordering::Acquire) {
+                    return Err(Error::StaleRef);
+                }
                 if revision(cdp, session, reference.context)
                     .await
                     .map_err(|_| Error::StaleRef)?
@@ -601,18 +631,7 @@ impl BrowserService {
             }
             "input" => {
                 page.refs.clear();
-                let kind = string(&args, "kind")?;
-                let method = match kind {
-                    "mouse" => "Input.dispatchMouseEvent",
-                    "key" => "Input.dispatchKeyEvent",
-                    "text" => "Input.insertText",
-                    _ => return Err(Error::Unsupported(format!("input {kind}"))),
-                };
-                let params = args
-                    .get("params")
-                    .filter(|v| v.is_object())
-                    .ok_or_else(|| Error::Invalid("input params object required".into()))?;
-                cdp.call(session, method, params.clone()).await
+                host_input(cdp, session, &args).await
             }
             _ => Err(Error::Invalid(format!("unknown action {action}"))),
         }
@@ -674,7 +693,7 @@ impl BrowserService {
         })
     }
 
-    async fn connect(&self, child: &mut Child) -> Result<Cdp, Error> {
+    async fn connect(&self, child: &mut Child) -> Result<Arc<Cdp>, Error> {
         let port_file = self.config.data_dir.join("profile/DevToolsActivePort");
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -689,11 +708,15 @@ impl BrowserService {
                         && port.parse::<u16>().is_ok()
                         && path.starts_with("/devtools/browser/")
                     {
-                        return Cdp::connect(
-                            &format!("ws://127.0.0.1:{port}{path}"),
-                            self.frames.clone(),
-                        )
-                        .await;
+                        let cdp = Arc::new(
+                            Cdp::connect(
+                                &format!("ws://127.0.0.1:{port}{path}"),
+                                self.frames.clone(),
+                            )
+                            .await?,
+                        );
+                        *self.connection.write().expect("connection lock") = Some(cdp.clone());
+                        return Ok(cdp);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -706,6 +729,7 @@ impl BrowserService {
     pub async fn close(&self) -> Result<(), Error> {
         self.closed.store(true, Ordering::Release);
         self.closing.notify_waiters();
+        self.connection.write().expect("connection lock").take();
         let mut guard = self.running.lock().await;
         if let Some(running) = guard.as_mut() {
             stop_running(running).await?;
@@ -762,6 +786,22 @@ async fn stop_running(running: &mut Running) -> Result<(), Error> {
     }
     running.cdp.take();
     Ok(())
+}
+
+async fn host_input(cdp: &Cdp, session: Option<&str>, args: &Value) -> Result<Value, Error> {
+    let kind = string(args, "kind")?;
+    let method = match kind {
+        "mouse" => "Input.dispatchMouseEvent",
+        "key" => "Input.dispatchKeyEvent",
+        "text" => "Input.insertText",
+        _ => return Err(Error::Unsupported(format!("input {kind}"))),
+    };
+    let params = args
+        .get("params")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| Error::Invalid("input params object required".into()))?;
+    cdp.input_generation.fetch_add(1, Ordering::AcqRel);
+    cdp.call(session, method, params.clone()).await
 }
 
 async fn page_state(cdp: &Cdp, session: Option<&str>) -> Result<Value, Error> {
