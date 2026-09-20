@@ -96,7 +96,7 @@ fn public_scheduler_runs_native_children_with_native_completion_wakes() {
 
                 // Zero is rejected, not silently promoted to sixty seconds.
                 let mut invalid = create(false, false);
-                invalid.interval_secs = 0;
+                invalid.cadence = SchedulerCadence::Interval { every_secs: 0, anchor: chrono::Utc::now().to_rfc3339() };
                 let error = parent
                     .create_scheduled_task(
                         OperationId::new("invalid-create"),

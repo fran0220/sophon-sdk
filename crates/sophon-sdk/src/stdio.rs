@@ -228,7 +228,7 @@ impl Runtime {
                 .browser
                 .as_ref()
                 .ok_or_else(|| Error::Operation("browser is not configured".into()))?
-                .execute("browser", args)
+                .execute_host(args)
                 .await
                 .map_err(operation),
             Terminal { request } => self.terminal.execute(request).await,
