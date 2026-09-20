@@ -16,6 +16,7 @@ pub mod management;
 pub mod mcp;
 mod model_facts;
 pub mod native_media;
+pub mod native_terminal;
 pub mod native_tools;
 pub mod protocol;
 mod runtime;
@@ -39,7 +40,8 @@ pub use config::{
     MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings, MemoryInitialInjectionSettings,
     MemoryMode, MemorySearchSettings, MemorySessionSettings, MemoryV2Rollout, MemoryV2Settings,
     MemoryWatcherSettings, MmrSettings, ModelBehaviorConfig, ModelConfig, ModelRetryConfig,
-    PermissionPolicy, ProviderConfig, ProviderProtocol, PruningSettings, TemporalDecaySettings,
+    PermissionPolicy, ProviderConfig, ProviderProtocol, PruningSettings, SubagentDefinition,
+    TemporalDecaySettings,
 };
 pub use event::{
     Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,

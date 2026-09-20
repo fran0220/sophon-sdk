@@ -19,6 +19,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
+ptyctl = { path = "../codegen/ptyctl" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,6 +34,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 xai-acp-lib = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-agent = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-shell = { workspace = true }
@@ -41,6 +43,7 @@ xai-prompt-queue = { workspace = true }
 xai-tool-protocol = { workspace = true }
 xai-tool-runtime = { workspace = true }
 xai-tool-types = { workspace = true }
+xai-tty-utils = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

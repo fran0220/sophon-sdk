@@ -2,5 +2,6 @@
 import type { BrowserConfig } from "./BrowserConfig.js";
 import type { NativeMediaConfig } from "./NativeMediaConfig.js";
 import type { RuntimeModel } from "./RuntimeModel.js";
+import type { SubagentDefinition } from "./SubagentDefinition.js";
 
-export type RuntimeConfig = { models: Array<RuntimeModel>, defaultModel: string, webSearchModel: string | null, sessionSummaryModel: string | null, imageDescriptionModel: string | null, browser: BrowserConfig | null, media: NativeMediaConfig | null, };
+export type RuntimeConfig = { models: Array<RuntimeModel>, defaultModel: string, webSearchModel: string | null, sessionSummaryModel: string | null, imageDescriptionModel: string | null, browser: BrowserConfig | null, media: NativeMediaConfig | null, subagents: Array<SubagentDefinition>, };

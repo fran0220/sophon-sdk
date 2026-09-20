@@ -1075,21 +1075,13 @@ async fn command_loop(
                 let native_id = acp::SessionId::new(id.to_string());
                 let result = async {
                     let toolset = agent.session_toolset(&native_id).await.map_err(acp_error)?;
-                    let prompt_id = agent
-                        .session_current_prompt_id(&native_id)
-                        .await
-                        .map_err(acp_error)?;
                     for tool in tools {
                         let name = tool.spec.name.clone();
                         let schema = tool.spec.input_schema.clone();
                         toolset
                             .register_tool(
                                 name,
-                                crate::native_tools::RegisteredTool {
-                                    tool,
-                                    session_id: id.to_string(),
-                                    prompt_id: prompt_id.clone(),
-                                },
+                                crate::native_tools::RegisteredTool { tool },
                                 Some(schema),
                             )
                             .map_err(|error| Error::Operation(error.to_string()))?;
@@ -1692,6 +1684,22 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
     grok.default_model_override = config.default_model.clone();
     grok.models.default.clone_from(&config.default_model);
     grok.default_yolo_mode = config.permission_policy == PermissionPolicy::AllowAll;
+    for profile in &config.subagents {
+        let mut definition: xai_grok_agent::config::AgentDefinition = serde_json::from_value(
+            serde_json::json!({"name":profile.name,"description":profile.description,"model":profile.model}),
+        ).map_err(|error| Error::invalid_config(error.to_string()))?;
+        definition.prompt_mode = xai_grok_agent::config::PromptMode::Full;
+        definition.prompt_body = Some(profile.instructions.clone());
+        definition.session_tools_allowlist = profile.tools.clone();
+        if profile.tools.as_ref().is_some_and(Vec::is_empty) {
+            definition.discover_skills = false;
+            definition.inherit_skills = false;
+            definition.agents_md = false;
+            definition.mcp_inheritance = xai_grok_agent::config::McpInheritance::None;
+            definition.allowed_subagent_types = Some(Vec::new());
+        }
+        grok.cli_agents.push(definition);
+    }
     grok.web_search_model = config.web_search_model.clone().unwrap_or_default();
     grok.session_summary_model = config
         .session_summary_model

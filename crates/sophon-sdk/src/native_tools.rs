@@ -1,6 +1,6 @@
 //! In-process first-party registration against Grok Build's local tool registry.
 //! No MCP server, loopback transport, or host-owned execution loop is involved.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::Value;
 use xai_grok_tools::types::{
@@ -45,8 +45,6 @@ impl std::fmt::Debug for NativeTool {
 #[derive(Clone, Debug)]
 pub(crate) struct RegisteredTool {
     pub tool: NativeTool,
-    pub session_id: String,
-    pub prompt_id: Arc<Mutex<Option<String>>>,
 }
 
 impl Tool for RegisteredTool {
@@ -65,14 +63,14 @@ impl Tool for RegisteredTool {
     }
     async fn run(&self, ctx: ToolCallContext, args: Value) -> Result<Value, ToolError> {
         // The native actor supplies this identity; never infer it from TS UI state.
-        let cwd = ctx
-            .get::<xai_tool_runtime::Cwd>()
-            .ok_or_else(|| ToolError::invalid_arguments("native workspace is missing"))?;
+        let invocation = ctx
+            .get::<xai_grok_tools::registry::types::NativeInvocationContext>()
+            .ok_or_else(|| ToolError::invalid_arguments("native invocation context is missing"))?;
         let context = CallbackContext {
-            session_id: self.session_id.clone(),
-            prompt_id: self.prompt_id.lock().unwrap().clone(),
+            session_id: invocation.session_id.clone(),
+            prompt_id: invocation.prompt_id.clone(),
             tool_call_id: ctx.call_id.to_string(),
-            cwd: cwd.0.to_string_lossy().into_owned(),
+            cwd: invocation.cwd.to_string_lossy().into_owned(),
         };
         self.tool
             .handler

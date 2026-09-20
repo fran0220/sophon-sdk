@@ -539,21 +539,21 @@ pub struct Usage {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct PromptTokensDetails {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub cached_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub audio_tokens: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CompletionTokensDetails {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub reasoning_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub audio_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub accepted_prediction_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub rejected_prediction_tokens: u32,
 }
 // ============ Streaming types ============
@@ -1541,6 +1541,44 @@ mod tests {
                 other => panic!("Expected empty Text block, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn nullable_usage_breakdowns_preserve_required_totals() {
+        // Captured shape from the live GLM gateway final SSE usage chunk.
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 19, "completion_tokens": 7, "total_tokens": 26,
+            "prompt_tokens_details": {"audio_tokens": null, "cached_tokens": 11},
+            "completion_tokens_details": {"reasoning_tokens": 3, "audio_tokens": null,
+                "accepted_prediction_tokens": null, "rejected_prediction_tokens": 2}
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (19, 7, 26)
+        );
+        let prompt = usage.prompt_tokens_details.unwrap();
+        assert_eq!((prompt.audio_tokens, prompt.cached_tokens), (0, 11));
+        let completion = usage.completion_tokens_details.unwrap();
+        assert_eq!(
+            (
+                completion.reasoning_tokens,
+                completion.audio_tokens,
+                completion.accepted_prediction_tokens,
+                completion.rejected_prediction_tokens
+            ),
+            (3, 0, 0, 2)
+        );
+        assert!(
+            serde_json::from_value::<Usage>(serde_json::json!({
+                "prompt_tokens": null, "completion_tokens": 7, "total_tokens": 26
+            }))
+            .is_err()
+        );
     }
 
     #[test]

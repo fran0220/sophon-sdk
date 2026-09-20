@@ -56,6 +56,8 @@ pub struct RuntimeConfig {
     pub browser: Option<BrowserConfig>,
     #[serde(default)]
     pub media: Option<crate::native_media::NativeMediaConfig>,
+    #[serde(default)]
+    pub subagents: Vec<crate::SubagentDefinition>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -165,7 +167,37 @@ pub enum Update {
     ToolCallUpdate(ToolCall),
     Plan(Vec<PlanEntry>),
     TurnCompleted(Value),
+    /// Known native control/status records, not transcript content.
+    NativeStatus(Value),
+    Compaction(CompactionUpdate),
     Other(Value),
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "phase",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum CompactionUpdate {
+    Started {
+        tokens_used: u64,
+        context_window: u64,
+        percentage: u8,
+        reason: String,
+    },
+    Completed {
+        tokens_before: Option<u64>,
+        tokens_after: u64,
+        elapsed_ms: Option<i64>,
+        summary_preview: Option<String>,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -218,6 +250,9 @@ pub struct HistorySnapshot {
     rename_all_fields = "camelCase"
 )]
 pub enum RuntimeEvent {
+    Subagent {
+        event: crate::subagent::SubagentEvent,
+    },
     HistoryRecord {
         record: HistoryRecord,
     },
@@ -309,6 +344,12 @@ pub enum ServerFrame {
     BrowserFrame {
         frame: Value,
     },
+    Terminal {
+        event: crate::native_terminal::TerminalEvent,
+    },
+    TerminalGap {
+        dropped: u32,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -366,6 +407,9 @@ pub enum Request {
     },
     Browser {
         args: Value,
+    },
+    Terminal {
+        request: crate::native_terminal::TerminalRequest,
     },
     ReadArtifact {
         session_id: String,

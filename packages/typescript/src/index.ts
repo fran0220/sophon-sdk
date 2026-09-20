@@ -20,11 +20,18 @@ import type { ScheduledTaskCreate } from './generated/ScheduledTaskCreate.js'
 import type { ScheduledTaskUpdate } from './generated/ScheduledTaskUpdate.js'
 import type { SchedulerMutationResult } from './generated/SchedulerMutationResult.js'
 import type { Version } from './generated/Version.js'
+import type { TerminalRequest } from './generated/TerminalRequest.js'
+import type { TerminalEvent } from './generated/TerminalEvent.js'
 
 export type { ClientFrame, ServerFrame, Request, RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue }
 export type { SubagentStart, SubagentResult, SubagentSnapshot, SubagentHandle, SchedulerSnapshot, ScheduledTask, ScheduledTaskCreate, ScheduledTaskUpdate, SchedulerMutationResult, Version }
 export type { NativeMediaConfig } from './generated/NativeMediaConfig.js'
 export type { MediaRoute } from './generated/MediaRoute.js'
+export type { SubagentDefinition } from './generated/SubagentDefinition.js'
+export type { SubagentEvent } from './generated/SubagentEvent.js'
+export type { CompactionUpdate } from './generated/CompactionUpdate.js'
+export type { TerminalRequest, TerminalEvent }
+export type TerminalStreamEvent = TerminalEvent | { type: 'gap'; dropped: number }
 export type { BrowserConfig } from './generated/BrowserConfig.js'
 export type { HistoryRecord } from './generated/HistoryRecord.js'
 export type { PromptBlock } from './generated/PromptBlock.js'
@@ -80,6 +87,7 @@ export class Agent {
   private callbacks = new Map<string, AbortController>()
   private listeners = new Set<EventListener>()
   private browserListeners = new Set<(frame: JsonValue) => void>()
+  private terminalListeners = new Set<(event: TerminalStreamEvent) => void>()
   private stopped: Error | undefined
   private exiting = false
   private readyResolve!: () => void
@@ -113,6 +121,11 @@ export class Agent {
   subscribeBrowserFrames(listener: (frame: JsonValue) => void): () => void {
     this.browserListeners.add(listener)
     return () => { this.browserListeners.delete(listener) }
+  }
+
+  subscribeTerminalEvents(listener: (event: TerminalStreamEvent) => void): () => void {
+    this.terminalListeners.add(listener)
+    return () => { this.terminalListeners.delete(listener) }
   }
 
   private emit(event: RuntimeEvent, sequence: number): void {
@@ -156,6 +169,11 @@ export class Agent {
           case 'browser_frame':
             for (const listener of this.browserListeners) {
               try { listener(frame.frame) } catch (error) { this.options.onObserverError?.(error) }
+            }
+            break
+          case 'terminal': case 'terminal_gap':
+            for (const listener of this.terminalListeners) {
+              try { listener(frame.type === 'terminal' ? frame.event : { type: 'gap', dropped: frame.dropped }) } catch (error) { this.options.onObserverError?.(error) }
             }
             break
           case 'callback_cancelled': this.callbacks.get(frame.id)?.abort(new RuntimeError('cancelled', 'Native tool call was cancelled')); break
@@ -206,6 +224,7 @@ export class Agent {
   listSessions(cwd: string | null = null, cursor: string | null = null): Promise<JsonValue> { return this.request({ method: 'list_sessions', cwd, cursor }) }
   extension(name: string, params: JsonValue): Promise<JsonValue> { return this.request({ method: 'extension', sessionId: null, name, params }) }
   browser(args: JsonValue): Promise<JsonValue> { return this.request({ method: 'browser', args }) }
+  terminal(request: TerminalRequest): Promise<JsonValue> { return this.request({ method: 'terminal', request }) }
   skills(cwd: string): Promise<JsonValue> { return this.extension('x.ai/skills/list', { cwd }) }
   quiesce(timeoutMs = 30_000): Promise<JsonValue> { return this.request({ method: 'quiesce', timeoutMs }) }
 
@@ -237,7 +256,7 @@ export class Session {
   }
   subscribe(listener: EventListener): () => void {
     return this.agent.subscribe((event, sequence) => {
-      if (event.type === 'gap' || event.type === 'extension' || (event.type === 'history_record' ? event.record.sessionId === this.id : event.sessionId === this.id)) listener(event, sequence)
+      if (event.type === 'gap' || event.type === 'extension' || (event.type === 'history_record' ? event.record.sessionId === this.id : event.type === 'subagent' ? event.event.parentSessionId === this.id : event.sessionId === this.id)) listener(event, sequence)
     })
   }
   async prompt(prompt: Prompt): Promise<PromptReceipt> { return await this.agent.request({ method: 'prompt', sessionId: this.id, prompt }) as unknown as PromptReceipt }

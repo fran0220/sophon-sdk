@@ -10248,6 +10248,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "url",
  "uuid",
  "xai-tty-utils",
 ]
@@ -10262,6 +10263,7 @@ dependencies = [
  "chrono",
  "http 1.4.0",
  "indexmap",
+ "ptyctl",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -10275,6 +10277,7 @@ dependencies = [
  "url",
  "uuid",
  "xai-acp-lib",
+ "xai-grok-agent",
  "xai-grok-config",
  "xai-grok-config-types",
  "xai-grok-sampler",
@@ -10286,6 +10289,7 @@ dependencies = [
  "xai-tool-protocol",
  "xai-tool-runtime",
  "xai-tool-types",
+ "xai-tty-utils",
 ]
 
 [[package]]

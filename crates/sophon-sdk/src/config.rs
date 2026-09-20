@@ -511,6 +511,19 @@ pub enum PermissionPolicy {
 }
 
 /// Configuration for one embedded Grok Build agent.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentDefinition {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    pub model: Option<String>,
+    /// Null inherits native tools; an empty list permits no tools, skills,
+    /// MCP, project instructions, or child spawning.
+    pub tools: Option<Vec<String>>,
+}
+
+/// Configuration for one embedded Grok Build agent.
 #[derive(Clone)]
 pub struct AgentConfig {
     pub models: Vec<ModelConfig>,
@@ -523,6 +536,7 @@ pub struct AgentConfig {
     pub media: Option<MediaConfig>,
     pub memory: MemoryConfig,
     pub client_handler: Option<Arc<dyn ClientHandler>>,
+    pub subagents: Vec<SubagentDefinition>,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -556,6 +570,7 @@ impl AgentConfig {
             media: None,
             memory: MemoryConfig::default(),
             client_handler: None,
+            subagents: Vec::new(),
         }
     }
 
@@ -652,6 +667,21 @@ impl AgentConfig {
             return Err(Error::invalid_config(format!(
                 "default model is not configured: {default}"
             )));
+        }
+        let mut names = HashSet::new();
+        for definition in &self.subagents {
+            if definition.name.trim().is_empty() || !names.insert(&definition.name) {
+                return Err(Error::invalid_config(
+                    "subagent definition names must be nonempty and unique",
+                ));
+            }
+            if definition
+                .model
+                .as_ref()
+                .is_some_and(|model| !ids.contains(model.as_str()))
+            {
+                return Err(Error::invalid_config("subagent model is not configured"));
+            }
         }
         for (capability, model) in [
             ("web search", &self.web_search_model),

@@ -79,6 +79,7 @@ struct Runtime {
     workspaces: Mutex<HashMap<String, String>>,
     handlers: Arc<RuntimeTools>,
     native_specs: Vec<p::ToolSpec>,
+    terminal: crate::native_terminal::NativeTerminalService,
 }
 
 struct RuntimeTools {
@@ -232,6 +233,7 @@ impl Runtime {
                 .execute("browser", args)
                 .await
                 .map_err(operation),
+            Terminal { request } => self.terminal.execute(request).await,
             ReadArtifact { session_id, path } => {
                 let cwd = self
                     .workspaces
@@ -385,6 +387,7 @@ impl Runtime {
                 if let Some(browser) = &self.handlers.browser {
                     browser.close().await.map_err(operation)?;
                 }
+                self.terminal.shutdown().await?;
                 Ok(Value::Null)
             }
         }
@@ -484,6 +487,7 @@ fn agent_config(config: p::RuntimeConfig, callbacks: Arc<Callbacks>) -> Result<A
     native.web_search_model = config.web_search_model;
     native.session_summary_model = config.session_summary_model;
     native.image_description_model = config.image_description_model;
+    native.subagents = config.subagents;
     Ok(native)
 }
 
@@ -561,7 +565,63 @@ fn update(update: crate::SessionUpdate) -> p::Update {
         U::TurnCompleted(v) => p::Update::TurnCompleted(
             json!({"promptId":v.prompt_id,"promptIndex":v.prompt_index,"stopReason":stop_reason(v.stop_reason),"agentResult":v.agent_result,"errorKind":v.error_kind,"elapsedMs":v.elapsed_ms}),
         ),
-        U::Other(v) => p::Update::Other(v),
+        U::Other(v) => native_update(v),
+    }
+}
+
+fn native_update(value: Value) -> p::Update {
+    use xai_grok_shell::extensions::notification::SessionUpdate as N;
+    match serde_json::from_value::<N>(value.clone()) {
+        Ok(N::AutoCompactStarted {
+            tokens_used,
+            context_window,
+            percentage,
+            reason,
+        }) => p::Update::Compaction(p::CompactionUpdate::Started {
+            tokens_used,
+            context_window,
+            percentage,
+            reason,
+        }),
+        Ok(N::AutoCompactCompleted {
+            tokens_before,
+            tokens_after,
+            elapsed_ms,
+            summary_preview,
+        }) => p::Update::Compaction(p::CompactionUpdate::Completed {
+            tokens_before,
+            tokens_after,
+            elapsed_ms,
+            summary_preview,
+        }),
+        Ok(N::AutoCompactFailed { error }) => {
+            p::Update::Compaction(p::CompactionUpdate::Failed { error })
+        }
+        Ok(N::AutoCompactCancelled { reason }) => {
+            p::Update::Compaction(p::CompactionUpdate::Cancelled {
+                reason: serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".into()),
+            })
+        }
+        Ok(N::DiffReview { .. } | N::HookAnnotation { .. }) => p::Update::Other(value),
+        Ok(_) => p::Update::NativeStatus(value),
+        Err(_)
+            if matches!(
+                value.get("sessionUpdate").and_then(Value::as_str),
+                Some(
+                    "available_commands_update"
+                        | "current_mode_update"
+                        | "config_option_update"
+                        | "session_info_update"
+                        | "usage_update"
+                )
+            ) =>
+        {
+            p::Update::NativeStatus(value)
+        }
+        Err(_) => p::Update::Other(value),
     }
 }
 
@@ -604,6 +664,10 @@ fn event(event: crate::Event) -> Option<p::RuntimeEvent> {
         crate::Event::Extension { method, payload } => {
             Some(p::RuntimeEvent::Extension { method, payload })
         }
+        crate::Event::Management(crate::management::ManagementEvent {
+            kind: crate::management::ManagementEventKind::Subagent(event),
+            ..
+        }) => Some(p::RuntimeEvent::Subagent { event }),
         crate::Event::Management(_) => None,
     }
 }
@@ -632,13 +696,20 @@ fn respond(output: &mpsc::UnboundedSender<p::ServerFrame>, id: String, result: R
 /// it is never interpreted as successful persistence without a native receipt.
 pub async fn run() -> Result<()> {
     let (output, mut outgoing) = mpsc::unbounded_channel();
+    let (terminal_tx, mut terminal_rx) = mpsc::channel(256);
     let (frame_tx, mut frame_rx) = tokio::sync::watch::channel::<Option<Value>>(None);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
+        let mut control_open = true;
+        let mut terminal_open = true;
         loop {
+            if !control_open && !terminal_open {
+                break;
+            }
             let frame = tokio::select! {
                 biased;
-                frame = outgoing.recv() => match frame { Some(frame)=>frame,None=>break },
+                frame = outgoing.recv(), if control_open => match frame { Some(frame)=>frame,None=>{control_open=false;continue;} },
+                frame = terminal_rx.recv(), if terminal_open => match frame {Some(frame)=>frame,None=>{terminal_open=false;continue;}},
                 changed = frame_rx.changed() => {
                     if changed.is_err() { break; }
                     let frame = frame_rx.borrow_and_update().clone();
@@ -666,6 +737,7 @@ pub async fn run() -> Result<()> {
     let mut requests = tokio::task::JoinSet::new();
     let mut events = None;
     let mut browser_frames = None;
+    let mut terminal_events = None;
     let mut exit_requested = false;
     while let Some(line) = lines.next_line().await.map_err(operation)? {
         let frame: p::ClientFrame = serde_json::from_str(&line)
@@ -733,6 +805,25 @@ pub async fn run() -> Result<()> {
                 };
                 match started {
                     Ok(agent) => {
+                        let terminal = crate::native_terminal::NativeTerminalService::new();
+                        let mut rx = terminal.subscribe();
+                        let tx = terminal_tx.clone();
+                        terminal_events = Some(tokio::spawn(async move {
+                            loop {
+                                let frame = match rx.recv().await {
+                                    Ok(event) => p::ServerFrame::Terminal { event },
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        dropped,
+                                    )) => p::ServerFrame::TerminalGap {
+                                        dropped: dropped.min(u32::MAX as u64) as u32,
+                                    },
+                                    Err(_) => break,
+                                };
+                                if tx.send(frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }));
                         if let Some(browser) = browser {
                             let mut rx = browser.subscribe_frames();
                             let tx = frame_tx.clone();
@@ -778,6 +869,7 @@ pub async fn run() -> Result<()> {
                             workspaces: Mutex::default(),
                             handlers,
                             native_specs,
+                            terminal,
                         }));
                         respond(&output, id, Ok(initial));
                     }
@@ -842,6 +934,10 @@ pub async fn run() -> Result<()> {
         task.abort();
         let _ = task.await;
     }
+    if let Some(task) = terminal_events {
+        task.await.map_err(operation)?;
+    }
+    drop(terminal_tx);
     drop(output);
     // Keep the latest-frame channel alive until the reliable writer drains.
     let result = writer.await.map_err(operation)?.map_err(operation);

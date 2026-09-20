@@ -48,7 +48,8 @@ pub struct SubagentHandle {
 
 /// Native lifecycle notification. An absent attempt denotes a pre-launch
 /// rejection or a historical event without recorded attempt identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentEvent {
     pub parent_session_id: SessionId,
     pub id: SubagentId,
@@ -56,7 +57,8 @@ pub struct SubagentEvent {
     pub kind: SubagentEventKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentEventKind {
     Spawned,
     Progress,
