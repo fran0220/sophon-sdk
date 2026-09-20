@@ -73,6 +73,13 @@ impl Tool for RegisteredTool {
             prompt_id: invocation.prompt_id.clone(),
             tool_call_id: ctx.call_id.to_string(),
             cwd: invocation.cwd.to_string_lossy().into_owned(),
+            scheduled_invocation: invocation.scheduled_invocation.as_ref().map(|source| {
+                crate::protocol::ScheduledInvocation {
+                    session_id: source.session_id.clone(),
+                    task_id: source.task_id.clone(),
+                    occurrence: source.occurrence.to_rfc3339(),
+                }
+            }),
         };
         self.tool
             .handler

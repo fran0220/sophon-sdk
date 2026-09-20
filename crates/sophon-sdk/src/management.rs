@@ -436,6 +436,24 @@ pub struct ScheduledTask {
     pub last_subagent_id: Option<SubagentId>,
     pub iterations_since_fresh: u32,
     pub chain_reset_pending: bool,
+    pub last_dispatch: Option<SchedulerDispatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerDispatch {
+    pub occurrence: String,
+    pub status: SchedulerDispatchStatus,
+    pub subagent_id: Option<String>,
+}
+
+/// Registration status only. Accepted is not evidence of successful execution.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SchedulerDispatchStatus {
+    Unconfirmed,
+    Accepted,
+    Skipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -1192,6 +1210,18 @@ pub(crate) fn scheduled_task(
         last_subagent_id: task.last_subagent_id.map(SubagentId::new),
         iterations_since_fresh: task.iterations_since_fresh,
         chain_reset_pending: task.chain_reset_pending,
+        last_dispatch: task.last_dispatch.map(|dispatch| {
+            use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerDispatchStatus as N;
+            SchedulerDispatch {
+                occurrence: dispatch.occurrence.to_rfc3339(),
+                status: match dispatch.status {
+                    N::Unconfirmed => SchedulerDispatchStatus::Unconfirmed,
+                    N::Accepted => SchedulerDispatchStatus::Accepted,
+                    N::Skipped => SchedulerDispatchStatus::Skipped,
+                },
+                subagent_id: dispatch.subagent_id,
+            }
+        }),
     }
 }
 

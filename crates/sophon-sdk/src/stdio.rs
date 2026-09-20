@@ -92,13 +92,24 @@ struct RuntimeTools {
 impl crate::native_tools::NativeToolHandler for RuntimeTools {
     async fn execute(&self, name: &str, args: Value, context: p::CallbackContext) -> Result<Value> {
         match name {
-            "browser" => self
-                .browser
-                .as_ref()
-                .ok_or_else(|| Error::Operation("browser is not configured".into()))?
-                .execute(name, args)
-                .await
-                .map_err(operation),
+            "browser" => {
+                let browser = self
+                    .browser
+                    .as_ref()
+                    .ok_or_else(|| Error::Operation("browser is not configured".into()))?;
+                let mut result = browser.execute(name, args).await.map_err(operation)?;
+                if let Some(id) = result.get("artifact_id").and_then(Value::as_str) {
+                    let id = uuid::Uuid::parse_str(id).map_err(operation)?.to_string();
+                    let artifact = browser
+                        .execute_host(json!({"action":"artifact","artifact_id":id}))
+                        .await
+                        .map_err(operation)?;
+                    result["artifact"] =
+                        publish_browser_artifact(&context.cwd, &id, artifact).await?;
+                    result["reviewRequired"] = Value::Bool(true);
+                }
+                Ok(result)
+            }
             "generate_image" | "generate_speech" | "generate_video" => {
                 self.media
                     .as_ref()
@@ -113,6 +124,51 @@ impl crate::native_tools::NativeToolHandler for RuntimeTools {
             }
         }
     }
+}
+
+async fn publish_browser_artifact(cwd: &str, id: &str, artifact: Value) -> Result<Value> {
+    use sha2::Digest;
+    let mime = artifact
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Operation("browser artifact MIME is missing".into()))?;
+    let extension = match mime {
+        "image/png" => "png",
+        "video/mp4" => "mp4",
+        _ => return Err(Error::Operation("unsupported browser artifact MIME".into())),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            artifact
+                .get("base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Operation("browser artifact bytes are missing".into()))?,
+        )
+        .map_err(operation)?;
+    let revision = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let relative = format!(".native-browser/{id}.{extension}");
+    let result = json!({"path":relative,"mimeType":mime,"bytes":bytes.len(),"revision":revision});
+    let cwd = std::path::PathBuf::from(cwd);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let root = cwd.canonicalize().map_err(operation)?;
+        let directory = root.join(".native-browser");
+        std::fs::create_dir_all(&directory).map_err(operation)?;
+        let directory = directory.canonicalize().map_err(operation)?;
+        if !directory.starts_with(&root) {
+            return Err(Error::Operation(
+                "browser artifact directory escapes workspace".into(),
+            ));
+        }
+        let destination = root.join(relative);
+        let mut staging = tempfile::NamedTempFile::new_in(directory).map_err(operation)?;
+        staging.write_all(&bytes).map_err(operation)?;
+        staging.as_file().sync_all().map_err(operation)?;
+        staging.persist_noclobber(destination).map_err(operation)?;
+        Ok(result)
+    })
+    .await
+    .map_err(operation)?
 }
 
 impl Runtime {
@@ -974,4 +1030,76 @@ pub async fn run() -> Result<()> {
     let result = writer.await.map_err(operation)?.map_err(operation);
     drop(frame_tx);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn browser_artifacts_use_invocation_workspace_and_never_clobber() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let id = "01995175-3b18-7001-8ac1-3ac1a7e80d11";
+        let artifact = |bytes: &[u8]| json!({"mime_type":"image/png", "base64":base64::engine::general_purpose::STANDARD.encode(bytes)});
+        let (a, b) = tokio::join!(
+            publish_browser_artifact(
+                first.path().to_str().unwrap(),
+                id,
+                artifact(b"first-workspace")
+            ),
+            publish_browser_artifact(
+                second.path().to_str().unwrap(),
+                id,
+                artifact(b"second-workspace-29")
+            ),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_eq!(a["mimeType"], "image/png");
+        assert_eq!(b["bytes"], 19);
+        assert_ne!(a["revision"], b["revision"]);
+        let relative = a["path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(first.path().join(relative)).unwrap(),
+            b"first-workspace"
+        );
+        assert_eq!(
+            std::fs::read(second.path().join(relative)).unwrap(),
+            b"second-workspace-29"
+        );
+        assert!(
+            publish_browser_artifact(first.path().to_str().unwrap(), id, artifact(b"overwrite"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(first.path().join(relative)).unwrap(),
+            b"first-workspace"
+        );
+        assert_eq!(
+            std::fs::read_dir(first.path().join(".native-browser"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_artifact_symlink_escape_fails_without_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".native-browser")).unwrap();
+        assert!(
+            publish_browser_artifact(
+                root.path().to_str().unwrap(),
+                "artifact",
+                json!({"mime_type":"image/png","base64":"YWJj"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 }

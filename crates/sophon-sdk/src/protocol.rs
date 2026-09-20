@@ -158,6 +158,19 @@ pub struct PromptReceipt {
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalOpenResult {
+    pub terminal_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalCloseResult {
+    pub terminal_id: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Update {
     UserText(String),
@@ -295,6 +308,17 @@ pub struct CallbackContext {
     pub tool_call_id: String,
     /// Actual invocation workspace on the runtime machine (including children).
     pub cwd: String,
+    pub scheduled_invocation: Option<ScheduledInvocation>,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledInvocation {
+    /// Owning scheduler's native Session, not the invoking child Session.
+    pub session_id: String,
+    pub task_id: String,
+    /// Exact consumed native cadence cursor in RFC3339, not a product Turn ID.
+    pub occurrence: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -493,6 +517,8 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     crate::subagent::SubagentResult::export_all(&config)?;
     crate::subagent::SubagentSnapshot::export_all(&config)?;
     crate::subagent::SubagentCancelIdResult::export_all(&config)?;
+    TerminalOpenResult::export_all(&config)?;
+    TerminalCloseResult::export_all(&config)?;
     crate::management::SchedulerSnapshot::export_all(&config)?;
     crate::management::SchedulerMutationResult::<crate::management::ScheduledTask>::export_all(
         &config,

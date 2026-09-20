@@ -22,6 +22,8 @@ import type { SchedulerMutationResult } from './generated/SchedulerMutationResul
 import type { Version } from './generated/Version.js'
 import type { TerminalRequest } from './generated/TerminalRequest.js'
 import type { TerminalEvent } from './generated/TerminalEvent.js'
+import type { TerminalOpenResult } from './generated/TerminalOpenResult.js'
+import type { TerminalCloseResult } from './generated/TerminalCloseResult.js'
 import type { QueueSnapshot } from './generated/QueueSnapshot.js'
 import type { SubagentCancelIdResult } from './generated/SubagentCancelIdResult.js'
 import type { SubagentCancelOutcome } from './generated/SubagentCancelOutcome.js'
@@ -34,11 +36,15 @@ export type { SubagentDefinition } from './generated/SubagentDefinition.js'
 export type { SubagentEvent } from './generated/SubagentEvent.js'
 export type { CompactionUpdate } from './generated/CompactionUpdate.js'
 export type { SchedulerCadence } from './generated/SchedulerCadence.js'
+export type { SchedulerDispatch } from './generated/SchedulerDispatch.js'
+export type { ScheduledInvocation } from './generated/ScheduledInvocation.js'
 export type { TurnCompletion } from './generated/TurnCompletion.js'
 export type { TurnUsage } from './generated/TurnUsage.js'
 export type { QueueSnapshot }
 export type { SubagentCancelIdResult, SubagentCancelOutcome }
 export type { TerminalRequest, TerminalEvent }
+export type { TerminalOpenResult, TerminalCloseResult }
+export type TerminalResult<T extends TerminalRequest> = T extends { action: 'open' } ? TerminalOpenResult : T extends { action: 'close' } ? TerminalCloseResult : Record<string, never>
 export type TerminalStreamEvent = TerminalEvent | { type: 'gap'; dropped: number }
 export type { BrowserConfig } from './generated/BrowserConfig.js'
 export type { HistoryRecord } from './generated/HistoryRecord.js'
@@ -232,7 +238,7 @@ export class Agent {
   listSessions(cwd: string | null = null, cursor: string | null = null): Promise<JsonValue> { return this.request({ method: 'list_sessions', cwd, cursor }) }
   extension(name: string, params: JsonValue): Promise<JsonValue> { return this.request({ method: 'extension', sessionId: null, name, params }) }
   browser(args: JsonValue): Promise<JsonValue> { return this.request({ method: 'browser', args }) }
-  terminal(request: TerminalRequest): Promise<JsonValue> { return this.request({ method: 'terminal', request }) }
+  async terminal<T extends TerminalRequest>(request: T): Promise<TerminalResult<T>> { return await this.request({ method: 'terminal', request }) as unknown as TerminalResult<T> }
   skills(cwd: string): Promise<JsonValue> { return this.extension('x.ai/skills/list', { cwd }) }
   quiesce(timeoutMs = 30_000): Promise<JsonValue> { return this.request({ method: 'quiesce', timeoutMs }) }
 
