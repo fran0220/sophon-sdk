@@ -400,6 +400,13 @@ struct FinalizedTool {
     register_runtime_instance:
         Option<Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>>,
 }
+/// The originating native prompt, distinct from a child's own current prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePromptOrigin {
+    pub session_id: String,
+    pub prompt_id: String,
+}
+
 /// Identity captured by native dispatch, never by an embedding tool's closure.
 /// Child toolsets bind their own source even when sharing concrete tool instances.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +416,7 @@ pub struct NativeInvocationContext {
     pub cwd: std::path::PathBuf,
     pub scheduled_invocation:
         Option<crate::implementations::grok_build::task::types::ScheduledInvocation>,
+    pub originating_prompt: Option<NativePromptOrigin>,
 }
 
 struct NativeInvocationSource {
@@ -417,6 +425,23 @@ struct NativeInvocationSource {
     cwd: std::path::PathBuf,
     scheduled_invocation:
         Option<crate::implementations::grok_build::task::types::ScheduledInvocation>,
+    // None follows this root session's current prompt. Some(None) is a child
+    // without an originating prompt, not permission to invent one from its turn.
+    originating_prompt: Option<Option<NativePromptOrigin>>,
+}
+
+impl NativeInvocationSource {
+    fn originating_prompt(&self, prompt_id: Option<&str>) -> Option<NativePromptOrigin> {
+        if self.scheduled_invocation.is_some() {
+            return None;
+        }
+        self.originating_prompt.clone().unwrap_or_else(|| {
+            prompt_id.map(|prompt_id| NativePromptOrigin {
+                session_id: self.session_id.clone(),
+                prompt_id: prompt_id.to_owned(),
+            })
+        })
+    }
 }
 
 /// Toolset produced by `ToolRegistryBuilder::finalize()`. The tools vector is wrapped in `parking_lot::RwLock` to allow
@@ -1314,7 +1339,41 @@ impl FinalizedToolset {
             current_prompt_id,
             cwd,
             scheduled_invocation: None,
+            originating_prompt: None,
         });
+    }
+
+    /// Bind a child's originating prompt, including an explicit absence.
+    pub fn set_native_originating_prompt(&self, origin: Option<NativePromptOrigin>) {
+        if let Some(source) = self.native_invocation.write().as_mut() {
+            source.originating_prompt = Some(origin);
+        }
+    }
+
+    /// Resolve lineage using the parent's prompt ID captured by native admission,
+    /// rather than reading a potentially newer active prompt after child startup.
+    pub fn native_originating_prompt(&self, prompt_id: Option<&str>) -> Option<NativePromptOrigin> {
+        self.native_invocation
+            .read()
+            .as_ref()?
+            .originating_prompt(prompt_id)
+    }
+
+    /// Preserve lineage across a same-session bridge rebuild, without copying
+    /// session identity or the active prompt slot.
+    pub fn copy_native_lineage_from(&self, source: &Self) {
+        let lineage = source.native_invocation.read().as_ref().map(|source| {
+            (
+                source.scheduled_invocation.clone(),
+                source.originating_prompt.clone(),
+            )
+        });
+        if let Some((scheduled_invocation, originating_prompt)) = lineage
+            && let Some(destination) = self.native_invocation.write().as_mut()
+        {
+            destination.scheduled_invocation = scheduled_invocation;
+            destination.originating_prompt = originating_prompt;
+        }
     }
 
     /// Bind the actual scheduler occurrence before the child's first dispatch.
@@ -1343,15 +1402,18 @@ impl FinalizedToolset {
     ) -> Option<NativeInvocationContext> {
         let source = self.native_invocation.read();
         let source = source.as_ref()?;
+        let prompt_id = source
+            .current_prompt_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let originating_prompt = source.originating_prompt(prompt_id.as_deref());
         Some(NativeInvocationContext {
             session_id: source.session_id.clone(),
-            prompt_id: source
-                .current_prompt_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            prompt_id,
             cwd: cwd.unwrap_or(&source.cwd).clone(),
             scheduled_invocation: source.scheduled_invocation.clone(),
+            originating_prompt,
         })
     }
     pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
@@ -3309,6 +3371,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_prompt_origin_preserves_admission_identity_and_absence() {
+        let parent = FinalizedToolset::empty_for_test();
+        parent.set_native_invocation_context(
+            "root".into(),
+            Arc::new(std::sync::Mutex::new(Some("later".into()))),
+            "/root".into(),
+        );
+        let origin = parent.native_originating_prompt(Some("admitted"));
+        assert_eq!(
+            origin,
+            Some(NativePromptOrigin {
+                session_id: "root".into(),
+                prompt_id: "admitted".into()
+            })
+        );
+        let child = FinalizedToolset::empty_for_test();
+        child.set_native_invocation_context(
+            "child".into(),
+            Arc::new(std::sync::Mutex::new(Some("child-turn".into()))),
+            "/child".into(),
+        );
+        child.set_native_originating_prompt(origin.clone());
+        let dispatch = child.native_invocation_context(None).unwrap();
+        assert_eq!(dispatch.originating_prompt, origin);
+        assert_eq!(dispatch.prompt_id.as_deref(), Some("child-turn"));
+        let rebuilt = FinalizedToolset::empty_for_test();
+        rebuilt.set_native_invocation_context(
+            "child".into(),
+            Arc::new(std::sync::Mutex::new(Some("next-child-turn".into()))),
+            "/child".into(),
+        );
+        rebuilt.copy_native_lineage_from(&child);
+        assert_eq!(
+            rebuilt
+                .native_invocation_context(None)
+                .unwrap()
+                .originating_prompt,
+            origin
+        );
+        child.set_native_originating_prompt(None);
+        assert_eq!(
+            child
+                .native_invocation_context(None)
+                .unwrap()
+                .originating_prompt,
+            None
+        );
+        rebuilt.copy_native_lineage_from(&child);
+        assert_eq!(
+            rebuilt
+                .native_invocation_context(None)
+                .unwrap()
+                .originating_prompt,
+            None
+        );
+        // A rebuilt root continues following actual future prompts, not a frozen old ID.
+        rebuilt.copy_native_lineage_from(&parent);
+        assert_eq!(
+            rebuilt.native_originating_prompt(Some("next-root")),
+            Some(NativePromptOrigin {
+                session_id: "child".into(),
+                prompt_id: "next-root".into()
+            })
+        );
+        assert_eq!(dispatch.originating_prompt, origin);
+    }
+
     #[tokio::test]
     async fn native_runtime_inheritance_keeps_instance_but_uses_child_identity() {
         let parent = Arc::new(FinalizedToolset::empty_for_test());
@@ -3348,6 +3478,7 @@ mod tests {
         child.set_native_scheduled_invocation(Some(occurrence.clone()));
         let captured = child.native_invocation_context(None).unwrap();
         assert_eq!(captured.scheduled_invocation, Some(occurrence.clone()));
+        assert_eq!(captured.originating_prompt, None);
         assert_eq!(captured.session_id, "child");
         child.set_native_scheduled_invocation(None);
         assert_eq!(captured.scheduled_invocation, Some(occurrence));

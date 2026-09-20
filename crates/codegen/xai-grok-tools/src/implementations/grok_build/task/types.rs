@@ -221,6 +221,8 @@ pub struct SubagentRuntimeOverrides {
     pub agent_admission: Option<crate::management::admission::AdmissionPermit>,
     /// Harness-owned scheduler source; not accepted from model-facing arguments.
     pub scheduled_invocation: Option<ScheduledInvocation>,
+    /// Captured native originating prompt; never supplied by model-facing arguments.
+    pub originating_prompt: Option<crate::registry::types::NativePromptOrigin>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.

@@ -385,13 +385,7 @@ impl SessionActor {
         new_agent
             .tool_bridge()
             .toolset()
-            .set_native_scheduled_invocation(
-                self.agent
-                    .borrow()
-                    .tool_bridge()
-                    .toolset()
-                    .native_scheduled_invocation(),
-            );
+            .copy_native_lineage_from(&self.agent.borrow().tool_bridge().toolset());
         self.abort_and_clear_prefire().await;
         *self.agent.borrow_mut() = new_agent;
         *self.active_agent_type.lock() = Some(new_agent_name.clone());

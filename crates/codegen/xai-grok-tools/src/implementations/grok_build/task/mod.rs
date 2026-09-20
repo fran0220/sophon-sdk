@@ -609,6 +609,9 @@ impl xai_tool_runtime::Tool for TaskTool {
                 scheduled_invocation: ctx
                     .get::<crate::registry::types::NativeInvocationContext>()
                     .and_then(|native| native.scheduled_invocation.clone()),
+                originating_prompt: ctx
+                    .get::<crate::registry::types::NativeInvocationContext>()
+                    .and_then(|native| native.originating_prompt.clone()),
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
@@ -901,65 +904,75 @@ mod tests {
 
     #[tokio::test]
     async fn raised_max_depth_allows_nested_spawn() {
-        let (backend, mut rx) = make_backend();
-        let mut resources = Resources::new();
-        resources.insert(backend);
-        resources.insert(SubagentDepthCounter(1));
-        resources.insert(MaxSubagentDepth(2));
-        resources.insert(SessionIdResource("child-session".to_string()));
-        resources.insert(CurrentPromptIdResource("prompt-nested".to_string()));
+        for scheduled in [false, true] {
+            let (backend, mut rx) = make_backend();
+            let mut resources = Resources::new();
+            resources.insert(backend);
+            resources.insert(SubagentDepthCounter(1));
+            resources.insert(MaxSubagentDepth(2));
+            resources.insert(SessionIdResource("child-session".to_string()));
+            resources.insert(CurrentPromptIdResource("prompt-nested".to_string()));
 
-        let invocation = types::ScheduledInvocation {
-            session_id: "scheduler-owner".into(),
-            task_id: "scheduled-task".into(),
-            occurrence: chrono::DateTime::parse_from_rfc3339("2026-09-20T10:30:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        };
-        let expected = invocation.clone();
-        let drain = tokio::spawn(async move {
-            if let Some(SubagentEvent::Spawn(mut req)) = rx.recv().await {
-                assert_eq!(req.runtime_overrides.scheduled_invocation, Some(expected));
-                assert_eq!(req.parent_session_id, "child-session");
-                req.notify_registered();
-            }
-        });
-
-        let mut context = test_ctx(resources.into_shared());
-        context
-            .extensions
-            .insert(crate::registry::types::NativeInvocationContext {
-                session_id: "child-session".into(),
-                prompt_id: Some("prompt-nested".into()),
-                cwd: "/child".into(),
-                scheduled_invocation: Some(invocation),
+            let invocation = types::ScheduledInvocation {
+                session_id: "scheduler-owner".into(),
+                task_id: "scheduled-task".into(),
+                occurrence: chrono::DateTime::parse_from_rfc3339("2026-09-20T10:30:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            };
+            let originating_prompt =
+                (!scheduled).then(|| crate::registry::types::NativePromptOrigin {
+                    session_id: "original-root".into(),
+                    prompt_id: "original-prompt".into(),
+                });
+            let expected = scheduled.then_some(invocation.clone());
+            let expected_origin = originating_prompt.clone();
+            let drain = tokio::spawn(async move {
+                if let Some(SubagentEvent::Spawn(mut req)) = rx.recv().await {
+                    assert_eq!(req.runtime_overrides.scheduled_invocation, expected);
+                    assert_eq!(req.runtime_overrides.originating_prompt, expected_origin);
+                    assert_eq!(req.parent_session_id, "child-session");
+                    req.notify_registered();
+                }
             });
-        let result = xai_tool_runtime::Tool::run(
-            &TaskTool,
-            context,
-            TaskToolInput {
-                description: "nested ok".into(),
-                prompt: "should be allowed at max_depth=2".into(),
-                subagent_type: "explore".into(),
-                run_in_background: true,
-                capability_mode: None,
-                isolation: None,
-                resume_from: None,
-                cwd: None,
-                model: None,
-                task_id: None,
-            },
-        )
-        .await;
 
-        assert!(
-            result.is_ok(),
-            "expected Ok at depth 1 with max 2: {result:?}"
-        );
-        tokio::time::timeout(std::time::Duration::from_millis(500), drain)
-            .await
-            .unwrap()
-            .unwrap();
+            let mut context = test_ctx(resources.into_shared());
+            context
+                .extensions
+                .insert(crate::registry::types::NativeInvocationContext {
+                    session_id: "child-session".into(),
+                    prompt_id: Some("prompt-nested".into()),
+                    cwd: "/child".into(),
+                    scheduled_invocation: scheduled.then_some(invocation),
+                    originating_prompt,
+                });
+            let result = xai_tool_runtime::Tool::run(
+                &TaskTool,
+                context,
+                TaskToolInput {
+                    description: "nested ok".into(),
+                    prompt: "should be allowed at max_depth=2".into(),
+                    subagent_type: "explore".into(),
+                    run_in_background: true,
+                    capability_mode: None,
+                    isolation: None,
+                    resume_from: None,
+                    cwd: None,
+                    model: None,
+                    task_id: None,
+                },
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "expected Ok at depth 1 with max 2: {result:?}"
+            );
+            tokio::time::timeout(std::time::Duration::from_millis(500), drain)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

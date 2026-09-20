@@ -1745,6 +1745,8 @@ pub(crate) async fn run_shell_child(
     }
     child_toolset
         .set_native_scheduled_invocation(request.runtime_overrides.scheduled_invocation.clone());
+    child_toolset
+        .set_native_originating_prompt(request.runtime_overrides.originating_prompt.clone());
     session::bind_installed_toolset(
         &ctx.workspace_ops,
         &child_handle.info.id,

@@ -169,6 +169,10 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 ctx.parent_mcp_pool = pool;
                 ctx.client_hooks = hooks;
                 ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+                if run.request.runtime_overrides.originating_prompt.is_none() {
+                    run.request.runtime_overrides.originating_prompt =
+                        toolset.native_originating_prompt(run.request.parent_prompt_id.as_deref());
+                }
                 ctx.parent_toolset = Some(toolset);
             }
             if let Some(spawner) = spawner_session_id.as_deref() {
