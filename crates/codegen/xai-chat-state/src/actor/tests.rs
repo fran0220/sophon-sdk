@@ -1407,6 +1407,71 @@ async fn update_sampling_config_is_queryable() {
 }
 
 #[tokio::test]
+async fn prepared_config_installs_head_route_and_credentials_or_nothing() {
+    for cancel in [false, true] {
+        let h = TestHarness::with_conversation(vec![
+            ConversationItem::system("old instructions"),
+            ConversationItem::user("retained user turn"),
+        ]);
+        let before = h.handle.snapshot().await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        if cancel {
+            token.cancel();
+        }
+        let mut config = test_config_with_window(64_000);
+        config.model = "new-route".into();
+        config.base_url = "https://new-provider.example/v1".into();
+        config.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::High);
+        let credentials = crate::Credentials {
+            api_key: Some("test-only-new-key".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.handle
+                .install_prepared_config(
+                    "new instructions".into(),
+                    config,
+                    credentials,
+                    token.clone(),
+                )
+                .await,
+            Some(!cancel),
+        );
+        // A cancellation after acknowledgment must not undo the committed bundle.
+        token.cancel();
+        let after = h.handle.snapshot().await.unwrap();
+        if cancel {
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        } else {
+            assert_eq!(after.sampling_config.model, "new-route");
+            assert_eq!(
+                after.sampling_config.base_url,
+                "https://new-provider.example/v1"
+            );
+            assert_eq!(after.sampling_config.context_window.get(), 64_000);
+            assert_eq!(
+                after.sampling_config.reasoning_effort,
+                Some(xai_grok_sampling_types::ReasoningEffort::High)
+            );
+            assert_eq!(
+                after.credentials.api_key.as_deref(),
+                Some("test-only-new-key")
+            );
+            assert!(
+                matches!(&after.conversation[0], ConversationItem::System(s) if s.content.as_ref() == "new instructions")
+            );
+            assert_eq!(
+                serde_json::to_value(&after.conversation[1..]).unwrap(),
+                serde_json::to_value(&before.conversation[1..]).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn notification_meta_reflects_timing() {
     let h = TestHarness::new();
     h.handle.record_stream_start(1000);

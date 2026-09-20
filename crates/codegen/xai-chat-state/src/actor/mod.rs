@@ -227,6 +227,25 @@ impl ChatStateActor {
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = *config;
             }
+            ChatStateCommand::InstallPreparedConfig {
+                prompt,
+                config,
+                credentials,
+                cancelled,
+                reply,
+            } => {
+                if cancelled.is_cancelled() || reply.is_closed() {
+                    let _ = reply.send(false);
+                } else {
+                    // No await: requests can observe only the old bundle or the
+                    // complete replacement. Cancellation after this point loses
+                    // to publication; the session must finish its matching swap.
+                    self.state.sampling_config = *config;
+                    self.state.credentials = credentials;
+                    self.replace_system_head(&prompt);
+                    let _ = reply.send(true);
+                }
+            }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
             }

@@ -136,6 +136,17 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: Box<SamplingConfig> },
 
+    /// Install a prepared prompt head, model route, and credentials together.
+    /// The session actor must fence turn admission around this command. A
+    /// cancelled preparation cannot publish any part of the candidate.
+    InstallPreparedConfig {
+        prompt: String,
+        config: Box<SamplingConfig>,
+        credentials: crate::Credentials,
+        cancelled: tokio_util::sync::CancellationToken,
+        reply: oneshot::Sender<bool>,
+    },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 

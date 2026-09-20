@@ -232,6 +232,28 @@ impl ChatStateHandle {
         });
     }
 
+    /// Publish one prepared configuration in the chat-state actor. `Some(true)`
+    /// acknowledges the entire install; `Some(false)` means cancellation won
+    /// before publication. `None` means the actor is unavailable.
+    pub async fn install_prepared_config(
+        &self,
+        prompt: String,
+        config: SamplingConfig,
+        credentials: crate::Credentials,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> Option<bool> {
+        self.query("InstallPreparedConfig", |reply| {
+            ChatStateCommand::InstallPreparedConfig {
+                prompt,
+                config: Box::new(config),
+                credentials,
+                cancelled,
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self
