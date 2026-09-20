@@ -203,12 +203,24 @@ pub enum ModelOverrideProvenance {
     Tool,
 }
 
+/// Authoritative origin of a scheduled firing, retained across child/descendant
+/// sessions. The occurrence is the actor's consumed cursor, never a poll time or
+/// a synthetic ordinary prompt ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledInvocation {
+    pub session_id: String,
+    pub task_id: String,
+    pub occurrence: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
     /// Agent-level admission retained by scheduler-originated work while it
     /// is queued or running in the shared subagent coordinator. Never set by
     /// model-facing task input.
     pub agent_admission: Option<crate::management::admission::AdmissionPermit>,
+    /// Harness-owned scheduler source; not accepted from model-facing arguments.
+    pub scheduled_invocation: Option<ScheduledInvocation>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.

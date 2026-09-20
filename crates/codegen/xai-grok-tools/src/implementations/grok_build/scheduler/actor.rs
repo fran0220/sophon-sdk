@@ -6,9 +6,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::implementations::grok_build::task::types::{
-    SessionIdResource, SubagentEvent, SubagentEventSender, SubagentLoopUnitActiveRequest,
-    SubagentOwner, SubagentQueryRequest, SubagentRequest, SubagentRuntimeOverrides,
-    SubagentSnapshotStatus, SubagentSpawnRequest,
+    ScheduledInvocation, SessionIdResource, SubagentEvent, SubagentEventSender,
+    SubagentLoopUnitActiveRequest, SubagentOwner, SubagentQueryRequest, SubagentRequest,
+    SubagentRuntimeOverrides, SubagentSnapshotStatus, SubagentSpawnRequest,
 };
 use crate::notification::types::ToolNotificationHandle;
 use crate::notification::{
@@ -499,7 +499,9 @@ impl SchedulerActor {
         let Some(task) = state.tasks.get_mut(idx) else {
             return;
         };
-        let previous_occurrence = task.next_run_at;
+        let Some(previous_occurrence) = task.next_run_at else {
+            return;
+        };
         task.next_run_at = task.cadence.next_after(now);
         let next_fire_at = task.next_occurrence().map(|at| at.to_rfc3339());
 
@@ -527,6 +529,7 @@ impl SchedulerActor {
                     &events,
                     parent_session_id,
                     &task_id,
+                    previous_occurrence,
                     &prompt,
                     &human_schedule,
                     last_subagent_id,
@@ -558,7 +561,7 @@ impl SchedulerActor {
                         .iter_mut()
                         .find(|task| task.id == task_id)
                     {
-                        task.next_run_at = previous_occurrence;
+                        task.next_run_at = Some(previous_occurrence);
                     }
                 }
                 if let Err(error) = self.persist_resources().await {
@@ -671,6 +674,7 @@ impl SchedulerActor {
         events: &SubagentEventSender,
         parent_session_id: String,
         task_id: &str,
+        occurrence: chrono::DateTime<Utc>,
         prompt: &str,
         human_schedule: &str,
         last_subagent_id: Option<String>,
@@ -838,12 +842,17 @@ impl SchedulerActor {
             prompt: framed_prompt,
             description,
             subagent_type: "general-purpose".to_string(),
-            parent_session_id,
+            parent_session_id: parent_session_id.clone(),
             parent_prompt_id: None,
             resume_from,
             cwd: None,
             runtime_overrides: SubagentRuntimeOverrides {
                 agent_admission,
+                scheduled_invocation: Some(ScheduledInvocation {
+                    session_id: parent_session_id,
+                    task_id: task_id.to_string(),
+                    occurrence,
+                }),
                 completion_output_cap: Some(LOOP_COMPLETION_OUTPUT_CAP),
                 spawn_depth: Some(0),
                 loop_task_id: Some(task_id.to_string()),
@@ -1518,6 +1527,14 @@ mod tests {
             );
             assert!(spawn.request.parent_prompt_id.is_none());
             assert_eq!(spawn.request.owner, SubagentOwner::Task);
+            assert_eq!(
+                spawn.request.runtime_overrides.scheduled_invocation,
+                Some(ScheduledInvocation {
+                    session_id: "parent-session".into(),
+                    task_id: task.id.clone(),
+                    occurrence: anchor,
+                })
+            );
             spawn.registered_tx.take().unwrap().send(()).unwrap();
             (requests, state)
         });
@@ -3079,6 +3096,21 @@ mod tests {
         assert_eq!(fired.revision, 1);
         assert_eq!(second.resume_from.as_deref(), Some(first_id.as_str()));
         assert_ne!(second.id, first_id);
+        let first_source = first
+            .runtime_overrides
+            .scheduled_invocation
+            .as_ref()
+            .unwrap();
+        let second_source = second
+            .runtime_overrides
+            .scheduled_invocation
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_source.session_id, "parent-session");
+        assert_eq!(second_source.session_id, first_source.session_id);
+        assert_eq!(second_source.task_id, first_source.task_id);
+        assert!(second_source.occurrence > first_source.occurrence);
+        assert!(first.parent_prompt_id.is_none() && second.parent_prompt_id.is_none());
 
         cancel.cancel();
     }

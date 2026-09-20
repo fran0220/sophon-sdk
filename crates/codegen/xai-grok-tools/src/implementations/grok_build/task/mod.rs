@@ -606,6 +606,7 @@ impl xai_tool_runtime::Tool for TaskTool {
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
                 agent_admission: None,
+                scheduled_invocation: None,
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
