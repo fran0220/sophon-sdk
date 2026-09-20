@@ -131,18 +131,41 @@ impl PtyHandle {
             .spawn_command(cmd)
             .context("failed to spawn command in PTY")?;
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
+        Self::finish_spawn(pair.master, child)
+    }
 
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
+    /// The process already exists: every fallible stream acquisition must pass
+    /// through this rollback boundary rather than dropping an unreaped child.
+    fn finish_spawn(
+        master: Box<dyn MasterPty + Send>,
+        mut child: Box<dyn portable_pty::Child + Send>,
+    ) -> Result<Self> {
+        let streams = (|| {
+            let reader = master
+                .try_clone_reader()
+                .context("failed to clone PTY reader")?;
+            let writer = master.take_writer().context("failed to take PTY writer")?;
+            Ok::<_, anyhow::Error>((reader, writer))
+        })();
+        let (reader, writer) = match streams {
+            Ok(streams) => streams,
+            Err(mut acquisition_error) => {
+                // Do not replace the acquisition error with cleanup's result.
+                // Wait even if kill fails: an already-exited child still needs reaping.
+                if let Err(e) = child.kill() {
+                    acquisition_error =
+                        acquisition_error.context(format!("PTY rollback kill failed: {e}"));
+                }
+                if let Err(e) = child.wait() {
+                    acquisition_error =
+                        acquisition_error.context(format!("PTY rollback wait failed: {e}"));
+                }
+                return Err(acquisition_error);
+            }
+        };
 
         Ok(Self {
-            master: pair.master,
+            master,
             child,
             reader,
             writer,
@@ -167,5 +190,83 @@ impl PtyHandle {
             self.reader,
             self.writer,
         )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_acquisition_failure_reaps_child() {
+        const CHILD_MODE: &str = "PTYCTL_FD_EXHAUSTION_TEST";
+        if std::env::var_os(CHILD_MODE).is_none() {
+            // Change RLIMIT_NOFILE only in a fresh test process, never in the test
+            // runner (whose other tests may be opening files concurrently).
+            for spare in ["0", "1"] {
+                let status = std::process::Command::new("/bin/sh")
+                    .args(["-c", "ulimit -n 64; exec \"$1\" --exact pty::tests::stream_acquisition_failure_reaps_child --nocapture", "ptyctl-test"])
+                    .arg(std::env::current_exe().expect("test executable"))
+                    .env(CHILD_MODE, spare)
+                    .status()
+                    .expect("isolated test process");
+                assert!(
+                    status.success(),
+                    "isolated FD-exhaustion test ({spare} spare descriptors)"
+                );
+            }
+            return;
+        }
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open PTY before exhaustion");
+        let mut command = CommandBuilder::new("/bin/sleep");
+        command.arg("300");
+        #[allow(clippy::disallowed_methods)]
+        let child = pair.slave.spawn_command(command).expect("real child");
+        let pid = child.process_id().expect("PID");
+        drop(pair.slave);
+        let mut descriptors = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => descriptors.push(file),
+                Err(e) => {
+                    assert_eq!(e.raw_os_error(), Some(24), "must reach EMFILE");
+                    break;
+                }
+            }
+        }
+        let spare = std::env::var(CHILD_MODE).expect("mode");
+        if spare == "1" {
+            descriptors.pop();
+        }
+        // With zero spare FDs the reader dup fails. With one spare, reader
+        // acquisition succeeds and the writer dup fails. Neither is a mock.
+        let error = match PtyHandle::finish_spawn(pair.master, child) {
+            Ok(_) => panic!("stream acquisition unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        let stage = if spare == "0" {
+            "failed to clone PTY reader"
+        } else {
+            "failed to take PTY writer"
+        };
+        assert!(
+            message.contains(stage),
+            "original acquisition error lost: {message}"
+        );
+        assert!(message.contains("Too many open files"), "{message}");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "spawned child was not reaped"
+        );
+        drop(descriptors);
     }
 }
