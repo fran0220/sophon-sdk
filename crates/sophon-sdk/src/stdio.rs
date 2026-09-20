@@ -2,6 +2,7 @@
 //! only Grok Build owns prompt admission, scheduling, and durable execution.
 use std::{collections::HashMap, num::NonZeroU64, sync::Arc, time::Duration};
 
+use base64::Engine;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -75,6 +76,42 @@ impl ClientHandler for Callbacks {
 struct Runtime {
     agent: Agent,
     sessions: Mutex<HashMap<String, Session>>,
+    workspaces: Mutex<HashMap<String, String>>,
+    handlers: Arc<RuntimeTools>,
+    native_specs: Vec<p::ToolSpec>,
+}
+
+struct RuntimeTools {
+    callbacks: Arc<Callbacks>,
+    browser: Option<Arc<sophon_browser::BrowserService>>,
+    media: Option<crate::native_media::NativeMediaService>,
+}
+
+#[async_trait::async_trait]
+impl crate::native_tools::NativeToolHandler for RuntimeTools {
+    async fn execute(&self, name: &str, args: Value, context: p::CallbackContext) -> Result<Value> {
+        match name {
+            "browser" => self
+                .browser
+                .as_ref()
+                .ok_or_else(|| Error::Operation("browser is not configured".into()))?
+                .execute(name, args)
+                .await
+                .map_err(operation),
+            "generate_image" | "generate_speech" | "generate_video" => {
+                self.media
+                    .as_ref()
+                    .ok_or_else(|| Error::Operation("media is not configured".into()))?
+                    .execute(name, args, std::path::Path::new(&context.cwd))
+                    .await
+            }
+            _ => {
+                self.callbacks
+                    .call(format!("tool/{name}"), args, Some(context))
+                    .await
+            }
+        }
+    }
 }
 
 impl Runtime {
@@ -187,7 +224,149 @@ impl Runtime {
                 Some(id) => self.session(&id).await?.extension(name, params).await,
                 None => self.agent.extension(name, params).await,
             },
-            Browser { .. } => Err(Error::Operation("browser is not configured".into())),
+            Browser { args } => self
+                .handlers
+                .browser
+                .as_ref()
+                .ok_or_else(|| Error::Operation("browser is not configured".into()))?
+                .execute("browser", args)
+                .await
+                .map_err(operation),
+            ReadArtifact { session_id, path } => {
+                let cwd = self
+                    .workspaces
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| Error::Operation("session is not attached".into()))?;
+                let root = tokio::fs::canonicalize(cwd).await.map_err(operation)?;
+                let relative = std::path::Path::new(&path);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|v| matches!(v, std::path::Component::ParentDir))
+                {
+                    return Err(Error::invalid_config(
+                        "artifact path must be workspace-relative",
+                    ));
+                }
+                let file = tokio::fs::canonicalize(root.join(relative))
+                    .await
+                    .map_err(operation)?;
+                if !file.starts_with(root) {
+                    return Err(Error::invalid_config("artifact escapes workspace"));
+                }
+                if tokio::fs::metadata(&file).await.map_err(operation)?.len() > 32 * 1024 * 1024 {
+                    return Err(Error::Operation(
+                        "artifact exceeds 32 MiB transport limit".into(),
+                    ));
+                }
+                let bytes = tokio::fs::read(file).await.map_err(operation)?;
+                Ok(
+                    json!({"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                )
+            }
+            SubagentStart {
+                session_id,
+                request,
+            } => encode(
+                self.session(&session_id)
+                    .await?
+                    .subagents()
+                    .start(request)
+                    .await
+                    .map_err(operation)?,
+            ),
+            SubagentQuery { session_id, id } => encode(
+                self.session(&session_id)
+                    .await?
+                    .subagents()
+                    .query(&id)
+                    .await
+                    .map_err(operation)?,
+            ),
+            SubagentWait {
+                session_id,
+                id,
+                timeout_ms,
+            } => {
+                let subagents = self.session(&session_id).await?.subagents();
+                tokio::time::timeout(Duration::from_millis(timeout_ms.into()), async {
+                    loop {
+                        let snapshot = subagents
+                            .query(&id)
+                            .await
+                            .map_err(operation)?
+                            .ok_or_else(|| Error::Operation("unknown subagent".into()))?;
+                        if !matches!(
+                            snapshot.state,
+                            crate::subagent::SubagentState::Initializing
+                                | crate::subagent::SubagentState::Running
+                        ) {
+                            return encode(snapshot);
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    Error::Operation("subagent wait timed out; native child remains running".into())
+                })?
+            }
+            SubagentCancel { session_id, target } => {
+                let outcome = self
+                    .session(&session_id)
+                    .await?
+                    .subagents()
+                    .cancel(&target)
+                    .await
+                    .map_err(operation)?;
+                Ok(json!({"outcome":format!("{outcome:?}")}))
+            }
+            SchedulerList { session_id } => encode(
+                self.session(&session_id)
+                    .await?
+                    .scheduler_snapshot()
+                    .await
+                    .map_err(operation)?,
+            ),
+            SchedulerCreate {
+                session_id,
+                operation_id,
+                expected,
+                task,
+            } => encode(
+                self.session(&session_id)
+                    .await?
+                    .create_scheduled_task(operation_id, expected, task)
+                    .await
+                    .map_err(operation)?,
+            ),
+            SchedulerUpdate {
+                session_id,
+                operation_id,
+                expected,
+                task,
+            } => encode(
+                self.session(&session_id)
+                    .await?
+                    .update_scheduled_task(operation_id, expected, task)
+                    .await
+                    .map_err(operation)?,
+            ),
+            SchedulerDelete {
+                session_id,
+                operation_id,
+                expected,
+                id,
+            } => encode(
+                self.session(&session_id)
+                    .await?
+                    .delete_scheduled_task(operation_id, expected, id)
+                    .await
+                    .map_err(operation)?,
+            ),
             Quiesce { timeout_ms } => {
                 let report = self
                     .agent
@@ -203,6 +382,9 @@ impl Runtime {
                     .final_exit(Duration::from_millis(timeout_ms.into()))
                     .await
                     .map_err(operation)?;
+                if let Some(browser) = &self.handlers.browser {
+                    browser.close().await.map_err(operation)?;
+                }
                 Ok(Value::Null)
             }
         }
@@ -215,11 +397,12 @@ impl Runtime {
             p::Request::ResumeSession { id, options } => (options, Some(id), false),
             other => return self.dispatch(other).await,
         };
-        if !options.tools.is_empty() {
-            return Err(Error::Operation(
-                "product tool registration is not installed".into(),
-            ));
-        }
+        let specs = self
+            .native_specs
+            .iter()
+            .cloned()
+            .chain(options.tools)
+            .collect::<Vec<_>>();
         let mut config = SessionConfig::new(&options.workspace.cwd);
         if let Some(model) = options.model {
             config = config.model(model);
@@ -235,6 +418,21 @@ impl Runtime {
             Some(id) if load => self.agent.load_session(id.into(), config).await?,
             Some(id) => self.agent.resume_session(id.into(), config).await?,
         };
+        session
+            .register_tools(
+                specs
+                    .into_iter()
+                    .map(|spec| crate::native_tools::NativeTool {
+                        spec,
+                        handler: self.handlers.clone(),
+                    })
+                    .collect(),
+            )
+            .await?;
+        self.workspaces
+            .lock()
+            .await
+            .insert(session.id().to_string(), options.workspace.cwd.clone());
         let descriptor = p::SessionDescriptor {
             id: session.id().to_string(),
             workspace: options.workspace,
@@ -434,9 +632,19 @@ fn respond(output: &mpsc::UnboundedSender<p::ServerFrame>, id: String, result: R
 /// it is never interpreted as successful persistence without a native receipt.
 pub async fn run() -> Result<()> {
     let (output, mut outgoing) = mpsc::unbounded_channel();
+    let (frame_tx, mut frame_rx) = tokio::sync::watch::channel::<Option<Value>>(None);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        while let Some(frame) = outgoing.recv().await {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                frame = outgoing.recv() => match frame { Some(frame)=>frame,None=>break },
+                changed = frame_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let frame = frame_rx.borrow_and_update().clone();
+                    match frame {Some(frame)=>p::ServerFrame::BrowserFrame {frame},None=>continue}
+                }
+            };
             let mut bytes = serde_json::to_vec(&frame).map_err(std::io::Error::other)?;
             bytes.push(b'\n');
             stdout.write_all(&bytes).await?;
@@ -457,6 +665,7 @@ pub async fn run() -> Result<()> {
     let mut runtime: Option<Arc<Runtime>> = None;
     let mut requests = tokio::task::JoinSet::new();
     let mut events = None;
+    let mut browser_frames = None;
     let mut exit_requested = false;
     while let Some(line) = lines.next_line().await.map_err(operation)? {
         let frame: p::ClientFrame = serde_json::from_str(&line)
@@ -475,9 +684,72 @@ pub async fn run() -> Result<()> {
                 id,
                 request: p::Request::Initialize { config },
             } if runtime.is_none() => {
-                let started = Agent::start(agent_config(config, callbacks.clone())?).await;
+                let browser = config.browser.as_ref().map(|config| {
+                    Arc::new(sophon_browser::BrowserService::new(
+                        sophon_browser::BrowserConfig {
+                            executable: config.executable.clone().into(),
+                            data_dir: config.data_dir.clone().into(),
+                            artifact_dir: config.artifact_dir.clone().into(),
+                            headless: config.headless,
+                            no_sandbox: config.no_sandbox,
+                        },
+                    ))
+                });
+                let mut native_specs = Vec::new();
+                if browser.is_some() {
+                    native_specs.extend(
+                        sophon_browser::BrowserService::tool_specs()
+                            .into_iter()
+                            .map(|v| p::ToolSpec {
+                                name: v.name,
+                                description: v.description,
+                                input_schema: v.input_schema,
+                            }),
+                    );
+                }
+                if let Some(media) = &config.media {
+                    native_specs.extend(
+                        crate::native_media::NativeMediaService::tool_specs()
+                            .into_iter()
+                            .filter(|v| match v.name.as_str() {
+                                "generate_image" => media.image.is_some(),
+                                "generate_speech" => media.speech.is_some(),
+                                "generate_video" => media.video.is_some(),
+                                _ => false,
+                            }),
+                    );
+                }
+                let handlers = Arc::new(RuntimeTools {
+                    callbacks: callbacks.clone(),
+                    browser: browser.clone(),
+                    media: config
+                        .media
+                        .clone()
+                        .map(crate::native_media::NativeMediaService::new),
+                });
+                let started = match agent_config(config, callbacks.clone()) {
+                    Ok(config) => Agent::start(config).await,
+                    Err(error) => Err(error),
+                };
                 match started {
                     Ok(agent) => {
+                        if let Some(browser) = browser {
+                            let mut rx = browser.subscribe_frames();
+                            let tx = frame_tx.clone();
+                            browser_frames = Some(tokio::spawn(async move {
+                                loop {
+                                    match rx.recv().await {
+                                        Ok(frame) => {
+                                            tx.send_replace(Some(frame));
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            _,
+                                        )) => continue,
+                                        Err(_) => break,
+                                    }
+                                }
+                            }));
+                        }
                         let mut rx = agent.subscribe();
                         let out = output.clone();
                         events = Some(tokio::spawn(async move {
@@ -503,6 +775,9 @@ pub async fn run() -> Result<()> {
                         runtime = Some(Arc::new(Runtime {
                             agent,
                             sessions: Mutex::default(),
+                            workspaces: Mutex::default(),
+                            handlers,
+                            native_specs,
                         }));
                         respond(&output, id, Ok(initial));
                     }
@@ -518,9 +793,22 @@ pub async fn run() -> Result<()> {
                     let runtime = runtime.clone();
                     let out = output.clone();
                     exit_requested = matches!(request, p::Request::FinalExit { .. });
+                    let is_exit = exit_requested;
                     requests.spawn(async move {
                         let result = runtime.run_request(request).await;
+                        let exit_error = if is_exit {
+                            result
+                                .as_ref()
+                                .err()
+                                .map(|e| Error::Operation(e.to_string()))
+                        } else {
+                            None
+                        };
                         respond(&out, id, result);
+                        match exit_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        }
                     });
                     if exit_requested {
                         break;
@@ -538,20 +826,25 @@ pub async fn run() -> Result<()> {
     if !exit_requested {
         if let Some(runtime) = &runtime {
             runtime
-                .agent
-                .final_exit(Duration::from_secs(30))
-                .await
-                .map_err(operation)?;
+                .dispatch(p::Request::FinalExit { timeout_ms: 30_000 })
+                .await?;
         }
     }
     while let Some(result) = requests.join_next().await {
-        result.map_err(operation)?;
+        result.map_err(operation)??;
     }
     drop(runtime);
     drop(callbacks);
     if let Some(events) = events {
         events.await.map_err(operation)?;
     }
+    if let Some(task) = browser_frames {
+        task.abort();
+        let _ = task.await;
+    }
     drop(output);
-    writer.await.map_err(operation)?.map_err(operation)
+    // Keep the latest-frame channel alive until the reliable writer drains.
+    let result = writer.await.map_err(operation)?.map_err(operation);
+    drop(frame_tx);
+    result
 }

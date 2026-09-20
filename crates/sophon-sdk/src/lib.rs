@@ -15,6 +15,8 @@ mod event;
 pub mod management;
 pub mod mcp;
 mod model_facts;
+pub mod native_media;
+pub mod native_tools;
 pub mod protocol;
 mod runtime;
 pub mod stdio;
@@ -78,7 +80,8 @@ impl Error {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(transparent)]
 pub struct SessionId(pub(crate) String);
 
 impl fmt::Display for SessionId {

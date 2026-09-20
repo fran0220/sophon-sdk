@@ -59,6 +59,7 @@ enum Command {
     LoadSession(SessionConfig, SessionId, Reply<serde_json::Value>),
     ResumeSession(SessionConfig, SessionId, Reply<serde_json::Value>),
     ListSessions(Option<PathBuf>, Option<String>, Reply<SessionPage>),
+    RegisterTools(SessionId, Vec<crate::native_tools::NativeTool>, Reply<()>),
     Prompt(
         SessionId,
         Vec<PromptBlock>,
@@ -210,6 +211,15 @@ pub enum FinalExitError {
 }
 
 impl Agent {
+    pub(crate) async fn register_tools(
+        &self,
+        id: SessionId,
+        tools: Vec<crate::native_tools::NativeTool>,
+    ) -> Result<(), Error> {
+        self.request(|reply| Command::RegisterTools(id, tools, reply))
+            .await
+    }
+
     pub async fn start(config: AgentConfig) -> Result<Self, Error> {
         require_hermetic_discovery()?;
         config.validate()?;
@@ -1060,6 +1070,34 @@ async fn command_loop(
             }
             Command::PortableImportStatus(snapshot, cwd, reply) => {
                 let _ = reply.send(agent.portable_import_status(&snapshot, &cwd));
+            }
+            Command::RegisterTools(id, tools, reply) => {
+                let native_id = acp::SessionId::new(id.to_string());
+                let result = async {
+                    let toolset = agent.session_toolset(&native_id).await.map_err(acp_error)?;
+                    let prompt_id = agent
+                        .session_current_prompt_id(&native_id)
+                        .await
+                        .map_err(acp_error)?;
+                    for tool in tools {
+                        let name = tool.spec.name.clone();
+                        let schema = tool.spec.input_schema.clone();
+                        toolset
+                            .register_tool(
+                                name,
+                                crate::native_tools::RegisteredTool {
+                                    tool,
+                                    session_id: id.to_string(),
+                                    prompt_id: prompt_id.clone(),
+                                },
+                                Some(schema),
+                            )
+                            .map_err(|error| Error::Operation(error.to_string()))?;
+                    }
+                    Ok(())
+                }
+                .await;
+                let _ = reply.send(result);
             }
             Command::CreateSession(config, reply) => {
                 let agent = agent.clone();

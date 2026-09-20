@@ -4,4 +4,4 @@ import type { RpcError } from "./RpcError.js";
 import type { RuntimeEvent } from "./RuntimeEvent.js";
 import type { JsonValue } from "./serde_json/JsonValue.js";
 
-export type ServerFrame = { "type": "ready", protocolVersion: number, } | { "type": "response", id: string, result: JsonValue, } | { "type": "error", id: string, error: RpcError, } | { "type": "event", sequence: number, event: RuntimeEvent, } | { "type": "callback", id: string, method: string, params: JsonValue, context: CallbackContext | null, } | { "type": "callback_cancelled", id: string, };
+export type ServerFrame = { "type": "ready", protocolVersion: number, } | { "type": "response", id: string, result: JsonValue, } | { "type": "error", id: string, error: RpcError, } | { "type": "event", sequence: number, event: RuntimeEvent, } | { "type": "callback", id: string, method: string, params: JsonValue, context: CallbackContext | null, } | { "type": "callback_cancelled", id: string, } | { "type": "browser_frame", frame: JsonValue, };

@@ -4,4 +4,4 @@ export type BrowserConfig = { executable: string,
 /**
  * Account/runtime-scoped persistent profile, never per product thread.
  */
-dataDir: string, headless: boolean, noSandbox: boolean, };
+dataDir: string, artifactDir: string, headless: boolean, noSandbox: boolean, };

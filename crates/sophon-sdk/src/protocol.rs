@@ -54,6 +54,8 @@ pub struct RuntimeConfig {
     pub image_description_model: Option<String>,
     #[serde(default)]
     pub browser: Option<BrowserConfig>,
+    #[serde(default)]
+    pub media: Option<crate::native_media::NativeMediaConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -62,6 +64,7 @@ pub struct BrowserConfig {
     pub executable: String,
     /// Account/runtime-scoped persistent profile, never per product thread.
     pub data_dir: String,
+    pub artifact_dir: String,
     pub headless: bool,
     #[serde(default)]
     pub no_sandbox: bool,
@@ -243,6 +246,8 @@ pub struct CallbackContext {
     pub session_id: String,
     pub prompt_id: Option<String>,
     pub tool_call_id: String,
+    /// Actual invocation workspace on the runtime machine (including children).
+    pub cwd: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -299,6 +304,10 @@ pub enum ServerFrame {
     },
     CallbackCancelled {
         id: String,
+    },
+    /// Lossy bounded display channel, independent of ordered Session events.
+    BrowserFrame {
+        frame: Value,
     },
 }
 
@@ -358,6 +367,48 @@ pub enum Request {
     Browser {
         args: Value,
     },
+    ReadArtifact {
+        session_id: String,
+        path: String,
+    },
+    SubagentStart {
+        session_id: String,
+        request: crate::subagent::SubagentStart,
+    },
+    SubagentQuery {
+        session_id: String,
+        id: crate::subagent::SubagentId,
+    },
+    SubagentWait {
+        session_id: String,
+        id: crate::subagent::SubagentId,
+        timeout_ms: u32,
+    },
+    SubagentCancel {
+        session_id: String,
+        target: crate::subagent::SubagentHandle,
+    },
+    SchedulerList {
+        session_id: String,
+    },
+    SchedulerCreate {
+        session_id: String,
+        operation_id: crate::management::OperationId,
+        expected: crate::management::Version,
+        task: crate::management::ScheduledTaskCreate,
+    },
+    SchedulerUpdate {
+        session_id: String,
+        operation_id: crate::management::OperationId,
+        expected: crate::management::Version,
+        task: crate::management::ScheduledTaskUpdate,
+    },
+    SchedulerDelete {
+        session_id: String,
+        operation_id: crate::management::OperationId,
+        expected: crate::management::Version,
+        id: crate::management::ScheduledTaskId,
+    },
     Quiesce {
         timeout_ms: u32,
     },
@@ -376,5 +427,11 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     ServerFrame::export_all(&config)?;
     SessionDescriptor::export_all(&config)?;
     HistorySnapshot::export_all(&config)?;
+    crate::subagent::SubagentResult::export_all(&config)?;
+    crate::subagent::SubagentSnapshot::export_all(&config)?;
+    crate::management::SchedulerSnapshot::export_all(&config)?;
+    crate::management::SchedulerMutationResult::<crate::management::ScheduledTask>::export_all(
+        &config,
+    )?;
     PromptReceipt::export_all(&config)
 }

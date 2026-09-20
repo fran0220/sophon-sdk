@@ -13,7 +13,7 @@ use crate::{Error, Session, SessionId};
 
 macro_rules! identity {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -39,7 +39,8 @@ identity!(SubagentId);
 identity!(AttemptId);
 
 /// An exact activation. Mutations carrying this handle cannot affect a successor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentHandle {
     pub id: SubagentId,
     pub attempt_id: AttemptId,
@@ -62,7 +63,8 @@ pub enum SubagentEventKind {
     Finished { state: SubagentState },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentStart {
     pub id: SubagentId,
     pub prompt: String,
@@ -86,7 +88,7 @@ impl SubagentStart {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentState {
     Initializing,
@@ -96,7 +98,8 @@ pub enum SubagentState {
     Cancelled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentResult {
     pub id: SubagentId,
     /// None if rejected before launch or handed off while still queued.
@@ -118,7 +121,8 @@ impl SubagentResult {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentSnapshot {
     pub id: SubagentId,
     pub attempt_id: Option<AttemptId>,

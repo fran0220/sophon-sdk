@@ -15,11 +15,16 @@ publish = false
 [dependencies]
 agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+sophon-browser = { path = "../sophon-browser" }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 toml = { workspace = true }
@@ -33,9 +38,11 @@ xai-grok-sampler = { workspace = true }
 xai-grok-shell = { workspace = true }
 xai-grok-tools = { workspace = true }
 xai-prompt-queue = { workspace = true }
+xai-tool-protocol = { workspace = true }
+xai-tool-runtime = { workspace = true }
+xai-tool-types = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 xai-grok-test-support = { workspace = true }
 xai-grok-workspace = { workspace = true }

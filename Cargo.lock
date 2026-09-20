@@ -10249,6 +10249,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "xai-tty-utils",
 ]
 
 [[package]]
@@ -10257,11 +10258,15 @@ version = "0.6.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "http 1.4.0",
  "indexmap",
+ "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "sophon-browser",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -10278,6 +10283,9 @@ dependencies = [
  "xai-grok-tools",
  "xai-grok-workspace",
  "xai-prompt-queue",
+ "xai-tool-protocol",
+ "xai-tool-runtime",
+ "xai-tool-types",
 ]
 
 [[package]]

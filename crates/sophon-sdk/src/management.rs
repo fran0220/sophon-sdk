@@ -15,7 +15,8 @@ use crate::subagent::SubagentId;
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+        #[serde(transparent)]
         pub struct $name(pub(crate) String);
 
         impl $name {
@@ -66,7 +67,9 @@ string_id!(
 );
 
 /// Actor-incarnation generation and monotonic revision.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, ts_rs::TS,
+)]
 pub struct Version {
     pub generation: String,
     pub revision: u64,
@@ -328,7 +331,8 @@ pub enum QueueMutationResult {
 
 // ── Scheduler ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledTask {
     pub id: ScheduledTaskId,
     pub interval_secs: u64,
@@ -344,13 +348,14 @@ pub struct ScheduledTask {
     pub chain_reset_pending: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 pub struct SchedulerSnapshot {
     pub version: Version,
     pub tasks: Vec<ScheduledTask>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskCreate {
     /// Positive native interval/delay. The SDK does not silently clamp it.
     pub interval_secs: u64,
@@ -360,14 +365,20 @@ pub struct ScheduledTaskCreate {
     pub fire_immediately: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskUpdate {
     pub id: ScheduledTaskId,
     pub prompt: Option<String>,
     pub interval_secs: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum SchedulerMutationResult<T> {
     Committed {

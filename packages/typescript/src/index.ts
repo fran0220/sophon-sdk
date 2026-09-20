@@ -10,8 +10,21 @@ import type { Prompt } from './generated/Prompt.js'
 import type { PromptReceipt } from './generated/PromptReceipt.js'
 import type { CallbackContext } from './generated/CallbackContext.js'
 import type { JsonValue } from './generated/serde_json/JsonValue.js'
+import type { SubagentStart } from './generated/SubagentStart.js'
+import type { SubagentResult } from './generated/SubagentResult.js'
+import type { SubagentSnapshot } from './generated/SubagentSnapshot.js'
+import type { SubagentHandle } from './generated/SubagentHandle.js'
+import type { SchedulerSnapshot } from './generated/SchedulerSnapshot.js'
+import type { ScheduledTask } from './generated/ScheduledTask.js'
+import type { ScheduledTaskCreate } from './generated/ScheduledTaskCreate.js'
+import type { ScheduledTaskUpdate } from './generated/ScheduledTaskUpdate.js'
+import type { SchedulerMutationResult } from './generated/SchedulerMutationResult.js'
+import type { Version } from './generated/Version.js'
 
 export type { ClientFrame, ServerFrame, Request, RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue }
+export type { SubagentStart, SubagentResult, SubagentSnapshot, SubagentHandle, SchedulerSnapshot, ScheduledTask, ScheduledTaskCreate, ScheduledTaskUpdate, SchedulerMutationResult, Version }
+export type { NativeMediaConfig } from './generated/NativeMediaConfig.js'
+export type { MediaRoute } from './generated/MediaRoute.js'
 export type { BrowserConfig } from './generated/BrowserConfig.js'
 export type { HistoryRecord } from './generated/HistoryRecord.js'
 export type { PromptBlock } from './generated/PromptBlock.js'
@@ -66,6 +79,7 @@ export class Agent {
   private pending = new Map<string, Pending>()
   private callbacks = new Map<string, AbortController>()
   private listeners = new Set<EventListener>()
+  private browserListeners = new Set<(frame: JsonValue) => void>()
   private stopped: Error | undefined
   private exiting = false
   private readyResolve!: () => void
@@ -94,6 +108,11 @@ export class Agent {
   subscribe(listener: EventListener): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  subscribeBrowserFrames(listener: (frame: JsonValue) => void): () => void {
+    this.browserListeners.add(listener)
+    return () => { this.browserListeners.delete(listener) }
   }
 
   private emit(event: RuntimeEvent, sequence: number): void {
@@ -134,6 +153,11 @@ export class Agent {
             this.emit(frame.event, frame.sequence)
             break
           case 'callback': void this.callback(frame); break
+          case 'browser_frame':
+            for (const listener of this.browserListeners) {
+              try { listener(frame.frame) } catch (error) { this.options.onObserverError?.(error) }
+            }
+            break
           case 'callback_cancelled': this.callbacks.get(frame.id)?.abort(new RuntimeError('cancelled', 'Native tool call was cancelled')); break
           default: throw new RuntimeError('invalid_frame', 'Unrecognized Runtime frame')
         }
@@ -204,7 +228,13 @@ export class Agent {
 
 export class Session {
   readonly id: string
-  constructor(private readonly agent: Agent, readonly descriptor: SessionDescriptor) { this.id = descriptor.id }
+  readonly subagents: Subagents
+  readonly scheduler: Scheduler
+  constructor(private readonly agent: Agent, readonly descriptor: SessionDescriptor) {
+    this.id = descriptor.id
+    this.subagents = new Subagents(agent, this.id)
+    this.scheduler = new Scheduler(agent, this.id)
+  }
   subscribe(listener: EventListener): () => void {
     return this.agent.subscribe((event, sequence) => {
       if (event.type === 'gap' || event.type === 'extension' || (event.type === 'history_record' ? event.record.sessionId === this.id : event.sessionId === this.id)) listener(event, sequence)
@@ -215,6 +245,26 @@ export class Session {
   async cancel(turnId: string | null = null): Promise<void> { await this.agent.request({ method: 'cancel', sessionId: this.id, turnId }) }
   async dispose(): Promise<void> { await this.agent.request({ method: 'dispose', sessionId: this.id }) }
   queue(): Promise<JsonValue> { return this.agent.request({ method: 'queue', sessionId: this.id }) }
+  readArtifact(path: string): Promise<JsonValue> { return this.agent.request({ method: 'read_artifact', sessionId: this.id, path }) }
   async setModel(model: string, metadata: Record<string, JsonValue> = {}): Promise<void> { await this.agent.request({ method: 'set_model', sessionId: this.id, model, metadata }) }
   extension(name: string, params: JsonValue): Promise<JsonValue> { return this.agent.request({ method: 'extension', sessionId: this.id, name, params }) }
+}
+
+/** Native child coordinator, never an independent host Session loop. */
+export class Subagents {
+  constructor(private readonly agent: Agent, private readonly sessionId: string) {}
+  async start(request: SubagentStart): Promise<SubagentResult> { return await this.agent.request({ method: 'subagent_start', sessionId: this.sessionId, request }) as unknown as SubagentResult }
+  async query(id: string): Promise<SubagentSnapshot | null> { return await this.agent.request({ method: 'subagent_query', sessionId: this.sessionId, id }) as unknown as SubagentSnapshot | null }
+  /** Waits for native state, without adding a host queue or retrying execution. */
+  async wait(id: string, timeoutMs = 300_000): Promise<SubagentSnapshot> { return await this.agent.request({ method: 'subagent_wait', sessionId: this.sessionId, id, timeoutMs }) as unknown as SubagentSnapshot }
+  cancel(target: SubagentHandle): Promise<JsonValue> { return this.agent.request({ method: 'subagent_cancel', sessionId: this.sessionId, target }) }
+}
+
+/** Mutations carry native revision and caller-chosen idempotency key. */
+export class Scheduler {
+  constructor(private readonly agent: Agent, private readonly sessionId: string) {}
+  async list(): Promise<SchedulerSnapshot> { return await this.agent.request({ method: 'scheduler_list', sessionId: this.sessionId }) as unknown as SchedulerSnapshot }
+  async create(operationId: string, expected: Version, task: ScheduledTaskCreate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent.request({ method: 'scheduler_create', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
+  async update(operationId: string, expected: Version, task: ScheduledTaskUpdate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent.request({ method: 'scheduler_update', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
+  async delete(operationId: string, expected: Version, id: string): Promise<SchedulerMutationResult<boolean>> { return await this.agent.request({ method: 'scheduler_delete', sessionId: this.sessionId, operationId, expected, id }) as unknown as SchedulerMutationResult<boolean> }
 }
