@@ -2,17 +2,21 @@
 // Requires built packages/typescript/dist and SOPHON_RUNTIME; never simulates CDP.
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Agent } from '../../../packages/typescript/dist/index.js'
 
 assert.ok(process.env.SOPHON_RUNTIME, 'SOPHON_RUNTIME must point to a built native Runtime')
 const root = await mkdtemp(join(tmpdir(), 'sophon-browser-runtime-'))
+const workspace = join(root, 'workspace')
+await mkdir(workspace)
 let tabId
 let nativeDefinition = false
 let nativeResult = false
-let modelCalls = 0
+let nativeScreenshotRequested = false
+let nativeScreenshot
+let providerFixtureRequests = 0
 let hostToolCallbacks = 0
 const toolResults = []
 const server = createServer(async (request, response) => {
@@ -28,11 +32,22 @@ const server = createServer(async (request, response) => {
   const browser = payload.tools?.find(tool => tool.function?.name === 'browser')
   const result = payload.messages?.find(message => message.role === 'tool' && JSON.stringify(message.content).includes('Native Runtime fixture'))
   if (result) nativeResult = true
-  const delta = browser && !nativeDefinition
-    ? { role: 'assistant', tool_calls: [{ index: 0, id: 'native-browser-proof', type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action: 'snapshot', tab_id: tabId }) } }] }
+  for (const content of toolResults) {
+    for (const text of typeof content === 'string' ? [content] : (content ?? []).map(block => block.text)) {
+      try {
+        const value = JSON.parse(text)
+        if (value.artifact_id && value.mime_type === 'image/png') nativeScreenshot = value
+      } catch { /* Other tool messages need not contain JSON. */ }
+    }
+  }
+  const action = browser && !nativeDefinition ? 'snapshot'
+    : browser && nativeResult && !nativeScreenshotRequested ? 'screenshot' : null
+  if (action === 'screenshot') nativeScreenshotRequested = true
+  const delta = action
+    ? { role: 'assistant', tool_calls: [{ index: 0, id: `native-browser-${action}`, type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action, tab_id: tabId }) } }] }
     : { role: 'assistant', content: 'Native browser verification complete.' }
   if (browser) nativeDefinition = true
-  modelCalls++
+  providerFixtureRequests++
   const chunk = (delta, finish_reason) => ({ id: 'local-fixture', object: 'chat.completion.chunk', created: 1234567890, model: 'fixture', choices: [{ index: 0, delta, finish_reason }] })
   response.writeHead(200, { 'content-type': 'text/event-stream' })
   response.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, delta.tool_calls ? 'tool_calls' : 'stop'))}\n\ndata: ${JSON.stringify({ id: 'local-fixture', object: 'chat.completion.chunk', created: 1234567890, model: 'fixture', choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } })}\n\ndata: [DONE]\n\n`)
@@ -100,15 +115,28 @@ try {
   const video = await agent.browser({ action: 'artifact', artifact_id: recording.artifact_id })
   assert.equal(video.mime_type, 'video/mp4')
   assert.equal(Buffer.from(video.base64, 'base64').subarray(4, 8).toString(), 'ftyp')
-  const session = await agent.createSession({ workspace: { id: 'browser-proof', cwd: root }, model: 'fixture', metadata: {}, mcpServers: [], tools: [] })
+  const session = await agent.createSession({ workspace: { id: 'browser-proof', cwd: workspace }, model: 'fixture', metadata: {}, mcpServers: [], tools: [] })
   await session.prompt({ turnId: 'native-browser-roundtrip', blocks: [{ type: 'text', text: 'Verify native browser fixture using the browser tool.' }], metadata: {} })
-  assert.equal(nativeDefinition, true, 'model must receive native browser definition')
-  assert.equal(nativeResult, true, `model must receive actual Chromium snapshot result: ${JSON.stringify(toolResults)}`)
+  assert.equal(nativeDefinition, true, 'provider-protocol fixture must receive native browser definition')
+  assert.equal(nativeResult, true, `model-facing payload must contain actual Chromium snapshot: ${JSON.stringify(toolResults)}`)
+  assert.ok(nativeScreenshot?.artifact, `native screenshot must publish workspace artifact: ${JSON.stringify(nativeScreenshot)}`)
+  const published = nativeScreenshot.artifact
+  assert.match(nativeScreenshot.artifact_id, /^[0-9a-f-]{36}$/)
+  assert.equal(published.path, `.native-browser/${nativeScreenshot.artifact_id}.png`)
+  assert.equal(published.mimeType, 'image/png')
+  assert.equal(nativeScreenshot.reviewRequired, true)
+  assert.ok(published.revision)
+  const publishedRead = await session.readArtifact(published.path)
+  const publishedBytes = Buffer.from(publishedRead.base64, 'base64')
+  assert.equal(publishedBytes.length, published.bytes)
+  assert.deepEqual([...publishedBytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10])
+  assert.deepEqual(publishedBytes, await readFile(join(workspace, published.path)))
+  await assert.rejects(readFile(join(root, 'evidence', published.path)), { code: 'ENOENT' })
   assert.equal(hostToolCallbacks, 0, 'first-party browser must not route to a TS callback')
   await agent.browser({ action: 'stream_stop', tab_id: tabId })
   await agent.finalExit()
   exited = true
-  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, modelCalls, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, recording: true, checkedRuntimeExit: true }))
+  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, providerFixtureRequests, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, workspaceArtifact: true, recording: true, checkedRuntimeExit: true }))
 } finally {
   if (agent && !exited) await agent.finalExit().catch(() => {})
   await new Promise(resolve => server.close(resolve))
