@@ -818,6 +818,11 @@ pub enum SessionCommand {
     SnapshotToolDefinitions {
         respond_to: oneshot::Sender<Vec<xai_grok_sampling_types::ToolSpec>>,
     },
+    /// Access the resident native registry for instance-local embedding tools.
+    SnapshotToolset {
+        respond_to:
+            oneshot::Sender<std::sync::Arc<xai_grok_tools::registry::types::FinalizedToolset>>,
+    },
     /// Replace the session's client-registered hooks.
     /// Sent on `load_session` reconnect to a live actor so a client can re-register (or clear) its hooks without a fresh session.
     SetClientHooks {

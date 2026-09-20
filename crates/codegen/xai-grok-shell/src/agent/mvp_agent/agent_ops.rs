@@ -609,6 +609,30 @@ impl MvpAgent {
     ) -> Option<crate::session::SessionHandle> {
         self.resident_handle(&agent_client_protocol::SessionId::new(session_id))
     }
+    /// The resident native tool registry. Register embedding tools before admitting
+    /// prompts; registrations are session-local, not process-global definitions.
+    pub async fn session_toolset(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+    ) -> agent_client_protocol::Result<Arc<xai_grok_tools::registry::types::FinalizedToolset>> {
+        let handle = self.session_handle_waiting_for_load(session_id).await
+            .ok_or_else(|| agent_client_protocol::Error::invalid_params().data("unknown session id"))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.cmd_tx.send(crate::session::SessionCommand::SnapshotToolset { respond_to: tx })
+            .map_err(|_| agent_client_protocol::Error::internal_error().data("session actor unavailable"))?;
+        rx.await.map_err(|_| agent_client_protocol::Error::internal_error().data("session actor unavailable"))
+    }
+
+    /// Actor-maintained identity for local tool callbacks. Read it when a tool
+    /// starts, rather than capturing the identity at registration time.
+    pub async fn session_current_prompt_id(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+    ) -> agent_client_protocol::Result<Arc<std::sync::Mutex<Option<String>>>> {
+        self.session_handle_waiting_for_load(session_id).await
+            .map(|handle| handle.current_prompt_id.clone())
+            .ok_or_else(|| agent_client_protocol::Error::invalid_params().data("unknown session id"))
+    }
     /// Install the channel that fans new session cwds into the leader's `ConfigFileWatcher::watch_path`.
     /// Called once after the watcher is constructed in `agent/app.rs`.
     /// In simple / non-leader mode the channel is never wired and `notify_session_cwd_for_watch` is a no-op.

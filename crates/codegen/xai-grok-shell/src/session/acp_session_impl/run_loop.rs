@@ -2139,6 +2139,9 @@ pub(super) async fn run_session(
                             let specs = session.turn_base_tool_specs(&defs);
                             let _ = respond_to.send(specs);
                         }
+                        SessionCommand::SnapshotToolset { respond_to } => {
+                            let _ = respond_to.send(session.agent.borrow().tool_bridge().toolset());
+                        }
                         SessionCommand::SetClientHooks { hooks } => {
                             *session.client_hooks.borrow_mut() = hooks;
                         }
