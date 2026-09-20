@@ -1532,8 +1532,35 @@ impl CliAgentOverrides {
         &self,
         def: &mut xai_grok_agent::config::AgentDefinition,
     ) {
-        def.session_tools_allowlist = self.tools.clone();
-        def.session_tools_denylist = self.disallowed_tools.clone();
+        if let Some(parent) = &self.tools {
+            def.session_tools_allowlist = Some(match def.session_tools_allowlist.take() {
+                None => parent.clone(),
+                Some(own) => own
+                    .iter()
+                    .flat_map(|own| {
+                        parent.iter().filter_map(move |parent| {
+                            // Match the native full-id/short-name gate, retaining the
+                            // narrower qualified ID when only one side is qualified.
+                            if own == parent || parent == own.rsplit(':').next().unwrap_or(own) {
+                                Some(own.clone())
+                            } else if own == parent.rsplit(':').next().unwrap_or(parent) {
+                                Some(parent.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect(),
+            });
+        }
+        if let Some(parent) = &self.disallowed_tools {
+            let denied = def.session_tools_denylist.get_or_insert_with(Vec::new);
+            for name in parent {
+                if !denied.contains(name) {
+                    denied.push(name.clone());
+                }
+            }
+        }
         if let Some(ref parent_mode) = self.permission_mode
             && def.plugin_name.is_none()
         {

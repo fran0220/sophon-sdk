@@ -579,6 +579,45 @@ async fn subagent_inherits_session_cli_overrides() {
     assert_eq!(def.disallowed_tools, vec!["write"]);
     assert_eq!(def.permission_mode, PermissionMode::AcceptEdits);
 }
+#[tokio::test]
+async fn subagent_no_tools_survives_parent_overrides_and_native_build() {
+    for parent_tools in [None, Some(vec!["read_file".into()])] {
+        let mut profile = xai_grok_agent::config::AgentDefinition::general_purpose();
+        profile.name = "no-tools-native-probe".into();
+        profile.session_tools_allowlist = Some(vec![]);
+        let mut config = crate::agent::config::Config::default();
+        config.cli_agents = vec![profile];
+        config.cli_agent_overrides.tools = parent_tools;
+        let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+        ctx.agent_config = Some(config);
+        let definition = resolve_agent_definition("no-tools-native-probe", &ctx).unwrap();
+        assert_eq!(definition.session_tools_allowlist, Some(vec![]));
+        let agent = xai_grok_agent::AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+            xai_grok_tools::notification::ToolNotificationHandle::noop(),
+        ).from_definition(definition).build().await.unwrap();
+        assert!(agent.tool_definitions().await.is_empty());
+        assert!(agent.tool_bridge().toolset().call(
+            "read_file", serde_json::json!({"path":"/etc/passwd"}), "denied", None,
+        ).await.is_err());
+    }
+}
+
+#[test]
+fn subagent_clamps_intersect_qualified_names_and_preserve_denials() {
+    let mut definition = xai_grok_agent::config::AgentDefinition::general_purpose();
+    definition.session_tools_allowlist = Some(vec!["A:read".into(), "write".into(), "B:run".into()]);
+    definition.session_tools_denylist = Some(vec!["unsafe".into()]);
+    crate::agent::config::CliAgentOverrides {
+        tools: Some(vec!["read".into(), "C:write".into(), "D:run".into()]),
+        disallowed_tools: Some(vec!["network".into()]),
+        ..Default::default()
+    }.apply_to_subagent_definition(&mut definition);
+    assert_eq!(definition.session_tools_allowlist, Some(vec!["A:read".into(), "C:write".into()]));
+    assert_eq!(definition.session_tools_denylist, Some(vec!["unsafe".into(), "network".into()]));
+}
+
 #[test]
 fn subagent_bypass_permission_mode_gated_by_policy_pin() {
     use xai_grok_agent::config::PermissionMode;
