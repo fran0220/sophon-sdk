@@ -608,6 +608,7 @@ impl SessionActor {
             std::path::Path::new(&self.session_info.cwd),
         );
         self.snapshot_refresher(Some(generation.clone()), disabled_gateway_tools)
+            .await
             .refresh()
             .await;
     }
@@ -619,10 +620,11 @@ impl SessionActor {
         >,
     ) {
         self.snapshot_refresher(None, disabled_gateway_tools.clone())
+            .await
             .refresh()
             .await;
     }
-    fn snapshot_refresher(
+    pub(super) async fn snapshot_refresher(
         &self,
         generation: Option<crate::session::mcp_servers::Generation>,
         disabled_gateway_tools: std::collections::HashMap<
@@ -630,8 +632,15 @@ impl SessionActor {
             std::collections::HashSet<String>,
         >,
     ) -> SnapshotRefresher {
+        // Pin even non-pass refreshes before capturing the bridge. A refresher
+        // that retained an old bridge must never adopt a replacement generation
+        // later and publish the old tools into the new mount's shared snapshot.
+        let generation = match generation {
+            Some(generation) => generation,
+            None => self.mcp_state.lock().await.current_generation(),
+        };
         SnapshotRefresher {
-            generation,
+            generation: Some(generation),
             tool_bridge: self.agent.borrow().tool_bridge().clone(),
             mcp_state: Arc::clone(&self.mcp_state),
             refresh_gate: Arc::clone(&self.mcp_refresh_gate),
@@ -1437,12 +1446,14 @@ impl SessionActor {
             self.cancel_superseded_init(&generation, claim.guard);
             return;
         };
-        let refresher = self.snapshot_refresher(
-            Some(generation.clone()),
-            crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(
-                &self.session_info.cwd,
-            )),
-        );
+        let refresher = self
+            .snapshot_refresher(
+                Some(generation.clone()),
+                crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(
+                    &self.session_info.cwd,
+                )),
+            )
+            .await;
         let mut pass = InitPass::new(
             self,
             claim,

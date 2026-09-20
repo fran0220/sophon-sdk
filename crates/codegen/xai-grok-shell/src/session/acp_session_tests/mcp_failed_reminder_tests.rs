@@ -703,6 +703,45 @@ async fn completion_re_arms_the_reminder() {
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
+async fn non_pass_refresh_keeps_its_original_bridge_generation() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = plain_actor().await;
+            let old_bridge = a.agent.borrow().tool_bridge().clone();
+            register_stub(&old_bridge, "old__tool").await;
+            let old_refresh = a.snapshot_refresher(None, Default::default()).await;
+
+            // A new mount fences old producers before publishing its bridge.
+            drop(a.mcp_state.lock().await.restart_init());
+            *a.agent.borrow_mut() = test_agent_with_tools(vec![]).await;
+            let new_bridge = a.agent.borrow().tool_bridge().clone();
+            register_stub(&new_bridge, "new__tool").await;
+            a.snapshot_refresher(None, Default::default())
+                .await
+                .refresh()
+                .await;
+            a.mcp_reminder_dirty
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+
+            old_refresh.refresh().await;
+            let tools: Vec<_> = a
+                .tool_metadata_snapshot
+                .lock()
+                .unwrap()
+                .tools
+                .iter()
+                .map(|tool| tool.qualified_name.clone())
+                .collect();
+            assert_eq!(tools, vec!["new__tool"]);
+            assert!(
+                !a.mcp_reminder_dirty
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn superseded_refresh_does_not_publish() {
     tokio::task::LocalSet::new()
         .run_until(async {
