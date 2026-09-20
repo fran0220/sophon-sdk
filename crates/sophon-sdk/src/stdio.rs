@@ -197,9 +197,7 @@ impl Runtime {
                     .queue_snapshot()
                     .await
                     .map_err(operation)?;
-                Ok(
-                    json!({"sessionId":queue.session_id.to_string(),"version":{"generation":queue.version.generation,"revision":queue.version.revision}, "running":queue.running.map(|v|json!({"id":v.id.as_str(),"text":v.text})), "pending": queue.pending.into_iter().map(|v| json!({"id":v.id.as_str(),"text":v.text,"position":v.position})).collect::<Vec<_>>()}),
-                )
+                encode(queue)
             }
             Dispose { session_id } => {
                 self.session(&session_id).await?.close().await?;
@@ -324,8 +322,16 @@ impl Runtime {
                     .cancel(&target)
                     .await
                     .map_err(operation)?;
-                Ok(json!({"outcome":format!("{outcome:?}")}))
+                encode(outcome)
             }
+            SubagentCancelId { session_id, id } => encode(
+                self.session(&session_id)
+                    .await?
+                    .subagents()
+                    .cancel_id(&id)
+                    .await
+                    .map_err(operation)?,
+            ),
             SchedulerList { session_id } => encode(
                 self.session(&session_id)
                     .await?
@@ -562,9 +568,7 @@ fn update(update: crate::SessionUpdate) -> p::Update {
                 })
                 .collect(),
         ),
-        U::TurnCompleted(v) => p::Update::TurnCompleted(
-            json!({"promptId":v.prompt_id,"promptIndex":v.prompt_index,"stopReason":stop_reason(v.stop_reason),"agentResult":v.agent_result,"errorKind":v.error_kind,"elapsedMs":v.elapsed_ms}),
-        ),
+        U::TurnCompleted(v) => p::Update::TurnCompleted(v),
         U::Other(v) => native_update(v),
     }
 }
@@ -668,6 +672,27 @@ fn event(event: crate::Event) -> Option<p::RuntimeEvent> {
             kind: crate::management::ManagementEventKind::Subagent(event),
             ..
         }) => Some(p::RuntimeEvent::Subagent { event }),
+        crate::Event::Management(crate::management::ManagementEvent {
+            kind: crate::management::ManagementEventKind::Queue(snapshot),
+            ..
+        }) => Some(p::RuntimeEvent::Queue { snapshot }),
+        crate::Event::Management(crate::management::ManagementEvent {
+            kind:
+                crate::management::ManagementEventKind::Scheduler {
+                    session_id,
+                    task_id,
+                    version,
+                    occurrence,
+                    snapshot_required,
+                },
+            ..
+        }) => Some(p::RuntimeEvent::Scheduler {
+            session_id: session_id.to_string(),
+            task_id,
+            version,
+            occurrence,
+            snapshot_required,
+        }),
         crate::Event::Management(_) => None,
     }
 }

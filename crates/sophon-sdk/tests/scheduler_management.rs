@@ -4,19 +4,28 @@ use sophon_sdk::{
     Agent, AgentConfig, ModelConfig, ProviderConfig, SessionConfig,
     management::{
         ManagementErrorKind, ManagementEventKind, OperationId, QueueEntrySource, QueueSnapshot,
-        ScheduledTaskCreate, ScheduledTaskEvent, ScheduledTaskUpdate, SchedulerMutationResult,
+        ScheduledTaskCreate, ScheduledTaskEvent, ScheduledTaskUpdate, SchedulerCadence,
+        SchedulerMutationResult,
     },
     subagent::SubagentState,
 };
 use xai_grok_test_support::{EnvGuard, MockInferenceServer};
 
 fn create(recurring: bool, fire_immediately: bool) -> ScheduledTaskCreate {
+    let at = (chrono::Utc::now()
+        + chrono::Duration::seconds(if fire_immediately { -1 } else { 3600 }))
+    .to_rfc3339();
     ScheduledTaskCreate {
-        interval_secs: 3600,
+        cadence: if recurring {
+            SchedulerCadence::Interval {
+                every_secs: 3600,
+                anchor: at,
+            }
+        } else {
+            SchedulerCadence::Once { at }
+        },
         prompt: "Reply briefly without tools: scheduler child completed.".into(),
-        recurring,
         durable: false,
-        fire_immediately,
     }
 }
 
@@ -120,13 +129,14 @@ fn public_scheduler_runs_native_children_with_native_completion_wakes() {
                 let conflict = parent.delete_scheduled_task(OperationId::new("stale-delete"), initial.version, task.id.clone()).await.unwrap();
                 assert!(matches!(conflict, SchedulerMutationResult::Conflict { snapshot, .. } if snapshot.version == version && snapshot.tasks == vec![task.clone()]));
                 let before = parent.scheduler_snapshot().await.unwrap();
-                let error = parent.update_scheduled_task(OperationId::new("invalid-update"), version.clone(), ScheduledTaskUpdate { id: task.id.clone(), prompt: None, interval_secs: Some(0) }).await.unwrap_err();
+                let anchor = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+                let error = parent.update_scheduled_task(OperationId::new("invalid-update"), version.clone(), ScheduledTaskUpdate { id: task.id.clone(), prompt: None, cadence: Some(SchedulerCadence::Interval { every_secs: 0, anchor: anchor.clone() }) }).await.unwrap_err();
                 assert_eq!(error.kind, ManagementErrorKind::InvalidRequest);
                 assert_eq!(parent.scheduler_snapshot().await.unwrap(), before);
                 // Native numeric intervals below sixty are legal and must remain exact.
-                let updated = parent.update_scheduled_task(OperationId::new("short-interval"), version, ScheduledTaskUpdate { id: task.id.clone(), prompt: None, interval_secs: Some(59) }).await.unwrap();
+                let updated = parent.update_scheduled_task(OperationId::new("short-interval"), version, ScheduledTaskUpdate { id: task.id.clone(), prompt: None, cadence: Some(SchedulerCadence::Interval { every_secs: 59, anchor: anchor.clone() }) }).await.unwrap();
                 let SchedulerMutationResult::Committed { value, version, .. } = updated else { panic!("update: {updated:?}"); };
-                assert_eq!(value.interval_secs, 59);
+                assert_eq!(value.cadence, SchedulerCadence::Interval { every_secs: 59, anchor });
                 assert!(matches!(parent.delete_scheduled_task(OperationId::new("delete-future"), version, task.id).await.unwrap(), SchedulerMutationResult::Committed { value: true, .. }));
 
                 for recurring in [false, true] {

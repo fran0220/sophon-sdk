@@ -166,7 +166,7 @@ pub enum Update {
     ToolCall(ToolCall),
     ToolCallUpdate(ToolCall),
     Plan(Vec<PlanEntry>),
-    TurnCompleted(Value),
+    TurnCompleted(crate::TurnCompletion),
     /// Known native control/status records, not transcript content.
     NativeStatus(Value),
     Compaction(CompactionUpdate),
@@ -250,6 +250,16 @@ pub struct HistorySnapshot {
     rename_all_fields = "camelCase"
 )]
 pub enum RuntimeEvent {
+    Queue {
+        snapshot: crate::management::QueueSnapshot,
+    },
+    Scheduler {
+        session_id: String,
+        task_id: crate::management::ScheduledTaskId,
+        version: crate::management::Version,
+        occurrence: crate::management::ScheduledTaskEvent,
+        snapshot_required: bool,
+    },
     Subagent {
         event: crate::subagent::SubagentEvent,
     },
@@ -432,6 +442,10 @@ pub enum Request {
         session_id: String,
         target: crate::subagent::SubagentHandle,
     },
+    SubagentCancelId {
+        session_id: String,
+        id: crate::subagent::SubagentId,
+    },
     SchedulerList {
         session_id: String,
     },
@@ -473,6 +487,7 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     HistorySnapshot::export_all(&config)?;
     crate::subagent::SubagentResult::export_all(&config)?;
     crate::subagent::SubagentSnapshot::export_all(&config)?;
+    crate::subagent::SubagentCancelIdResult::export_all(&config)?;
     crate::management::SchedulerSnapshot::export_all(&config)?;
     crate::management::SchedulerMutationResult::<crate::management::ScheduledTask>::export_all(
         &config,

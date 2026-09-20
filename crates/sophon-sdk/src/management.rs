@@ -229,7 +229,8 @@ impl QuiesceReport {
 
 // ── Native FIFO ────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueEntry {
     pub id: QueueEntryId,
     pub source: QueueEntrySource,
@@ -242,7 +243,8 @@ pub struct QueueEntry {
     pub position: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct RunningQueueEntry {
     pub id: QueueEntryId,
     pub source: QueueEntrySource,
@@ -251,7 +253,8 @@ pub struct RunningQueueEntry {
     pub combined_texts: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueueEntrySource {
     Human,
@@ -259,7 +262,8 @@ pub enum QueueEntrySource {
     Internal,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueSnapshot {
     pub session_id: SessionId,
     pub version: Version,
@@ -332,10 +336,96 @@ pub enum QueueMutationResult {
 // ── Scheduler ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SchedulerCadence {
+    Once {
+        at: String,
+    },
+    Interval {
+        every_secs: u64,
+        anchor: String,
+    },
+    Daily {
+        time: String,
+        time_zone: String,
+        weekdays: Option<Vec<u8>>,
+    },
+}
+
+impl SchedulerCadence {
+    pub(crate) fn native(
+        self,
+    ) -> Result<
+        xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerCadence,
+        xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError,
+    > {
+        use xai_grok_tools::implementations::grok_build::scheduler::types::{
+            SchedulerCadence as N, SchedulerError,
+        };
+        let parse = |value: String| {
+            value.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| {
+                SchedulerError::InvalidInterval("cadence timestamp must be RFC3339".into())
+            })
+        };
+        let cadence = match self {
+            Self::Once { at } => N::Once { at: parse(at)? },
+            Self::Interval { every_secs, anchor } => N::Interval {
+                every_secs,
+                anchor: parse(anchor)?,
+            },
+            Self::Daily {
+                time,
+                time_zone,
+                weekdays,
+            } => N::Daily {
+                time,
+                time_zone,
+                weekdays,
+            },
+        };
+        cadence.validate()?;
+        Ok(cadence)
+    }
+}
+
+impl From<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerCadence>
+    for SchedulerCadence
+{
+    fn from(
+        value: xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerCadence,
+    ) -> Self {
+        use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerCadence as N;
+        match value {
+            N::Once { at } => Self::Once {
+                at: at.to_rfc3339(),
+            },
+            N::Interval { every_secs, anchor } => Self::Interval {
+                every_secs,
+                anchor: anchor.to_rfc3339(),
+            },
+            N::Daily {
+                time,
+                time_zone,
+                weekdays,
+            } => Self::Daily {
+                time,
+                time_zone,
+                weekdays,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTask {
     pub id: ScheduledTaskId,
-    pub interval_secs: u64,
+    pub cadence: SchedulerCadence,
     pub prompt: String,
     pub recurring: bool,
     pub durable: bool,
@@ -357,12 +447,9 @@ pub struct SchedulerSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskCreate {
-    /// Positive native interval/delay. The SDK does not silently clamp it.
-    pub interval_secs: u64,
+    pub cadence: SchedulerCadence,
     pub prompt: String,
-    pub recurring: bool,
     pub durable: bool,
-    pub fire_immediately: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -370,7 +457,7 @@ pub struct ScheduledTaskCreate {
 pub struct ScheduledTaskUpdate {
     pub id: ScheduledTaskId,
     pub prompt: Option<String>,
-    pub interval_secs: Option<u64>,
+    pub cadence: Option<SchedulerCadence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -394,7 +481,8 @@ pub enum SchedulerMutationResult<T> {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ScheduledTaskRemovalReason {
     Deleted,
@@ -899,7 +987,12 @@ pub enum ManagementEventKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 #[non_exhaustive]
 pub enum ScheduledTaskEvent {
     /// The upstream notification is emitted for both create and update.
@@ -1088,7 +1181,7 @@ pub(crate) fn scheduled_task(
         .map(|timestamp| timestamp.to_rfc3339());
     ScheduledTask {
         id: ScheduledTaskId::new(task.id),
-        interval_secs: task.interval_secs,
+        cadence: task.cadence.into(),
         prompt: task.prompt,
         recurring: task.recurring,
         durable: task.durable,
@@ -2024,7 +2117,7 @@ mod tests {
             scheduled,
             SchedulerMutationResult::Committed {
                 operation_id,
-                value: ScheduledTask { interval_secs: 300, .. },
+                value: ScheduledTask { cadence: SchedulerCadence::Interval { every_secs: 300, .. }, .. },
                 version: Version { revision: 9, .. },
                 replayed: false,
             } if operation_id.as_str() == "schedule-op"

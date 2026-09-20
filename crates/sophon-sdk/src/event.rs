@@ -45,7 +45,8 @@ pub enum SessionUpdate {
     Other(Value),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnCompletion {
     pub prompt_id: String,
     /// Native consumed index; old persisted terminals may omit it.
@@ -57,7 +58,8 @@ pub struct TurnCompletion {
     pub elapsed_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

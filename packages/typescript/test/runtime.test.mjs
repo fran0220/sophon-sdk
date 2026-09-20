@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { Agent } from '../dist/index.js'
 
 const executable = process.env.SOPHON_RUNTIME ?? resolve('../../target/debug/sophon-runtime')
@@ -20,6 +21,7 @@ async function setup(t) {
     }, contextWindow: 200000, maxCompletionTokens: 4096 }],
     defaultModel: 'runtime-test', webSearchModel: null, sessionSummaryModel: null,
     imageDescriptionModel: null, browser: null, media: null,
+    subagents: [{ name: 'refiner', description: 'Fixed no-tools refinement', instructions: 'Return only refinement text.', model: 'runtime-test', tools: [] }],
   }
   return { root, cwd, config, env: { GROK_HOME: join(root, 'native-home'), GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_TURN_SUMMARY: 'false', GROK_FEEDBACK_ENABLED: 'false' } }
 }
@@ -39,10 +41,18 @@ test('real stdio Runtime creates, snapshots, schedules, reloads and checks proce
   const queue = await session.queue()
   assert.equal(queue.running, null)
   assert.deepEqual(queue.pending, [])
+  await assert.rejects(session.prompt({ turnId: 'unsupported-candidate', blocks: [{ type: 'text', text: 'Must never execute.' }], metadata: { 'x.sophon/configCandidate': { instructions: 'Changed instructions', model: 'unpublished-model' } } }), /configCandidate|config_candidate|candidate/i)
+  assert.equal((await session.history()).records.some(record => record.promptId === 'unsupported-candidate'), false)
+  const childId = randomUUID()
+  assert.deepEqual(await session.subagents.cancelId(childId), { subagentId: childId, fenced: true, outcome: { kind: 'not_found' } })
+  const cancelled = await session.subagents.start({ id: childId, prompt: 'Never infer.', description: 'cancelled before registration', subagentType: 'refiner', cwd: null, model: 'runtime-test' })
+  assert.equal(cancelled.state, 'cancelled')
+  assert.equal(cancelled.attemptId, null)
   const before = await session.scheduler.list()
-  const created = await session.scheduler.create('schedule-a', before.version, { intervalSecs: 3600, prompt: 'future explicit scheduled task', recurring: false, durable: true, fireImmediately: false })
+  const cadence = { kind: 'once', at: new Date(Date.now() + 3600000).toISOString() }
+  const created = await session.scheduler.create('schedule-a', before.version, { cadence, prompt: 'future explicit scheduled task', durable: true })
   assert.equal(created.type, 'committed')
-  const conflict = await session.scheduler.create('schedule-stale', before.version, { intervalSecs: 7200, prompt: 'must not commit', recurring: false, durable: true, fireImmediately: false })
+  const conflict = await session.scheduler.create('schedule-stale', before.version, { cadence, prompt: 'must not commit', durable: true })
   assert.equal(conflict.type, 'conflict')
   const removed = await session.scheduler.delete('schedule-remove', created.version, created.value.id)
   assert.equal(removed.type, 'committed')

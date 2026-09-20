@@ -235,12 +235,21 @@ pub enum SubagentMessageOutcome {
     ChannelClosed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentCancelOutcome {
     Cancelled,
     AlreadyFinished { status: SubagentState },
     NotFound,
+}
+
+/// The fence prevents future admissions; it does not establish active-child exit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCancelIdResult {
+    pub subagent_id: SubagentId,
+    pub fenced: bool,
+    pub outcome: SubagentCancelOutcome,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -351,6 +360,15 @@ impl Subagents {
             json!({"subagentId": target.id, "expectedAttemptId": target.attempt_id}),
         )
         .await
+    }
+
+    /// Cancel and permanently fence this logical ID for this coordinator lifetime,
+    /// including when no attempt has been admitted yet.
+    pub async fn cancel_id(
+        &self,
+        id: &SubagentId,
+    ) -> Result<SubagentCancelIdResult, SubagentError> {
+        self.call("cancel_id", json!({"subagentId": id})).await
     }
 
     async fn spawn(

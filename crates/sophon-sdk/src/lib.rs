@@ -153,7 +153,8 @@ pub enum PromptBlock {
     Raw(serde_json::Value),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StopReason {
     EndTurn,

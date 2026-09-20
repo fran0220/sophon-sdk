@@ -1553,25 +1553,16 @@ async fn scheduler_create(
 ) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
     use xai_grok_tools::implementations::grok_build::scheduler::types::ScheduledTask;
     let request_fingerprint = format!("create:{create:?}");
-    if create.interval_secs == 0 {
-        return Err(management_error(
-            mgmt::ManagementErrorKind::InvalidRequest,
-            "scheduled-task interval must be greater than zero",
-            session_id,
-        )
-        .operation(operation_id));
-    }
     let expected = scheduler_version(expected)
         .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
     let handle = scheduler_handle(agent, session_id)
         .map_err(|error| error.operation(operation_id.clone()))?;
-    let task = ScheduledTask::with_fire_immediately(
-        create.interval_secs,
-        create.prompt,
-        create.recurring,
-        create.durable,
-        create.fire_immediately,
-    );
+    let cadence = create
+        .cadence
+        .native()
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
+    let task = ScheduledTask::from_cadence(cadence, create.prompt, create.durable)
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
     handle
         .create(operation_id.0.clone(), request_fingerprint, expected, task)
         .await
@@ -1587,22 +1578,19 @@ async fn scheduler_update(
     update: mgmt::ScheduledTaskUpdate,
 ) -> Result<mgmt::SchedulerMutationResult<mgmt::ScheduledTask>, mgmt::ManagementError> {
     let request_fingerprint = format!("update:{update:?}");
-    if update.prompt.is_none() && update.interval_secs.is_none() {
+    if update.prompt.is_none() && update.cadence.is_none() {
         return Err(management_error(
             mgmt::ManagementErrorKind::InvalidRequest,
-            "scheduled-task update must change prompt and/or interval",
+            "scheduled-task update must change prompt and/or cadence",
             session_id,
         )
         .operation(operation_id));
     }
-    if update.interval_secs == Some(0) {
-        return Err(management_error(
-            mgmt::ManagementErrorKind::InvalidRequest,
-            "scheduled-task interval must be greater than zero",
-            session_id,
-        )
-        .operation(operation_id));
-    }
+    let cadence = update
+        .cadence
+        .map(mgmt::SchedulerCadence::native)
+        .transpose()
+        .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
     let expected = scheduler_version(expected)
         .map_err(|error| scheduler_error(error, session_id, Some(operation_id.clone())))?;
     let handle = scheduler_handle(agent, session_id)
@@ -1614,7 +1602,7 @@ async fn scheduler_update(
             expected,
             update.id.0,
             update.prompt,
-            update.interval_secs,
+            cadence,
         )
         .await
         .map(mgmt::scheduler_task_result)
