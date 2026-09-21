@@ -218,13 +218,15 @@ impl SchedulerActor {
     }
 
     pub async fn run(mut self) {
-        let gate = self
-            .resources
-            .lock()
-            .await
-            .get::<SchedulerActivationGate>()
-            .cloned()
-            .unwrap_or_default();
+        let gate = {
+            let mut resources = self.resources.lock().await;
+            let gate = resources
+                .get::<SchedulerActivationGate>()
+                .cloned()
+                .unwrap_or_default();
+            resources.insert(gate.clone());
+            gate
+        };
         if gate.is_active() {
             self.await_subagent_wiring_for_due_tasks().await;
         }
@@ -257,6 +259,12 @@ impl SchedulerActor {
         }
 
         gate.close();
+        // Commands queued behind an admitted mutation never crossed its gate.
+        // Resolve them explicitly instead of dropping their response channels.
+        self.cmd_rx.close();
+        while let Some(command) = self.cmd_rx.recv().await {
+            self.handle_command(command).await;
+        }
         let task_ids: Vec<String> = {
             let res = self.resources.lock().await;
             res.get::<State<SchedulerState>>()
@@ -981,6 +989,12 @@ impl SchedulerActor {
                 "Loop iteration spawn failed; clearing chain anchor"
             );
             let mut res = resources.lock().await;
+            if res
+                .get::<SchedulerActivationGate>()
+                .is_some_and(|gate| gate.is_closed())
+            {
+                return;
+            }
             let state = res.get_or_default::<State<SchedulerState>>();
             if let Some(task) = state
                 .tasks
@@ -1224,29 +1238,36 @@ impl SchedulerActor {
     }
 
     async fn handle_command(&mut self, cmd: SchedulerCommand) {
-        let blocked = self
+        let gate = self
             .resources
             .lock()
             .await
             .get::<SchedulerActivationGate>()
-            .is_some_and(|gate| !gate.is_active());
-        if blocked {
+            .cloned();
+        if gate.as_ref().is_some_and(|gate| !gate.is_active()) {
+            let rejection = || {
+                if gate.as_ref().is_some_and(|gate| gate.is_closed()) {
+                    SchedulerError::Closed
+                } else {
+                    SchedulerError::ActivationRequired
+                }
+            };
             match cmd {
                 SchedulerCommand::List { reply } => {
                     let _ = reply.send(self.scheduler_snapshot().await);
                 }
                 SchedulerCommand::Create { reply, .. } | SchedulerCommand::Update { reply, .. } => {
-                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                    let _ = reply.send(Err(rejection()));
                 }
                 SchedulerCommand::Delete { reply, .. } => {
-                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                    let _ = reply.send(Err(rejection()));
                 }
                 SchedulerCommand::CreateManaged { reply, .. }
                 | SchedulerCommand::UpdateManaged { reply, .. } => {
-                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                    let _ = reply.send(Err(rejection()));
                 }
                 SchedulerCommand::DeleteManaged { reply, .. } => {
-                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                    let _ = reply.send(Err(rejection()));
                 }
             }
             return;

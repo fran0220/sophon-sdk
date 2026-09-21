@@ -489,6 +489,7 @@ pub struct FinalizedToolset {
     pub resources: SharedResources,
     resources_persistence: Arc<ResourcesPersistence>,
     scheduler_cancel: Option<tokio_util::sync::CancellationToken>,
+    scheduler_task: tokio::sync::Mutex<Option<SchedulerTask>>,
     /// Shared local registry for in-process dispatch.
     /// Contains only config-enabled tools. Can be shared with ToolHarness.
     local_registry: xai_computer_hub_sdk::LocalRegistry,
@@ -503,6 +504,12 @@ pub struct FinalizedToolset {
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
 }
+
+enum SchedulerTask {
+    Running(tokio::task::JoinHandle<()>),
+    Settled(Result<(), String>),
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequirementError {
     pub tool: String,
@@ -1281,6 +1288,7 @@ impl ToolRegistryBuilder {
             (Some(scheduler_cmd_rx), Some(cancel_token))
         };
         let shared_resources = resources.into_shared();
+        let mut scheduler_task = None;
         if let (Some(cmd_rx), Some(cancel_token)) = (scheduler_cmd_rx, &scheduler_cancel_token) {
             let actor = crate::implementations::grok_build::scheduler::actor::SchedulerActor {
                 resources: shared_resources.clone(),
@@ -1292,7 +1300,7 @@ impl ToolRegistryBuilder {
                 pending_removal: None,
                 blocked_expiries: Default::default(),
             };
-            tokio::spawn(actor.run());
+            scheduler_task = Some(SchedulerTask::Running(tokio::spawn(actor.run())));
         }
         Ok(FinalizedToolset {
             tools: parking_lot::RwLock::new(tools),
@@ -1300,6 +1308,7 @@ impl ToolRegistryBuilder {
             resources: shared_resources,
             resources_persistence: persistence,
             scheduler_cancel: scheduler_cancel_token,
+            scheduler_task: tokio::sync::Mutex::new(scheduler_task),
             local_registry,
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
@@ -1346,6 +1355,34 @@ impl xai_tool_runtime::ToolDispatch for InnerDispatchForToolset {
     }
 }
 impl FinalizedToolset {
+    /// Fence new scheduler work, then settle admitted work before releasing this
+    /// owner. Awaiting the retained handle is cancellation-safe; retries observe
+    /// the same task or cached terminal failure. Inherited schedulers are not ours
+    /// to close.
+    pub async fn close_scheduler_checked(&self) -> Result<(), String> {
+        if self.scheduler_cancel.is_none() {
+            return Ok(());
+        }
+        {
+            let resources = self.resources.lock().await;
+            if let Some(gate) = resources.get::<crate::implementations::grok_build::scheduler::types::SchedulerActivationGate>() {
+                gate.close();
+            }
+        }
+        let mut owned = self.scheduler_task.lock().await;
+        match owned.as_mut() {
+            Some(SchedulerTask::Running(task)) => {
+                let result = task
+                    .await
+                    .map_err(|error| format!("scheduler shutdown failed: {error}"));
+                *owned = Some(SchedulerTask::Settled(result.clone()));
+                result
+            }
+            Some(SchedulerTask::Settled(result)) => result.clone(),
+            None => Err("owned scheduler completion handle is missing".into()),
+        }
+    }
+
     /// Construct an empty toolset for tests. No tools, no background tasks.
     ///
     /// Safe to call from sync `#[test]` — does not require a tokio runtime.
@@ -1358,6 +1395,7 @@ impl FinalizedToolset {
             )),
             resources_persistence: Arc::new(ResourcesPersistence::noop()),
             scheduler_cancel: None,
+            scheduler_task: tokio::sync::Mutex::new(None),
             local_registry: xai_computer_hub_sdk::LocalRegistry::new(),
             renderer: Arc::new(TemplateRenderer::new(
                 std::collections::HashMap::new(),
@@ -4418,6 +4456,161 @@ mod tests {
             "GrokBuild:run_terminal_cmd",
         ]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduler_checked_close_settles_admitted_mutation_and_rejects_queue() {
+        use crate::implementations::grok_build::scheduler::types::{
+            ScheduledTask, SchedulerCommand, SchedulerError, SchedulerHandle,
+        };
+        let tmp = TempDir::new().unwrap();
+        let mut context = test_session_context(&tmp);
+        let (notifications, mut deliveries) =
+            crate::notification::ToolNotificationHandle::acknowledged_channel();
+        context.notification_handle = notifications;
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![],
+                    behavior_preset: None,
+                },
+                context,
+            )
+            .unwrap();
+        let handle = toolset
+            .resources
+            .lock()
+            .await
+            .get::<SchedulerHandle>()
+            .unwrap()
+            .clone();
+        let task = ScheduledTask::new(3600, "admitted".into(), true, true);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        handle
+            .0
+            .send(SchedulerCommand::Create {
+                task: task.clone(),
+                reply,
+            })
+            .unwrap();
+        response.await.unwrap().unwrap();
+        let (reply, deletion) = tokio::sync::oneshot::channel();
+        handle
+            .0
+            .send(SchedulerCommand::Delete {
+                id: task.id.clone(),
+                reply,
+            })
+            .unwrap();
+        let acknowledgement = loop {
+            let delivery = deliveries.recv().await.unwrap();
+            if let Some(ack) = delivery.acknowledgement {
+                break ack;
+            }
+        };
+        // Deletion has persisted absence and is admitted, waiting only for its
+        // independent durable notification acknowledgement. Later create is not.
+        let (reply, queued) = tokio::sync::oneshot::channel();
+        handle
+            .0
+            .send(SchedulerCommand::Create {
+                task: task.clone(),
+                reply,
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                toolset.close_scheduler_checked()
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            &*toolset.scheduler_task.lock().await,
+            Some(SchedulerTask::Running(_))
+        ));
+
+        // A different session and an inherited handle are not closed by this wait.
+        let other_tmp = TempDir::new().unwrap();
+        let other = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![],
+                    behavior_preset: None,
+                },
+                test_session_context(&other_tmp),
+            )
+            .unwrap();
+        let other_handle = other
+            .resources
+            .lock()
+            .await
+            .get::<SchedulerHandle>()
+            .unwrap()
+            .clone();
+        let child_tmp = TempDir::new().unwrap();
+        let mut child_context = test_session_context(&child_tmp);
+        child_context.parent_scheduler_handle = Some(other_handle.clone());
+        let child = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![],
+                    behavior_preset: None,
+                },
+                child_context,
+            )
+            .unwrap();
+        child.close_scheduler_checked().await.unwrap();
+        let version = other_handle.snapshot().await.unwrap().version;
+        other_handle
+            .create(
+                "peer-create".into(),
+                "peer-create".into(),
+                version,
+                task.clone(),
+            )
+            .await
+            .unwrap();
+
+        acknowledgement.send(Ok(())).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            toolset.close_scheduler_checked(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(deletion.await.unwrap().unwrap());
+        assert!(matches!(queued.await.unwrap(), Err(SchedulerError::Closed)));
+        assert!(matches!(
+            handle
+                .create("late".into(), "late".into(), version, task)
+                .await,
+            Err(SchedulerError::Closed)
+        ));
+        toolset.close_scheduler_checked().await.unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("resources_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            disk["state"]["grok_build.Scheduler"]["tasks"],
+            serde_json::json!([])
+        );
+        other.close_scheduler_checked().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_checked_close_caches_join_failure() {
+        let mut toolset = FinalizedToolset::empty_for_test();
+        toolset.scheduler_cancel = Some(tokio_util::sync::CancellationToken::new());
+        *toolset.scheduler_task.get_mut() = Some(SchedulerTask::Running(tokio::spawn(async {
+            panic!("scheduler failure probe");
+        })));
+        let first = toolset.close_scheduler_checked().await.unwrap_err();
+        assert!(first.contains("scheduler failure probe"));
+        assert_eq!(toolset.close_scheduler_checked().await.unwrap_err(), first);
     }
 
     #[tokio::test]

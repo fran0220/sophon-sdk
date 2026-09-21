@@ -41,6 +41,10 @@ impl SchedulerActivationGate {
         self.state.load(std::sync::atomic::Ordering::SeqCst) == 1
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) == 2
+    }
+
     /// Terminal for this session owner. Reopening requires a new gate.
     pub fn close(&self) {
         self.state.store(2, std::sync::atomic::Ordering::SeqCst);
@@ -231,6 +235,9 @@ impl Default for SchedulerClock {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SchedulerError {
+    #[error("scheduler is closed; command was not admitted")]
+    Closed,
+
     #[error("scheduler requires a committed configuration candidate")]
     ActivationRequired,
 
@@ -270,6 +277,7 @@ pub enum SchedulerError {
 
 pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolError {
     let code = match &error {
+        SchedulerError::Closed => "scheduler_closed",
         SchedulerError::ActivationRequired => "scheduler_activation_required",
         SchedulerError::InvalidVersion(_)
         | SchedulerError::InvalidInterval(_)
@@ -618,7 +626,7 @@ impl SchedulerHandle {
         let (reply, response) = oneshot::channel();
         self.0
             .send(SchedulerCommand::List { reply })
-            .map_err(|_| SchedulerError::Cancelled)?;
+            .map_err(|_| SchedulerError::Closed)?;
         response.await.map_err(|_| SchedulerError::Cancelled)
     }
 
@@ -638,7 +646,7 @@ impl SchedulerHandle {
                 task,
                 reply,
             })
-            .map_err(|_| SchedulerError::Cancelled)?;
+            .map_err(|_| SchedulerError::Closed)?;
         response.await.map_err(|_| SchedulerError::Cancelled)?
     }
 
@@ -662,7 +670,7 @@ impl SchedulerHandle {
                 cadence,
                 reply,
             })
-            .map_err(|_| SchedulerError::Cancelled)?;
+            .map_err(|_| SchedulerError::Closed)?;
         response.await.map_err(|_| SchedulerError::Cancelled)?
     }
 
@@ -682,7 +690,7 @@ impl SchedulerHandle {
                 id,
                 reply,
             })
-            .map_err(|_| SchedulerError::Cancelled)?;
+            .map_err(|_| SchedulerError::Closed)?;
         response.await.map_err(|_| SchedulerError::Cancelled)?
     }
 }
