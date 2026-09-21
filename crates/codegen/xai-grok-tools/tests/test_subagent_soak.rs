@@ -294,6 +294,7 @@ struct SoakControl {
 }
 
 impl ChildControl for SoakControl {
+    type Inheritance = ();
     type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
@@ -323,6 +324,7 @@ impl ChildRunner for SoakRunner {
         Box::pin(async move {
             let ChildRunRequest {
                 request,
+                spawner_inheritance: _,
                 cancellation,
                 reporter,
                 attempt_id: _,
