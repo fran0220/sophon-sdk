@@ -2156,6 +2156,24 @@ async fn read_parent_sampling_config_pins_mounted_dispatch_despite_later_parent_
 }
 
 #[tokio::test]
+async fn inherited_auth_uses_captured_catalog_key_before_wire_alias() {
+    let mut selected = test_model_entry("shared-wire");
+    selected.api_key = Some("captured-byok".into());
+    selected.info.auth_scheme = xai_grok_sampler::AuthScheme::XApiKey;
+    let competing = test_model_entry("shared-wire");
+    let mut models = indexmap::IndexMap::new();
+    models.insert("selected-route".into(), selected);
+    models.insert("shared-wire".into(), competing);
+    let mut ctx = ctx_with_parent_chat_state("selected-route", "shared-wire", "shared-wire", models);
+    ctx.auth_method_id = acp::AuthMethodId::new(crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID);
+    assert!(inherited_bearer_resolver(&ctx, "shared-wire", "https://api.x.ai/v1").is_none());
+    let (sampling, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(sampling.auth_scheme, xai_grok_sampler::AuthScheme::XApiKey);
+    ctx.available_models.get_mut("selected-route").unwrap().api_key = None;
+    assert!(inherited_bearer_resolver(&ctx, "shared-wire", "https://api.x.ai/v1").is_some());
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_keeps_catalog_threshold_when_routing_slug_is_also_key() {
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry("grok-4.5");

@@ -8,6 +8,8 @@ struct PreparedCandidate {
     mounted: MountedConfig,
     model: crate::agent::config::ModelEntry,
     sampling: crate::sampling::SamplerConfig,
+    auth_type: xai_chat_state::AuthType,
+    auto_compact_threshold_percent: u8,
     config_version: xai_prompt_queue::QueueVersion,
     skill_revision: u64,
     plugin_revision: u64,
@@ -224,7 +226,7 @@ impl SessionActor {
             .plugins_for_preparation(self.plugin_registry.borrow().clone());
         let client_hooks = self.candidate_admission
             .client_hooks_for_preparation(self.client_hooks.borrow().clone());
-        let (model, sampling) = self
+        let (model, sampling, auth_type) = self
             .models_manager
             .prepare_published_model(&candidate.model, candidate.reasoning_effort.as_deref())?;
         if model.info().agent_type != self.agent.borrow().definition().name {
@@ -233,6 +235,9 @@ impl SessionActor {
             ));
         }
         let mut config = self.models_manager.native_config_snapshot();
+        let auto_compact_threshold_percent = crate::util::config::resolve_auto_compact_threshold_percent(
+            &config, &candidate.model, Some(model.info()),
+        );
         let mut seen = std::collections::HashSet::new();
         for brief in &candidate.subagent_briefs {
             if !seen.insert(&brief.name) {
@@ -417,6 +422,8 @@ impl SessionActor {
             },
             model,
             sampling,
+            auth_type,
+            auto_compact_threshold_percent,
             config_version,
             skill_revision,
             plugin_revision,
@@ -464,12 +471,13 @@ impl SessionActor {
         {
             return Err(candidate_error("candidate superseded during preparation"));
         }
-        let (current_model, current_sampling) = self.models_manager.prepare_published_model(
+        let (current_model, current_sampling, current_auth_type) = self.models_manager.prepare_published_model(
             &prepared.mounted.candidate.model,
             prepared.mounted.candidate.reasoning_effort.as_deref(),
         )?;
         if serde_json::to_value(current_model).ok() != serde_json::to_value(&prepared.model).ok()
             || current_sampling.api_key != prepared.sampling.api_key
+            || current_auth_type != prepared.auth_type
         {
             return Err(candidate_error(
                 "candidate model changed during preparation",
@@ -485,7 +493,8 @@ impl SessionActor {
             .ok_or_else(|| candidate_error("chat state unavailable"))?;
         let old_credentials = self.chat_state_handle.get_credentials().await;
         let sampling = prepared.sampling.clone();
-        let context_window = std::num::NonZeroU64::new(sampling.context_window)
+        let context_window = self.compaction.context_window_override
+            .or_else(|| std::num::NonZeroU64::new(sampling.context_window))
             .ok_or_else(|| candidate_error("candidate has invalid context window"))?;
         let chat_sampling = xai_grok_sampling_types::SamplingConfig {
             base_url: sampling.base_url.clone(),
@@ -510,16 +519,10 @@ impl SessionActor {
             api_key: sampling.api_key.clone(),
             client_version: sampling.client_version.clone(),
             alpha_test_key: old_credentials.alpha_test_key,
-            auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                sampling.model.as_str(),
-                self.auth_manager
-                    .as_ref()
-                    .and_then(|manager| manager.current_or_expired())
-                    .as_ref()
-                    .map(|auth| auth.key.as_str()),
-                old_credentials.auth_type,
-            ),
+            auth_type: prepared.auth_type,
         };
+        let model_id = acp::ModelId::new(prepared.mounted.candidate.model.clone());
+        let auto_compact_threshold_percent = prepared.auto_compact_threshold_percent;
         let instructions = prepared.mounted.candidate.instructions.clone();
         let skill_effects = prepared.skill_effects.clone();
         let plugin_registry = prepared.plugin_registry.clone();
@@ -616,7 +619,14 @@ impl SessionActor {
         self.compactions_remaining
             .set(sampling.compactions_remaining);
         self.compaction_at_tokens.set(sampling.compaction_at_tokens);
+        self.compaction.threshold_percent.set(auto_compact_threshold_percent);
         self.invalidate_model_auth_memo();
+        self.signals_handle().record_model_usage(&sampling.model);
+        let _ = self.notifications.persistence_tx.send(PersistenceMsg::CurrentModel {
+            model_id,
+            agent_name: Some(self.agent.borrow().definition().name.clone()),
+            reasoning_effort: Some(sampling.reasoning_effort),
+        });
         self.apply_skill_update_effects(skill_effects).await;
         let version = self.tool_context.config_clock.bump();
         self.broadcast_effective_config_changed(version);
@@ -730,11 +740,14 @@ mod tests {
                     }
                 });
                 let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel::<crate::session::persistence::PersistenceMsg>();
+                let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
                 tokio::task::spawn_local(async move {
                     while let Some(message) = persistence_rx.recv().await {
                         if let crate::session::persistence::PersistenceMsg::FlushAndAck { respond_to }
                         | crate::session::persistence::PersistenceMsg::FlushForExit { respond_to } = message {
                             let _ = respond_to.send(Ok(()));
+                        } else if let PersistenceMsg::CurrentModel { model_id, .. } = message {
+                            let _ = model_tx.send(model_id);
                         }
                     }
                 });
@@ -743,6 +756,7 @@ mod tests {
                 ).await;
                 let (sampler_tx, mut sampler_rx) = tokio::sync::mpsc::unbounded_channel();
                 actor.sampler_handle = xai_grok_sampler::SamplerActor::spawn(Default::default(), Default::default(), sampler_tx);
+                actor.compaction.context_window_override = std::num::NonZeroU64::new(123_456);
                 for (key, wire, backend) in [
                     ("route-a", "wire-A", xai_grok_sampling_types::ApiBackend::Responses),
                     ("route-c", "wire-C", xai_grok_sampling_types::ApiBackend::ChatCompletions),
@@ -752,6 +766,7 @@ mod tests {
                     entry.info.base_url = server.url();
                     entry.info.api_backend = backend;
                     entry.info.max_retries = Some(0);
+                    entry.info.auto_compact_threshold_percent = Some(if key == "route-a" { 61 } else { 73 });
                     entry.api_key = Some("test-fifo-key".into());
                     actor.models_manager.insert_test_entry(key, entry);
                 }
@@ -783,6 +798,8 @@ mod tests {
                 barrier.await.unwrap();
                 assert_eq!(actor.candidate_admission.mounted().unwrap().candidate.revision, "A");
                 assert_eq!(actor.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("A"));
+                assert_eq!(actor.compaction.threshold_percent.get(), 61);
+                assert_eq!(actor.chat_state_handle.get_credentials().await.auth_type, xai_chat_state::AuthType::ApiKey);
                 assert_eq!(actor.tool_context.admission.snapshot().accepted, 2);
                 std::fs::write(&skill_path, "---\nname: frozen\ndescription: changed skill\n---\nSKILL_C").unwrap();
                 actor.reload_skills_from_disk().await;
@@ -805,6 +822,11 @@ mod tests {
                 cmd_tx.send(c).unwrap();
                 response_c.await.unwrap().unwrap();
                 assert_eq!(actor.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("C"));
+                assert_eq!(actor.compaction.threshold_percent.get(), 73);
+                assert_eq!(actor.effective_config_snapshot().await.unwrap().route.context_window, 123_456);
+                assert_eq!(model_rx.recv().await.unwrap().0.as_ref(), "route-a");
+                assert_eq!(model_rx.recv().await.unwrap().0.as_ref(), "route-c");
+                assert!(model_rx.try_recv().is_err());
                 let requests = server.requests();
                 let inference: Vec<_> = requests.iter().filter(|request| request.path == "/v1/responses" || request.path == "/v1/chat/completions").collect();
                 assert_eq!(inference.len(), 3);
@@ -907,6 +929,24 @@ mod tests {
                 assert!(inherited.skills.as_ref().unwrap().iter().any(|skill| skill.name == "mounted-skill-a"));
                 assert!(Arc::ptr_eq(&inherited.toolset, &toolset));
                 assert!(inherited.hook_registry.as_ref().unwrap().all_hooks().iter().any(|hook| hook.name.starts_with("plugin/mount-a/")));
+                // Cancellation between preparation and the seal lock must not
+                // publish; close and required cold actors must also refuse it.
+                let captured = inherited.mounted.as_ref().unwrap();
+                let child_admission = crate::session::config_candidate::CandidateAdmission::default();
+                let ticket = child_admission.generation();
+                child_admission.cancel();
+                assert!(!child_admission.inherit(ticket, (**captured).clone(), || panic!("stale seal published")));
+                assert!(child_admission.inherit(child_admission.generation(), (**captured).clone(), || {}));
+                assert!(!child_admission.inherit(child_admission.generation(), (**captured).clone(), || panic!("duplicate seal published")));
+                child_admission.close();
+                assert!(!child_admission.inherit(child_admission.generation(), (**captured).clone(), || panic!("closed seal published")));
+                let required = crate::session::config_candidate::CandidateAdmission::new(true, None);
+                assert!(!required.inherit(required.generation(), (**captured).clone(), || panic!("required actor inherited")));
+                let hook_event = xai_grok_hooks::event::HookEventName::PreToolUse;
+                assert!(!actor.client_hooks.borrow().contains_key(&hook_event));
+                let hooks = std::collections::HashMap::from([(hook_event, vec![])]);
+                assert!(actor.admit_candidate_command(SessionCommand::SetClientHooks { hooks }).await.is_none());
+                assert!(!actor.client_hooks.borrow().contains_key(&hook_event));
                 assert_eq!(actor.apply_plugin_registry_snapshot(Some(plugins_b.clone())).await, (0, false, 0));
                 for failure in ["cancel", "unknown-option", "invalid-directory"] {
                     let mut next = candidate.clone();
@@ -925,6 +965,7 @@ mod tests {
                     }
                     assert!(actor.mount_candidate(next, cancelled).await.is_err());
                     assert!(Arc::ptr_eq(actor.plugin_registry.borrow().as_ref().unwrap(), &plugins_a));
+                    assert!(!actor.client_hooks.borrow().contains_key(&hook_event));
                     assert!(actor.hook_registry.borrow().as_ref().unwrap().all_hooks().iter().any(|hook| hook.name.starts_with("plugin/mount-a/")));
                     assert_eq!(
                         serde_json::to_value(actor.chat_state_handle.snapshot().await.unwrap())
@@ -956,6 +997,7 @@ mod tests {
                 next["revision"] = serde_json::json!("B");
                 drop(actor.mount_candidate(next, Default::default()).await.unwrap());
                 let replacement = actor.snapshot_subagent_parent().await;
+                assert!(replacement.client_hooks.contains_key(&hook_event));
                 assert!(Arc::ptr_eq(replacement.plugin_registry.as_ref().unwrap(), &plugins_b));
                 let replacement_hooks = replacement.hook_registry.as_ref().unwrap().all_hooks();
                 assert!(replacement_hooks.iter().any(|hook| hook.name.starts_with("plugin/mount-b/")));

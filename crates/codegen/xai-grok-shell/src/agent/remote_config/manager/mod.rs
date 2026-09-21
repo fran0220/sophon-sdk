@@ -1037,7 +1037,7 @@ impl ModelsManager {
         &self,
         model_id: &str,
         effort: Option<&str>,
-    ) -> Result<(ModelEntry, SamplingConfig), acp::Error> {
+    ) -> Result<(ModelEntry, SamplingConfig, xai_chat_state::AuthType), acp::Error> {
         let cfg = self.inner.cfg.read().clone();
         let entry = self.models().get(model_id).cloned().ok_or_else(|| {
             acp::Error::invalid_params().data("candidate model must be an exact configured published ID")
@@ -1054,6 +1054,7 @@ impl ModelsManager {
         if credentials.api_key.is_none() {
             return Err(acp::Error::invalid_params().data("candidate model credentials unavailable"));
         }
+        let auth_type = credentials.auth_type;
         let mut sampling = sampling_config_for_model(
             &entry, credentials, cfg.endpoints.alpha_test_key.clone(), cfg.client_version.clone(),
             crate::managed_config::resolve_deployment_id(cfg.endpoints.deployment_key.as_deref()), None,
@@ -1067,7 +1068,7 @@ impl ModelsManager {
             sampling.reasoning_effort = Some(effort);
             sampling.model = entry.info().model_at(effort).to_owned();
         }
-        Ok((entry, sampling))
+        Ok((entry, sampling, auth_type))
     }
 
     /// Build a `SamplingConfig` from the current model and auth state.
