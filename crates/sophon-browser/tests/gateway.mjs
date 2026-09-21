@@ -5,7 +5,7 @@ import { createServer } from 'node:http'
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { Agent } from '../../../packages/typescript/dist/index.js'
+const { Agent } = await import(process.env.SOPHON_SDK_MODULE ?? '../../../packages/typescript/dist/index.js')
 
 assert.ok(process.env.SOPHON_RUNTIME && process.env.OG_AI_GATEWAY && process.env.OG_API_KEY)
 const gateway = process.env.OG_AI_GATEWAY.replace(/\/+$/, '').replace(/\/v1$/, '')
@@ -61,6 +61,7 @@ let session
 let timer
 let callbacks = 0
 const calls = new Map()
+const completions = new Map()
 try {
   agent = await Agent.spawn({ executable: process.env.SOPHON_RUNTIME,
     env: { ...process.env, GROK_HOME: join(root, 'home'), GROK_AUTH: '', GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_FEEDBACK_ENABLED: 'false', GROK_TURN_SUMMARY: 'false' },
@@ -68,6 +69,9 @@ try {
     onCallback: async () => { callbacks++; throw new Error('Unexpected client callback') },
   })
   agent.subscribe(event => {
+    if (event.type === 'session' && event.update.type === 'tool_call_update' && event.update.value.status === 'completed') {
+      completions.set(event.update.value.id, event.update.value)
+    }
     if (event.type === 'history_record' && ['tool_call', 'tool_call_update'].includes(event.record.update.type)) {
       const call = event.record.update.value
       calls.set(call.id, { ...calls.get(call.id), ...call, rawInput: call.rawInput ?? calls.get(call.id)?.rawInput })
@@ -84,18 +88,31 @@ try {
   assert.equal(callbacks, 0)
   const actions = [...calls.values()].filter(call => call.rawInput?.tool_name === 'browser').map(call => call.rawInput.tool_input?.action).filter(Boolean)
   for (const action of ['new_tab', 'navigate', 'snapshot', 'type', 'click', 'screenshot']) assert.ok(actions.includes(action), `Missing native action ${action}`)
+  for (const call of calls.values()) {
+    assert.equal(call.rawInput?.tool_name, 'browser', 'acceptance must use browser tools only')
+    assert.ok(completions.has(call.id), `Missing completed event for ${call.rawInput.tool_input.action}`)
+  }
+  const screenshotCall = [...calls.values()].find(call => call.rawInput.tool_input.action === 'screenshot')
+  const screenshotOutput = completions.get(screenshotCall.id).rawOutput
+  assert.equal(screenshotOutput.type, 'Dynamic')
+  const published = screenshotOutput.value
+  assert.equal(published.reviewRequired, true)
+  assert.equal(published.artifact.mimeType, 'image/png')
   const files = await readdir(join(workspace, '.native-browser'))
   const screenshots = files.filter(file => file.endsWith('.png'))
   assert.equal(screenshots.length, 1)
   const path = `.native-browser/${screenshots[0]}`
+  assert.equal(published.artifact.path, path)
+  assert.equal(path, `.native-browser/${published.artifact_id}.png`)
   const artifact = await session.readArtifact(path)
   const bytes = Buffer.from(artifact.base64, 'base64')
+  assert.equal(bytes.length, published.artifact.bytes)
   assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10])
   assert.deepEqual(bytes, await readFile(join(workspace, path)))
   if (process.env.SOPHON_BROWSER_EVIDENCE_DIR) await writeFile(join(process.env.SOPHON_BROWSER_EVIDENCE_DIR, 'gateway-browser.png'), bytes)
   await agent.finalExit()
   agent = null
-  console.log(JSON.stringify({ ok: true, realGateway: true, model: route.model, effectiveRevision: effective.revision, actions, submissions: submitted.length, hostToolCallbacks: callbacks, workspaceArtifact: true, pngBytes: bytes.length, checkedRuntimeExit: true }))
+  console.log(JSON.stringify({ ok: true, realGateway: true, model: route.model, effectiveRevision: effective.revision, actions, completedNativeEvents: completions.size, screenshotDynamicOutput: true, submissions: submitted.length, hostToolCallbacks: callbacks, workspaceArtifact: true, pngBytes: bytes.length, checkedRuntimeExit: true }))
 } catch (error) {
   const diagnostic = String(error.message).replaceAll(process.env.OG_API_KEY, '[credential]').replaceAll(gateway, '[gateway]').slice(0, 800)
   console.error(JSON.stringify({ ok: false, errorType: error.name, diagnostic, actions: [...calls.values()].map(call => ({ tool: call.rawInput?.tool_name, action: call.rawInput?.tool_input?.action, status: call.status })), submissions: submitted.length, callbacks }))
