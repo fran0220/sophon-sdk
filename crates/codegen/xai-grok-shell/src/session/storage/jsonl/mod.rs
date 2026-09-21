@@ -1182,6 +1182,16 @@ async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 
 }
 #[async_trait]
 impl StorageAdapter for JsonlStorageAdapter {
+    fn capture_history(
+        &self,
+        info: &Info,
+    ) -> Result<
+        crate::session::portability::NativeHistorySnapshot,
+        crate::session::portability::PortabilityError,
+    > {
+        crate::session::portability::capture_history(&self.session_dir(info), info)
+    }
+
     fn capture_portable(
         &self,
         info: &Info,

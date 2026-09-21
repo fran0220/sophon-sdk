@@ -2,6 +2,27 @@ use super::*;
 use crate::session::portability::{PortabilityError, PortableImportStatus, PortableSession};
 
 impl MvpAgent {
+    /// Capture this idle session's display history without reserving agent-wide
+    /// admission or treating its tools/scheduler resources as portable state.
+    pub async fn capture_history(
+        &self,
+        id: &str,
+        boundary_id: String,
+    ) -> Result<crate::session::portability::NativeHistorySnapshot, PortabilityError> {
+        let handle = self
+            .get_session_handle(&acp::SessionId::new(id.to_owned()))
+            .ok_or(PortabilityError::Unavailable)?;
+        let (respond_to, response) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(SessionCommand::CaptureHistory {
+                boundary_id,
+                respond_to,
+            })
+            .map_err(|_| PortabilityError::Unavailable)?;
+        response.await.map_err(|_| PortabilityError::Unavailable)?
+    }
+
     /// Capture while leaving the same session actor resident and usable.
     /// Conservatively reserves agent-wide admission: no accepted root work
     /// may straddle the capture, including scheduler/peer work.

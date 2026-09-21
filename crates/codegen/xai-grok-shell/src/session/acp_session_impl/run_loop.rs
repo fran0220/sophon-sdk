@@ -369,6 +369,74 @@ mod startup_task_tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn history_capture_handoff_holds_mailbox_after_caller_drops() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (gateway_tx, mut gateway) = mpsc::unbounded_channel();
+            let (boundary_tx, mut boundaries) = mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(message) = gateway.recv().await {
+                    match message {
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args)
+                            if args.request.method.as_ref() == "sophon-sdk/history-boundary" => {
+                            boundary_tx.send(args).unwrap();
+                        }
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        _ => {}
+                    }
+                }
+            });
+            let (persistence_tx, mut persistence) = mpsc::unbounded_channel();
+            let (capture_tx, mut captures) = mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(message) = persistence.recv().await {
+                    if let PersistenceMsg::CaptureHistory { respond_to } = message {
+                        capture_tx.send(respond_to).unwrap();
+                    }
+                }
+            });
+            let (actor, events) = super::super::support::create_test_actor_ex(
+                0, 256_000, 85, gateway_tx, persistence_tx,
+            ).await;
+            let actor = Arc::new(actor);
+            let (commands, receiver) = mpsc::unbounded_channel();
+            let (_chat, chat_rx) = mpsc::unbounded_channel();
+            let task = tokio::task::spawn_local(run_session(
+                actor.clone(), receiver, chat_rx, events, None,
+                Arc::new(parking_lot::Mutex::new(CodebaseIndexManager::new())),
+                std::path::PathBuf::from("/tmp"), fs_watch::FsWatchCapabilities::none(),
+            ));
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            commands.send(SessionCommand::CaptureHistory { boundary_id: "handoff-7".into(), respond_to }).unwrap();
+            drop(response);
+            let capture = captures.recv().await.unwrap();
+            let (respond_to, mut busy) = tokio::sync::oneshot::channel();
+            commands.send(SessionCommand::IsBusy { respond_to }).unwrap();
+            assert!(matches!(busy.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            capture.send(Ok(crate::session::portability::NativeHistorySnapshot {
+                session_id: actor.session_id_string(), revision: "history-revision".into(), updates_jsonl: String::new(),
+            })).unwrap();
+            let boundary = boundaries.recv().await.unwrap();
+            let params: serde_json::Value = serde_json::from_str(boundary.request.params.get()).unwrap();
+            assert_eq!(params, serde_json::json!({"sessionId": actor.session_id_string(), "boundaryId": "handoff-7"}));
+            assert!(matches!(busy.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            boundary.response_tx.send(Ok(())).unwrap();
+            assert!(!busy.await.unwrap());
+
+            let held = tokio::task::spawn_local(std::future::pending::<()>());
+            actor.state.lock().await.running_task = Some(AgentTask::new("held-turn", held.abort_handle()));
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            commands.send(SessionCommand::CaptureHistory { boundary_id: "busy-handoff".into(), respond_to }).unwrap();
+            assert!(matches!(response.await.unwrap(), Err(crate::session::portability::PortabilityError::Busy)));
+            assert!(captures.try_recv().is_err(), "busy target never starts persistence capture");
+            assert!(boundaries.try_recv().is_err(), "busy target never publishes a boundary");
+            held.abort();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn checked_close_real_actor_flush_failure_retry_and_stop() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -1943,6 +2011,36 @@ pub(super) async fn run_session(
                                     snapshot,
                                 },
                             );
+                        }
+                        SessionCommand::CaptureHistory { boundary_id, respond_to } => {
+                            use crate::session::portability::PortabilityError;
+                            // Only this actor's mailbox is held through capture and
+                            // the acknowledged handoff. Peer sessions remain usable.
+                            let result = async {
+                                if session.is_busy().await {
+                                    return Err(PortabilityError::Busy);
+                                }
+                                if let Some(notification) = replay_buffer.flush() {
+                                    session.emit_buffered(notification).await;
+                                }
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                session.notifications.persistence_tx
+                                    .send(PersistenceMsg::CaptureHistory { respond_to: tx })
+                                    .map_err(|_| PortabilityError::Unavailable)?;
+                                let snapshot = rx.await.map_err(|_| PortabilityError::Unavailable)??;
+                                let params = serde_json::json!({"sessionId": snapshot.session_id, "boundaryId": boundary_id});
+                                let notification = acp::ExtNotification::new(
+                                    "sophon-sdk/history-boundary",
+                                    serde_json::value::to_raw_value(&params).map_err(|error| PortabilityError::Malformed(error.to_string()))?.into(),
+                                );
+                                tokio::time::timeout(std::time::Duration::from_secs(10),
+                                    session.notifications.gateway.forward_with_completion(notification))
+                                    .await.map_err(|_| PortabilityError::Unavailable)?
+                                    .map_err(|_| PortabilityError::Unavailable)?
+                                    .map_err(|_| PortabilityError::Unavailable)?;
+                                Ok(snapshot)
+                            }.await;
+                            let _ = respond_to.send(result);
                         }
                         SessionCommand::ExportPortable { fence, history_boundary, respond_to } => {
                             use crate::session::portability::PortabilityError;

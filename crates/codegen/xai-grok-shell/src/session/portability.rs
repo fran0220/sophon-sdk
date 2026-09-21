@@ -24,6 +24,56 @@ pub const PORTABLE_FORMAT_VERSION: u32 = 1;
 pub const PORTABLE_COMPATIBILITY: &str = "sophon-conversation-v1-grok-build-1.0.16-chat-1";
 pub const MAX_PORTABLE_BYTES: usize = 200 * 1024 * 1024;
 
+/// Read-only persisted event projection, not a portable execution snapshot.
+#[derive(Debug, Clone)]
+pub struct NativeHistorySnapshot {
+    pub session_id: String,
+    pub revision: String,
+    pub updates_jsonl: String,
+}
+
+/// Called only inside the persistence actor after its checked flush. History
+/// does not capture orchestration resources or impose their portability rules.
+pub(crate) fn capture_history(
+    dir: &Path,
+    info: &Info,
+) -> Result<NativeHistorySnapshot, PortabilityError> {
+    use std::io::Read;
+    let path = dir.join(st::UPDATES_FILE);
+    let updates_jsonl = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(PortabilityError::Incomplete(
+                    "nonregular updates.jsonl".into(),
+                ));
+            }
+            if metadata.len() > MAX_PORTABLE_BYTES as u64 {
+                return Err(PortabilityError::TooLarge);
+            }
+            let mut data = String::new();
+            std::fs::File::open(path)?
+                .take(MAX_PORTABLE_BYTES as u64 + 1)
+                .read_to_string(&mut data)?;
+            if data.len() > MAX_PORTABLE_BYTES {
+                return Err(PortabilityError::TooLarge);
+            }
+            data
+        }
+    };
+    let session_id = info.id.0.to_string();
+    let revision = revision(&BTreeMap::from([
+        ("session_id".into(), session_id.clone()),
+        (st::UPDATES_FILE.into(), updates_jsonl.clone()),
+    ]));
+    Ok(NativeHistorySnapshot {
+        session_id,
+        revision,
+        updates_jsonl,
+    })
+}
+
 /// Checked against current native data without attaching an actor. Only
 /// MatchesSnapshot can reconcile an uncertain import response as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

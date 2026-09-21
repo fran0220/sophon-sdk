@@ -1165,6 +1165,17 @@ impl SessionFileSet {
 /// Abstracts over different storage backends (JSONL, SQLite, etc.)
 #[async_trait]
 pub trait StorageAdapter: Send + Sync {
+    /// Read-only history capture inside the persistence actor's checked barrier.
+    fn capture_history(
+        &self,
+        _info: &Info,
+    ) -> Result<super::portability::NativeHistorySnapshot, super::portability::PortabilityError>
+    {
+        Err(super::portability::PortabilityError::Incomplete(
+            "storage backend does not support history capture".into(),
+        ))
+    }
+
     /// Synchronous capture inside the persistence actor's checked barrier.
     fn capture_portable(
         &self,

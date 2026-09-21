@@ -346,6 +346,11 @@ pub enum PersistenceMsg {
     FlushForExit {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    CaptureHistory {
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<super::portability::NativeHistorySnapshot, super::portability::PortabilityError>,
+        >,
+    },
     CapturePortable {
         respond_to: tokio::sync::oneshot::Sender<
             Result<super::portability::PortableSession, super::portability::PortabilityError>,
@@ -1981,6 +1986,14 @@ impl SessionPersistence {
                     let result = match self.flush_and_sync().await {
                         Ok(()) if self.portability_write_failed => Err(super::portability::PortabilityError::Incomplete("a native write failed during this actor's lifetime; memory/disk agreement is unconfirmed".into())),
                         Ok(()) => self.storage.capture_portable(&self.info),
+                        Err(error) => Err(error.into()),
+                    };
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::CaptureHistory { respond_to } => {
+                    let result = match self.flush_and_sync().await {
+                        Ok(()) if self.portability_write_failed => Err(super::portability::PortabilityError::Incomplete("a native write failed during this actor's lifetime; memory/disk agreement is unconfirmed".into())),
+                        Ok(()) => self.storage.capture_history(&self.info),
                         Err(error) => Err(error.into()),
                     };
                     let _ = respond_to.send(result);

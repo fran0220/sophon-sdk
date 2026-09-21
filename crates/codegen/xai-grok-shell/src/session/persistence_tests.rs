@@ -666,6 +666,91 @@ fn actor_with_barrier_probes(dir: &std::path::Path, info: &Info) -> (ActorGuard,
     (actor, SyncBarrierProbe { appends, syncs })
 }
 
+async fn history_capture(
+    handle: &PersistenceHandle,
+) -> Result<
+    super::super::portability::NativeHistorySnapshot,
+    super::super::portability::PortabilityError,
+> {
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(PersistenceMsg::CaptureHistory { respond_to })
+        .unwrap();
+    response.await.unwrap()
+}
+
+#[tokio::test]
+async fn history_capture_flushes_events_without_exporting_orchestration() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
+        cwd: "/test".into(),
+    };
+    JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf())
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (actor, probe) = actor_with_barrier_probes(dir.path(), &info);
+    let empty = history_capture(&actor.handle).await.unwrap();
+    assert!(empty.updates_jsonl.is_empty());
+    // These resources disqualify portable export, never display history.
+    std::fs::create_dir(dir.path().join("workflows")).unwrap();
+    std::fs::write(dir.path().join("resources_state.json"), "not history JSON").unwrap();
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "first-event")))
+        .unwrap();
+    let captured = history_capture(&actor.handle).await.unwrap();
+    assert_eq!(captured.session_id, info.id.0.as_ref());
+    assert!(captured.updates_jsonl.contains("first-event"));
+    assert!(!captured.updates_jsonl.contains("not history JSON"));
+    assert_ne!(captured.revision, empty.revision);
+    assert_eq!(
+        captured.updates_jsonl,
+        std::fs::read_to_string(dir.path().join("updates.jsonl")).unwrap()
+    );
+    assert!(
+        probe
+            .syncs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|files| files.updates)
+    );
+    assert!(matches!(
+        portable_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Incomplete(_))
+    ));
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::CurrentModel {
+            model_id: acp::ModelId::new("changed-summary-only"),
+            agent_name: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+    assert_eq!(
+        history_capture(&actor.handle).await.unwrap().revision,
+        captured.revision
+    );
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(
+            &info,
+            "second-event",
+        )))
+        .unwrap();
+    let later = history_capture(&actor.handle).await.unwrap();
+    assert_ne!(later.revision, captured.revision);
+    assert!(later.updates_jsonl.contains("first-event"));
+    assert!(later.updates_jsonl.contains("second-event"));
+    actor.stop().await;
+}
+
 async fn portable_capture(
     handle: &PersistenceHandle,
 ) -> Result<super::super::portability::PortableSession, super::super::portability::PortabilityError>
@@ -763,6 +848,10 @@ async fn portable_capture_propagates_real_sync_failure_without_artifact() {
         portable_capture(&actor.handle).await,
         Err(super::super::portability::PortabilityError::Persistence(_))
     ));
+    assert!(matches!(
+        history_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Persistence(_))
+    ));
     let (respond_to, ack) = tokio::sync::oneshot::channel();
     actor
         .handle
@@ -807,6 +896,10 @@ async fn portable_capture_cannot_forget_a_lost_write_after_an_ack_consumes_its_e
     flush_ack(&actor.handle).await.unwrap();
     assert!(matches!(
         portable_capture(&actor.handle).await,
+        Err(super::super::portability::PortabilityError::Incomplete(_))
+    ));
+    assert!(matches!(
+        history_capture(&actor.handle).await,
         Err(super::super::portability::PortabilityError::Incomplete(_))
     ));
     let (respond_to, ack) = tokio::sync::oneshot::channel();

@@ -773,6 +773,13 @@ pub enum SessionCommand {
     CloseChecked {
         completion: tokio::sync::watch::Sender<Option<Result<(), String>>>,
     },
+    /// Per-session display projection with an ordered live-event handoff.
+    CaptureHistory {
+        boundary_id: String,
+        respond_to: oneshot::Sender<
+            Result<super::portability::NativeHistorySnapshot, super::portability::PortabilityError>,
+        >,
+    },
     /// Fence is owned by this mailbox operation, not the cancellable caller.
     ExportPortable {
         fence: xai_grok_tools::management::admission::ExclusiveAdmission,
