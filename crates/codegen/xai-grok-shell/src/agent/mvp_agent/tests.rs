@@ -5135,6 +5135,104 @@ async fn new_root_session(agent: &MvpAgent, cwd: &std::path::Path) -> acp::Sessi
         .expect("session/new succeeds")
         .session_id
 }
+
+#[test]
+fn native_nested_child_keeps_spawner_mount_after_root_remount() {
+    use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
+    use xai_grok_tools::implementations::grok_build::task::types::{SubagentOwner, SubagentRequest};
+    fn mount(handle: &crate::session::SessionHandle, model: &str, revision: &str) -> tokio::sync::oneshot::Receiver<crate::session::PromptTurnResult> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        let prompt = SessionCommand::Prompt {
+            prompt_id: uuid::Uuid::now_v7().to_string(),
+            prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new("mount"))],
+            prompt_mode: Default::default(), artifact_upload_ctx: None,
+            client_identifier: None, screen_mode: None, verbatim: false, traceparent: None,
+            json_schema: None, send_now: false, admission: None, agent_admission: None,
+            tool_overrides_update: None, respond_to, prompt_admitted: None,
+            persist_ack: None, parsed_prompt_tx: None,
+        };
+        handle.cmd_tx.send(SessionCommand::PromptCandidate {
+            candidate: serde_json::json!({
+                "instructions":format!("ROOT_{revision}"), "skillDirectories":[], "externalMcpServers":[],
+                "model":model, "subjectOptions":{}, "subagentBriefs":[], "revision":revision
+            }),
+            generation: handle.candidate_admission.generation(), prompt: Box::new(prompt),
+        }).unwrap();
+        response
+    }
+    fn child(id: &str, parent: &str) -> SubagentRequest {
+        SubagentRequest {
+            id: id.into(), prompt: "answer briefly".into(), description: "inheritance test".into(),
+            subagent_type: "general-purpose".into(), parent_session_id: parent.into(),
+            parent_prompt_id: None, resume_from: None, cwd: None, runtime_overrides: Default::default(),
+            run_in_background: true, surface_completion: false, await_to_completion: false,
+            fork_context: false, owner: SubagentOwner::Task, cancel_token: Default::default(),
+            spawn_root: Default::default(),
+        }
+    }
+    run_local_for_bridge_test(|| Box::pin(async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let cwd = tempfile::tempdir().unwrap();
+            let server = xai_grok_test_support::MockInferenceServer::start().await.unwrap();
+            server.set_response("done");
+            let mut cfg = crate::agent::config::Config::default();
+            let mut models = indexmap::IndexMap::new();
+            for (key, wire) in [("test-model", "wire-A"), ("route-c", "wire-C")] {
+                let mut entry = crate::agent::config::ModelEntry::fallback(wire, &Default::default());
+                entry.info.base_url = server.url();
+                entry.info.api_backend = crate::sampling::ApiBackend::Responses;
+                entry.info.max_retries = Some(0);
+                entry.api_key = Some("test-nested-key".into());
+                models.insert(key.into(), entry);
+            }
+            cfg.registered_models = Some(models);
+            cfg.default_model_override = Some("test-model".into());
+            let auth = Arc::new(xai_grok_login::AuthManager::new(cwd.path(), Default::default()));
+            let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(message) = gateway_rx.recv().await {
+                    match message {
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        _ => {}
+                    }
+                }
+            });
+            let agent = Box::new(MvpAgent::new(GatewaySender::new(gateway_tx), &cfg, auth, None, None).unwrap());
+            agent.start_subagent_coordinator();
+            let sid = new_root_session(&agent, cwd.path()).await;
+            let handle = agent.resident_handle(&sid).unwrap();
+            mount(&handle, "test-model", "A").await.unwrap().unwrap();
+            server.hold_agent_completions();
+            let child_id = uuid::Uuid::now_v7().to_string();
+            let backend = ChannelBackend::for_coordinator_session(agent.subagent_event_tx.clone(), sid.0.to_string());
+            let first_backend = backend.clone();
+            let request = child(&child_id, sid.0.as_ref());
+            let first = tokio::task::spawn_local(async move { first_backend.spawn(request, None).await });
+            // Background title/summary calls share this server. Only this
+            // child's foreground request proves it captured A before remount.
+            while !server.requests().iter().any(|request| request.conversation.is_some() && request.header("x-grok-session-id") == Some(child_id.as_str())) { tokio::task::yield_now().await; }
+            let root_c = mount(&handle, "route-c", "C");
+            while !server.requests().iter().any(|request| request.conversation.is_some() && request.header("x-grok-session-id") == Some(sid.0.as_ref()) && request.body.as_ref().is_some_and(|body| body["model"] == "wire-C")) { tokio::task::yield_now().await; }
+            assert_eq!(handle.candidate_admission.mounted().unwrap().candidate.revision, "C");
+            let nested_backend = ChannelBackend::for_coordinator_session(agent.subagent_event_tx.clone(), child_id.clone());
+            let nested_id = uuid::Uuid::now_v7().to_string();
+            let request = child(&nested_id, &child_id);
+            let nested = tokio::task::spawn_local(async move { nested_backend.spawn(request, None).await });
+            while !server.requests().iter().any(|request| request.conversation.is_some() && request.header("x-grok-session-id") == Some(nested_id.as_str())) { tokio::task::yield_now().await; }
+            let requests = server.requests();
+            let models = requests.iter().filter(|request| request.path == "/v1/responses" && request.conversation.is_some())
+                .map(|request| request.body.as_ref().unwrap()["model"].as_str().unwrap()).collect::<Vec<_>>();
+            assert_eq!(models, ["wire-A", "wire-A", "wire-C", "wire-A"]);
+            server.release_agent_completions();
+            root_c.await.unwrap().unwrap();
+            assert!(first.await.unwrap().unwrap().success);
+            assert!(nested.await.unwrap().unwrap().success);
+            drive_close(&agent, sid.0.as_ref()).await.unwrap();
+        }).await.expect("native nested mount test timed out");
+    }));
+}
+
 /// Bindings the real spawn path took through the agent's (lazily built) local workspace ops.
 fn workspace_session_count(agent: &MvpAgent) -> usize {
     agent
