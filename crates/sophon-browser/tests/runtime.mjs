@@ -5,7 +5,7 @@ import { createServer } from 'node:http'
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Agent } from '../../../packages/typescript/dist/index.js'
+const { Agent } = await import(process.env.SOPHON_SDK_MODULE ?? '../../../packages/typescript/dist/index.js')
 
 assert.ok(process.env.SOPHON_RUNTIME, 'SOPHON_RUNTIME must point to a built native Runtime')
 const root = await mkdtemp(join(tmpdir(), 'sophon-browser-runtime-'))
@@ -55,7 +55,7 @@ const server = createServer(async (request, response) => {
   if (action === 'screenshot') nativeScreenshotRequested = true
   if (action === 'download_status') downloadRequested = true
   const delta = action
-    ? { role: 'assistant', tool_calls: [{ index: 0, id: `native-browser-${action}`, type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action, tab_id: tabId, ...(action === 'download_status' ? { download_id: downloadId } : {}) }) } }] }
+    ? { role: 'assistant', tool_calls: [{ index: 0, id: `native-browser-${action}-${providerFixtureRequests}`, type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action, tab_id: tabId, ...(action === 'download_status' ? { download_id: downloadId } : {}) }) } }] }
     : { role: 'assistant', content: 'Native browser verification complete.' }
   if (browser) nativeDefinition = true
   providerFixtureRequests++
@@ -161,11 +161,27 @@ try {
   assert.equal(downloaded.toString(), 'runtime-download-evidence73')
   assert.equal(downloaded.length, nativeDownload.artifact.bytes)
   assert.deepEqual(downloaded, await readFile(join(workspace, nativeDownload.artifact.path)))
+  const originalRevision = nativeDownload.artifact.revision
+  downloadRequested = false
+  await session.prompt({ turnId: 'native-download-repeat', blocks: [{ type: 'text', text: 'Read the same completed download status again.' }] })
+  assert.equal(nativeDownload.artifact.revision, originalRevision)
+  assert.equal(Buffer.from((await session.readArtifact(nativeDownload.artifact.path)).base64, 'base64').toString(), 'runtime-download-evidence73')
+  await writeFile(join(workspace, nativeDownload.artifact.path), 'user-modified-do-not-clobber')
+  const failed = []
+  const unsubscribe = agent.subscribe(event => {
+    if (event.type === 'session' && event.update.type === 'tool_call_update' && event.update.value.status === 'failed') failed.push(event.update.value)
+  })
+  downloadRequested = false
+  await session.prompt({ turnId: 'native-download-no-clobber', blocks: [{ type: 'text', text: 'Read completed download status; do not overwrite modified workspace evidence.' }] })
+  unsubscribe()
+  assert.equal(failed.length, 1, 'modified artifact must reject republication')
+  assert.equal(await readFile(join(workspace, nativeDownload.artifact.path), 'utf8'), 'user-modified-do-not-clobber')
+  assert.equal(Buffer.from((await session.readArtifact(nativeDownload.artifact.path)).base64, 'base64').toString(), 'user-modified-do-not-clobber')
   assert.equal(hostToolCallbacks, 0, 'first-party browser must not route to a TS callback')
   await agent.browser({ action: 'stream_stop', tab_id: tabId })
   await agent.finalExit()
   exited = true
-  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, providerFixtureRequests, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, workspaceArtifact: true, downloadArtifact: true, recording: true, checkedRuntimeExit: true }))
+  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, providerFixtureRequests, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, workspaceArtifact: true, downloadArtifact: true, downloadRepeatRead: true, downloadNoClobber: true, recording: true, checkedRuntimeExit: true }))
 } finally {
   if (agent && !exited) await agent.finalExit().catch(() => {})
   await new Promise(resolve => server.close(resolve))
