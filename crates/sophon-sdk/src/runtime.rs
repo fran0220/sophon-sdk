@@ -1041,12 +1041,15 @@ async fn command_loop(
                 return worker_result;
             }
             Command::HistorySnapshot(id, reply) => {
-                let boundary_id = uuid::Uuid::new_v4().to_string();
-                let result = agent
-                    .capture_portable(id.as_str(), Some(boundary_id.clone()))
-                    .await
-                    .and_then(|snapshot| history_snapshot(snapshot, boundary_id));
-                let _ = reply.send(result);
+                let agent = agent.clone();
+                prompt_tasks.spawn_local(async move {
+                    let boundary_id = uuid::Uuid::new_v4().to_string();
+                    let result = agent
+                        .capture_history(id.as_str(), boundary_id.clone())
+                        .await
+                        .and_then(|snapshot| history_snapshot(snapshot, boundary_id));
+                    let _ = reply.send(result);
+                });
             }
             Command::ExportPortable(id, reply) => {
                 // Do not dispatch another SDK mutation until capture settles.
@@ -1500,7 +1503,9 @@ fn scheduler_error(
 ) -> mgmt::ManagementError {
     use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError;
     let kind = match error {
-        SchedulerError::ActivationRequired => mgmt::ManagementErrorKind::AdmissionClosed,
+        SchedulerError::ActivationRequired | SchedulerError::Closed => {
+            mgmt::ManagementErrorKind::AdmissionClosed
+        }
         SchedulerError::InvalidVersion(_)
         | SchedulerError::InvalidInterval(_)
         | SchedulerError::TaskLimitReached(_) => mgmt::ManagementErrorKind::InvalidRequest,
@@ -2199,17 +2204,12 @@ fn history_record(payload: &serde_json::Value, historical: bool) -> Option<crate
 }
 
 fn history_snapshot(
-    snapshot: crate::PortableSession,
+    snapshot: xai_grok_shell::session::portability::NativeHistorySnapshot,
     boundary_id: String,
 ) -> Result<crate::HistorySnapshot, crate::PortabilityError> {
-    // SDK-owned projection of this pinned native format; consumers never parse
-    // portable files or replay these rows as agent input.
-    let value = serde_json::to_value(&snapshot)
-        .map_err(|error| crate::PortabilityError::Malformed(error.to_string()))?;
-    let lines = value["files"]["updates.jsonl"]
-        .as_str()
-        .ok_or_else(|| crate::PortabilityError::Incomplete("missing native history".into()))?;
-    let records = lines
+    // Display projection only, not portable custody or agent input replay.
+    let records = snapshot
+        .updates_jsonl
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
@@ -2221,8 +2221,8 @@ fn history_snapshot(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(crate::HistorySnapshot {
-        session_id: SessionId::from(snapshot.session_id()),
-        revision: snapshot.revision().into(),
+        session_id: SessionId::from(snapshot.session_id),
+        revision: snapshot.revision,
         boundary_id,
         records,
     })
@@ -2626,7 +2626,8 @@ impl SessionConfig {
 impl Session {
     /// Projection-only persisted history plus an ordered live handoff marker.
     /// Subscribe first; see [`crate::HistorySnapshot`] for the handoff protocol.
-    /// Uses the same idle/unsupported-state checks as portable export.
+    /// Requires this session to be idle, not unrelated sessions. Does not
+    /// transfer scheduler, background-task or workflow custody.
     pub async fn history_snapshot(
         &self,
     ) -> Result<crate::HistorySnapshot, crate::PortabilityError> {
@@ -2977,6 +2978,20 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[test]
+    fn scheduler_closed_is_refused_but_cancelled_has_unknown_outcome() {
+        use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError;
+        let id = SessionId::from("scheduler-session");
+        assert_eq!(
+            scheduler_error(SchedulerError::Closed, &id, None).kind,
+            mgmt::ManagementErrorKind::AdmissionClosed
+        );
+        assert_eq!(
+            scheduler_error(SchedulerError::Cancelled, &id, None).kind,
+            mgmt::ManagementErrorKind::AuthorityUnavailable
+        );
+    }
 
     #[test]
     fn native_compaction_notifications_keep_typed_session_delivery() {

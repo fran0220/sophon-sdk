@@ -352,8 +352,10 @@ shortcut. After successful inspection, use validated create-only
 ### Display history and live handoff
 
 `Session::history_snapshot().await` returns `HistorySnapshot { session_id,
-revision, boundary_id, records }`. It uses the native portable flush/capture
-boundary and shares its idle/unsupported-state errors. Records are in unfiltered
+revision, boundary_id, records }`. Its native history-only flush/capture requires
+the target session to be idle; unrelated active sessions and scheduled tasks do
+not block display history. Portable export retains its stricter agent-wide
+admission and execution-custody checks. Records are in unfiltered
 persisted order (including rewind markers), not reconstructed live Turns.
 Each `HistoryRecord` retains native `event_id`, optional `prompt_id`,
 `prompt_index`, `hide_from_scrollback`, `model`,
@@ -372,8 +374,8 @@ For a lossless display handoff within one runtime:
 4. Apply subsequent `Event::HistoryRecord` values in stream order. Do not also
    project `Event::Session`, which would duplicate live output.
 
-The actor awaits boundary delivery to the SDK broadcast stream before releasing
-its admission fence. This is the snapshot-completion barrier, not a promise that
+The actor awaits boundary delivery to the SDK broadcast stream before completing
+the capture. This is the snapshot-completion barrier, not a promise that
 every subscriber has consumed it. A fresh boundary ID disambiguates identical
 repeated snapshots; event-ID dedup is not required across the cut, including
 legacy or natively merged records. On broadcast `Lagged`, invalidate the handoff,

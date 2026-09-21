@@ -329,6 +329,18 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(first.request.context.cwd, childCwd)
   assert.equal(first.request.context.scheduledInvocation, null)
   assert.equal(first.request.context.originatingPrompt, null, 'direct child before any parent prompt has no invented root')
+  // Creating and inspecting a different idle Session must not acquire the
+  // portability/export fence for the active parent or its child callback.
+  const peer = await agent.createSession({ workspace: { id: 'busy-peer-history', cwd: childCwd }, model: 'runtime-test', mcpServers: [], tools: [] })
+  const peerSchedule = await peer.scheduler.list()
+  const peerTask = await peer.scheduler.create('peer-future', peerSchedule.version, { cadence: { kind: 'once', at: new Date(Date.now() + 3600000).toISOString() }, prompt: 'Future peer task.', durable: true })
+  assert.equal(peerTask.type, 'committed')
+  let peerHistory
+  let peerHistoryFailure
+  try { peerHistory = await peer.history() } catch (error) { peerHistoryFailure = error }
+  assert.equal(first.request.signal.aborted, false, 'peer inspection must not cancel active work')
+  await peer.scheduler.delete('peer-remove', peerTask.version, peerTask.value.id)
+  await peer.dispose()
   first.answer()
   assert.equal((await ordinary).state, 'completed')
   assert.ok(toolCompletions.some(update => update.rawOutput?.type === 'Dynamic' && update.rawOutput.value?.answer === 'ANSWER_29'), 'successful structured callback must emit a native completed tool event with its exact output')
@@ -439,6 +451,9 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal((await unrelated.prompt({ turnId: 'unrelated-after-close', blocks: [{ type: 'text', text: 'Complete independently.' }] })).stopReason, 'end_turn')
   await unrelated.dispose()
   await agent.finalExit()
+  assert.equal(peerHistoryFailure, undefined, 'peer history must not use the agent-global portable-export fence')
+  assert.equal(peerHistory.sessionId, peer.id)
+  assert.ok(peerHistory.boundaryId)
 })
 
 test('native exit errors flush a structured receipt before process closure', { timeout: 30000 }, async t => {
