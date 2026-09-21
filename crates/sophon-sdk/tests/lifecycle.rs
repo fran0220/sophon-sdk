@@ -1,8 +1,8 @@
 use std::{future::Future, path::Path, time::Duration};
 
 use sophon_sdk::{
-    Agent, AgentConfig, Error, Event, ModelConfig, PromptBlock, ProviderConfig, Session,
-    SessionConfig, SessionUpdate, StopReason,
+    Agent, AgentConfig, Error, Event, ModelConfig, PromptBlock, PromptOptions, ProviderConfig,
+    Session, SessionConfig, SessionUpdate, StopReason,
     management::{AdmissionState, RuntimeState},
 };
 use xai_grok_test_support::{EnvGuard, MockInferenceServer};
@@ -36,11 +36,14 @@ fn prompt(
     let id = id.to_owned();
     tokio::spawn(async move {
         session
-            .prompt_blocks_with_metadata(
+            .prompt_blocks_with_options(
                 [PromptBlock::Text(
                     "Reply with a short greeting, without tools.".into(),
                 )],
-                serde_json::Map::from_iter([("promptId".into(), id.into())]),
+                PromptOptions {
+                    prompt_id: Some(id),
+                    ..Default::default()
+                },
             )
             .await
     })
@@ -161,12 +164,13 @@ fn public_facade_lifecycle_is_cancellable_and_flushes_before_stopping() {
             "plan-resume-",
         ] {
             for send_now in [false, true] {
-                let result = bounded(session.prompt_blocks_with_metadata(
+                let result = bounded(session.prompt_blocks_with_options(
                     [PromptBlock::Text("not a native synthetic turn".into())],
-                    serde_json::Map::from_iter([
-                        ("promptId".into(), format!("{prefix}forged").into()),
-                        ("sendNow".into(), send_now.into()),
-                    ]),
+                    PromptOptions {
+                        prompt_id: Some(format!("{prefix}forged")),
+                        send_now,
+                        ..Default::default()
+                    },
                 ))
                 .await;
                 assert!(

@@ -15,7 +15,7 @@ fi
 # text, hiding its origin. Build the forbidden-but-internal ACP docs first.
 cargo doc --manifest-path "$root/Cargo.toml" --locked --no-deps \
   -p agent-client-protocol -p agent-client-protocol-schema -p xai-acp-lib
-cargo rustdoc --manifest-path "$root/Cargo.toml" --locked -p sophon-sdk -- -D rustdoc::broken_intra_doc_links
+cargo rustdoc --manifest-path "$root/Cargo.toml" --locked -p sophon-sdk --lib -- -D rustdoc::broken_intra_doc_links
 target="$(cargo metadata --manifest-path "$root/Cargo.toml" --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 python3 - "$target/doc/sophon_sdk" <<'PY'
 import pathlib
@@ -24,6 +24,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 FORBIDDEN = {"agent_client_protocol", "agent_client_protocol_schema", "xai_acp_lib", "xai_grok_pager", "ratatui", "crossterm"}
+REMOVED_METHODS = {"extension", "notify_extension", "initial_response", "initialization_response", "prompt_blocks_with_metadata", "set_model_with_metadata", "cancel_with_metadata"}
 
 
 class Signatures(HTMLParser):
@@ -37,6 +38,8 @@ class Signatures(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        if attrs.get("id", "").removeprefix("method.") in REMOVED_METHODS:
+            self.leaks.append(attrs["id"])
         if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr", "source", "area", "base", "embed", "param", "track", "col"}:
             self.depth += 1
         # External `impl<T> Trait for T` is not an SDK declaration. Such traits
@@ -72,6 +75,9 @@ assert probe.count == 1 and len(probe.leaks) == 1
 probe = Signatures()
 probe.feed('<div class="docblock"><a href="../agent_client_protocol/index.html">internal docs</a></div>')
 assert not probe.leaks
+probe = Signatures()
+probe.feed('<h3 id="method.extension" class="code-header">pub fn extension(&amp;self, method: String, params: Value)</h3>')
+assert probe.leaks == ["method.extension"]
 probe = Signatures()
 probe.feed('<div id="blanket-implementations-list"><h3 class="code-header"><a href="../agent_client_protocol_schema/trait.IntoOption.html">blanket</a></h3></div><h3 class="code-header"><a href="../agent_client_protocol/trait.Client.html">explicit impl</a></h3>')
 assert probe.count == 1 and len(probe.leaks) == 1

@@ -151,7 +151,7 @@ fn public_scheduler_runs_native_children_with_native_completion_wakes() {
                             ManagementEventKind::Queue(snapshot) if snapshot.session_id == fifo.session_id => {
                                 assert_native_completion_only(&snapshot);
                             }
-                            ManagementEventKind::Scheduler { session_id, task_id, occurrence: ScheduledTaskEvent::Fired { subagent_id }, .. }
+                            ManagementEventKind::Scheduler { session_id, task_id, occurrence: ScheduledTaskEvent::Fired { subagent_id, .. }, .. }
                                 if session_id == fifo.session_id && task_id == task.id => {
                                     break subagent_id.expect("immediate occurrence must launch a native child");
                                 }

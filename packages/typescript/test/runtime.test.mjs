@@ -9,6 +9,8 @@ import { StdioTransport } from '../dist/stdio.js'
 
 const executable = process.env.SOPHON_RUNTIME ?? resolve('../../target/debug/sophon-runtime')
 
+const candidate = (revision, model) => ({ revision, model, instructions: `BASELINE_${revision}`, skillDirectories: [], externalMcpServers: [], reasoningEffort: null, subagentBriefs: [] })
+
 async function setup(t) {
   const root = await mkdtemp(join(tmpdir(), 'sophon-runtime-test-'))
   const cwd = join(root, 'workspace')
@@ -27,13 +29,46 @@ async function setup(t) {
   return { root, cwd, config, env: { GROK_HOME: join(root, 'native-home'), GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_TURN_SUMMARY: 'false', GROK_FEEDBACK_ENABLED: 'false' } }
 }
 
+test('protocol v2 mock handshake exposes only the typed Agent facade', { timeout: 10000 }, async t => {
+  const { config, env } = await setup(t)
+  const agent = await Agent.spawn({ executable: process.execPath, config, env, args: ['--input-type=module', '-e', `
+    import { createInterface } from 'node:readline'
+    const send = frame => process.stdout.write(JSON.stringify(frame) + '\\n')
+    send({ type: 'ready', protocolVersion: 2 })
+    const lines = createInterface({ input: process.stdin })
+    for await (const line of lines) {
+      const frame = JSON.parse(line)
+      if (!['initialize', 'final_exit'].includes(frame.request.method)) process.exit(2)
+      send({ type: 'response', id: frame.id, result: {} })
+      if (frame.request.method === 'final_exit') { lines.close(); process.stdin.destroy(); break }
+    }
+  `] })
+  assert.equal(agent.request, undefined)
+  assert.equal(agent.extension, undefined)
+  await agent.finalExit()
+})
+
+test('old protocol executable is rejected before initialization', { timeout: 10000 }, async t => {
+  const { config, env } = await setup(t)
+  await assert.rejects(Agent.spawn({ executable: process.execPath, config, env, args: ['-e', `
+    process.stdout.write(JSON.stringify({ type: 'ready', protocolVersion: 1 }) + '\\n')
+    process.stdin.resume()
+    process.stdin.on('data', () => process.exit(2))
+  `] }), error => error.code === 'protocol_version' && /expected 2/.test(error.message))
+})
+
+test('supplied old Runtime executable is rejected', { timeout: 10000, skip: !process.env.SOPHON_OLD_RUNTIME }, async t => {
+  const { config, env } = await setup(t)
+  await assert.rejects(Agent.spawn({ executable: process.env.SOPHON_OLD_RUNTIME, config, env }), error => error.code === 'protocol_version' && /expected 2/.test(error.message))
+})
+
 test('real stdio Runtime creates, snapshots, schedules, reloads and checks process exit', { timeout: 60000 }, async t => {
   const { cwd, config, env } = await setup(t)
   const agent = await Agent.spawn({ executable, config, env })
   t.after(() => agent.finalExit().catch(() => {}))
   const events = []
   agent.subscribe(event => events.push(event))
-  const options = { workspace: { id: 'asymmetric-workspace', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] }
+  const options = { workspace: { id: 'asymmetric-workspace', cwd }, model: 'runtime-test', mcpServers: [], tools: [] }
   const session = await agent.createSession(options)
   assert.match(session.id, /.+/)
   const snapshot = await session.history()
@@ -42,7 +77,7 @@ test('real stdio Runtime creates, snapshots, schedules, reloads and checks proce
   const queue = await session.queue()
   assert.equal(queue.running, null)
   assert.deepEqual(queue.pending, [])
-  await assert.rejects(session.prompt({ turnId: 'unsupported-candidate', blocks: [{ type: 'text', text: 'Must never execute.' }], metadata: { 'x.sophon/configCandidate': { instructions: 'Changed instructions', model: 'unpublished-model' } } }), /configCandidate|config_candidate|candidate/i)
+  await assert.rejects(session.prompt({ turnId: 'unsupported-candidate', blocks: [{ type: 'text', text: 'Must never execute.' }], configCandidate: candidate('unsupported', 'unpublished-model') }), /configCandidate|config_candidate|candidate/i)
   assert.equal((await session.history()).records.some(record => record.promptId === 'unsupported-candidate'), false)
   const childId = await session.subagents.newId()
   assert.match(childId, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
@@ -75,7 +110,7 @@ test('candidate-required create, load and resume keep scheduler inspection read-
   const { cwd, config, env } = await setup(t)
   const agent = await Agent.spawn({ executable, config, env })
   t.after(() => agent.finalExit().catch(() => {}))
-  const options = { workspace: { id: 'candidate-required', cwd }, requireConfigCandidate: true, model: 'runtime-test', metadata: { 'x.ai/requireConfigCandidate': false }, mcpServers: [], tools: [] }
+  const options = { workspace: { id: 'candidate-required', cwd }, requireConfigCandidate: true, model: 'runtime-test', mcpServers: [], tools: [] }
   let session = await agent.createSession(options)
   const id = session.id
   for (const attach of ['create', 'load', 'resume']) {
@@ -87,7 +122,7 @@ test('candidate-required create, load and resume keep scheduler inspection read-
     assert.equal(effective.sessionId, session.id)
     assert.equal(effective.mountedRevision, null, 'cold attachment is not a successful candidate mount')
     assert.equal(typeof effective.version.generation, 'string')
-    await assert.rejects(session.prompt({ turnId: `unmounted-${attach}`, blocks: [{ type: 'text', text: 'Must not infer.' }], metadata: {} }), /requires a configuration candidate before execution/)
+    await assert.rejects(session.prompt({ turnId: `unmounted-${attach}`, blocks: [{ type: 'text', text: 'Must not infer.' }] }), /requires a configuration candidate before execution/)
     await assert.rejects(session.scheduler.create(`blocked-${attach}`, before.version, {
       cadence: { kind: 'once', at: new Date(Date.now() - 60000).toISOString() },
       prompt: 'Must never run before native publication.', durable: true,
@@ -97,6 +132,81 @@ test('candidate-required create, load and resume keep scheduler inspection read-
     assert.equal((await session.effectiveConfig()).mountedRevision, null)
     await session.dispose()
   }
+  await agent.finalExit()
+})
+
+test('official candidate ingress publishes native receipts and keeps busy prompts on the mounted route', { timeout: 60000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  const requests = []
+  let entered
+  const firstEntered = new Promise(resolve => { entered = resolve })
+  let release
+  const releaseFirst = new Promise(resolve => { release = resolve })
+  t.after(() => release())
+  const server = createServer(async (request, response) => {
+    let body = ''
+    for await (const chunk of request) body += chunk
+    const payload = JSON.parse(body)
+    requests.push(payload)
+    const latest = JSON.stringify(payload.messages.filter(message => message.role === 'user').at(-1))
+    if (latest.includes('SDK_MOUNT_FIRST_29')) { entered(); await releaseFirst }
+    const chunk = (delta, finish_reason) => ({ id: 'mount-fixture', object: 'chat.completion.chunk', created: 1, model: payload.model, choices: [{ index: 0, delta, finish_reason }] })
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    response.end(`data: ${JSON.stringify(chunk({ role: 'assistant', content: 'MOUNT_COMPLETE' }, null))}\n\ndata: ${JSON.stringify(chunk({}, 'stop'))}\n\ndata: [DONE]\n\n`)
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
+  config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'mount-a-wire', headers: {}, queryParams: {} }
+  config.models.push({ ...config.models[0], id: 'mount-c', provider: { ...config.models[0].provider, model: 'mount-c-wire' } })
+  const agent = await Agent.spawn({ executable, config, env })
+  t.after(() => agent.finalExit().catch(() => {}))
+  const options = { workspace: { id: 'official-mount', cwd }, requireConfigCandidate: true, model: 'runtime-test', mcpServers: [], tools: [] }
+  const session = await agent.createSession(options)
+  const events = []
+  session.subscribe(event => events.push(event))
+  const prompt = (turnId, text, configCandidate, sendNow = false) => session.prompt({ turnId, blocks: [{ type: 'text', text }], configCandidate, sendNow })
+  assert.equal((await session.effectiveConfig()).mountedRevision, null)
+  await assert.rejects(prompt('cold-invalid', 'Must not infer.', candidate('invalid', 'missing-route')))
+  assert.equal(requests.length, 0)
+  assert.equal((await session.effectiveConfig()).mountedRevision, null)
+  const first = prompt('mount-first', 'SDK_MOUNT_FIRST_29', candidate('A', 'runtime-test'))
+  await Promise.race([firstEntered, first.then(() => { throw new Error('First prompt completed before its provider barrier') })])
+  assert.equal((await session.effectiveConfig()).mountedRevision, 'A')
+  let queued
+  const busyQueued = new Promise(resolve => { queued = resolve })
+  const unsubscribe = session.subscribe(event => {
+    if (event.type === 'queue' && event.snapshot.pending.some(entry => entry.id === 'mount-busy')) queued()
+  })
+  const busy = prompt('mount-busy', 'SDK_MOUNT_BUSY_41', candidate('B', 'missing-route'))
+  await Promise.race([busyQueued, busy.then(() => { throw new Error('Busy prompt completed before queue admission') })])
+  unsubscribe()
+  assert.equal((await session.effectiveConfig()).mountedRevision, 'A')
+  release()
+  assert.equal((await first).stopReason, 'end_turn')
+  assert.equal((await busy).stopReason, 'end_turn')
+  const count = requests.length
+  await assert.rejects(prompt('idle-invalid', 'Must not infer either.', candidate('invalid-idle', 'missing-route')))
+  assert.equal(requests.length, count)
+  assert.equal((await session.effectiveConfig()).mountedRevision, 'A')
+  assert.equal((await prompt('mount-idle', 'SDK_MOUNT_IDLE_73', candidate('C', 'mount-c'), true)).stopReason, 'end_turn')
+  assert.equal((await session.effectiveConfig()).mountedRevision, 'C')
+  assert.deepEqual(requests.map(request => request.model), ['mount-a-wire', 'mount-a-wire', 'mount-c-wire'])
+  assert.match(JSON.stringify(requests[0].messages), /BASELINE_A/)
+  assert.match(JSON.stringify(requests[1].messages), /BASELINE_A/)
+  assert.match(JSON.stringify(requests[2].messages), /BASELINE_C/)
+  for (const promptId of ['mount-first', 'mount-busy', 'mount-idle']) {
+    assert.ok(events.some(event => event.type === 'session' && event.promptId === promptId), `native session events must identify ${promptId}`)
+  }
+  const before = await session.scheduler.list()
+  const created = await session.scheduler.create('mounted-schedule', before.version, { cadence: { kind: 'once', at: new Date(Date.now() + 3600000).toISOString() }, prompt: 'Future mounted task.', durable: true })
+  assert.equal(created.type, 'committed')
+  assert.equal((await session.scheduler.delete('mounted-delete', created.version, created.value.id)).type, 'committed')
+  await session.dispose()
+  const loaded = await agent.loadSession(session.id, options)
+  assert.equal((await loaded.effectiveConfig()).mountedRevision, null, 'a persisted Session must not reuse a prior process-local mount receipt')
+  const closed = await loaded.scheduler.list()
+  await assert.rejects(loaded.scheduler.delete('cold-delete', closed.version, created.value.id), /requires a committed configuration candidate/)
+  await loaded.dispose()
   await agent.finalExit()
 })
 
@@ -147,9 +257,9 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'main-wire', headers: {}, queryParams: {} }
   config.models.push({ ...config.models[0], id: 'distillation', provider: { ...config.models[0].provider, model: 'distill-wire' } })
   config.subagents[0] = { name: 'refiner', description: 'Product-owned fixed refiner', instructions: 'BASELINE_REFINEMENT_73. Return the requested refinement.', model: 'distillation', tools: [] }
-  const agent = await Agent.spawn({ executable, config, env, onCallback: () => { throw new Error('No tools allowed') } })
+  const agent = await Agent.spawn({ executable, config, env, onToolCall: () => { throw new Error('No tools allowed') } })
   t.after(() => agent.finalExit().catch(() => {}))
-  const session = await agent.createSession({ workspace: { id: 'refiner-before-parent', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [{ name: 'product_echo', description: 'Must not inherit into refiner', inputSchema: { type: 'object', properties: {} } }] })
+  const session = await agent.createSession({ workspace: { id: 'refiner-before-parent', cwd }, model: 'runtime-test', mcpServers: [], tools: [{ name: 'product_echo', description: 'Must not inherit into refiner', inputSchema: { type: 'object', properties: {} } }] })
   const result = await session.subagents.start({ id: await session.subagents.newId(), prompt: 'EVIDENCE_29. Refine this trajectory.', description: 'Fixed refiner test', subagentType: 'refiner', cwd: null, model: 'distillation' })
   assert.equal(result.state, 'completed', result.error ?? result.output)
   assert.match(result.output, /REFINEMENT_73/)
@@ -197,13 +307,14 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   }
   let receive
   let nextQuestion = new Promise(resolve => { receive = resolve })
-  const agent = await Agent.spawn({ executable, config, env, onCallback: request => new Promise(resolve => {
-    assert.equal(request.method, 'tool/ask_user')
+  const agent = await Agent.spawn({ executable, config, env, onToolCall: request => new Promise(resolve => {
+    assert.equal(request.name, 'ask_user')
+    assert.deepEqual(request.args, { question: 'Choose 29?' })
     receive({ request, answer: () => resolve({ answer: 'ANSWER_29' }) })
     request.signal.addEventListener('abort', () => resolve({ cancelled: true }), { once: true })
   }) })
   t.after(() => agent.finalExit().catch(() => {}))
-  const session = await agent.createSession({ workspace: { id: 'callback-parent', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [{ name: 'ask_user', description: 'Ask a human question', inputSchema: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] } }] })
+  const session = await agent.createSession({ workspace: { id: 'callback-parent', cwd }, model: 'runtime-test', mcpServers: [], tools: [{ name: 'ask_user', description: 'Ask a human question', inputSchema: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] } }] })
   const ordinary = session.subagents.start({ id: await session.subagents.newId(), prompt: 'Ask the human.', description: 'ordinary child', subagentType: 'task', cwd: childCwd, model: 'runtime-test' })
   const first = await nextQuestion
   assert.equal(first.request.context.ownerSessionId, session.id)
@@ -214,7 +325,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   first.answer()
   assert.equal((await ordinary).state, 'completed')
   nextQuestion = new Promise(resolve => { receive = resolve })
-  const rootTurn = session.prompt({ turnId: 'root-prompt-73', blocks: [{ type: 'text', text: 'ROOT_NATIVE_TASK_73' }], metadata: {} })
+  const rootTurn = session.prompt({ turnId: 'root-prompt-73', blocks: [{ type: 'text', text: 'ROOT_NATIVE_TASK_73' }] })
   const rooted = await nextQuestion
   assert.equal(rooted.request.context.ownerSessionId, session.id)
   assert.notEqual(rooted.request.context.sessionId, session.id)
@@ -307,7 +418,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(later.request.signal.aborted, false, 'stopping earlier occurrence must not cancel later question')
   later.answer()
   assert.equal((await session.subagents.wait(laterId, 10000)).state, 'completed')
-  const unrelated = await agent.createSession({ workspace: { id: 'unrelated-close-owner', cwd: childCwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  const unrelated = await agent.createSession({ workspace: { id: 'unrelated-close-owner', cwd: childCwd }, model: 'runtime-test', mcpServers: [], tools: [] })
   nextQuestion = new Promise(resolve => { receive = resolve })
   const beforeClose = await session.scheduler.list()
   const closeTask = await session.scheduler.create('pending-at-dispose', beforeClose.version, { cadence: { kind: 'once', at: new Date(Date.now() - 1000).toISOString() }, prompt: 'Ask the human before finishing.', durable: true })
@@ -317,7 +428,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(pendingAtClose.request.signal.aborted, false)
   await session.dispose()
   assert.equal(pendingAtClose.request.signal.aborted, true, 'checked dispose must abort owned callback before acknowledging close')
-  assert.equal((await unrelated.prompt({ turnId: 'unrelated-after-close', blocks: [{ type: 'text', text: 'Complete independently.' }], metadata: {} })).stopReason, 'end_turn')
+  assert.equal((await unrelated.prompt({ turnId: 'unrelated-after-close', blocks: [{ type: 'text', text: 'Complete independently.' }] })).stopReason, 'end_turn')
   await unrelated.dispose()
   await agent.finalExit()
 })
@@ -326,7 +437,7 @@ test('native exit errors flush a structured receipt before process closure', { t
   const { cwd, config, env } = await setup(t)
   const transport = new StdioTransport({ executable, env })
   const agent = await Agent.connect(transport, config)
-  await agent.createSession({ workspace: { id: 'exit-error', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  await agent.createSession({ workspace: { id: 'exit-error', cwd }, model: 'runtime-test', mcpServers: [], tools: [] })
   await assert.rejects(agent.finalExit(0), error => error.code === 'operation_failed' && /timed out/i.test(error.message))
   assert.deepEqual(await transport.closed, { code: 1, signal: null })
 })
@@ -336,7 +447,7 @@ test('idle newly created Session exits with a checked native receipt', { timeout
   let diagnostics = ''
   const transport = new StdioTransport({ executable, env, onStderr: chunk => { diagnostics += chunk } })
   const agent = await Agent.connect(transport, config)
-  await agent.createSession({ workspace: { id: 'unbound-product-identity', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  await agent.createSession({ workspace: { id: 'unbound-product-identity', cwd }, model: 'runtime-test', mcpServers: [], tools: [] })
   // Product identity persistence can fail after native creation. Admit no
   // prompt, do not dispose first, and do not retry an uncertain final exit.
   try { await agent.finalExit() }
@@ -350,18 +461,18 @@ test('idle newly created Session exits with a checked native receipt', { timeout
 test('live provider dispatches native OS and explicit product tools with native prompt identity', { timeout: 180000, skip: !process.env.OG_API_KEY }, async t => {
   const { cwd, config, env } = await setup(t)
   const calls = []
-  const agent = await Agent.spawn({ executable, config, env, onCallback: async request => {
-    assert.equal(request.method, 'tool/product_echo')
+  const agent = await Agent.spawn({ executable, config, env, onToolCall: async request => {
+    assert.equal(request.name, 'product_echo')
     calls.push(request)
     return { content: [{ type: 'text', text: 'PRODUCT_VERIFIED_29' }] }
   } })
   t.after(() => agent.finalExit().catch(() => {}))
   const events = []
   agent.subscribe(event => events.push(event))
-  const session = await agent.createSession({ workspace: { id: 'native-tools', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [
+  const session = await agent.createSession({ workspace: { id: 'native-tools', cwd }, model: 'runtime-test', mcpServers: [], tools: [
     { name: 'product_echo', description: 'Return a product-service test receipt. Call with code 29.', inputSchema: { type: 'object', properties: { code: { type: 'integer' } }, required: ['code'], additionalProperties: false } },
   ] })
-  const receipt = await session.prompt({ turnId: 'turn-native-37', blocks: [{ type: 'text', text: 'Use a native file or shell tool to write exactly NATIVE_FILE_37 to file probe.txt in the current workspace. Then invoke product_echo with code 29. Do both tool calls. Reply with the product receipt after success.' }], metadata: {} })
+  const receipt = await session.prompt({ turnId: 'turn-native-37', blocks: [{ type: 'text', text: 'Use a native file or shell tool to write exactly NATIVE_FILE_37 to file probe.txt in the current workspace. Then invoke product_echo with code 29. Do both tool calls. Reply with the product receipt after success.' }] })
   assert.equal(receipt.stopReason, 'end_turn')
   assert.equal(receipt.promptId, 'turn-native-37')
   assert.equal((await readFile(join(cwd, 'probe.txt'), 'utf8')).trim(), 'NATIVE_FILE_37')
@@ -370,7 +481,7 @@ test('live provider dispatches native OS and explicit product tools with native 
   assert.equal(calls[0].context.ownerSessionId, session.id)
   assert.equal(calls[0].context.promptId, 'turn-native-37')
   assert.deepEqual(calls[0].context.originatingPrompt, { sessionId: session.id, promptId: 'turn-native-37' })
-  assert.equal(calls[0].params.code, 29)
+  assert.equal(calls[0].args.code, 29)
   assert.ok(events.some(event => event.type === 'history_record' && event.record.promptId === 'turn-native-37'))
   assert.equal(JSON.stringify(events).includes(process.env.OG_API_KEY), false)
   const history = await session.history()

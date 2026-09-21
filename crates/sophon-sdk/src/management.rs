@@ -854,7 +854,8 @@ pub struct ActionOutcome {
     pub requires_restart: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SkillScope {
     Local,
@@ -866,7 +867,8 @@ pub enum SkillScope {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillInfo {
     pub name: String,
     pub display_name: Option<String>,
@@ -891,7 +893,8 @@ pub struct SkillInfo {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillsSnapshot {
     pub skills: Vec<SkillInfo>,
 }

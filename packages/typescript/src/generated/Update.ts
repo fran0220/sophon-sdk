@@ -3,6 +3,5 @@ import type { CompactionUpdate } from "./CompactionUpdate.js";
 import type { PlanEntry } from "./PlanEntry.js";
 import type { ToolCall } from "./ToolCall.js";
 import type { TurnCompletion } from "./TurnCompletion.js";
-import type { JsonValue } from "./serde_json/JsonValue.js";
 
-export type Update = { "type": "user_text", "value": string } | { "type": "assistant_text", "value": string } | { "type": "thought_text", "value": string } | { "type": "tool_call", "value": ToolCall } | { "type": "tool_call_update", "value": ToolCall } | { "type": "plan", "value": Array<PlanEntry> } | { "type": "turn_completed", "value": TurnCompletion } | { "type": "native_status", "value": JsonValue } | { "type": "compaction", "value": CompactionUpdate } | { "type": "other", "value": JsonValue };
+export type Update = { "type": "user_text", "value": string } | { "type": "assistant_text", "value": string } | { "type": "thought_text", "value": string } | { "type": "tool_call", "value": ToolCall } | { "type": "tool_call_update", "value": ToolCall } | { "type": "plan", "value": Array<PlanEntry> } | { "type": "turn_completed", "value": TurnCompletion } | { "type": "status", "value": { kind: string, } } | { "type": "compaction", "value": CompactionUpdate };

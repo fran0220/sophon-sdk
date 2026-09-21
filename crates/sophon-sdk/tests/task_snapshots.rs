@@ -49,7 +49,6 @@ fn native_serialization_projects_every_row_field_without_recomputing_status() {
         assert_eq!(snapshot.session_id, SessionId::from("session-one"));
         assert_eq!(snapshot.delivery, Delivery::Live);
         assert!(!snapshot.truncated);
-        assert_eq!(snapshot.metadata, None);
         assert_eq!(
             snapshot.tasks,
             vec![tasks::Row {
@@ -82,14 +81,8 @@ fn replay_and_empty_full_snapshots_replace_instead_of_merge() {
     assert_eq!(view.tasks[0].recorded_status, RecordedStatus::Running);
     assert_eq!(view.tasks[0].kind, management::BackgroundTaskKind::Command);
     assert!(view.truncated);
-    assert_eq!(
-        view.metadata.as_ref().unwrap()["attemptId"],
-        "optional-attempt"
-    );
-    assert_eq!(
-        view.metadata.as_ref().unwrap()["sessionId"],
-        "optional-session"
-    );
+    assert!(!format!("{view:?}").contains("optional-attempt"));
+    assert!(!format!("{view:?}").contains("optional-session"));
     for replay in [true, false] {
         let empty = serde_json::to_value(SessionNotification {
             session_id: agent_client_protocol::SessionId::new("session-one"),
@@ -170,5 +163,4 @@ fn historical_optional_fields_can_be_absent() {
         ),
         (&None, &None, &None, &None, &None, &None)
     );
-    assert!(snapshot.metadata.is_none());
 }

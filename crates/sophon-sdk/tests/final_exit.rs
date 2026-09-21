@@ -2,8 +2,10 @@
 
 use serde_json::{Value, json};
 use sophon_sdk::{
-    Agent, AgentConfig, ClientHandler, Error, ModelConfig, PermissionPolicy, ProviderConfig,
-    SessionConfig, StopReason,
+    Agent, AgentConfig, Error, ModelConfig, PermissionPolicy, ProviderConfig, SessionConfig,
+    StopReason,
+    native_tools::{NativeTool, NativeToolHandler},
+    protocol::{CallbackContext, ToolSpec},
 };
 use std::{
     future::Future,
@@ -33,11 +35,9 @@ impl Drop for Release {
 }
 
 #[async_trait::async_trait]
-impl ClientHandler for Questions {
-    async fn extension(&self, method: &str, _: Value) -> Result<Value, Error> {
-        if method != "x.ai/ask_user_question" {
-            return Err(Error::UnsupportedClientRequest(method.into()));
-        }
+impl NativeToolHandler for Questions {
+    async fn execute(&self, name: &str, _: Value, _: CallbackContext) -> Result<Value, Error> {
+        assert_eq!(name, "host_question");
         let _release = Release(self.released.clone());
         self.entered.notify_one();
         std::future::pending().await
@@ -60,7 +60,7 @@ fn tool(
 }
 
 #[test]
-fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
+fn final_exit_releases_host_tool_cancels_queue_and_reaps_running_process() {
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("GROK_HOME", home.path());
@@ -83,8 +83,16 @@ fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
         server.set_response("native tool complete");
         let questions = Arc::new(Questions { entered: tokio::sync::Notify::new(), released: Arc::new(AtomicBool::new(false)) });
         let agent = bounded(Agent::start(AgentConfig::new(ModelConfig::new("exit-model", ProviderConfig::openai_chat(server.url(), "test-key", "wire-model")))
-            .permission_policy(PermissionPolicy::AllowAll).client_handler(questions.clone()))).await.unwrap();
+            .permission_policy(PermissionPolicy::AllowAll))).await.unwrap();
         let session = bounded(agent.create_session(SessionConfig::new(workspace.path()))).await.unwrap();
+        bounded(session.register_tools(vec![NativeTool {
+            spec: ToolSpec {
+                name: "host_question".into(),
+                description: "Wait for a host answer".into(),
+                input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            },
+            handler: questions.clone(),
+        }])).await.unwrap();
         let pidfile = workspace.path().join("exit-child.pid");
         let _process_turn = tool(&server, "running-process", "run_terminal_command", json!({"command":format!("echo $$ > '{}'; exec /bin/sleep 600", pidfile.display()),"description":"final exit process lifecycle test","is_background":true}));
         let first = bounded(session.prompt("start the test background process")).await.unwrap();
@@ -112,7 +120,7 @@ fn final_exit_releases_real_question_cancels_queue_and_reaps_running_process() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await;
-        let _question_turn = tool(&server, "pending-question", "ask_user_question", json!({"questions":[{"question":"Wait for a human answer","options":[{"label":"Yes","description":"answer"},{"label":"No","description":"decline"}]}]}));
+        let _question_turn = tool(&server, "pending-question", "host_question", json!({}));
         let running = { let session = session.clone(); tokio::spawn(async move { session.prompt("ask the question now").await }) };
         bounded(questions.entered.notified()).await;
         assert!(!questions.released.load(Ordering::SeqCst));

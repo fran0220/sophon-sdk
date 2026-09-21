@@ -13,23 +13,18 @@ pub enum Event {
         session_id: SessionId,
         boundary_id: String,
     },
-    /// Stable typed management state published in causal order with the raw
-    /// Session or extension notification that produced it.
+    /// Stable typed management state published in native causal order.
     Management(crate::management::ManagementEvent),
     Session {
         session_id: SessionId,
         update: SessionUpdate,
-        /// Opaque metadata attached to the upstream notification envelope.
-        metadata: Option<Value>,
+        prompt_id: Option<String>,
     },
-    /// Upstream xAI extension notification, preserved without an SDK mirror.
-    Extension { method: String, payload: Value },
 }
 
 /// Stable projection of common session updates.
 ///
-/// Updates added by upstream remain available through `Other` until callers
-/// need a dedicated convenience variant.
+/// Unknown status categories expose no native protocol envelope.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum SessionUpdate {
@@ -42,7 +37,10 @@ pub enum SessionUpdate {
     /// Durable terminal for a prompt admitted without a [`crate::Session`]
     /// prompt future, such as a scheduler-owned foreground occurrence.
     TurnCompleted(TurnCompletion),
-    Other(Value),
+    Compaction(crate::protocol::CompactionUpdate),
+    Status {
+        kind: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -113,8 +111,6 @@ pub struct HistoryRecord {
     pub model: Option<String>,
     pub is_replay: bool,
     pub update: SessionUpdate,
-    pub envelope_metadata: Option<Value>,
-    pub chunk_metadata: Option<Value>,
 }
 
 /// Complete projection at an idle persistence cut, not a list of live turns.

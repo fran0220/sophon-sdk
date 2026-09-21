@@ -1,10 +1,25 @@
 use std::time::Duration;
 
 use sophon_sdk::{
-    Agent, AgentConfig, Event, ModelConfig, ProviderConfig, SessionConfig, SessionUpdate,
-    StopReason,
+    Agent, AgentConfig, ConfigCandidate, Event, ModelBehaviorConfig, ModelConfig, PromptBlock,
+    PromptOptions, ProviderConfig, SessionConfig, SessionUpdate, StopReason,
 };
 use xai_grok_test_support::{EnvGuard, MockInferenceServer};
+
+fn authored_options(revision: &str, instructions: &str, model: &str) -> PromptOptions {
+    PromptOptions {
+        config_candidate: Some(ConfigCandidate {
+            revision: revision.into(),
+            instructions: instructions.into(),
+            model: model.into(),
+            reasoning_effort: None,
+            skill_directories: Vec::new(),
+            external_mcp_servers: Vec::new(),
+            subagent_briefs: Vec::new(),
+        }),
+        ..Default::default()
+    }
+}
 
 #[test]
 fn all_provider_protocols_execute_through_the_agent_facade() {
@@ -12,10 +27,7 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(
         grok_home.path().join("config.toml"),
-        "[features]\nsession_recap = false\nweb_fetch = true\n\
-         [model.sdk-concise]\nuse_concise = true\n\
-         [model.sdk-codex]\nagent_type = 'codex'\n\
-         [model.sdk-codex-concise]\nagent_type = 'codex'\nuse_concise = true\n",
+        "[features]\nsession_recap = false\nweb_fetch = true\n",
     )
     .expect("write effective Grok config");
     std::fs::write(
@@ -97,9 +109,25 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             let agent = Agent::start(
                 AgentConfig::new(ModelConfig::new("sdk-model", provider.clone()))
                     .model(ModelConfig::new("sdk-other", provider.clone()))
-                    .model(ModelConfig::new("sdk-concise", provider.clone()))
-                    .model(ModelConfig::new("sdk-codex", provider.clone()))
-                    .model(ModelConfig::new("sdk-codex-concise", provider))
+                    .model(ModelConfig::new("sdk-concise", provider.clone()).behavior(
+                        ModelBehaviorConfig {
+                            use_concise: Some(true),
+                            ..Default::default()
+                        },
+                    ))
+                    .model(ModelConfig::new("sdk-codex", provider.clone()).behavior(
+                        ModelBehaviorConfig {
+                            agent_type: Some("codex".into()),
+                            ..Default::default()
+                        },
+                    ))
+                    .model(ModelConfig::new("sdk-codex-concise", provider).behavior(
+                        ModelBehaviorConfig {
+                            agent_type: Some("codex".into()),
+                            use_concise: Some(true),
+                            ..Default::default()
+                        },
+                    ))
                     .model(ModelConfig::new(
                         "suggestion-model",
                         ProviderConfig::openai_responses(
@@ -137,45 +165,34 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                 policy.plugin_auto_update.source(),
                 Some(layers[0].path.as_path())
             );
+            let model_state = agent.effective_config_snapshot();
             assert!(
-                agent
-                    .initialization_response()
-                    .get("agentCapabilities")
-                    .is_some(),
-                "initialization capabilities were not preserved"
-            );
-            assert_eq!(
-                agent.initialization_response()["_meta"]["sessionRecap"],
-                false,
-                "effective GROK_HOME config was not preserved"
-            );
-            let model_state = agent
-                .extension("x.ai/models/list", serde_json::json!({}))
-                .await
-                .expect("raw model extension");
-            assert!(
-                model_state.to_string().contains("sdk-model"),
-                "configured model missing from extension response: {model_state}"
+                model_state
+                    .routes
+                    .iter()
+                    .any(|route| route.route_id == "sdk-model"),
+                "configured model missing from typed routes: {model_state:?}"
             );
             let mut events = agent.subscribe();
             let session = agent
-                .create_session(SessionConfig::new(workspace.path()).metadata(
-                    "rules",
-                    serde_json::json!("ORIGINAL_ATTACH_RULES: retain this authored rule"),
-                ))
+                .create_session(SessionConfig::new(workspace.path()))
                 .await
                 .expect("create session");
-            assert!(
-                session.initial_response().get("_meta").is_some(),
-                "session initialization metadata was not preserved"
-            );
             session.set_mode("default").await.expect("set session mode");
             let result = session
-                .prompt("exercise the SDK facade")
+                .prompt_blocks_with_options(
+                    [PromptBlock::Text("exercise the SDK facade".into())],
+                    authored_options(
+                        "original",
+                        "ORIGINAL_ATTACH_RULES: retain this authored rule",
+                        "sdk-model",
+                    ),
+                )
                 .await
                 .expect("prompt");
             assert_eq!(result.stop_reason, StopReason::EndTurn);
-            assert!(result.raw_response.get("_meta").is_some());
+            assert!(result.prompt_id.is_some());
+            assert_eq!(result.prompt_index, Some(0));
 
             let assistant_text = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut assistant_text = String::new();
@@ -198,35 +215,9 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
             .expect("assistant event timeout");
             assert!(assistant_text.contains("response from Grok Build"));
 
-            let suggestion_request_start = suggestion_server.requests().len();
-            let suggestion_response = session
-                .extension("x.ai/suggestPrompt", serde_json::json!({ "generation": 1 }))
-                .await
-                .expect("prompt suggestion extension");
-            let suggestion_requests = suggestion_server.requests();
-            let suggestion_request = suggestion_requests[suggestion_request_start..]
-                .iter()
-                .find(|request| request.path == "/v1/responses")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "prompt suggestion did not use its provider; response: \
-                         {suggestion_response}; requests: {suggestion_requests:?}"
-                    )
-                });
             assert_eq!(
-                suggestion_request.header("authorization"),
-                Some("Bearer suggestion-secret")
-            );
-            assert_eq!(
-                suggestion_request.header("x-suggestion-tenant"),
-                Some("tenant")
-            );
-            assert_eq!(
-                suggestion_request
-                    .body
-                    .as_ref()
-                    .and_then(|body| body["model"].as_str()),
-                Some("suggestion-wire-model")
+                model_state.auxiliary.prompt_suggestion_model.as_deref(),
+                Some("suggestion-model")
             );
 
             let requests = server.requests();
@@ -272,13 +263,7 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                 if cold {
                     session.close().await.expect("evict before cold attach");
                 }
-                let mut config = SessionConfig::new(workspace.path());
-                if replace {
-                    config = config.metadata(
-                        "systemPromptOverride",
-                        serde_json::json!("ADMISSION_ATTACH_OVERRIDE: replacement system prompt"),
-                    );
-                }
+                let config = SessionConfig::new(workspace.path());
                 let attached = agent
                     .resume_session(session_id.clone(), config)
                     .await
@@ -299,7 +284,18 @@ fn all_provider_protocols_execute_through_the_agent_facade() {
                 }
                 let start = server.requests().len();
                 attached
-                    .prompt("verify attached prompt head")
+                    .prompt_blocks_with_options(
+                        [PromptBlock::Text("verify attached prompt head".into())],
+                        if replace {
+                            authored_options(
+                                "replacement",
+                                "ADMISSION_ATTACH_OVERRIDE: replacement system prompt",
+                                "sdk-model",
+                            )
+                        } else {
+                            PromptOptions::default()
+                        },
+                    )
                     .await
                     .expect("attached turn");
                 let requests = server.requests();
@@ -352,10 +348,7 @@ async fn verify_model_switch_prompts(
     const COMPACT: &str = "You are an AI coding agent. You operate in a workspace with a provided codebase.\n\nYour main goal is to complete the user's request, denoted within the <user_query> tag.";
     for explicit in [false, true] {
         for rebuild in [false, true] {
-            let mut config = SessionConfig::new(workspace).model("sdk-model");
-            if explicit {
-                config = config.metadata("systemPromptOverride", serde_json::json!(AUTHORED));
-            }
+            let config = SessionConfig::new(workspace).model("sdk-model");
             let session = agent
                 .create_session(config)
                 .await
@@ -388,7 +381,14 @@ async fn verify_model_switch_prompts(
                 }
                 let start = server.requests().len();
                 session
-                    .prompt("verify model switch prompt")
+                    .prompt_blocks_with_options(
+                        [PromptBlock::Text("verify model switch prompt".into())],
+                        if explicit && step == 0 {
+                            authored_options("authored", AUTHORED, model)
+                        } else {
+                            PromptOptions::default()
+                        },
+                    )
                     .await
                     .expect("model-switch turn");
                 let requests = server.requests();

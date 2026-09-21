@@ -356,10 +356,11 @@ revision, boundary_id, records }`. It uses the native portable flush/capture
 boundary and shares its idle/unsupported-state errors. Records are in unfiltered
 persisted order (including rewind markers), not reconstructed live Turns.
 Each `HistoryRecord` retains native `event_id`, optional `prompt_id`,
-`prompt_index`, `hide_from_scrollback`, `model`, envelope/chunk metadata,
+`prompt_index`, `hide_from_scrollback`, `model`,
 `is_replay`, and the typed `SessionUpdate` (including terminal/tool status).
 Absent legacy identities remain `None`; never invent prompt IDs or infer
-settlement. Unknown updates remain `Other` rather than being silently dropped.
+settlement. Unknown updates retain a `SessionUpdate::Status` kind rather than
+an opaque protocol envelope.
 
 For a lossless display handoff within one runtime:
 
@@ -369,7 +370,7 @@ For a lossless display handoff within one runtime:
 3. Discard this Session's buffered projection records through
    `Event::HistoryBoundary` with the returned unique `boundary_id`.
 4. Apply subsequent `Event::HistoryRecord` values in stream order. Do not also
-   project `Event::Session`/`Extension`, which would duplicate live output.
+   project `Event::Session`, which would duplicate live output.
 
 The actor awaits boundary delivery to the SDK broadcast stream before releasing
 its admission fence. This is the snapshot-completion barrier, not a promise that
@@ -457,7 +458,7 @@ The management invariants are:
   snapshot. Successful operation receipts are replayable within that actor
   incarnation; reusing an ID for a different request is rejected.
 - **Ordered observation.** `Agent::subscribe` publishes typed management and
-  raw Session/extension events in one causal order. In particular, the prior
+  Session events in one causal order. In particular, the prior
   prompt's terminal state precedes successor promotion, and promotion precedes
   successor content. A lag in that stream is unrecoverable event-history loss.
   The management-only stream has an Agent-global monotonic sequence; queue
@@ -482,64 +483,53 @@ The management invariants are:
   reimplementing them.
 - `Agent::start`, `subscribe`, `subscribe_management`, `runtime_health`,
   `subscribe_runtime_health`, `quiesce`, session creation/attachment/listing,
-  and `shutdown` own the embedding lifecycle. Raw initialization and attach
-  responses remain available for forward-compatible capability discovery, but
-  are not the lifecycle or management contract.
-- `SessionConfig` accepts raw upstream metadata and MCP server definitions.
-  This preserves agent profiles, plugin directories, tool overrides,
-  reasoning settings, SDK-provided MCP servers, and future additions without
-  reproducing their schemas in the facade.
-- `Session::prompt` and `prompt_blocks` send text, image, audio, linked or
-  embedded resources, and forward-compatible raw content. Per-turn metadata,
-  model/mode switching, title rename, cancellation, and close map directly to
-  upstream operations. Prompt results and session events retain their opaque
-  upstream metadata; cancellation metadata exposes subagent cancellation and
-  optional rewind controls.
+  and `shutdown` own the embedding lifecycle. Effective configuration snapshots
+  expose typed model route facts rather than raw initialization/attach responses.
+- `SessionConfig` accepts a workspace, model, configuration-candidate requirement,
+  and typed MCP transports. Authored instructions are supplied through
+  `ConfigCandidate` in `PromptOptions`, not arbitrary session metadata.
+- `Session::prompt` and `prompt_blocks` accept neutral typed content.
+  `prompt_blocks_with_options` supplies a prompt ID, configuration candidate,
+  and send-now choice. Model/mode switching, title rename, cancellation, and
+  close use named operations; prompt results expose typed receipts and usage,
+  not opaque upstream responses. Rewind uses the typed management API.
 - `management` and typed `Agent` / `Session` methods cover the stable embedded
   management surface: native FIFO, scheduler, rewind, effective configuration,
   usage/info, hooks, skills/workflows, MCP inventory/status, background tasks,
   and subagents.
-- `Agent::extension`, `Agent::notify_extension`, and `Session::extension`
-  retain the complete Grok Build `x.ai/*` JSON seam for new, experimental, or
-  uncommon capabilities. Stable consumers do not need to spell the typed
-  management method names or parse their responses.
 - `Event` carries typed management plus common user/assistant/thought,
   tool-call, plan, and durable turn-terminal updates in one causal stream.
-  Unmirrored standard updates remain available as JSON through
-  `SessionUpdate::Other`; xAI extension notifications remain available through
-  `Event::Extension`. This is the forward-compatible escape hatch for upstream
-  additions, not a second protocol model.
+  Unknown update kinds are represented without a raw protocol payload. There
+  is no public arbitrary extension request/notification or raw-content escape hatch.
 - `PermissionPolicy` supports fail-closed `DenyAll` (the default), `AllowAll`,
-  or host-delegated decisions. `ClientHandler` also receives blocking
-  agent-to-host extension calls such as ask-user, folder trust, plan exit,
-  hooks, and SDK MCP calls. Grok Build remains responsible for tool execution.
+  or host-delegated decisions through `ClientHandler`. First-party host tools
+  use `Session::register_tools` and `NativeToolHandler`; Grok Build remains
+  responsible for native tool selection and execution.
 - `source_provenance()` reports the exact public and embedded source commits.
 
-For example, the raw seam remains available for deliberately untyped areas:
+For example, inspect the configured model catalog without a protocol request:
 
 ```rust
-# async fn discover(agent: &sophon_sdk::Agent) -> Result<(), sophon_sdk::Error> {
-let models = agent.extension("x.ai/models/list", serde_json::json!({})).await?;
-let session_matches = agent
-    .extension("x.ai/session/search", serde_json::json!({ "query": "provider" }))
-    .await?;
-# let _ = (models, session_matches);
-# Ok(())
+# fn discover(agent: &sophon_sdk::Agent) {
+let configured = agent.effective_config_snapshot();
+for route in configured.routes {
+    println!("{}: {}", route.route_id, route.model);
+}
 # }
 ```
 
 ### Agent capability coverage
 
 The audit boundary is the compiled public-source Grok Build `MvpAgent`, not
-pager/TUI commands or private services. The table distinguishes typed access,
-native agent execution, and raw forwarding. A reachable extension is not a
-stable typed SDK contract or evidence that every route has been exercised.
+pager/TUI commands or private services. The table distinguishes typed access
+from native agent execution. Upstream routes without a neutral typed facade
+are not exposed merely because the private adapter can reach them.
 
 | Grok Build capability | SDK access |
 |---|---|
-| Prompt loop; text/image/audio/resource input; image understanding | typed `Session` prompt methods plus raw blocks/metadata |
+| Prompt loop; text/image/audio/resource input; image understanding | typed `Session` prompt methods and `PromptOptions` |
 | Native repository, terminal, web-fetch, web-search, image and video tools | executed by the upstream agent; configured through `GROK_HOME` and provider routes |
-| Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; raw summary/compaction extensions |
+| Automatic titles, summaries, compaction, prompt suggestions | explicit auxiliary model routes; native agent execution |
 | Runtime lifecycle and Agent replacement | typed health watch, Agent-wide admission fence, cancellable `quiesce`, and drain-before-stop `shutdown` |
 | Native prompt FIFO | typed running/pending snapshot with prompt origin; CAS/idempotent remove, reorder, clear, edit, interject, hold, and release; versioned queue events |
 | Scheduler | typed versioned records and snapshot; CAS/idempotent create, update, and delete; versioned upsert/fire/removal events; native child execution only |
@@ -550,39 +540,31 @@ stable typed SDK contract or evidence that every route has been exercised.
 | Effective configuration | credential-free Agent and Session snapshots plus versioned invalidation; active batch versus next empty-FIFO state |
 | Hooks, skills and workflows | typed inventories/config/action outcomes, skill mutations, and workflow run list/start/pause/resume/stop; hook invalidation events |
 | MCP | session-scoped reduced inventory, typed configuration/auth/setup/resource operations, generation-aware readiness and status events |
-| Session search/state/history/import/fork/repair/delete | raw `x.ai/session/*` / `x.ai/sessions/*`; content and persistence workflows are not runtime authority |
-| Models, modes, commands, workspaces, prompt history | typed model/mode switching plus `x.ai/models/*`, `x.ai/commands/*`, `x.ai/workspaces/*` |
-| Local file/content/code search, filesystem and terminal/PTY control | `x.ai/search/*`, `x.ai/code/*`, `x.ai/fs/*`, `x.ai/terminal/*` |
-| MCP tools/resources/auth/setup/toggles/config | typed `Session::mcp` management/resources; raw tool calls and reverse `ClientHandler` calls |
-| Skills, workflows, plugins, marketplaces and hooks | typed skills/workflows/hooks; raw plugins and marketplaces |
+| Session history and conversation transfer | typed history snapshot, portable export/import and import status |
+| Models and modes | typed switching and configured/effective route facts |
+| Local file/content/code search, filesystem and terminal/PTY control | native tools; no arbitrary protocol forwarding |
+| MCP tools/resources/auth/setup/toggles/config | typed `Session::mcp` management/resources; native tool execution |
+| Skills, workflows, plugins, marketplaces and hooks | typed skills/workflows/hooks; plugin execution/configuration stays upstream |
 | Tasks, scheduler and subagents | typed records, supported mutations/results, snapshots, and events |
-| Git, diffs/staging/commits and linked worktrees | upstream tools plus `x.ai/git/*` and `x.ai/git/worktree/*` |
-| Memory, manual/automatic compaction, recap and suggestions | `x.ai/memory/*`, `x.ai/compact_conversation*`, `x.ai/recap`, `x.ai/suggest*` |
-| Permissions, ask-user, folder trust, plan exit, client hooks and SDK MCP | `PermissionPolicy::Delegate` and `ClientHandler` |
-| New or uncommon standard/extension updates | `SessionUpdate::Other`, `Event::Extension`, and raw request/notification methods |
+| Git, diffs/staging/commits and linked worktrees | upstream tools |
+| Memory, compaction, recap and suggestions | typed configuration and native agent execution |
+| Permissions and host tools | `PermissionPolicy::Delegate`, `ClientHandler`, and `NativeToolHandler` |
+| New or uncommon updates | typed unknown-kind representation, not raw request/notification methods |
 
-### Raw extension audit
+### Private adapter boundary
 
-The following remain raw by design. This is an explicit stability decision,
-not an unimplemented management DTO:
-
-| Raw route family | Reason |
-|---|---|
-| `x.ai/fs/*`, `search/*`, `code/*`, `terminal/*`, `git/*`, worktree and hunk operations | Imperative workspace/tool and UI plumbing; the agent's normal tool loop owns execution. |
-| account, auth, billing/credits, privacy/consent, feedback, sharing/cloud and rollout/survey routes | First-party control-plane or product-specific contracts, often identity-bearing. |
-| `plugins/*` and `marketplace/*` install/reload/action routes | Experimental product catalog and executable installation lifecycle. |
-| session content/search/import/fork/repair/history/state/delete, memory, compact, recap and suggest routes | Content/persistence workflows rather than runtime lifecycle authority; shapes evolve with upstream storage. |
-| MCP tool calls and uncommon extensions | Native tool execution and forward compatibility; configuration/auth/setup/resources have typed `Session::mcp` access. |
-| models, commands, workspaces and prompt-history catalogs | Discovery/UI catalogs not required for lifecycle correctness; model switching itself is typed. |
-| debug/internal/telemetry notifications | Diagnostic and explicitly unstable implementation details. |
-| raw queue/scheduler/rewind/task/subagent routes | Compatibility only. The typed native actor methods are the stable path and preserve CAS, idempotency, and recovery semantics. |
+Arbitrary `x.ai/*` requests, notifications, ACP metadata, raw content blocks,
+and initialization/attach/prompt responses are not public APIs. Product catalog,
+account, UI, diagnostic, and experimental upstream routes remain private.
+Use the named typed operations for supported lifecycle and management features;
+there is no compatibility bypass around their native actor invariants.
 
 One declared upstream feature is not part of this usable public-source
 baseline: Grok Build declares Cargo feature `local-workspace`, but the public
 snapshot omits its `gateway_bridge` module and the feature does not compile.
 The SDK therefore does not claim the private Computer Hub own/attach path.
 Ordinary local repositories, git worktrees, session rehydration, tools, and all
-compiled `MvpAgent` extensions retain their native entry points. Reimplementing that missing
+compiled `MvpAgent` extensions retain their private native entry points. Reimplementing that missing
 private service would violate the thin-wrapper boundary.
 
 Image/video generation remains a native agent tool rather than a parallel
@@ -602,14 +584,14 @@ For **explicit app final exit or account retirement**, call
 `Agent::final_exit(timeout).await` directly, not `quiesce(120s)` followed by
 another drain within the same outer budget. This irreversible operation fences
 native admission, cancels native queued/running turns and foreground/background
-tasks, cancels subagents/workflows, and releases pending SDK permission/extension
+tasks, cancels subagents/workflows, and releases pending SDK permission/tool
 callback futures. It then checks native settlement, final persistence ACKs,
 notification delivery and worker joining against **one total deadline**.
 Conversation history is retained; this never replays a Host queue.
 
 Each prompt future's `PromptResult` carries `prompt_id: Option<String>`,
 `prompt_index: Option<u64>`, and `usage: Option<TurnUsage>` alongside its outcome
-and raw response. These are native per-prompt receipts, usable after the worker
+and stop reason. These are native per-prompt receipts, usable after the worker
 stops. The index is stamped where native conversation state consumes it, not
 inferred from history length; unstarted, removed, hook-blocked and rewound inputs
 have no retained index. `TurnCompletion.prompt_index` exposes the same native
@@ -646,8 +628,8 @@ been verified by these Linux tests.
   ownership, management access and hermetic policy. `tests/lifecycle.rs`
   exercises actual Agent/Session timeout/retry, concurrent drain/cancel,
   targeted cancellation, closed-session errors and terminal-event delivery.
-  Native actor tests cover queue CAS and targeted cancel. Raw route families
-  are forwarded, not exhaustively integration-tested; live providers and
+  Native actor tests cover queue CAS and targeted cancel. Private adapter routes
+  are not exhaustively integration-tested; live providers and
   Windows/macOS execution are not verified by these Linux tests.
 - `shutdown_with_timeout` bounds admission drain. Concurrent quiesce/shutdown
   requests share the first drain's deadline. Timeout returns without joining
@@ -665,8 +647,7 @@ been verified by these Linux tests.
   Agent/Session handles retain senders: stop consumers on terminal runtime
   health, not by waiting indefinitely for broadcast channel closure.
 - `cancel_prompt(id)` atomically checks the actor's front; stale IDs are no-ops.
-  Queued rows use typed Remove. Legacy cancellation metadata `promptId` is
-  rewind-only; `targetPromptId` explicitly targets cancellation. Reserved native
+  Queued rows use typed Remove; rewind uses its own typed operation. Reserved native
   synthetic IDs are rejected only at SDK prompt ingress, preserving native
   scheduler/TUI behavior.
 - Failed typed entry-version Edit/Remove/Interject preserves holds and does not
@@ -680,7 +661,7 @@ been verified by these Linux tests.
 | Model and independently credentialed media routing | Agent and model loop | ACP request/transport types |
 | Stable typed `Agent` / `Session` lifecycle and management facade | FIFO, scheduler, rewind, task/subagent and hook/MCP actors | Pager/TUI APIs or dependencies |
 | Prompt block conversion | Session persistence and replay | A second session store or journal |
-| Typed recoverable management events + raw fallback | Skills, plugins, hooks, MCP discovery | Product/control-plane and experimental extension schemas |
+| Typed recoverable management events | Skills, plugins, hooks, MCP discovery | Product/control-plane and experimental extension schemas |
 | Provider routing + host callback boundary | Subagents, tasks, scheduler, workflows, compaction, worktrees | Kernels, harnesses, artifact or workflow platforms |
 
 ACP is used only as a private in-process adapter because the pinned
@@ -693,8 +674,8 @@ would require feature-gating/refactoring the upstream agent rather than a thin
 facade change. The pager/TUI, `ratatui`, and `crossterm` are absent from the
 normal `sophon-sdk` dependency closure.
 The normal closure still includes shell terminal/PTY utilities needed by native
-tools; these are not the pager UI. Raw JSON fields and `x.ai/*` method names
-retain upstream protocol semantics even though ACP Rust types are private.
+tools; these are not the pager UI. JSON remains where application content is
+open-ended, such as tool arguments, not as an arbitrary ACP forwarding channel.
 `scripts/check-sdk-boundary.sh` checks the upstream digests, normal dependency
 tree and resolved SDK-declared rustdoc signatures/reexports for ACP/TUI leakage.
 Dependency blanket implementations (for example ACP schema's `IntoOption<T>`

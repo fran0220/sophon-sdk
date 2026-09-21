@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import type { ClientFrame, ServerFrame, SpawnOptions, Transport } from './index.js'
+import type { SpawnOptions, Transport } from './index.js'
+import type { ClientFrame } from './generated/ClientFrame.js'
+import type { ServerFrame } from './generated/ServerFrame.js'
 import { RuntimeError } from './index.js'
 
 /** Private stdio only. No CLI flags containing credentials and no CLI parsing. */

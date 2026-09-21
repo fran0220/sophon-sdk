@@ -57,12 +57,7 @@ impl Drop for CallbackGuard {
 }
 
 impl Callbacks {
-    async fn call(
-        &self,
-        method: String,
-        params: Value,
-        context: Option<p::CallbackContext>,
-    ) -> Result<Value> {
+    async fn call(&self, name: String, args: Value, context: p::CallbackContext) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -75,8 +70,8 @@ impl Callbacks {
             .send(
                 p::ServerFrame::Callback {
                     id,
-                    method,
-                    params,
+                    name,
+                    args,
                     context,
                 }
                 .into(),
@@ -86,12 +81,7 @@ impl Callbacks {
     }
 }
 
-#[async_trait::async_trait]
-impl ClientHandler for Callbacks {
-    async fn extension(&self, method: &str, params: Value) -> Result<Value> {
-        self.call(method.to_owned(), params, None).await
-    }
-}
+impl ClientHandler for Callbacks {}
 
 struct Runtime {
     agent: Agent,
@@ -137,11 +127,7 @@ impl crate::native_tools::NativeToolHandler for RuntimeTools {
                     .execute(name, args, std::path::Path::new(&context.cwd))
                     .await
             }
-            _ => {
-                self.callbacks
-                    .call(format!("tool/{name}"), args, Some(context))
-                    .await
-            }
+            _ => self.callbacks.call(name.to_owned(), args, context).await,
         }
     }
 }
@@ -221,24 +207,27 @@ impl Runtime {
                     json!({"sessions": page.sessions.into_iter().map(|s| json!({"id":s.id.to_string(),"cwd":s.cwd,"title":s.title,"updatedAt":s.updated_at})).collect::<Vec<_>>(), "nextCursor":page.next_cursor}),
                 )
             }
+            Skills { cwd } => encode(self.agent.skills(cwd).await.map_err(operation)?),
             Prompt { session_id, prompt } => {
                 let session = self.session(&session_id).await?;
                 if prompt.turn_id.is_empty() {
                     return Err(Error::invalid_config("turnId cannot be empty"));
                 }
-                let mut metadata: serde_json::Map<_, _> = prompt.metadata.into_iter().collect();
-                metadata.insert("promptId".into(), Value::String(prompt.turn_id));
                 let result = session
-                    .prompt_blocks_with_metadata(
+                    .prompt_blocks_with_options(
                         prompt.blocks.into_iter().map(prompt_block),
-                        metadata,
+                        crate::PromptOptions {
+                            prompt_id: Some(prompt.turn_id),
+                            config_candidate: prompt.config_candidate,
+                            send_now: prompt.send_now.unwrap_or(false),
+                        },
                     )
                     .await?;
                 encode(p::PromptReceipt {
                     stop_reason: stop_reason(result.stop_reason),
                     prompt_id: result.prompt_id,
                     prompt_index: result.prompt_index,
-                    raw_response: result.raw_response,
+                    usage: result.usage,
                 })
             }
             Cancel {
@@ -290,22 +279,14 @@ impl Runtime {
             SetModel {
                 session_id,
                 model,
-                metadata,
+                reasoning_effort,
             } => {
                 self.session(&session_id)
                     .await?
-                    .set_model_with_metadata(model, metadata.into_iter().collect())
+                    .set_model_with_effort(model, reasoning_effort)
                     .await?;
                 Ok(Value::Null)
             }
-            Extension {
-                session_id,
-                name,
-                params,
-            } => match session_id {
-                Some(id) => self.session(&id).await?.extension(name, params).await,
-                None => self.agent.extension(name, params).await,
-            },
             Browser { args } => self
                 .handlers
                 .browser
@@ -506,9 +487,6 @@ impl Runtime {
         if let Some(model) = options.model {
             config = config.model(model);
         }
-        for (key, value) in options.metadata {
-            config = config.metadata(key, value);
-        }
         for server in options.mcp_servers {
             config = config.mcp_server(server);
         }
@@ -535,7 +513,6 @@ impl Runtime {
         let descriptor = p::SessionDescriptor {
             id: session.id().to_string(),
             workspace: options.workspace,
-            initial_response: session.initial_response().clone(),
         };
         self.sessions
             .lock()
@@ -660,63 +637,8 @@ fn update(update: crate::SessionUpdate) -> p::Update {
                 .collect(),
         ),
         U::TurnCompleted(v) => p::Update::TurnCompleted(v),
-        U::Other(v) => native_update(v),
-    }
-}
-
-fn native_update(value: Value) -> p::Update {
-    use xai_grok_shell::extensions::notification::SessionUpdate as N;
-    match serde_json::from_value::<N>(value.clone()) {
-        Ok(N::AutoCompactStarted {
-            tokens_used,
-            context_window,
-            percentage,
-            reason,
-        }) => p::Update::Compaction(p::CompactionUpdate::Started {
-            tokens_used,
-            context_window,
-            percentage,
-            reason,
-        }),
-        Ok(N::AutoCompactCompleted {
-            tokens_before,
-            tokens_after,
-            elapsed_ms,
-            summary_preview,
-        }) => p::Update::Compaction(p::CompactionUpdate::Completed {
-            tokens_before,
-            tokens_after,
-            elapsed_ms,
-            summary_preview,
-        }),
-        Ok(N::AutoCompactFailed { error }) => {
-            p::Update::Compaction(p::CompactionUpdate::Failed { error })
-        }
-        Ok(N::AutoCompactCancelled { reason }) => {
-            p::Update::Compaction(p::CompactionUpdate::Cancelled {
-                reason: serde_json::to_value(reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unknown".into()),
-            })
-        }
-        Ok(N::DiffReview { .. } | N::HookAnnotation { .. }) => p::Update::Other(value),
-        Ok(_) => p::Update::NativeStatus(value),
-        Err(_)
-            if matches!(
-                value.get("sessionUpdate").and_then(Value::as_str),
-                Some(
-                    "available_commands_update"
-                        | "current_mode_update"
-                        | "config_option_update"
-                        | "session_info_update"
-                        | "usage_update"
-                )
-            ) =>
-        {
-            p::Update::NativeStatus(value)
-        }
-        Err(_) => p::Update::Other(value),
+        U::Compaction(v) => p::Update::Compaction(v),
+        U::Status { kind } => p::Update::Status { kind },
     }
 }
 
@@ -730,8 +652,6 @@ fn history_record(record: crate::HistoryRecord) -> p::HistoryRecord {
         model: record.model,
         is_replay: record.is_replay,
         update: update(record.update),
-        envelope_metadata: record.envelope_metadata,
-        chunk_metadata: record.chunk_metadata,
     }
 }
 
@@ -750,15 +670,12 @@ fn event(event: crate::Event) -> Option<p::RuntimeEvent> {
         crate::Event::Session {
             session_id,
             update: u,
-            metadata,
+            prompt_id,
         } => Some(p::RuntimeEvent::Session {
             session_id: session_id.to_string(),
             update: update(u),
-            metadata,
+            prompt_id,
         }),
-        crate::Event::Extension { method, payload } => {
-            Some(p::RuntimeEvent::Extension { method, payload })
-        }
         crate::Event::Management(crate::management::ManagementEvent {
             kind: crate::management::ManagementEventKind::Subagent(event),
             ..
@@ -1005,7 +922,6 @@ pub async fn run() -> Result<()> {
                                 }
                             }
                         }));
-                        let initial = agent.initialization_response().clone();
                         runtime = Some(Arc::new(Runtime {
                             agent,
                             sessions: Mutex::default(),
@@ -1014,7 +930,7 @@ pub async fn run() -> Result<()> {
                             native_specs,
                             terminal,
                         }));
-                        respond(&output, id, Ok(initial)).await?;
+                        respond(&output, id, Ok(Value::Null)).await?;
                     }
                     Err(error) => respond(&output, id, Err(error)).await?,
                 }

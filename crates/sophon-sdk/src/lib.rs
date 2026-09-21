@@ -18,6 +18,7 @@ mod model_facts;
 pub mod native_media;
 pub mod native_terminal;
 pub mod native_tools;
+mod prompt;
 pub mod protocol;
 mod runtime;
 pub mod stdio;
@@ -48,6 +49,7 @@ pub use event::{
     TurnCompletion, TurnUsage,
 };
 pub use model_facts::SessionModelFacts;
+pub use prompt::{ConfigCandidate, McpServer, PromptOptions, SubagentBrief};
 pub use runtime::{Agent, FinalExitError, FinalExitPhase};
 pub use xai_grok_shell::session::portability::{
     MAX_PORTABLE_BYTES, PORTABLE_COMPATIBILITY, PORTABLE_FORMAT_VERSION, PortabilityError,
@@ -97,15 +99,13 @@ pub struct SessionConfig {
     pub(crate) cwd: PathBuf,
     pub(crate) model: Option<String>,
     pub(crate) require_config_candidate: bool,
-    pub(crate) metadata: serde_json::Map<String, serde_json::Value>,
-    pub(crate) mcp_servers: Vec<serde_json::Value>,
+    pub(crate) mcp_servers: Vec<McpServer>,
 }
 
 #[derive(Clone)]
 pub struct Session {
     pub(crate) agent: Agent,
     pub(crate) id: SessionId,
-    pub(crate) initial_response: serde_json::Value,
 }
 
 /// Persisted Grok Build session metadata returned by [`Agent::list_sessions`].
@@ -150,8 +150,6 @@ pub enum PromptBlock {
         blob: String,
         mime_type: Option<String>,
     },
-    /// Forward-compatible ACP content block represented only as JSON.
-    Raw(serde_json::Value),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -176,9 +174,6 @@ pub struct PromptResult {
     pub prompt_index: Option<u64>,
     /// Per-prompt receipt, not cumulative session usage; may be incomplete.
     pub usage: Option<TurnUsage>,
-    /// Complete upstream prompt response, including usage, prompt identity,
-    /// structured output, cancellation context, and future response fields.
-    pub raw_response: serde_json::Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

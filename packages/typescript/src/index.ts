@@ -26,11 +26,15 @@ import type { TerminalOpenResult } from './generated/TerminalOpenResult.js'
 import type { TerminalCloseResult } from './generated/TerminalCloseResult.js'
 import type { QueueSnapshot } from './generated/QueueSnapshot.js'
 import type { SessionEffectiveConfigSnapshot } from './generated/SessionEffectiveConfigSnapshot.js'
+import type { SkillsSnapshot } from './generated/SkillsSnapshot.js'
 import type { SubagentCancelIdResult } from './generated/SubagentCancelIdResult.js'
 import type { SubagentCancelOutcome } from './generated/SubagentCancelOutcome.js'
 
 export type { SessionEffectiveConfigSnapshot }
-export type { ClientFrame, ServerFrame, Request, RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue }
+export type { RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue, SkillsSnapshot }
+export type { ConfigCandidate } from './generated/ConfigCandidate.js'
+export type { McpServer } from './generated/McpServer.js'
+export type { SubagentBrief } from './generated/SubagentBrief.js'
 export type { SubagentStart, SubagentResult, SubagentSnapshot, SubagentHandle, SchedulerSnapshot, ScheduledTask, ScheduledTaskCreate, ScheduledTaskUpdate, SchedulerMutationResult, Version }
 export type { NativeMediaConfig } from './generated/NativeMediaConfig.js'
 export type { MediaRoute } from './generated/MediaRoute.js'
@@ -67,15 +71,15 @@ export interface Transport {
   close(): Promise<void>
 }
 
-export interface CallbackRequest {
-  method: string
-  params: JsonValue
-  context: CallbackContext | null
+export interface ToolCallRequest {
+  name: string
+  args: JsonValue
+  context: CallbackContext
   signal: AbortSignal
 }
 
 export interface ClientOptions {
-  onCallback?: (request: CallbackRequest) => Promise<JsonValue>
+  onToolCall?: (request: ToolCallRequest) => Promise<JsonValue>
   /** Observer failures are isolated from native execution. */
   onObserverError?: (error: unknown) => void
 }
@@ -95,6 +99,7 @@ export class RuntimeError extends Error {
 
 type Pending = { resolve: (result: JsonValue) => void; reject: (error: unknown) => void }
 type EventListener = (event: RuntimeEvent, sequence: number) => void
+const sendRequest = Symbol('runtimeRequest')
 
 /** Exactly one Runtime Agent. Session handles do not own subprocesses. */
 export class Agent {
@@ -126,7 +131,7 @@ export class Agent {
   static async connect(transport: Transport, config: RuntimeConfig, options: ClientOptions = {}): Promise<Agent> {
     const agent = new Agent(transport, options)
     await agent.ready
-    await agent.request({ method: 'initialize', config })
+    await agent[sendRequest]({ method: 'initialize', config })
     return agent
   }
 
@@ -166,7 +171,7 @@ export class Agent {
       for await (const frame of this.transport.frames) {
         switch (frame.type) {
           case 'ready':
-            if (frame.protocolVersion !== 1) throw new RuntimeError('protocol_version', `Unsupported Runtime protocol ${frame.protocolVersion}`)
+            if (frame.protocolVersion !== 2) throw new RuntimeError('protocol_version', `Unsupported Runtime protocol ${frame.protocolVersion}; expected 2`)
             this.readyResolve()
             break
           case 'response': case 'error': {
@@ -207,8 +212,8 @@ export class Agent {
     const controller = new AbortController()
     this.callbacks.set(frame.id, controller)
     try {
-      if (!this.options.onCallback) throw new RuntimeError('unsupported_callback', `No handler for ${frame.method}`)
-      const result = await this.options.onCallback({ method: frame.method, params: frame.params, context: frame.context, signal: controller.signal })
+      if (!this.options.onToolCall) throw new RuntimeError('unsupported_tool', `No handler for ${frame.name}`)
+      const result = await this.options.onToolCall({ name: frame.name, args: frame.args, context: frame.context, signal: controller.signal })
       if (!controller.signal.aborted) await this.transport.send({ type: 'callback_result', id: frame.id, result, error: null })
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -219,7 +224,7 @@ export class Agent {
   }
 
   /** Correlation is transport-only; Grok Build owns the native FIFO. */
-  request(request: Request): Promise<JsonValue> {
+  [sendRequest](request: Request): Promise<JsonValue> {
     if (this.stopped) return Promise.reject(this.stopped)
     if (this.exiting && request.method !== 'final_exit') return Promise.reject(new RuntimeError('admission_closed', 'Runtime is exiting'))
     const id = String(++this.nextId)
@@ -230,20 +235,19 @@ export class Agent {
   }
 
   async createSession(options: SessionOptions): Promise<Session> {
-    return new Session(this, await this.request({ method: 'create_session', options }) as unknown as SessionDescriptor)
+    return new Session(this, await this[sendRequest]({ method: 'create_session', options }) as unknown as SessionDescriptor)
   }
   async loadSession(id: string, options: SessionOptions): Promise<Session> {
-    return new Session(this, await this.request({ method: 'load_session', id, options }) as unknown as SessionDescriptor)
+    return new Session(this, await this[sendRequest]({ method: 'load_session', id, options }) as unknown as SessionDescriptor)
   }
   async resumeSession(id: string, options: SessionOptions): Promise<Session> {
-    return new Session(this, await this.request({ method: 'resume_session', id, options }) as unknown as SessionDescriptor)
+    return new Session(this, await this[sendRequest]({ method: 'resume_session', id, options }) as unknown as SessionDescriptor)
   }
-  listSessions(cwd: string | null = null, cursor: string | null = null): Promise<JsonValue> { return this.request({ method: 'list_sessions', cwd, cursor }) }
-  extension(name: string, params: JsonValue): Promise<JsonValue> { return this.request({ method: 'extension', sessionId: null, name, params }) }
-  browser(args: JsonValue): Promise<JsonValue> { return this.request({ method: 'browser', args }) }
-  async terminal<T extends TerminalRequest>(request: T): Promise<TerminalResult<T>> { return await this.request({ method: 'terminal', request }) as unknown as TerminalResult<T> }
-  skills(cwd: string): Promise<JsonValue> { return this.extension('x.ai/skills/list', { cwd }) }
-  quiesce(timeoutMs = 30_000): Promise<JsonValue> { return this.request({ method: 'quiesce', timeoutMs }) }
+  listSessions(cwd: string | null = null, cursor: string | null = null): Promise<JsonValue> { return this[sendRequest]({ method: 'list_sessions', cwd, cursor }) }
+  browser(args: JsonValue): Promise<JsonValue> { return this[sendRequest]({ method: 'browser', args }) }
+  async terminal<T extends TerminalRequest>(request: T): Promise<TerminalResult<T>> { return await this[sendRequest]({ method: 'terminal', request }) as unknown as TerminalResult<T> }
+  async skills(cwd: string): Promise<SkillsSnapshot> { return await this[sendRequest]({ method: 'skills', cwd }) as unknown as SkillsSnapshot }
+  quiesce(timeoutMs = 30_000): Promise<JsonValue> { return this[sendRequest]({ method: 'quiesce', timeoutMs }) }
 
   /** Native checked persistence receipt AND successful process/transport exit. */
   async finalExit(timeoutMs = 30_000): Promise<void> {
@@ -253,7 +257,7 @@ export class Agent {
     const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new RuntimeError('exit_timeout', 'Runtime did not finish checked exit')), timeoutMs + 5_000) })
     try {
       await Promise.race([(async () => {
-        await this.request({ method: 'final_exit', timeoutMs })
+        await this[sendRequest]({ method: 'final_exit', timeoutMs })
         const exit = await this.transport.closed
         await this.reader
         if (exit.code !== 0 || exit.signal !== null) throw new RuntimeError('exit_failed', `Runtime exit code ${exit.code}, signal ${exit.signal}`)
@@ -273,40 +277,39 @@ export class Session {
   }
   subscribe(listener: EventListener): () => void {
     return this.agent.subscribe((event, sequence) => {
-      if (event.type === 'gap' || event.type === 'extension' || (event.type === 'history_record' ? event.record.sessionId === this.id : event.type === 'subagent' ? event.event.parentSessionId === this.id : event.type === 'queue' ? event.snapshot.sessionId === this.id : event.sessionId === this.id)) listener(event, sequence)
+      if (event.type === 'gap' || (event.type === 'history_record' ? event.record.sessionId === this.id : event.type === 'subagent' ? event.event.parentSessionId === this.id : event.type === 'queue' ? event.snapshot.sessionId === this.id : event.sessionId === this.id)) listener(event, sequence)
     })
   }
-  async prompt(prompt: Prompt): Promise<PromptReceipt> { return await this.agent.request({ method: 'prompt', sessionId: this.id, prompt }) as unknown as PromptReceipt }
-  async history(): Promise<HistorySnapshot> { return await this.agent.request({ method: 'history', sessionId: this.id }) as unknown as HistorySnapshot }
-  async cancel(turnId: string | null = null): Promise<void> { await this.agent.request({ method: 'cancel', sessionId: this.id, turnId }) }
-  async dispose(): Promise<void> { await this.agent.request({ method: 'dispose', sessionId: this.id }) }
-  async queue(): Promise<QueueSnapshot> { return await this.agent.request({ method: 'queue', sessionId: this.id }) as unknown as QueueSnapshot }
+  async prompt(prompt: Prompt): Promise<PromptReceipt> { return await this.agent[sendRequest]({ method: 'prompt', sessionId: this.id, prompt }) as unknown as PromptReceipt }
+  async history(): Promise<HistorySnapshot> { return await this.agent[sendRequest]({ method: 'history', sessionId: this.id }) as unknown as HistorySnapshot }
+  async cancel(turnId: string | null = null): Promise<void> { await this.agent[sendRequest]({ method: 'cancel', sessionId: this.id, turnId }) }
+  async dispose(): Promise<void> { await this.agent[sendRequest]({ method: 'dispose', sessionId: this.id }) }
+  async queue(): Promise<QueueSnapshot> { return await this.agent[sendRequest]({ method: 'queue', sessionId: this.id }) as unknown as QueueSnapshot }
   /** Current native mount receipt; version is only an invalidation token. */
-  async effectiveConfig(): Promise<SessionEffectiveConfigSnapshot> { return await this.agent.request({ method: 'effective_config', sessionId: this.id }) as unknown as SessionEffectiveConfigSnapshot }
-  readArtifact(path: string): Promise<JsonValue> { return this.agent.request({ method: 'read_artifact', sessionId: this.id, path }) }
-  async setModel(model: string, metadata: Record<string, JsonValue> = {}): Promise<void> { await this.agent.request({ method: 'set_model', sessionId: this.id, model, metadata }) }
-  extension(name: string, params: JsonValue): Promise<JsonValue> { return this.agent.request({ method: 'extension', sessionId: this.id, name, params }) }
+  async effectiveConfig(): Promise<SessionEffectiveConfigSnapshot> { return await this.agent[sendRequest]({ method: 'effective_config', sessionId: this.id }) as unknown as SessionEffectiveConfigSnapshot }
+  readArtifact(path: string): Promise<JsonValue> { return this.agent[sendRequest]({ method: 'read_artifact', sessionId: this.id, path }) }
+  async setModel(model: string, reasoningEffort: string | null = null): Promise<void> { await this.agent[sendRequest]({ method: 'set_model', sessionId: this.id, model, reasoningEffort }) }
 }
 
 /** Native child coordinator, never an independent host Session loop. */
 export class Subagents {
   constructor(private readonly agent: Agent, private readonly sessionId: string) {}
   /** Allocate a native UUIDv7 logical ID before admission, usable for cancelId. */
-  async newId(): Promise<string> { return await this.agent.request({ method: 'subagent_new_id', sessionId: this.sessionId }) as string }
-  async start(request: SubagentStart): Promise<SubagentResult> { return await this.agent.request({ method: 'subagent_start', sessionId: this.sessionId, request }) as unknown as SubagentResult }
-  async query(id: string): Promise<SubagentSnapshot | null> { return await this.agent.request({ method: 'subagent_query', sessionId: this.sessionId, id }) as unknown as SubagentSnapshot | null }
+  async newId(): Promise<string> { return await this.agent[sendRequest]({ method: 'subagent_new_id', sessionId: this.sessionId }) as string }
+  async start(request: SubagentStart): Promise<SubagentResult> { return await this.agent[sendRequest]({ method: 'subagent_start', sessionId: this.sessionId, request }) as unknown as SubagentResult }
+  async query(id: string): Promise<SubagentSnapshot | null> { return await this.agent[sendRequest]({ method: 'subagent_query', sessionId: this.sessionId, id }) as unknown as SubagentSnapshot | null }
   /** Waits for native state, without adding a host queue or retrying execution. */
-  async wait(id: string, timeoutMs = 300_000): Promise<SubagentSnapshot> { return await this.agent.request({ method: 'subagent_wait', sessionId: this.sessionId, id, timeoutMs }) as unknown as SubagentSnapshot }
-  async cancel(target: SubagentHandle): Promise<SubagentCancelOutcome> { return await this.agent.request({ method: 'subagent_cancel', sessionId: this.sessionId, target }) as unknown as SubagentCancelOutcome }
+  async wait(id: string, timeoutMs = 300_000): Promise<SubagentSnapshot> { return await this.agent[sendRequest]({ method: 'subagent_wait', sessionId: this.sessionId, id, timeoutMs }) as unknown as SubagentSnapshot }
+  async cancel(target: SubagentHandle): Promise<SubagentCancelOutcome> { return await this.agent[sendRequest]({ method: 'subagent_cancel', sessionId: this.sessionId, target }) as unknown as SubagentCancelOutcome }
   /** Fences even an unregistered ID. Active-child exit must still be awaited separately. */
-  async cancelId(id: string): Promise<SubagentCancelIdResult> { return await this.agent.request({ method: 'subagent_cancel_id', sessionId: this.sessionId, id }) as unknown as SubagentCancelIdResult }
+  async cancelId(id: string): Promise<SubagentCancelIdResult> { return await this.agent[sendRequest]({ method: 'subagent_cancel_id', sessionId: this.sessionId, id }) as unknown as SubagentCancelIdResult }
 }
 
 /** Mutations carry native revision and caller-chosen idempotency key. */
 export class Scheduler {
   constructor(private readonly agent: Agent, private readonly sessionId: string) {}
-  async list(): Promise<SchedulerSnapshot> { return await this.agent.request({ method: 'scheduler_list', sessionId: this.sessionId }) as unknown as SchedulerSnapshot }
-  async create(operationId: string, expected: Version, task: ScheduledTaskCreate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent.request({ method: 'scheduler_create', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
-  async update(operationId: string, expected: Version, task: ScheduledTaskUpdate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent.request({ method: 'scheduler_update', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
-  async delete(operationId: string, expected: Version, id: string): Promise<SchedulerMutationResult<boolean>> { return await this.agent.request({ method: 'scheduler_delete', sessionId: this.sessionId, operationId, expected, id }) as unknown as SchedulerMutationResult<boolean> }
+  async list(): Promise<SchedulerSnapshot> { return await this.agent[sendRequest]({ method: 'scheduler_list', sessionId: this.sessionId }) as unknown as SchedulerSnapshot }
+  async create(operationId: string, expected: Version, task: ScheduledTaskCreate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent[sendRequest]({ method: 'scheduler_create', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
+  async update(operationId: string, expected: Version, task: ScheduledTaskUpdate): Promise<SchedulerMutationResult<ScheduledTask>> { return await this.agent[sendRequest]({ method: 'scheduler_update', sessionId: this.sessionId, operationId, expected, task }) as unknown as SchedulerMutationResult<ScheduledTask> }
+  async delete(operationId: string, expected: Version, id: string): Promise<SchedulerMutationResult<boolean>> { return await this.agent[sendRequest]({ method: 'scheduler_delete', sessionId: this.sessionId, operationId, expected, id }) as unknown as SchedulerMutationResult<boolean> }
 }

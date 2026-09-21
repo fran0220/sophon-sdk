@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -94,9 +94,7 @@ pub struct SessionOptions {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
-    pub metadata: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub mcp_servers: Vec<Value>,
+    pub mcp_servers: Vec<crate::McpServer>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
 }
@@ -116,7 +114,6 @@ pub struct ToolSpec {
 pub struct SessionDescriptor {
     pub id: String,
     pub workspace: Workspace,
-    pub initial_response: Value,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -126,7 +123,11 @@ pub struct Prompt {
     pub turn_id: String,
     pub blocks: Vec<PromptBlock>,
     #[serde(default)]
-    pub metadata: BTreeMap<String, Value>,
+    #[ts(optional)]
+    pub config_candidate: Option<crate::ConfigCandidate>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub send_now: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -161,7 +162,7 @@ pub struct PromptReceipt {
     pub prompt_id: Option<String>,
     #[ts(type = "number | null")]
     pub prompt_index: Option<u64>,
-    pub raw_response: Value,
+    pub usage: Option<crate::TurnUsage>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -187,13 +188,14 @@ pub enum Update {
     ToolCallUpdate(ToolCall),
     Plan(Vec<PlanEntry>),
     TurnCompleted(crate::TurnCompletion),
-    /// Known native control/status records, not transcript content.
-    NativeStatus(Value),
+    /// A native status category without a protocol envelope.
+    Status {
+        kind: String,
+    },
     Compaction(CompactionUpdate),
-    Other(Value),
 }
 
-#[derive(Clone, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "phase",
     rename_all = "snake_case",
@@ -250,8 +252,6 @@ pub struct HistoryRecord {
     pub model: Option<String>,
     pub is_replay: bool,
     pub update: Update,
-    pub envelope_metadata: Option<Value>,
-    pub chunk_metadata: Option<Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -293,11 +293,7 @@ pub enum RuntimeEvent {
     Session {
         session_id: String,
         update: Update,
-        metadata: Option<Value>,
-    },
-    Extension {
-        method: String,
-        payload: Value,
+        prompt_id: Option<String>,
     },
     /// The stream is no longer a valid display handoff. Resnapshot all sessions.
     Gap {
@@ -384,9 +380,9 @@ pub enum ServerFrame {
     },
     Callback {
         id: String,
-        method: String,
-        params: Value,
-        context: Option<CallbackContext>,
+        name: String,
+        args: Value,
+        context: CallbackContext,
     },
     CallbackCancelled {
         id: String,
@@ -428,6 +424,9 @@ pub enum Request {
         cwd: Option<String>,
         cursor: Option<String>,
     },
+    Skills {
+        cwd: String,
+    },
     Prompt {
         session_id: String,
         prompt: Prompt,
@@ -451,13 +450,7 @@ pub enum Request {
     SetModel {
         session_id: String,
         model: String,
-        metadata: BTreeMap<String, Value>,
-    },
-    /// Native extension forwarding, not a second protocol or execution engine.
-    Extension {
-        session_id: Option<String>,
-        name: String,
-        params: Value,
+        reasoning_effort: Option<String>,
     },
     Browser {
         args: Value,
@@ -539,8 +532,49 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     TerminalCloseResult::export_all(&config)?;
     crate::management::SchedulerSnapshot::export_all(&config)?;
     crate::management::SessionEffectiveConfigSnapshot::export_all(&config)?;
+    crate::management::SkillsSnapshot::export_all(&config)?;
     crate::management::SchedulerMutationResult::<crate::management::ScheduledTask>::export_all(
         &config,
     )?;
     PromptReceipt::export_all(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn removed_protocol_escape_hatches_are_rejected() {
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "method": "extension", "name": "x.ai/models/list", "params": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SessionOptions>(json!({
+                "workspace": {"id": "w", "cwd": "/workspace"}, "metadata": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Prompt>(json!({
+                "turnId": "p", "blocks": [], "metadata": {"sendNow": true}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PromptBlock>(json!({
+                "type": "raw", "value": {"type": "text", "text": "hidden"}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::McpServer>(json!({
+                "type": "http", "name": "legacy", "url": "https://example.test", "headers": []
+            }))
+            .is_err()
+        );
+    }
 }

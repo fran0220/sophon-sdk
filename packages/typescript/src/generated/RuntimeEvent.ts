@@ -6,6 +6,5 @@ import type { ScheduledTaskId } from "./ScheduledTaskId.js";
 import type { SubagentEvent } from "./SubagentEvent.js";
 import type { Update } from "./Update.js";
 import type { Version } from "./Version.js";
-import type { JsonValue } from "./serde_json/JsonValue.js";
 
-export type RuntimeEvent = { "type": "queue", snapshot: QueueSnapshot, } | { "type": "scheduler", sessionId: string, taskId: ScheduledTaskId, version: Version, occurrence: ScheduledTaskEvent, snapshotRequired: boolean, } | { "type": "subagent", event: SubagentEvent, } | { "type": "history_record", record: HistoryRecord, } | { "type": "history_boundary", sessionId: string, boundaryId: string, } | { "type": "session", sessionId: string, update: Update, metadata: JsonValue | null, } | { "type": "extension", method: string, payload: JsonValue, } | { "type": "gap", dropped: number, };
+export type RuntimeEvent = { "type": "queue", snapshot: QueueSnapshot, } | { "type": "scheduler", sessionId: string, taskId: ScheduledTaskId, version: Version, occurrence: ScheduledTaskEvent, snapshotRequired: boolean, } | { "type": "subagent", event: SubagentEvent, } | { "type": "history_record", record: HistoryRecord, } | { "type": "history_boundary", sessionId: string, boundaryId: string, } | { "type": "session", sessionId: string, update: Update, promptId: string | null, } | { "type": "gap", dropped: number, };

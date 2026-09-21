@@ -1,6 +1,4 @@
-use serde_json::Value;
-
-use crate::{Error, SessionId};
+use crate::SessionId;
 
 /// One permission choice offered by Grok Build.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,9 +22,8 @@ pub enum PermissionOptionKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PermissionRequest {
     pub session_id: SessionId,
-    pub tool_call: Value,
+    pub tool_call: crate::ToolCallUpdate,
     pub options: Vec<PermissionOption>,
-    pub metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,8 +34,7 @@ pub enum PermissionDecision {
 
 /// Host callbacks for capabilities that require an embedding-side response.
 ///
-/// This keeps ACP private while preserving permission prompts and Grok Build's
-/// agent-to-client extension requests (for example ask-user and SDK MCP calls).
+/// Product tools use NativeToolHandler; this interface handles permissions only.
 #[async_trait::async_trait]
 pub trait ClientHandler: Send + Sync + 'static {
     /// The future is dropped when its requesting turn abandons the permission
@@ -46,12 +42,5 @@ pub trait ClientHandler: Send + Sync + 'static {
     /// host tasks are not cancelled by dropping the callback future.
     async fn request_permission(&self, _request: PermissionRequest) -> PermissionDecision {
         PermissionDecision::Cancel
-    }
-
-    /// Final exit drops this future to release pending reverse interactions.
-    /// Keep it cancellation-safe; independently spawned host tasks remain
-    /// host-owned. Ordinary native interaction resolution is not an answer ACK.
-    async fn extension(&self, method: &str, _params: Value) -> Result<Value, Error> {
-        Err(Error::UnsupportedClientRequest(method.to_owned()))
     }
 }

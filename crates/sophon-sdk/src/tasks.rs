@@ -51,9 +51,6 @@ pub struct Snapshot {
     pub tasks: Vec<Row>,
     pub truncated: bool,
     pub delivery: Delivery,
-    /// Native envelope metadata, retained without inventing missing event,
-    /// session or attempt identities. This is not process-custody evidence.
-    pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
 /// Decode native `SessionNotification` params (not a JSON-RPC wrapper).
@@ -115,6 +112,5 @@ pub(crate) fn decode_snapshot(event: &Value) -> Option<Snapshot> {
             .collect(),
         truncated: update.truncated,
         delivery,
-        metadata,
     })
 }

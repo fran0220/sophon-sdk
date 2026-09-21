@@ -74,7 +74,6 @@ enum Command {
     ),
     SetMode(SessionId, String, Reply<()>),
     Extension(String, serde_json::Value, Reply<serde_json::Value>),
-    ExtensionNotification(String, serde_json::Value, Reply<()>),
     Cancel(
         SessionId,
         serde_json::Map<String, serde_json::Value>,
@@ -153,7 +152,6 @@ struct AgentInner {
     management_events: broadcast::Sender<mgmt::ManagementEvent>,
     runtime_health: watch::Receiver<mgmt::RuntimeHealth>,
     effective_config: mgmt::AgentEffectiveConfigSnapshot,
-    initialization_response: serde_json::Value,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -254,14 +252,13 @@ impl Agent {
             .map_err(|error| Error::Start(error.to_string()))?;
 
         match ready_rx.await {
-            Ok(Ok((initialization_response, effective_config))) => Ok(Self {
+            Ok(Ok((_initialization_response, effective_config))) => Ok(Self {
                 inner: Arc::new(AgentInner {
                     commands,
                     events,
                     management_events,
                     runtime_health,
                     effective_config,
-                    initialization_response,
                     worker: Mutex::new(Some(worker)),
                 }),
             }),
@@ -315,15 +312,6 @@ impl Agent {
     ) -> Result<mgmt::QuiesceReport, mgmt::ManagementError> {
         self.management_request(|reply| Command::Quiesce(timeout, reply))
             .await
-    }
-
-    /// Complete upstream initialization response as forward-compatible JSON.
-    ///
-    /// This includes advertised capabilities, model state, commands, MCP
-    /// servers, agent identity/version metadata, and future additions without
-    /// exposing ACP types.
-    pub fn initialization_response(&self) -> &serde_json::Value {
-        &self.inner.initialization_response
     }
 
     pub async fn create_session(&self, config: SessionConfig) -> Result<Session, Error> {
@@ -501,25 +489,13 @@ impl Agent {
         mgmt::skills_snapshot(response)
     }
 
-    /// Invoke any Grok Build `x.ai/*` extension without exposing ACP types.
-    pub async fn extension(
+    pub(crate) async fn extension(
         &self,
         method: impl Into<String>,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, Error> {
         let method = method.into();
         self.request(|reply| Command::Extension(method, params, reply))
-            .await
-    }
-
-    /// Send a one-way Grok Build extension notification.
-    pub async fn notify_extension(
-        &self,
-        method: impl Into<String>,
-        params: serde_json::Value,
-    ) -> Result<(), Error> {
-        let method = method.into();
-        self.request(|reply| Command::ExtensionNotification(method, params, reply))
             .await
     }
 
@@ -1215,7 +1191,6 @@ async fn command_loop(
                                         .get("usage")
                                         .filter(|v| v.is_object())
                                         .map(turn_usage),
-                                    raw_response,
                                 })
                             }),
                         Err(error) => Err(error),
@@ -1246,10 +1221,6 @@ async fn command_loop(
                     let result = extension_request(&agent, method, params).await;
                     let _ = reply.send(result);
                 });
-            }
-            Command::ExtensionNotification(method, params, reply) => {
-                let result = extension_notification(&agent, method, params).await;
-                let _ = reply.send(result);
             }
             Command::SetMode(id, mode, reply) => {
                 let result = agent
@@ -1818,10 +1789,9 @@ fn session_parts(config: SessionConfig) -> Result<SessionParts, Error> {
         cwd,
         model,
         require_config_candidate,
-        mut metadata,
         mcp_servers,
     } = config;
-    // The typed startup contract takes precedence over arbitrary metadata.
+    let mut metadata = serde_json::Map::new();
     metadata.insert(
         "x.ai/requireConfigCandidate".into(),
         serde_json::Value::Bool(require_config_candidate),
@@ -1831,10 +1801,7 @@ fn session_parts(config: SessionConfig) -> Result<SessionParts, Error> {
     }
     let mcp_servers = mcp_servers
         .into_iter()
-        .map(|server| {
-            serde_json::from_value(server)
-                .map_err(|error| Error::invalid_config(format!("invalid MCP server: {error}")))
-        })
+        .map(native_mcp_server)
         .collect::<Result<Vec<_>, _>>()?;
     Ok((cwd, mcp_servers, metadata))
 }
@@ -1844,6 +1811,63 @@ fn session_request(config: SessionConfig) -> Result<acp::NewSessionRequest, Erro
     Ok(acp::NewSessionRequest::new(cwd)
         .mcp_servers(mcp_servers)
         .meta(metadata))
+}
+
+fn native_mcp_server(server: crate::McpServer) -> Result<acp::McpServer, Error> {
+    use crate::McpServer;
+    let pairs = |values: std::collections::BTreeMap<String, String>| {
+        values
+            .into_iter()
+            .map(|(name, value)| serde_json::json!({"name":name,"value":value}))
+            .collect::<Vec<_>>()
+    };
+    let value = match server {
+        McpServer::Stdio {
+            name,
+            command,
+            args,
+            env,
+        } => serde_json::json!({"name":name,"command":command,"args":args,"env":pairs(env)}),
+        McpServer::Http { name, url, headers } => {
+            serde_json::json!({"type":"http","name":name,"url":url,"headers":pairs(headers)})
+        }
+        McpServer::Sse { name, url, headers } => {
+            serde_json::json!({"type":"sse","name":name,"url":url,"headers":pairs(headers)})
+        }
+    };
+    serde_json::from_value(value)
+        .map_err(|error| Error::invalid_config(format!("invalid MCP configuration: {error}")))
+}
+
+fn prompt_metadata(
+    options: crate::PromptOptions,
+) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(id) = options.prompt_id {
+        if id.is_empty()
+            || xai_grok_shell::session::PromptOrigin::from_prompt_id(&id).is_synthetic()
+        {
+            return Err(Error::invalid_config(
+                "promptId is empty or uses a reserved native origin prefix",
+            ));
+        }
+        metadata.insert("promptId".into(), id.into());
+    }
+    metadata.insert("sendNow".into(), options.send_now.into());
+    if let Some(candidate) = options.config_candidate {
+        let servers = candidate
+            .external_mcp_servers
+            .iter()
+            .cloned()
+            .map(native_mcp_server)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut value = serde_json::to_value(&candidate)
+            .map_err(|error| Error::invalid_config(error.to_string()))?;
+        value["externalMcpServers"] = serde_json::to_value(servers)
+            .map_err(|error| Error::invalid_config(error.to_string()))?;
+        metadata.insert("x.sophon/configCandidate".into(), value);
+    }
+    Ok(metadata)
 }
 
 fn prompt_block(block: PromptBlock) -> Result<acp::ContentBlock, Error> {
@@ -1876,9 +1900,6 @@ fn prompt_block(block: PromptBlock) -> Result<acp::ContentBlock, Error> {
                 acp::BlobResourceContents::new(blob, uri).mime_type(mime_type),
             ),
         )),
-        PromptBlock::Raw(value) => serde_json::from_value(value).map_err(|error| {
-            Error::invalid_config(format!("invalid raw prompt content block: {error}"))
-        })?,
     };
     Ok(block)
 }
@@ -1895,19 +1916,6 @@ async fn extension_request(
         .await
         .map_err(acp_error)?;
     serde_json::from_str(response.0.get()).map_err(|error| Error::Operation(error.to_string()))
-}
-
-async fn extension_notification(
-    agent: &MvpAgent,
-    method: String,
-    params: serde_json::Value,
-) -> Result<(), Error> {
-    let params = serde_json::value::to_raw_value(&params)
-        .map_err(|error| Error::Operation(error.to_string()))?;
-    agent
-        .ext_notification(acp::ExtNotification::new(method, params.into()))
-        .await
-        .map_err(acp_error)
 }
 
 fn stop_reason(reason: acp::StopReason) -> StopReason {
@@ -2012,9 +2020,15 @@ impl acp::Client for EmbeddedClient {
                 _ = retired.wait_for(|value| *value) => PermissionDecision::Cancel,
                 decision = handler.request_permission(PermissionRequest {
                     session_id: SessionId(request.session_id.0.to_string()),
-                    tool_call: serde_json::to_value(&request.tool_call).unwrap_or_default(),
+                    tool_call: ToolCallUpdate {
+                        id: request.tool_call.tool_call_id.0.to_string(),
+                        title: request.tool_call.fields.title.clone(),
+                        kind: request.tool_call.fields.kind.as_ref().map(json_string),
+                        status: request.tool_call.fields.status.as_ref().map(json_string),
+                        raw_input: request.tool_call.fields.raw_input.clone(),
+                        raw_output: request.tool_call.fields.raw_output.clone(),
+                    },
                     options,
-                    metadata: request.meta.map(serde_json::Value::Object),
                 }) => decision,
             };
             let outcome = match decision {
@@ -2055,21 +2069,8 @@ impl acp::Client for EmbeddedClient {
         Ok(acp::RequestPermissionResponse::new(outcome))
     }
 
-    async fn ext_method(&self, request: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        let Some(handler) = &self.handler else {
-            return Err(acp::Error::method_not_found());
-        };
-        let params = serde_json::from_str(request.params.get())
-            .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
-        let mut retired = self.retired.clone();
-        let response = tokio::select! {
-            biased;
-            _ = retired.wait_for(|value| *value) => return Err(acp::Error::internal_error().data("SDK final exit released reverse request")),
-            response = handler.extension(request.method.as_ref(), params) => response,
-        }.map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
-        let response = serde_json::value::to_raw_value(&response)
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
-        Ok(acp::ExtResponse::new(response.into()))
+    async fn ext_method(&self, _request: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        Err(acp::Error::method_not_found())
     }
 
     async fn session_notification(
@@ -2095,7 +2096,12 @@ impl acp::Client for EmbeddedClient {
         let _ = self.events.send(Event::Session {
             session_id,
             update: session_update(notification.update),
-            metadata: notification.meta.map(serde_json::Value::Object),
+            prompt_id: notification
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("promptId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         });
         Ok(())
     }
@@ -2150,7 +2156,6 @@ impl acp::Client for EmbeddedClient {
         if let Some(kind) = management_extension_event(&method, &payload) {
             self.management.send(kind);
         }
-        let _ = self.events.send(Event::Extension { method, payload });
         if let Some(terminal) = terminal {
             let _ = self.events.send(terminal);
         }
@@ -2190,8 +2195,6 @@ fn history_record(payload: &serde_json::Value, historical: bool) -> Option<crate
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
         update,
-        envelope_metadata: envelope.cloned(),
-        chunk_metadata: chunk.cloned(),
     })
 }
 
@@ -2235,8 +2238,11 @@ fn typed_xai_session_event(payload: &serde_json::Value) -> Option<Event> {
     }
     Some(Event::Session {
         session_id: SessionId(string_field(payload, &["sessionId", "session_id"])?),
+        prompt_id: match &update {
+            SessionUpdate::TurnCompleted(completion) => Some(completion.prompt_id.clone()),
+            _ => None,
+        },
         update,
-        metadata: field(payload, &["_meta", "meta"]).cloned(),
     })
 }
 
@@ -2463,7 +2469,50 @@ fn other_session_update(
             .and_then(serde_json::Value::as_u64);
         return SessionUpdate::TurnCompleted(completion);
     }
-    SessionUpdate::Other(value)
+    native_status(value)
+}
+
+fn native_status(value: serde_json::Value) -> SessionUpdate {
+    use crate::protocol::CompactionUpdate as C;
+    use xai_grok_shell::extensions::notification::SessionUpdate as N;
+    let compaction = match serde_json::from_value::<N>(value.clone()) {
+        Ok(N::AutoCompactStarted {
+            tokens_used,
+            context_window,
+            percentage,
+            reason,
+        }) => C::Started {
+            tokens_used,
+            context_window,
+            percentage,
+            reason,
+        },
+        Ok(N::AutoCompactCompleted {
+            tokens_before,
+            tokens_after,
+            elapsed_ms,
+            summary_preview,
+        }) => C::Completed {
+            tokens_before,
+            tokens_after,
+            elapsed_ms,
+            summary_preview,
+        },
+        Ok(N::AutoCompactFailed { error }) => C::Failed { error },
+        Ok(N::AutoCompactCancelled { reason }) => C::Cancelled {
+            reason: json_string(&reason),
+        },
+        _ => {
+            return SessionUpdate::Status {
+                kind: value
+                    .get("sessionUpdate")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            };
+        }
+    };
+    SessionUpdate::Compaction(compaction)
 }
 
 fn turn_usage(usage: &serde_json::Value) -> crate::TurnUsage {
@@ -2529,10 +2578,9 @@ fn text_update(
 ) -> SessionUpdate {
     match content {
         acp::ContentBlock::Text(content) => text(content.text),
-        content => SessionUpdate::Other(serde_json::json!({
-            "sessionUpdate": kind,
-            "content": content,
-        })),
+        _ => SessionUpdate::Status {
+            kind: kind.to_owned(),
+        },
     }
 }
 
@@ -2549,7 +2597,6 @@ impl SessionConfig {
             cwd: cwd.into(),
             model: None,
             require_config_candidate: false,
-            metadata: serde_json::Map::new(),
             mcp_servers: Vec::new(),
         }
     }
@@ -2566,15 +2613,8 @@ impl SessionConfig {
         self
     }
 
-    /// Add Grok Build session metadata such as `agentProfile`, `pluginDirs`,
-    /// `toolOverrides`, reasoning effort, or forward-compatible additions.
-    pub fn metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.metadata.insert(key.into(), value);
-        self
-    }
-
-    /// Add one MCP server in the upstream ACP JSON shape.
-    pub fn mcp_server(mut self, server: serde_json::Value) -> Self {
+    /// Add a typed external MCP transport.
+    pub fn mcp_server(mut self, server: crate::McpServer) -> Self {
         self.mcp_servers.push(server);
         self
     }
@@ -2611,22 +2651,12 @@ impl Session {
         rx.await.map_err(|_| crate::PortabilityError::Unavailable)?
     }
 
-    pub(crate) fn new(agent: Agent, id: SessionId, initial_response: serde_json::Value) -> Self {
-        Self {
-            agent,
-            id,
-            initial_response,
-        }
+    pub(crate) fn new(agent: Agent, id: SessionId, _initial_response: serde_json::Value) -> Self {
+        Self { agent, id }
     }
 
     pub fn id(&self) -> &SessionId {
         &self.id
-    }
-
-    /// Complete response from the create/load/resume operation that attached
-    /// this handle, including initial model/mode/config state and metadata.
-    pub fn initial_response(&self) -> &serde_json::Value {
-        &self.initial_response
     }
 
     pub async fn prompt(&self, text: impl Into<String>) -> Result<PromptResult, Error> {
@@ -2637,24 +2667,17 @@ impl Session {
         &self,
         blocks: impl IntoIterator<Item = PromptBlock>,
     ) -> Result<PromptResult, Error> {
-        self.prompt_blocks_with_metadata(blocks, serde_json::Map::new())
+        self.prompt_blocks_with_options(blocks, crate::PromptOptions::default())
             .await
     }
 
-    /// Prompt with raw upstream metadata for per-turn options and future
-    /// additions that do not warrant an SDK mirror.
-    pub async fn prompt_blocks_with_metadata(
+    /// Submit typed options through native FIFO admission and cancellation.
+    pub async fn prompt_blocks_with_options(
         &self,
         blocks: impl IntoIterator<Item = PromptBlock>,
-        metadata: serde_json::Map<String, serde_json::Value>,
+        options: crate::PromptOptions,
     ) -> Result<PromptResult, Error> {
-        if let Some(id) = metadata.get("promptId").and_then(serde_json::Value::as_str)
-            && xai_grok_shell::session::PromptOrigin::from_prompt_id(id).is_synthetic()
-        {
-            return Err(Error::invalid_config(
-                "promptId uses a reserved native origin prefix",
-            ));
-        }
+        let metadata = prompt_metadata(options)?;
         let blocks = blocks.into_iter().collect::<Vec<_>>();
         if blocks.is_empty() {
             return Err(Error::invalid_config(
@@ -2665,16 +2688,18 @@ impl Session {
     }
 
     pub async fn set_model(&self, model: impl Into<String>) -> Result<(), Error> {
-        self.set_model_with_metadata(model, serde_json::Map::new())
-            .await
+        self.set_model_with_effort(model, None).await
     }
 
-    /// Switch model with upstream metadata, including reasoning effort.
-    pub async fn set_model_with_metadata(
+    pub async fn set_model_with_effort(
         &self,
         model: impl Into<String>,
-        metadata: serde_json::Map<String, serde_json::Value>,
+        reasoning_effort: Option<String>,
     ) -> Result<(), Error> {
+        let mut metadata = serde_json::Map::new();
+        if let Some(effort) = reasoning_effort {
+            metadata.insert("reasoningEffort".into(), effort.into());
+        }
         self.agent
             .set_model(self.id.clone(), model.into(), metadata)
             .await
@@ -2685,9 +2710,7 @@ impl Session {
         self.agent.set_mode(self.id.clone(), mode.into()).await
     }
 
-    /// Invoke a session-scoped `x.ai/*` extension. The session ID is injected
-    /// into the object payload.
-    pub async fn extension(
+    pub(crate) async fn extension(
         &self,
         method: impl Into<String>,
         mut params: serde_json::Value,
@@ -2731,10 +2754,7 @@ impl Session {
         .await
     }
 
-    /// Cancel with upstream metadata such as `cancelSubagents` or
-    /// `rewindIfNoOutput`. Legacy `promptId` applies only to rewind, not targeted
-    /// cancellation; use `cancel_prompt` (or `targetPromptId`) for that.
-    pub async fn cancel_with_metadata(
+    async fn cancel_with_metadata(
         &self,
         metadata: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), Error> {
@@ -2956,11 +2976,49 @@ mod tests {
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
 
     #[test]
+    fn neutral_candidate_converts_mcp_maps_only_at_private_boundary() {
+        let candidate: crate::ConfigCandidate = serde_json::from_value(serde_json::json!({
+            "revision": "r7", "instructions": "authored", "skillDirectories": [],
+            "externalMcpServers": [
+                {"transport":"stdio", "name":"local", "command":"/bin/server", "args":["--mode"], "env":{"TENANT":"seven"}},
+                {"transport":"http", "name":"remote", "url":"https://example.test/mcp", "headers":{"X-Tenant":"nine"}},
+                {"transport":"sse", "name":"stream", "url":"https://example.test/events", "headers":{"X-Stream":"eleven"}}
+            ],
+            "model": "m7", "reasoningEffort": null, "subagentBriefs": []
+        })).unwrap();
+        let metadata = prompt_metadata(crate::PromptOptions {
+            prompt_id: Some("caller-7".into()),
+            config_candidate: Some(candidate),
+            send_now: true,
+        })
+        .unwrap();
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(metadata["promptId"], "caller-7");
+        assert_eq!(metadata["sendNow"], true);
+        let candidate = &metadata["x.sophon/configCandidate"];
+        assert_eq!(candidate["revision"], "r7");
+        assert!(candidate.get("subjectOptions").is_none());
+        let servers = &candidate["externalMcpServers"];
+        assert_eq!(
+            servers[0]["env"],
+            serde_json::json!([{"name":"TENANT","value":"seven"}])
+        );
+        assert_eq!(servers[1]["type"], "http");
+        assert_eq!(
+            servers[1]["headers"],
+            serde_json::json!([{"name":"X-Tenant","value":"nine"}])
+        );
+        assert_eq!(servers[2]["type"], "sse");
+        assert_eq!(
+            servers[2]["headers"],
+            serde_json::json!([{"name":"X-Stream","value":"eleven"}])
+        );
+    }
+
+    #[test]
     fn candidate_requirement_is_typed_startup_metadata_for_create_load_and_resume() {
         for required in [false, true] {
-            let config = SessionConfig::new("/workspace")
-                .require_config_candidate(required)
-                .metadata("x.ai/requireConfigCandidate", serde_json::json!(!required));
+            let config = SessionConfig::new("/workspace").require_config_candidate(required);
             let created = session_request(config.clone()).unwrap();
             assert_eq!(
                 created.meta.unwrap()["x.ai/requireConfigCandidate"],
@@ -3587,18 +3645,13 @@ mod tests {
         let Event::Session {
             session_id,
             update,
-            metadata,
+            prompt_id,
         } = typed_xai_session_event(&payload).expect("typed xAI Session terminal")
         else {
             unreachable!("terminal decoder always returns a Session event")
         };
         assert_eq!(session_id.as_str(), "s1");
-        assert_eq!(
-            metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("eventId")),
-            Some(&serde_json::json!("s1-17"))
-        );
+        assert_eq!(prompt_id.as_deref(), Some("scheduler-fired-occurrence-1"));
 
         assert!(matches!(
             update,
