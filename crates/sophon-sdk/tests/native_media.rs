@@ -165,11 +165,43 @@ async fn image_json_and_ordered_multipart_use_explicit_route_and_publish_decoded
         .await
         .unwrap();
     assert_eq!(result["artifact"]["mimeType"], "image/png");
+    assert_eq!(result["width"], 32);
+    assert_eq!(result["height"], 24);
+    assert_eq!(result["requestedSize"], "32x24");
+    assert_eq!(
+        result["requestedDimensions"],
+        json!({"width":32,"height":24})
+    );
+    assert_eq!(result["dimensionMismatch"], false);
+    assert_eq!(result["warnings"], json!([]));
     assert_eq!(std::fs::read(root.path().join("first.png")).unwrap(), png);
     let digest = format!("{:x}", Sha256::digest(&png));
     assert_eq!(result["revision"], digest);
-    service.execute("generate_image",json!({"prompt":"edit rectangle","output_path":"edited.png","references":[{"path":"second.png","revision":second_digest},{"path":"fixture.png","revision":digest}]}),root.path()).await.unwrap();
+    let edited = service.execute("generate_image",json!({"prompt":"edit rectangle","output_path":"edited.png","size":"24x32","references":[{"path":"second.png","revision":second_digest},{"path":"fixture.png","revision":digest}]}),root.path()).await.unwrap();
+    assert_eq!(edited["width"], 32);
+    assert_eq!(edited["height"], 24);
+    assert_eq!(edited["requestedSize"], "24x32");
+    assert_eq!(
+        edited["requestedDimensions"],
+        json!({"width":24,"height":32})
+    );
+    assert_eq!(edited["dimensionMismatch"], true);
+    assert_eq!(
+        edited["warnings"],
+        json!([{"code":"image_dimensions_mismatch","requested":{"width":24,"height":32},"actual":{"width":32,"height":24}}])
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("edited.png")).unwrap(),
+        png,
+        "mismatched paid artifact must remain byte-for-byte intact, not resized/cropped/discarded"
+    );
+    assert_eq!(edited["revision"], digest);
     let requests = server.join().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "dimension mismatch must not retry generation"
+    );
     let first = String::from_utf8_lossy(&requests[0]);
     assert!(first.starts_with("POST /v1/images/generations "));
     assert!(first.contains("authorization: Bearer fixture-secret"));
@@ -603,4 +635,46 @@ async fn polling_reuses_the_submitted_job_and_decodes_completed_content() {
     assert!(requests[0].starts_with(b"POST /v1/videos "));
     assert!(requests[1].starts_with(b"GET /v1/videos/polled_job "));
     assert!(requests[2].starts_with(b"GET /v1/videos/polled_job/content "));
+}
+
+#[tokio::test]
+async fn image_dimensions_come_from_decoded_png_not_provider_metadata_or_requested_size() {
+    let root = tempfile::tempdir().unwrap();
+    let png = fixture(root.path(), "png");
+    let reply = json!({"data":[{"width":999,"height":888,"b64_json":base64::engine::general_purpose::STANDARD.encode(&png)}]});
+    let (base, server) = server(vec![
+        json_reply(reply.clone()),
+        json_reply(reply.clone()),
+        json_reply(reply),
+    ]);
+    for (index, size) in [None, Some("auto"), Some("32x32")].into_iter().enumerate() {
+        let path = format!("dimensions-{index}.png");
+        let mut args = json!({"prompt":"x","output_path":path});
+        if let Some(size) = size {
+            args["size"] = json!(size);
+        }
+        let result = service(&base)
+            .execute("generate_image", args, root.path())
+            .await
+            .unwrap();
+        assert_eq!(result["width"], 32);
+        assert_eq!(result["height"], 24);
+        assert_eq!(result["requestedSize"], json!(size));
+        assert_eq!(result["dimensionMismatch"], index == 2);
+        if index == 2 {
+            assert_eq!(
+                result["requestedDimensions"],
+                json!({"width":32,"height":32})
+            );
+            assert_eq!(
+                result["warnings"],
+                json!([{"code":"image_dimensions_mismatch","requested":{"width":32,"height":32},"actual":{"width":32,"height":24}}])
+            );
+        } else {
+            assert!(result["requestedDimensions"].is_null());
+            assert_eq!(result["warnings"], json!([]));
+        }
+        assert_eq!(std::fs::read(root.path().join(path)).unwrap(), png);
+    }
+    assert_eq!(server.join().unwrap().len(), 3);
 }

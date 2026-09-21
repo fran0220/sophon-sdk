@@ -19,6 +19,10 @@
 //! contain `{path, mimeType, bytes, revision}` with a workspace-relative path;
 //! `reviewRequired` is not a claim of visual or semantic quality. PNG, MP3 and MP4
 //! must contain decoded frames/samples, not merely a matching content type.
+//! Image results include actual `width`/`height`, `requestedSize` and parsed
+//! `requestedDimensions` (null for omitted/automatic sizes), `dimensionMismatch`,
+//! and structured `warnings`. A dimension mismatch preserves the original paid
+//! artifact unchanged and never claims that the requested size was satisfied.
 //!
 //! HTTP operations are bounded to 120 seconds and decoding to 60 seconds.
 //! `generate_video.poll_seconds` bounds only subsequent polling (0 by default,
@@ -90,6 +94,22 @@ struct ImageArgs {
     #[serde(default)]
     references: Vec<Reference>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+struct ImageDimensions {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+enum ImageWarning {
+    ImageDimensionsMismatch {
+        requested: ImageDimensions,
+        actual: ImageDimensions,
+    },
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpeechArgs {
@@ -134,7 +154,7 @@ impl NativeMediaService {
     pub fn tool_specs() -> Vec<ToolSpec> {
         let string = json!({"type":"string", "minLength":1});
         [
-            ("generate_image", "Generate a decoded PNG using the explicit image route; references require SHA-256 revisions.", json!({
+            ("generate_image", "Generate a decoded PNG using the explicit image route; references require SHA-256 revisions. Inspect returned width, height and dimensionMismatch: providers may ignore requested size. Preserve mismatched artifacts and report warnings; never claim exact-size success or retry automatically.", json!({
                 "prompt":string,"output_path":string,"size":string,
                 "references":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","revision"],"properties":{"path":string,"revision":string}}}
             }), vec!["prompt","output_path"]),
@@ -183,6 +203,7 @@ impl NativeMediaService {
     ) -> Result<Value, Error> {
         nonempty(&args.prompt)?;
         let output = output_path(workspace, &args.output_path, "png")?;
+        let requested_size = args.size.clone();
         let request = if args.references.is_empty() {
             let mut body = json!({"model":route.model,"prompt":args.prompt,"n":1,"response_format":"b64_json"});
             if let Some(size) = args.size {
@@ -241,7 +262,40 @@ impl NativeMediaService {
             .decode(encoded)
             .map_err(|_| fail("Invalid image base64"))?;
         decode(&bytes, "png").await?;
-        publish(&output, &args.output_path, &bytes, "image/png")
+        // PNG's mandatory first chunk is IHDR. Read its dimensions only after
+        // the complete image has passed the actual decoder, not from API claims.
+        let header = bytes
+            .get(8..24)
+            .filter(|header| &header[..8] == b"\0\0\0\rIHDR")
+            .ok_or_else(|| fail("Decoded PNG has no valid IHDR dimensions"))?;
+        let actual = ImageDimensions {
+            width: u32::from_be_bytes(header[8..12].try_into().unwrap()),
+            height: u32::from_be_bytes(header[12..16].try_into().unwrap()),
+        };
+        let requested = requested_size.as_deref().and_then(|size| {
+            let (width, height) = size.split_once('x')?;
+            Some(ImageDimensions {
+                width: width.parse().ok()?,
+                height: height.parse().ok()?,
+            })
+        });
+        let warnings: Vec<ImageWarning> = requested
+            .filter(|dimensions| *dimensions != actual)
+            .map(|requested| ImageWarning::ImageDimensionsMismatch { requested, actual })
+            .into_iter()
+            .collect();
+        let mut result = publish(&output, &args.output_path, &bytes, "image/png")?;
+        result.as_object_mut().unwrap().extend(
+            json!({
+                "width":actual.width,"height":actual.height,
+                "requestedSize":requested_size,"requestedDimensions":requested,
+                "dimensionMismatch":!warnings.is_empty(),"warnings":warnings,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        Ok(result)
     }
 
     async fn speech(
