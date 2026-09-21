@@ -43,7 +43,7 @@ Runtime registers it directly with its local tool registry. Use
 | `tabs` | `tabs` array of CDP page target metadata (`targetId`, `title`, `url`) |
 | `new_tab` | Optional HTTP(S) `url`, defaults to `about:blank`; returns `tab_id` |
 | `close_tab` | `tab_id`; recording must be stopped first |
-| `navigate` | `tab_id`, HTTP(S) `url`; starts navigation, does not imply load complete |
+| `navigate` | `tab_id`, HTTP(S) `url`; waits for the returned main-document loader's `DOMContentLoaded` (20s bound), not full resource loading; same-document navigation requires no new loader |
 | `frames` | `tab_id`; CDP frame tree for current document |
 | `snapshot` | `tab_id`, optional `frame_id`; accessible nodes, `snapshot_id`, revision and refs |
 | `click` | `tab_id`, `ref`; native mouse press/release at the element center |

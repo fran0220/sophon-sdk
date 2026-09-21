@@ -380,6 +380,13 @@ impl BrowserService {
             ] {
                 connection.call(Some(&session), method, json!({})).await?;
             }
+            connection
+                .call(
+                    Some(&session),
+                    "Page.setLifecycleEventsEnabled",
+                    json!({"enabled":true}),
+                )
+                .await?;
             running.pages.insert(
                 tab.into(),
                 Page {
@@ -520,6 +527,9 @@ impl BrowserService {
                     .await?;
                 if let Some(error) = result["errorText"].as_str() {
                     return Err(Error::Protocol(error.into()));
+                }
+                if let Some(loader) = result["loaderId"].as_str() {
+                    cdp.wait_for_document(&page.session, loader).await?;
                 }
                 Ok(result)
             }

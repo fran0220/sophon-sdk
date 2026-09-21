@@ -120,6 +120,91 @@ async fn capabilities_do_not_launch_and_close_is_terminal() {
     ));
 }
 
+/// Requires a real Chromium. No successful skip when absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires real Chromium; run with --ignored"]
+async fn stage_stream_and_new_web_navigation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                if String::from_utf8_lossy(&request[..n]).starts_with("GET /pending.gif ") {
+                    // Keep a subresource pending until the tab closes: navigation
+                    // must wait for DOM readiness, not the full load event.
+                    let _ = socket.read(&mut request).await;
+                    return;
+                }
+                let body = "<!doctype html><title>Stage and Web</title><button onclick='this.textContent=\"Clicked\"'>Counter</button><img src='/pending.gif'><iframe srcdoc='<p>Child frame</p>'></iframe>";
+                let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+            });
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let browser = BrowserService::new(config(root.path()));
+    let url = format!("http://{address}/");
+    let stage = call(&browser, "new_tab", json!({"url":url})).await["tab_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut frames = browser.subscribe_frames();
+    call(&browser, "stream_start", json!({"tab_id":stage})).await;
+    let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame["tab_id"], stage);
+    for _ in 0..20 {
+        let web = call(&browser, "new_tab", json!({"url":"about:blank"})).await["tab_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(web, stage);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            call(&browser, "navigate", json!({"tab_id":web,"url":url})),
+        )
+        .await
+        .unwrap();
+        let state = call(&browser, "state", json!({"tab_id":web})).await;
+        assert_eq!(state["url"], url);
+        assert_eq!(state["loading"], true);
+        // Same-document navigation has no loaderId and must not await a new commit.
+        let fragment = format!("{url}#same-document");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            call(&browser, "navigate", json!({"tab_id":web,"url":fragment})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call(&browser, "state", json!({"tab_id":web})).await["url"],
+            fragment
+        );
+        call(&browser, "close_tab", json!({"tab_id":web})).await;
+    }
+    assert_eq!(
+        call(&browser, "state", json!({"tab_id":stage})).await["url"],
+        url
+    );
+    evaluate(&browser, &stage, "document.querySelector('button').click()").await;
+    assert_eq!(
+        evaluate(
+            &browser,
+            &stage,
+            "document.querySelector('button').textContent"
+        )
+        .await,
+        "Clicked"
+    );
+    browser.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
 /// Requires a real Chromium and ffmpeg/ffprobe. No successful skip when absent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires real Chromium and ffmpeg; run with --ignored"]

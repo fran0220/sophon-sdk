@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -23,6 +23,7 @@ pub(crate) struct Cdp {
     pub tabs: Arc<Mutex<HashMap<String, String>>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Value>>>,
     pub downloads: Arc<Mutex<Downloads>>,
+    ready_loaders: watch::Receiver<HashMap<String, String>>,
 }
 
 impl Cdp {
@@ -44,8 +45,10 @@ impl Cdp {
         let latest = latest_frames.clone();
         let downloads = Arc::new(Mutex::new(Downloads::new(download_dir)));
         let download_events = downloads.clone();
+        let (ready, ready_loaders) = watch::channel(HashMap::<String, String>::new());
         let task = tokio::spawn(async move {
             let mut pending: HashMap<u64, Reply> = HashMap::new();
+            let mut main_frames = HashMap::<String, String>::new();
             let mut next = 0u64;
             let mut sequence = 0u64;
             let mut deadlines = tokio::time::interval(Duration::from_secs(1));
@@ -100,10 +103,24 @@ impl Cdp {
                                 let _ = frames.send(frame);
                             }
                         } else if value.get("method").is_some() {
+                            if value["method"] == "Page.frameNavigated"
+                                && value["params"]["frame"].get("parentId").is_none()
+                                && let (Some(session), Some(frame)) = (value["sessionId"].as_str(), value["params"]["frame"]["id"].as_str()) {
+                                main_frames.insert(session.into(), frame.into());
+                            }
+                            if value["method"] == "Page.lifecycleEvent"
+                                && value["params"]["name"] == "DOMContentLoaded"
+                                && let (Some(session), Some(loader)) = (value["sessionId"].as_str(), value["params"]["loaderId"].as_str())
+                                && main_frames.get(session).is_some_and(|frame| value["params"]["frameId"] == *frame) {
+                                ready.send_modify(|loaders| { loaders.insert(session.into(), loader.into()); });
+                            }
                             if value["method"] == "Target.detachedFromTarget"
-                                && let Some(session) = value["params"]["sessionId"].as_str()
-                                && let Some(tab) = tab_ids.lock().expect("tab lock").remove(session) {
-                                latest.lock().expect("frame lock").remove(&tab);
+                                && let Some(session) = value["params"]["sessionId"].as_str() {
+                                if let Some(tab) = tab_ids.lock().expect("tab lock").remove(session) {
+                                    latest.lock().expect("frame lock").remove(&tab);
+                                }
+                                main_frames.remove(session);
+                                ready.send_modify(|loaders| { loaders.remove(session); });
                             }
                             let mut log = log.lock().expect("event lock");
                             if log.len() == 512 { log.pop_front(); }
@@ -128,7 +145,24 @@ impl Cdp {
             tabs,
             latest_frames,
             downloads,
+            ready_loaders,
         })
+    }
+
+    /// Page.navigate can reply while its old RenderFrameHost is inactive. Wait
+    /// for this exact document's DOM readiness before exposing it to reads.
+    /// This never resends navigation or depends on the lossy diagnostic log.
+    pub async fn wait_for_document(&self, session: &str, loader: &str) -> Result<(), Error> {
+        let mut ready = self.ready_loaders.clone();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            ready
+                .wait_for(|loaders| loaders.get(session).is_some_and(|id| id == loader))
+                .await
+                .map(|_| ())
+                .map_err(|_| Error::Closed)
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
     }
 
     pub async fn call(
