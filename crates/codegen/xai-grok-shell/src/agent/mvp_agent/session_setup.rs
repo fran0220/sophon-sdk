@@ -930,6 +930,14 @@ impl MvpAgent {
         arguments: acp::LoadSessionRequest,
         op: AttachOperation,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
+        if self
+            .session_registry
+            .closing
+            .borrow()
+            .contains_key(&arguments.session_id)
+        {
+            return Err(acp::Error::invalid_request().data("session close is still pending"));
+        }
         let attach_started_at = std::time::Instant::now();
         let load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
@@ -1906,7 +1914,7 @@ impl MvpAgent {
         &self,
         args: acp::CloseSessionRequest,
     ) -> Result<acp::CloseSessionResponse, acp::Error> {
-        let outcome = self.close_active_session(&args.session_id).await;
+        let outcome = self.close_active_session(&args.session_id).await?;
         tracing::info!(
             session_id = %args.session_id.0,
             ?outcome,

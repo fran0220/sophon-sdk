@@ -6,6 +6,9 @@ use xai_grok_tools::registry::types::FinalizedToolset;
 #[derive(Clone, Default)]
 pub(super) struct SessionRegistry {
     sessions: Rc<RefCell<HashMap<acp::SessionId, SessionResources>>>,
+    pub(super) closing: Rc<
+        RefCell<HashMap<acp::SessionId, tokio::sync::watch::Receiver<Option<Result<(), String>>>>>,
+    >,
     pub(super) agent_directory: Rc<RefCell<super::agent_directory::AgentDirectory>>,
     next_install_id: Rc<std::cell::Cell<u64>>,
 }
@@ -322,6 +325,7 @@ impl SessionRegistry {
     /// Running actor threads stay, the presence's and any retired: dropping a handle would detach its
     /// thread, and nothing would track the memory it holds. The sweep reclaims them later.
     pub(super) fn release(&self, id: &acp::SessionId) {
+        self.closing.borrow_mut().remove(id);
         let mut entries = self.sessions.borrow_mut();
         let Some(mut released) = entries.remove(id) else {
             return;

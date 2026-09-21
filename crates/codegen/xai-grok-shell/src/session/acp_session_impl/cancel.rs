@@ -480,16 +480,18 @@ impl SessionActor {
 
         // A send-now redirect is the user continuing, not stopping, so it never kills an in-flight command.
         let send_now = matches!(trigger, Some(crate::session::CancelTrigger::SendNow));
+        let owner_scoped = self.startup_hints.is_subagent
+            || matches!(trigger, Some(crate::session::CancelTrigger::SessionClose));
 
         // Kill all running foreground terminal processes before aborting the task.
         // Send-now skips this and backgrounds them after the abort.
         // A narrow race exists: the running task could spawn a new terminal between this call and the abort() below In practice this is negligible; abort() drops the future and any child handle it owns.
         if !send_now {
-            self.kill_foreground_commands_for_cancel().await;
+            self.kill_foreground_commands_for_cancel(owner_scoped).await;
         }
 
         if kill_background_tasks {
-            if self.startup_hints.is_subagent {
+            if owner_scoped {
                 // Subagent teardown: only kill tasks owned by this session, not the parent's or sibling's tasks on the shared backend
                 self.agent
                     .borrow()
@@ -1010,7 +1012,8 @@ impl SessionActor {
         // Empty can mean nothing was running, or that this backend cannot background at all. Kill, so the command does not outlive its turn.
         // A kill does not report which commands it stopped, so `repair_dangling_tool_calls` answers the tool call before the next request.
         if backgrounded.is_empty() {
-            self.kill_foreground_commands_for_cancel().await;
+            self.kill_foreground_commands_for_cancel(self.startup_hints.is_subagent)
+                .await;
         }
 
         for bg in backgrounded {
@@ -1028,8 +1031,8 @@ impl SessionActor {
 
     /// Kill the foreground commands this cancel owns. A subagent kills only its own, never the parent's or a sibling's on the shared backend.
     #[tracing::instrument(name = "cancel.kill_foreground", skip_all)]
-    async fn kill_foreground_commands_for_cancel(&self) {
-        if self.startup_hints.is_subagent {
+    async fn kill_foreground_commands_for_cancel(&self, owner_scoped: bool) {
+        if owner_scoped {
             self.agent
                 .borrow()
                 .tool_bridge()

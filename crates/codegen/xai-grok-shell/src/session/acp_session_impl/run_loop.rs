@@ -369,6 +369,114 @@ mod startup_task_tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn checked_close_real_actor_flush_failure_retry_and_stop() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (gateway_tx, mut gateway) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = gateway.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+                let (persistence_tx, mut persistence) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    let mut first = true;
+                    while let Some(message) = persistence.recv().await {
+                        match message {
+                            PersistenceMsg::FlushForExit { respond_to } => {
+                                let _ = respond_to.send(if first {
+                                    first = false;
+                                    Err(std::io::Error::other("injected fsync error"))
+                                } else {
+                                    Ok(())
+                                });
+                            }
+                            PersistenceMsg::FlushAndAck { respond_to } => {
+                                let _ = respond_to.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                let (actor, events) = super::super::support::create_test_actor_ex(
+                    0,
+                    256_000,
+                    85,
+                    gateway_tx,
+                    persistence_tx,
+                )
+                .await;
+                let (callback_owned, callback_aborted) = tokio::sync::oneshot::channel::<()>();
+                let callback = tokio::task::spawn_local(async move {
+                    let _ownership = callback_owned;
+                    std::future::pending::<()>().await;
+                });
+                actor.state.lock().await.running_task =
+                    Some(AgentTask::new("held-callback", callback.abort_handle()));
+                actor
+                    .state
+                    .lock()
+                    .await
+                    .pending_inputs
+                    .push_back(super::super::support::user_item("held-callback", "owner"));
+                *actor.current_prompt_id.lock().unwrap() = Some("held-callback".into());
+                let (commands, receiver) = mpsc::unbounded_channel();
+                let (_chat, chat_rx) = mpsc::unbounded_channel();
+                let task = tokio::task::spawn_local(run_session(
+                    Arc::new(actor),
+                    receiver,
+                    chat_rx,
+                    events,
+                    None,
+                    Arc::new(parking_lot::Mutex::new(CodebaseIndexManager::new())),
+                    std::path::PathBuf::from("/tmp"),
+                    fs_watch::FsWatchCapabilities::none(),
+                ));
+                for fail in [true, false] {
+                    let (completion, mut response) = tokio::sync::watch::channel(None);
+                    commands
+                        .send(SessionCommand::CloseChecked { completion })
+                        .unwrap();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        response.wait_for(|value| value.is_some()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(response.borrow().as_ref().unwrap().is_err(), fail);
+                    if fail {
+                        assert!(
+                            !task.is_finished(),
+                            "flush failure must retain actor for retry"
+                        );
+                        let (respond_to, response) = tokio::sync::oneshot::channel();
+                        commands
+                            .send(SessionCommand::IsBusy { respond_to })
+                            .unwrap();
+                        assert!(
+                            response.await.is_err(),
+                            "closing actor rejects unrelated commands"
+                        );
+                    }
+                }
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    callback_aborted.await.is_err(),
+                    "callback ownership dropped before close success"
+                );
+                assert!(callback.await.unwrap_err().is_cancelled());
+                assert!(commands.is_closed());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stopping_startup_prevents_late_mcp_prompt_promotion() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -433,6 +541,7 @@ pub(super) async fn run_session(
     index_root: std::path::PathBuf,
     fs_watch_caps: fs_watch::FsWatchCapabilities,
 ) {
+    let mut closing = false;
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<super::turn_task::TurnCompletionMsg>();
     let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
@@ -758,6 +867,15 @@ pub(super) async fn run_session(
                         return;
                     };
 
+                    if closing && !matches!(&cmd,
+                        SessionCommand::CloseChecked { .. }
+                        | SessionCommand::PrepareFinalExit { .. }
+                        | SessionCommand::ShutdownChecked { .. }
+                        | SessionCommand::Shutdown(_)
+                    ) {
+                        // Dropping a command closes its reply, never acknowledges admission.
+                        continue;
+                    }
                     let Some(cmd) = session.admit_candidate_command(cmd).await else {
                         continue;
                     };
@@ -2613,15 +2731,45 @@ pub(super) async fn run_session(
                             let flushed = flush_for_exit(&session).await;
                             let _ = respond_to.send(result.and(flushed));
                         }
-                        command @ (SessionCommand::Shutdown(_) | SessionCommand::ShutdownChecked { .. }) => {
-                            let (kind, exit_reply) = match command {
-                                SessionCommand::Shutdown(kind) => (kind, None),
-                                SessionCommand::ShutdownChecked { respond_to } => (crate::session::ShutdownKind::Graceful, Some(respond_to)),
+                        command @ (SessionCommand::Shutdown(_) | SessionCommand::ShutdownChecked { .. } | SessionCommand::CloseChecked { .. }) => {
+                            let (kind, exit_reply, close_reply) = match command {
+                                SessionCommand::Shutdown(kind) => (kind, None, None),
+                                SessionCommand::ShutdownChecked { respond_to } => (crate::session::ShutdownKind::Graceful, Some(respond_to), None),
+                                SessionCommand::CloseChecked { completion } => {
+                                    closing = true;
+                                    (crate::session::ShutdownKind::CancelRunningTurn, None, Some(completion))
+                                }
                                 _ => unreachable!(),
                             };
                             // Stop deferred promotion before the first teardown await, not
                             // only when this loop finally returns after hooks and persistence.
                             drop(startup_tasks.take());
+                            if let Some(completion) = &close_reply {
+                                session.abort_turn_summary();
+                                session.abort_title_refresh();
+                                if let Some(notification) = replay_buffer.flush() {
+                                    session.emit_buffered(notification).await;
+                                }
+                                let _ = session.cancel_running_task(crate::session::CancelOptions {
+                                    cancel_subagents: true,
+                                    kill_background_tasks: true,
+                                    trigger: Some(crate::session::CancelTrigger::SessionClose),
+                                    ..Default::default()
+                                }).await;
+                                let result = async {
+                                    session.workflow_manager.lock().await.cancel_all_and_drain(std::time::Duration::from_secs(7))
+                                        .await.map_err(|runs| format!("session workflows still running: {runs:?}"))?;
+                                    if let Some(tx) = session.tool_context.subagent_event_tx.clone() {
+                                        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_session(tx, session.session_id_string())
+                                            .close_session_and_drain(&session.session_id_string()).await?;
+                                    }
+                                    flush_for_exit(&session).await.map_err(|e| e.to_string())
+                                }.await;
+                                if let Err(error) = result {
+                                    completion.send_replace(Some(Err(error)));
+                                    continue;
+                                }
+                            }
                             let end_timer = session_end::SessionEndTimer::new_shared();
                             session.persist_resume_status().await;
                             shutdown_workflows(&session, &end_timer).await;
@@ -2635,7 +2783,7 @@ pub(super) async fn run_session(
                             session.abort_turn_summary();
                             session.abort_title_refresh();
                             // This arm returns; an unanswered turn would race teardown and report `EndTurn` for unfinished work
-                            if kind == crate::session::ShutdownKind::CancelRunningTurn {
+                            if kind == crate::session::ShutdownKind::CancelRunningTurn && close_reply.is_none() {
                                 // Shutdown is not a stop gesture: the session-end `Stop` reports this teardown
                                 let _ = session
                                     .cancel_running_task(crate::session::CancelOptions {
@@ -2678,6 +2826,15 @@ pub(super) async fn run_session(
                                 .await;
                             if let Some(respond_to) = exit_reply {
                                 let _ = respond_to.send(flush_for_exit(&session).await);
+                            }
+                            if let Some(completion) = close_reply {
+                                let result = flush_for_exit(&session).await.map_err(|e| e.to_string());
+                                let failed = result.is_err();
+                                completion.send_replace(Some(result));
+                                if failed {
+                                    turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
+                                    continue;
+                                }
                             }
                             return;
                         }
@@ -2774,6 +2931,11 @@ pub(super) async fn run_session(
                     #[cfg(test)]
                     if let Some(processed) = processed {
                         let _ = processed.send(());
+                    }
+                    if closing {
+                        // A late completion may settle bookkeeping, but must not
+                        // start goal continuation, queued input, or helper calls.
+                        continue;
                     }
                     // Drain monitor events that were routed to the mid-turn buffer but arrived after the turn ended
                     // The is_turn_active check races the buffer push

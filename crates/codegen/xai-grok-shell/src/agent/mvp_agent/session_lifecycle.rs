@@ -65,37 +65,84 @@ impl MvpAgent {
     }
     /// ACP `session/close` and its pre-ACP spelling.
     /// Close waits its turn behind prompt intake; every wait spends from [`CLOSE_TOTAL_BUDGET`].
-    pub(crate) async fn close_active_session(&self, id: &acp::SessionId) -> CloseOutcome {
+    pub(crate) async fn close_active_session(
+        &self,
+        id: &acp::SessionId,
+    ) -> Result<CloseOutcome, acp::Error> {
         let deadline = tokio::time::Instant::now() + CLOSE_TOTAL_BUDGET;
+        let failure = |message: String| {
+            acp::Error::internal_error().data(format!("session close incomplete: {message}"))
+        };
         self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
             .await;
-        let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
-            return CloseOutcome::NotResident;
+        if self.session_registry.attach_waiter(id).is_some() {
+            return Err(failure("session attach has not settled".into()));
+        }
+        let Some(handle) = self.resident_handle(id) else {
+            return Ok(CloseOutcome::NotResident);
         };
         let intake = self.dispatch_lock(id);
-        let intake_guard =
+        let _intake_guard =
             tokio::time::timeout(stage_budget(deadline, CLOSE_INTAKE_WAIT), intake.lock())
                 .await
-                .ok();
-        match self.resident_handle(id).map(|h| h.cmd_tx.clone()) {
-            None => return CloseOutcome::NotResident,
-            Some(current) if !current.same_channel(&target) => {
-                return CloseOutcome::Superseded;
+                .map_err(|_| failure("prompt intake has not settled".into()))?;
+        if !self
+            .resident_handle(id)
+            .is_some_and(|current| current.cmd_tx.same_channel(&handle.cmd_tx))
+        {
+            return Ok(CloseOutcome::Superseded);
+        }
+        let existing = self.session_registry.closing.borrow().get(id).cloned();
+        let mut response = match existing {
+            Some(response) if !matches!(*response.borrow(), Some(Err(_))) => response,
+            _ => {
+                let (completion, response) = tokio::sync::watch::channel(None);
+                // No await between the admission fence and its mailbox operation.
+                self.session_registry
+                    .closing
+                    .borrow_mut()
+                    .insert(id.clone(), response.clone());
+                handle.candidate_admission.cancel();
+                handle
+                    .cmd_tx
+                    .send(SessionCommand::CloseChecked { completion })
+                    .map_err(|_| failure("session actor channel closed".into()))?;
+                response
             }
-            Some(_) => {}
+        };
+        loop {
+            if let Some(result) = response.borrow().clone() {
+                result.map_err(&failure)?;
+                break;
+            }
+            tokio::time::timeout_at(deadline, response.changed())
+                .await
+                .map_err(|_| failure("deadline elapsed; ownership retained".into()))?
+                .map_err(|_| failure("actor dropped close acknowledgement".into()))?;
         }
-        if let Some(handle) = self.resident_handle(id) {
-            handle.persist_resume_status().await;
+        while self.session_registry.thread_is_finished(id) == Some(false) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure(
+                    "actor thread still running; ownership retained".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        if !self.hard_stop_resident(id, CancelTrigger::SessionClose) {
-            return CloseOutcome::NotResident;
+        if !self
+            .resident_handle(id)
+            .is_some_and(|current| current.cmd_tx.same_channel(&handle.cmd_tx))
+        {
+            return Ok(CloseOutcome::Superseded);
         }
-        drop(intake_guard);
+        self.subagent_event_tx.send(
+            xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::ReleaseClosedSession {
+                parent_session_id: id.0.to_string(),
+            },
+        ).map_err(|_| failure("coordinator closed before ownership release".into()))?;
         self.remove_session_terminal(id, SessionLiveState::Completed);
-        self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
-            .await;
+        self.session_registry.clear_exited_thread(id);
         self.finalize_session_replica(id);
-        CloseOutcome::Closed
+        Ok(CloseOutcome::Closed)
     }
     /// Cancel the running turn and shut the actor down; `false` when not resident.
     /// Close finalizes the replica afterward, delete must not.
@@ -514,6 +561,9 @@ impl MvpAgent {
         self.session_registry.reap_retired_threads();
         let dead = self.session_registry.finished_threads();
         for id in dead {
+            if self.session_registry.closing.borrow().contains_key(&id) {
+                continue;
+            }
             if self.session_registry.live(&id) == Some(SessionLiveState::Attaching)
                 && !self.is_resident(&id)
             {

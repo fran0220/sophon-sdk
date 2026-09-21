@@ -14,6 +14,71 @@ use serde_json::json;
 fn meta_of(value: serde_json::Value) -> acp::Meta {
     value.as_object().cloned().expect("meta must be an object")
 }
+
+#[test]
+fn checked_close_retains_owner_on_error_and_retries() {
+    super::run_local_for_bridge_test(|| async {
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("close-retry");
+        let (handle, _tx, mut rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        tokio::task::spawn_local(async move {
+            let mut first = true;
+            while let Some(command) = rx.recv().await {
+                if let crate::session::SessionCommand::CloseChecked { completion } = command {
+                    completion.send_replace(Some(if first {
+                        first = false;
+                        Err("injected flush failure".into())
+                    } else {
+                        Ok(())
+                    }));
+                }
+            }
+        });
+        let error = agent.close_active_session(&sid).await.unwrap_err();
+        assert!(
+            error.to_string().contains("injected flush failure")
+                || format!("{error:?}").contains("injected flush failure")
+        );
+        assert!(agent.is_resident(&sid));
+        assert!(agent.finalize_spy.borrow().is_empty());
+        assert!(agent.session_handle_waiting_for_load(&sid).await.is_none());
+        assert_eq!(
+            agent.close_active_session(&sid).await.unwrap(),
+            CloseOutcome::Closed
+        );
+        assert_eq!(
+            agent.close_active_session(&sid).await.unwrap(),
+            CloseOutcome::NotResident
+        );
+    });
+}
+
+#[test]
+fn checked_close_caller_cancellation_keeps_ack_and_owner() {
+    super::run_local_for_bridge_test(|| async {
+        let agent = super::build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("close-cancelled-caller");
+        let (handle, _tx, mut rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        {
+            let close = agent.close_active_session(&sid);
+            tokio::pin!(close);
+            assert!(futures::poll!(close.as_mut()).is_pending());
+        }
+        assert!(agent.is_resident(&sid));
+        let Some(crate::session::SessionCommand::CloseChecked { completion }) = rx.recv().await
+        else {
+            panic!("close command")
+        };
+        completion.send_replace(Some(Ok(())));
+        assert_eq!(
+            agent.close_active_session(&sid).await.unwrap(),
+            CloseOutcome::Closed
+        );
+    });
+}
+
 fn mcp_servers() -> Vec<acp::McpServer> {
     vec![acp::McpServer::Stdio(
         acp::McpServerStdio::new("filesystem", std::path::PathBuf::from("/bin/mcp"))
@@ -134,7 +199,7 @@ fn close_does_not_free_a_session_that_replaced_its_target() {
         agent.insert_resident(&sid, replacement);
         drop(intake_guard);
         assert_eq!(
-            close.await,
+            close.await.unwrap(),
             CloseOutcome::Superseded,
             "a close whose target was replaced must say so, not report NotResident"
         );
@@ -253,7 +318,8 @@ fn close_waits_for_an_in_flight_load_to_settle() {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-cold-load");
         let guard = agent.begin_session_load(&sid);
-        let (handle, _tx, _rx) = super::make_live_session_handle(&sid, None);
+        let (handle, _tx, rx) = super::make_live_session_handle(&sid, None);
+        let _observed = super::spawn_fake_actor(rx, false);
         agent.insert_resident(&sid, handle);
         let mut close = std::pin::pin!(agent.close_active_session(&sid));
         assert!(
@@ -261,7 +327,7 @@ fn close_waits_for_an_in_flight_load_to_settle() {
             "close must not free a session whose load is still running"
         );
         drop(guard);
-        assert_eq!(close.await, CloseOutcome::Closed);
+        assert_eq!(close.await.unwrap(), CloseOutcome::Closed);
         assert!(!agent.is_resident(&sid));
     });
 }
@@ -326,10 +392,10 @@ fn close_gives_up_on_an_intake_that_stalls() {
         tokio::time::timeout(CLOSE_INTAKE_WAIT * 10, close)
             .await
             .expect("close must give up on the intake, not wait on it forever")
-            .expect("close responds once it stops waiting");
+            .expect_err("close must report unsettled intake");
         assert!(
-            !agent.is_resident(&sid),
-            "close must still free the session it gave up ordering behind"
+            agent.is_resident(&sid),
+            "close must retain ownership when intake does not settle"
         );
     });
 }
@@ -355,7 +421,11 @@ fn close_answers_within_the_aggregate_budget() {
         );
         let started = tokio::time::Instant::now();
         let outcome = agent.close_active_session(&sid).await;
-        assert_eq!(outcome, CloseOutcome::Closed);
+        assert!(outcome.is_err());
+        assert!(
+            agent.is_resident(&sid),
+            "timeout must retain native ownership"
+        );
         assert!(
             started.elapsed() <= CLOSE_TOTAL_BUDGET + std::time::Duration::from_secs(1),
             "every stage stalled, and close still waited {:?}: the aggregate \
@@ -395,7 +465,8 @@ fn close_orders_behind_prompt_intake() {
     super::run_local_for_bridge_test(|| async {
         let agent = super::build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-close-contended");
-        let (handle, _tx, _rx) = super::make_live_session_handle(&sid, Some("turn-1"));
+        let (handle, _tx, rx) = super::make_live_session_handle(&sid, Some("turn-1"));
+        let _observed = super::spawn_fake_actor(rx, true);
         agent.insert_resident(&sid, handle);
         let intake = agent.dispatch_lock(&sid);
         let intake_guard = intake.lock().await;

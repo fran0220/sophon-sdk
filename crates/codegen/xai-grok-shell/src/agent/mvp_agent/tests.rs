@@ -5865,7 +5865,7 @@ fn a_cancelled_installer_retires_its_thread_when_a_reinstall_takes_the_slot() {
         let sid = new_root_session(&agent, cwd.path()).await;
         assert_eq!(
             crate::agent::mvp_agent::session_lifecycle::CloseOutcome::Closed,
-            agent.close_active_session(&sid).await
+            agent.close_active_session(&sid).await.unwrap()
         );
         crate::session::persistence::STAMPS_SERVED.set(0);
         let (_installer_attach, installer_waiter) = agent.session_registry.begin_attach(&sid);
@@ -6395,6 +6395,9 @@ fn spawn_fake_actor(
                 }
                 TestSessionCommand::PersistResumeStatus { respond_to } => {
                     let _ = respond_to.send(());
+                }
+                TestSessionCommand::CloseChecked { completion } => {
+                    completion.send_replace(Some(Ok(())));
                 }
                 other => {
                     let _ = observed_tx.send(other);
@@ -7058,7 +7061,7 @@ fn session_live_state_map_is_bounded_across_cycles() {
             let _observed = spawn_fake_actor(rx, true);
             agent.set_session_live_state(&sid, SessionLiveState::IdleResident);
             assert_eq!(
-                agent.close_active_session(&sid).await,
+                agent.close_active_session(&sid).await.unwrap(),
                 crate::agent::mvp_agent::session_lifecycle::CloseOutcome::Closed,
                 "cycle {i} must actually close, or the bound below proves nothing"
             );
@@ -7792,7 +7795,7 @@ fn reload_after_terminal_removal_starts_clean() {
         agent.insert_resident(&sid, handle);
         let _observed = spawn_fake_actor(rx, true);
         assert_eq!(
-            agent.close_active_session(&sid).await,
+            agent.close_active_session(&sid).await.unwrap(),
             crate::agent::mvp_agent::session_lifecycle::CloseOutcome::Closed,
             "the reload below is only meaningful after a close that happened"
         );

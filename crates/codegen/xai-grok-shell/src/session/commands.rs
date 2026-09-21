@@ -763,6 +763,10 @@ pub enum SessionCommand {
     ShutdownChecked {
         respond_to: oneshot::Sender<std::io::Result<()>>,
     },
+    /// Mailbox-owned close; result survives a caller timeout for observation/retry.
+    CloseChecked {
+        completion: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    },
     /// Fence is owned by this mailbox operation, not the cancellable caller.
     ExportPortable {
         fence: xai_grok_tools::management::admission::ExclusiveAdmission,

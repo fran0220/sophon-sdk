@@ -243,7 +243,58 @@ pub(super) async fn reparent_surviving_child_tasks(
     }
 }
 const INITIAL_PROMPT_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const CHILD_COMPLETION_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Keep the runner (and therefore coordinator ownership) alive until checked
+/// actor persistence and real thread exit. Only an explicit close retries errors.
+async fn close_child_checked(
+    child: &crate::session::SessionHandle,
+    thread: &crate::session::SessionThread,
+    request: &SubagentRequest,
+    events: &mpsc::UnboundedSender<SubagentEvent>,
+) {
+    loop {
+        let (completion, mut response) = tokio::sync::watch::channel(None);
+        child.candidate_admission.cancel();
+        let closed = async {
+            child
+                .cmd_tx
+                .send(SessionCommand::CloseChecked { completion })
+                .map_err(|_| "child actor close channel closed".to_owned())?;
+            loop {
+                if let Some(result) = response.borrow().clone() {
+                    break result;
+                }
+                response
+                    .changed()
+                    .await
+                    .map_err(|_| "child close acknowledgement dropped".to_owned())?;
+            }
+        }
+        .await;
+        match closed {
+            Ok(()) => break,
+            Err(error) => {
+                let (retry, retried) = oneshot::channel();
+                let _ = events.send(SubagentEvent::ChildCloseFailed {
+                    parent_session_id: request.parent_session_id.clone(),
+                    subagent_id: request.id.clone(),
+                    error,
+                    retry,
+                });
+                if retried.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    while !thread.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _ = events.send(SubagentEvent::ReleaseClosedSession {
+        parent_session_id: child.info.id.0.to_string(),
+    });
+}
+
 #[cfg(not(test))]
 const WAKE_START_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
@@ -1761,9 +1812,13 @@ pub(crate) async fn run_shell_child(
                     .as_ref()
                     .is_none_or(|allowed| allowed.iter().any(|entry| entry == name))
         }) {
-            let _ = child_handle.cmd_tx.send(session::SessionCommand::Shutdown(
-                session::ShutdownKind::Graceful,
-            ));
+            close_child_checked(
+                &child_handle,
+                &child_thread,
+                &request,
+                &ctx.subagent_event_tx,
+            )
+            .await;
             return child_run_output(
                 failure_result(
                     &request,
@@ -1989,6 +2044,13 @@ pub(crate) async fn run_shell_child(
     if !promoted && completed_before_ack.is_none() {
         ready_to_first_turn_span.close();
         drop(spawn_root.take());
+        close_child_checked(
+            &child_handle,
+            &child_thread,
+            &request,
+            &ctx.subagent_event_tx,
+        )
+        .await;
         let result = cancel_pending_shell_child(
             &child_handle.cmd_tx,
             child_thread,
@@ -2402,49 +2464,15 @@ pub(crate) async fn run_shell_child(
         }
         (None, None) => {}
     }
-    {
-        let (respond_to, ack) = oneshot::channel();
-        if child_handle
-            .cmd_tx
-            .send(SessionCommand::FlushComplete { respond_to })
-            .is_ok()
-        {
-            match tokio::time::timeout(CHILD_COMPLETION_FLUSH_TIMEOUT, ack).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    tracing::warn!(
-                        subagent_id = %request.id,
-                        %error,
-                        "child transcript flush failed before completion"
-                    )
-                }
-                Ok(Err(_)) => {
-                    tracing::warn!(
-                        subagent_id = %request.id,
-                        "child session dropped the transcript flush ack before completion"
-                    )
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        subagent_id = %request.id,
-                        "child transcript flush timed out before completion"
-                    )
-                }
-            }
-        }
-    }
+    close_child_checked(
+        &child_handle,
+        &child_thread,
+        &request,
+        &ctx.subagent_event_tx,
+    )
+    .await;
     crate::waterfall::mark(&request.id, crate::waterfall::stage::FLUSH_DONE);
-    let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown(
-        crate::session::ShutdownKind::Graceful,
-    ));
     drop(child_handle);
-    if !await_session_thread_exit(&child_thread, UNPROMOTED_SESSION_THREAD_EXIT_TIMEOUT).await {
-        tracing::warn!(
-            subagent_id = %request.id,
-            child_session_id = %child_session_id.0,
-            "completed child actor did not exit before the teardown bound"
-        );
-    }
     ctx.workspace_ops
         .end_local_session(child_session_id.0.as_ref());
     let mut disposed_snapshot_ref: Option<String> = None;

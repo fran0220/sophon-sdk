@@ -147,7 +147,7 @@ async fn handle_session_close(
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
 
     let sid = acp::SessionId::new(req.session_id);
-    let outcome = agent.close_active_session(&sid).await;
+    let outcome = agent.close_active_session(&sid).await?;
     tracing::info!(
         session_id = %sid.0,
         ?outcome,

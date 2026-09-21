@@ -2871,11 +2871,17 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
+        if self.session_registry.closing.borrow().contains_key(session_id) {
+            return None;
+        }
         let existing = self.resident_handle(session_id);
         if existing.is_some() {
             return existing;
         }
         self.wait_for_in_flight_session_load(session_id).await;
+        if self.session_registry.closing.borrow().contains_key(session_id) {
+            return None;
+        }
         self.resident_handle(session_id)
     }
     /// If a `session/load` for `session_id` is in flight, wait (bounded) for it to finish. This closes the load-vs-request race after a leader restart. Clients replay `session/load` on reconnect.

@@ -12,9 +12,18 @@ impl RunShellChildTestRunner {
         contexts: impl IntoIterator<Item = SubagentSpawnContext>,
         complete_first: bool,
         gateway: GatewaySender,
+        events: xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     ) -> Self {
         Self {
-            contexts: std::sync::Arc::new(parking_lot::Mutex::new(contexts.into_iter().collect())),
+            contexts: std::sync::Arc::new(parking_lot::Mutex::new(
+                contexts
+                    .into_iter()
+                    .map(|mut ctx| {
+                        ctx.subagent_event_tx = events.event_sender().0;
+                        ctx
+                    })
+                    .collect(),
+            )),
             complete_first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(complete_first)),
             gateway,
         }
@@ -193,7 +202,7 @@ async fn assert_wake_setup_failure_preserves_prior_durable_state(
     let coordinator = tokio::task::spawn_local(
         SubagentCoordinator::from_channel(
             command_rx,
-            RunShellChildTestRunner::new([ctx], true, gateway),
+            RunShellChildTestRunner::new([ctx], true, gateway, command_tx.clone()),
             CoordinatorConfig::default(),
         )
         .run(),
@@ -392,7 +401,7 @@ async fn unpublished_wake_completion_preserves_prior_durable_state_and_worktree(
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ctx], true, gateway),
+                    RunShellChildTestRunner::new([ctx], true, gateway, command_tx.clone()),
                     CoordinatorConfig::default(),
                 )
                 .run(),
@@ -501,7 +510,7 @@ async fn ordinary_spawn_with_failed_metadata_write_persists_output_and_disposes_
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ctx], false, gateway),
+                    RunShellChildTestRunner::new([ctx], false, gateway, command_tx.clone()),
                     CoordinatorConfig::default(),
                 )
                 .run(),
@@ -575,7 +584,7 @@ async fn ordinary_spawn_disposes_worktree_when_only_remote_settings_enable_snaps
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ctx], false, gateway),
+                    RunShellChildTestRunner::new([ctx], false, gateway, command_tx.clone()),
                     CoordinatorConfig::default(),
                 )
                 .run(),
@@ -609,6 +618,15 @@ async fn ordinary_spawn_disposes_worktree_when_only_remote_settings_enable_snaps
 /// ahead of the first turn, and teardown releases it.
 #[tokio::test(flavor = "current_thread")]
 async fn ordinary_spawn_binds_the_child_workspace_session_before_its_first_turn() {
+    exercise_child_workspace_teardown(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn checked_close_stops_real_child_waiting_for_provider() {
+    exercise_child_workspace_teardown(true).await;
+}
+
+async fn exercise_child_workspace_teardown(close_while_running: bool) {
     use xai_grok_tools::implementations::grok_build::task::backend::{
         ChannelBackend, SubagentBackend,
     };
@@ -645,15 +663,16 @@ async fn ordinary_spawn_binds_the_child_workspace_session_before_its_first_turn(
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ctx], false, gateway),
+                    RunShellChildTestRunner::new([ctx], false, gateway, command_tx.clone()),
                     CoordinatorConfig::default(),
                 )
                 .run(),
             );
             let backend = ChannelBackend::for_coordinator_session(command_tx, "setup-parent");
             let request = auto_wake_test_request(&id);
+            let spawn_backend = backend.clone();
             let spawned =
-                tokio::task::spawn_local(async move { backend.spawn(request, None).await });
+                tokio::task::spawn_local(async move { spawn_backend.spawn(request, None).await });
             let first_turn_at_model = async {
                 while server.request_count() == 0 {
                     tokio::task::yield_now().await;
@@ -669,14 +688,32 @@ async fn ordinary_spawn_binds_the_child_workspace_session_before_its_first_turn(
                 workspace.session(&id).is_some(),
                 "the child's toolset is bound before its first turn dispatches"
             );
+            if close_while_running {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    backend.close_session_and_drain("setup-parent"),
+                )
+                .await
+                .expect("close cannot depend on provider completion")
+                .expect("checked drain");
+                assert!(
+                    workspace.session(&id).is_none(),
+                    "drain waits for child actor teardown"
+                );
+                backend
+                    .close_session_and_drain("setup-parent")
+                    .await
+                    .expect("repeated close");
+            }
             server.release_agent_completions();
             let result = spawned.await.expect("spawn task").expect("ordinary spawn");
-            assert!(result.success);
+            assert_eq!(result.success, !close_while_running);
             assert!(
                 workspace.session(&id).is_none(),
                 "teardown releases the child's binding"
             );
 
+            drop(backend);
             coordinator.await.expect("coordinator");
             usage_ack.abort();
         })
@@ -731,7 +768,12 @@ async fn unacked_wake_start_and_abort_fail_closed_without_parking_runner() {
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ordinary_ctx, wake_ctx], false, gateway),
+                    RunShellChildTestRunner::new(
+                        [ordinary_ctx, wake_ctx],
+                        false,
+                        gateway,
+                        command_tx.clone(),
+                    ),
                     CoordinatorConfig::default(),
                 )
                 .run(),
@@ -860,7 +902,12 @@ async fn rejected_deferred_start_restores_prior_without_publication() {
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ordinary_ctx, wake_ctx], false, gateway),
+                    RunShellChildTestRunner::new(
+                        [ordinary_ctx, wake_ctx],
+                        false,
+                        gateway,
+                        command_tx.clone(),
+                    ),
                     CoordinatorConfig::default(),
                 )
                 .run(),
@@ -985,7 +1032,12 @@ async fn started_wake_with_failed_metadata_write_preserves_prior_durable_artifac
             let coordinator = tokio::task::spawn_local(
                 SubagentCoordinator::from_channel(
                     command_rx,
-                    RunShellChildTestRunner::new([ordinary_ctx, wake_ctx], false, gateway),
+                    RunShellChildTestRunner::new(
+                        [ordinary_ctx, wake_ctx],
+                        false,
+                        gateway,
+                        command_tx.clone(),
+                    ),
                     CoordinatorConfig::default(),
                 )
                 .run(),
