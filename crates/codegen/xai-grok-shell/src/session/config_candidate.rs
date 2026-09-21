@@ -39,6 +39,7 @@ pub struct ConfigCandidate {
     pub external_mcp_servers: Vec<agent_client_protocol::McpServer>,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub subject_options: serde_json::Map<String, serde_json::Value>,
     pub subagent_briefs: Vec<SubagentBrief>,
     pub revision: String,

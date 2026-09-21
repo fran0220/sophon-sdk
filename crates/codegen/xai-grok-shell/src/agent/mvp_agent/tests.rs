@@ -6271,7 +6271,7 @@ fn native_candidate_prompt_admission_preserves_fifo_and_cancellation() {
     use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate;
     fn candidate(model: &str, revision: &str) -> serde_json::Value {
         serde_json::json!({"instructions":format!("MOUNT_{revision}"), "model":model,
-            "skillDirectories":[], "externalMcpServers":[], "subjectOptions":{},
+            "skillDirectories":[], "externalMcpServers":[],
             "subagentBriefs":[], "revision":revision})
     }
     fn prompt(sid: &acp::SessionId, id: &str, candidate: serde_json::Value, send_now: bool) -> acp::PromptRequest {
