@@ -150,10 +150,13 @@ impl BrowserService {
     pub fn tool_specs() -> Vec<BrowserToolSpec> {
         vec![BrowserToolSpec {
             name: "browser".into(),
-            description: "Use the Runtime-owned browser. Snapshot gives revision-scoped refs; refresh after page changes. Never retry a timed-out interaction automatically. Screenshots and silent video recordings return durable artifact IDs. Audio unsupported.".into(),
+            description: "Use the Runtime-owned browser. Set unused optional fields to null, not empty strings. Snapshot gives revision-scoped refs; refresh after page changes. Never retry a timed-out interaction automatically. Screenshots and silent video recordings return durable artifact IDs. Audio unsupported.".into(),
             input_schema: json!({"type":"object","required":["action"],"properties":{
                 "action":{"type":"string","enum":AGENT_ACTIONS},
-                "tab_id":{"type":"string"},"frame_id":{"type":"string"},"url":{"type":"string"},"ref":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},"delta_x":{"type":"number"},"delta_y":{"type":"number"},"milliseconds":{"type":"integer","minimum":0,"maximum":10000}
+                "tab_id":{"type":["string","null"]},
+                "frame_id":{"type":["string","null"],"description":"Snapshot only: null selects the top frame; otherwise use an ID from frames."},
+                "url":{"type":["string","null"],"description":"HTTP(S) URL for navigate/new_tab; null creates about:blank for new_tab."},
+                "ref":{"type":["string","null"]},"text":{"type":["string","null"]},"key":{"type":["string","null"]},"delta_x":{"type":["number","null"]},"delta_y":{"type":["number","null"]},"milliseconds":{"type":["integer","null"],"minimum":0,"maximum":10000}
             },"additionalProperties":false}),
         }]
     }

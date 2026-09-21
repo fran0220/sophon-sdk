@@ -67,6 +67,12 @@ fn reference(snapshot: &Value, role: &str, name: &str) -> String {
 
 #[tokio::test]
 async fn capabilities_do_not_launch_and_close_is_terminal() {
+    let specs = BrowserService::tool_specs();
+    for (name, schema) in specs[0].input_schema["properties"].as_object().unwrap() {
+        if name != "action" {
+            assert!(schema["type"].as_array().unwrap().contains(&json!("null")));
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     let mut cfg = config(root.path());
     cfg.executable = "missing-chromium".into();
@@ -152,10 +158,13 @@ async fn real_chromium_tools_stream_record_and_cleanup() {
     });
     let root = tempfile::tempdir().unwrap();
     let browser = Arc::new(BrowserService::new(config(root.path())));
-    let tab = call(&browser, "new_tab", json!({})).await["tab_id"]
+    let tab = call(&browser, "new_tab", json!({"url":null})).await["tab_id"]
         .as_str()
         .unwrap()
         .to_owned();
+    assert!(
+        call(&browser, "snapshot", json!({"tab_id":tab,"frame_id":null})).await["nodes"].is_array()
+    );
     let competing = BrowserService::new(config(root.path()));
     assert!(matches!(
         competing.execute("browser", json!({"action":"tabs"})).await,

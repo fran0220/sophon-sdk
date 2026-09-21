@@ -71,17 +71,18 @@ try {
     if (event.type === 'history_record' && ['tool_call', 'tool_call_update'].includes(event.record.update.type)) {
       const call = event.record.update.value
       calls.set(call.id, { ...calls.get(call.id), ...call, rawInput: call.rawInput ?? calls.get(call.id)?.rawInput })
+      if (call.status === 'failed') console.error(JSON.stringify({ phase: 'tool_failure', title: call.title, output: JSON.stringify(call.rawOutput).replaceAll(process.env.OG_API_KEY, '[credential]').replaceAll(gateway, '[gateway]').slice(0, 1000) }))
     }
   })
   session = await agent.createSession({ workspace: { id: 'gateway-browser', cwd: workspace }, requireConfigCandidate: true, model: dial, mcpServers: [], tools: [] })
-  timer = setTimeout(() => { session.cancel('gateway-browser').catch(() => {}) }, 180000)
+  timer = setTimeout(() => { session.cancel('gateway-browser').catch(() => {}) }, 300000)
   const receipt = await session.prompt({ turnId: 'gateway-browser', configCandidate: { revision: `browser-${effective.revision}`, instructions: 'Use only the native browser tool for this acceptance task. Do not use shell, file, network, or delegation tools. Never retry submission. The page is a disposable local fixture. Do not access other websites.', skillDirectories: [], externalMcpServers: [], model: dial, reasoningEffort: route.reasoning_effort, subagentBriefs: [] }, blocks: [{ type: 'text', text: `Use browser new_tab to create a blank tab, then navigate it to ${url}. Take a semantic snapshot. Type exactly BROWSER_GATEWAY_73 into Acceptance code using its snapshot ref. Take a fresh snapshot, then click Submit once using its ref exactly once. Wait briefly and snapshot the receipt. Finally take a screenshot of the receipt with the browser tool, then report the artifact path. Do not claim to visually inspect the screenshot. Do not use other tools.` }] })
   clearTimeout(timer)
   assert.equal(receipt.stopReason, 'end_turn')
   assert.ok(pageLoads >= 1)
   assert.deepEqual(submitted, ['BROWSER_GATEWAY_73'])
   assert.equal(callbacks, 0)
-  const actions = [...calls.values()].map(call => call.rawInput?.action).filter(Boolean)
+  const actions = [...calls.values()].filter(call => call.rawInput?.tool_name === 'browser').map(call => call.rawInput.tool_input?.action).filter(Boolean)
   for (const action of ['new_tab', 'navigate', 'snapshot', 'type', 'click', 'screenshot']) assert.ok(actions.includes(action), `Missing native action ${action}`)
   const files = await readdir(join(workspace, '.native-browser'))
   const screenshots = files.filter(file => file.endsWith('.png'))
@@ -97,7 +98,7 @@ try {
   console.log(JSON.stringify({ ok: true, realGateway: true, model: route.model, effectiveRevision: effective.revision, actions, submissions: submitted.length, hostToolCallbacks: callbacks, workspaceArtifact: true, pngBytes: bytes.length, checkedRuntimeExit: true }))
 } catch (error) {
   const diagnostic = String(error.message).replaceAll(process.env.OG_API_KEY, '[credential]').replaceAll(gateway, '[gateway]').slice(0, 800)
-  console.error(JSON.stringify({ ok: false, errorType: error.name, diagnostic, actions: [...calls.values()].map(call => ({ action: call.rawInput?.action, status: call.status })), submissions: submitted.length, callbacks }))
+  console.error(JSON.stringify({ ok: false, errorType: error.name, diagnostic, actions: [...calls.values()].map(call => ({ tool: call.rawInput?.tool_name, action: call.rawInput?.tool_input?.action, status: call.status })), submissions: submitted.length, callbacks }))
   process.exitCode = 1
 } finally {
   clearTimeout(timer)
