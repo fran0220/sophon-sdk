@@ -494,7 +494,8 @@ impl Runtime {
             .cloned()
             .chain(options.tools)
             .collect::<Vec<_>>();
-        let mut config = SessionConfig::new(&options.workspace.cwd);
+        let mut config = SessionConfig::new(&options.workspace.cwd)
+            .require_config_candidate(options.require_config_candidate.unwrap_or(false));
         if let Some(model) = options.model {
             config = config.model(model);
         }

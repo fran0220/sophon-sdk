@@ -96,6 +96,7 @@ impl fmt::Display for SessionId {
 pub struct SessionConfig {
     pub(crate) cwd: PathBuf,
     pub(crate) model: Option<String>,
+    pub(crate) require_config_candidate: bool,
     pub(crate) metadata: serde_json::Map<String, serde_json::Value>,
     pub(crate) mcp_servers: Vec<serde_json::Value>,
 }

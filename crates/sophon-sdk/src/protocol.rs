@@ -86,6 +86,11 @@ pub struct Workspace {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionOptions {
     pub workspace: Workspace,
+    /// Keep scheduler execution and mutations blocked until native candidate publication.
+    /// Set on every create/load/resume requiring a product-owned configuration.
+    #[serde(default)]
+    #[ts(optional)]
+    pub require_config_candidate: Option<bool>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]

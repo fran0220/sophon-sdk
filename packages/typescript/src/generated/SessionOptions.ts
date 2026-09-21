@@ -3,4 +3,15 @@ import type { ToolSpec } from "./ToolSpec.js";
 import type { Workspace } from "./Workspace.js";
 import type { JsonValue } from "./serde_json/JsonValue.js";
 
-export type SessionOptions = { workspace: Workspace, model: string | null, metadata: { [key in string]: JsonValue }, mcpServers: Array<JsonValue>, tools: Array<ToolSpec>, };
+export type SessionOptions = {
+  workspace: Workspace;
+  /**
+   * Keep scheduler execution and mutations blocked until native candidate publication.
+   * Set on every create/load/resume requiring a product-owned configuration.
+   */
+  requireConfigCandidate?: boolean;
+  model: string | null;
+  metadata: { [key in string]: JsonValue };
+  mcpServers: Array<JsonValue>;
+  tools: Array<ToolSpec>;
+};

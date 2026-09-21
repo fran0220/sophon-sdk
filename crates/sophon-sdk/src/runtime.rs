@@ -1529,6 +1529,7 @@ fn scheduler_error(
 ) -> mgmt::ManagementError {
     use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerError;
     let kind = match error {
+        SchedulerError::ActivationRequired => mgmt::ManagementErrorKind::AdmissionClosed,
         SchedulerError::InvalidVersion(_)
         | SchedulerError::InvalidInterval(_)
         | SchedulerError::TaskLimitReached(_) => mgmt::ManagementErrorKind::InvalidRequest,
@@ -1816,9 +1817,15 @@ fn session_parts(config: SessionConfig) -> Result<SessionParts, Error> {
     let SessionConfig {
         cwd,
         model,
+        require_config_candidate,
         mut metadata,
         mcp_servers,
     } = config;
+    // The typed startup contract takes precedence over arbitrary metadata.
+    metadata.insert(
+        "x.ai/requireConfigCandidate".into(),
+        serde_json::Value::Bool(require_config_candidate),
+    );
     if let Some(model) = model {
         metadata.insert("modelId".into(), serde_json::Value::String(model));
     }
@@ -2541,6 +2548,7 @@ impl SessionConfig {
         Self {
             cwd: cwd.into(),
             model: None,
+            require_config_candidate: false,
             metadata: serde_json::Map::new(),
             mcp_servers: Vec::new(),
         }
@@ -2548,6 +2556,13 @@ impl SessionConfig {
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Require native configuration publication before scheduler activation.
+    /// Supply on every create/load/resume; reopening does not reuse an old receipt.
+    pub fn require_config_candidate(mut self, required: bool) -> Self {
+        self.require_config_candidate = required;
         self
     }
 
@@ -2939,6 +2954,29 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[test]
+    fn candidate_requirement_is_typed_startup_metadata_for_create_load_and_resume() {
+        for required in [false, true] {
+            let config = SessionConfig::new("/workspace")
+                .require_config_candidate(required)
+                .metadata("x.ai/requireConfigCandidate", serde_json::json!(!required));
+            let created = session_request(config.clone()).unwrap();
+            assert_eq!(
+                created.meta.unwrap()["x.ai/requireConfigCandidate"],
+                required
+            );
+            // Both load and resume use these same parts before native admission.
+            let (_, _, meta) = session_parts(config).unwrap();
+            assert_eq!(meta["x.ai/requireConfigCandidate"], required);
+        }
+        let (_, _, meta) = session_parts(SessionConfig::new("/workspace")).unwrap();
+        assert_eq!(meta["x.ai/requireConfigCandidate"], false);
+        let options: crate::protocol::SessionOptions =
+            serde_json::from_value(serde_json::json!({"workspace":{"id":"w","cwd":"/workspace"}}))
+                .unwrap();
+        assert!(!options.require_config_candidate.unwrap_or(false));
+    }
 
     #[test]
     fn subagent_events_preserve_attempts_and_reject_unknown_terminal_states() {

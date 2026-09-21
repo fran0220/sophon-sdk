@@ -71,6 +71,30 @@ test('real stdio Runtime creates, snapshots, schedules, reloads and checks proce
   await agent.finalExit()
 })
 
+test('candidate-required create, load and resume keep scheduler inspection read-only', { timeout: 30000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  const agent = await Agent.spawn({ executable, config, env })
+  t.after(() => agent.finalExit().catch(() => {}))
+  const options = { workspace: { id: 'candidate-required', cwd }, requireConfigCandidate: true, model: 'runtime-test', metadata: { 'x.ai/requireConfigCandidate': false }, mcpServers: [], tools: [] }
+  let session = await agent.createSession(options)
+  const id = session.id
+  for (const attach of ['create', 'load', 'resume']) {
+    if (attach === 'load') session = await agent.loadSession(id, options)
+    if (attach === 'resume') session = await agent.resumeSession(id, options)
+    const before = await session.scheduler.list()
+    assert.deepEqual(before.tasks, [])
+    await assert.rejects(session.prompt({ turnId: `unmounted-${attach}`, blocks: [{ type: 'text', text: 'Must not infer.' }], metadata: {} }), /requires a configuration candidate before execution/)
+    await assert.rejects(session.scheduler.create(`blocked-${attach}`, before.version, {
+      cadence: { kind: 'once', at: new Date(Date.now() - 60000).toISOString() },
+      prompt: 'Must never run before native publication.', durable: true,
+    }), /requires a committed configuration candidate/)
+    await assert.rejects(session.scheduler.delete(`blocked-delete-${attach}`, before.version, 'unmounted-task'), /requires a committed configuration candidate/)
+    assert.deepEqual(await session.scheduler.list(), before, 'refused writes must not alter scheduler state')
+    await session.dispose()
+  }
+  await agent.finalExit()
+})
+
 test('native terminal survives stdio transport through resize, input, output and reaped exit', { timeout: 30000 }, async t => {
   const { cwd, config, env } = await setup(t)
   const agent = await Agent.spawn({ executable, config, env })
