@@ -2233,7 +2233,10 @@ fn typed_xai_session_event(payload: &serde_json::Value) -> Option<Event> {
         field(payload, &["update"])?.clone(),
         field(payload, &["_meta", "meta"]),
     );
-    if !matches!(update, SessionUpdate::TurnCompleted(_)) {
+    if !matches!(
+        update,
+        SessionUpdate::TurnCompleted(_) | SessionUpdate::Compaction(_)
+    ) {
         return None;
     }
     Some(Event::Session {
@@ -2974,6 +2977,33 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[test]
+    fn native_compaction_notifications_keep_typed_session_delivery() {
+        let update =
+            xai_grok_shell::extensions::notification::SessionUpdate::AutoCompactCompleted {
+                tokens_before: Some(9876),
+                tokens_after: 321,
+                elapsed_ms: Some(73),
+                summary_preview: Some("native summary".into()),
+            };
+        let event = typed_xai_session_event(
+            &serde_json::json!({"sessionId":"compact-session", "update":update}),
+        )
+        .expect("typed compaction event");
+        assert!(matches!(
+            event,
+            Event::Session {
+                update: SessionUpdate::Compaction(crate::protocol::CompactionUpdate::Completed {
+                    tokens_before: Some(9876),
+                    tokens_after: 321,
+                    elapsed_ms: Some(73),
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn neutral_candidate_converts_mcp_maps_only_at_private_boundary() {

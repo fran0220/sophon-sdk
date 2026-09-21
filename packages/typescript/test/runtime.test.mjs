@@ -317,6 +317,10 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     request.signal.addEventListener('abort', () => resolve({ cancelled: true }), { once: true })
   }) })
   t.after(() => agent.finalExit().catch(() => {}))
+  const toolCompletions = []
+  agent.subscribe(event => {
+    if (event.type === 'session' && event.update.type === 'tool_call_update' && event.update.value.status === 'completed') toolCompletions.push(event.update.value)
+  })
   const session = await agent.createSession({ workspace: { id: 'callback-parent', cwd }, model: 'runtime-test', mcpServers: [], tools: [{ name: 'ask_user', description: 'Ask a human question', inputSchema: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] } }] })
   const ordinary = session.subagents.start({ id: await session.subagents.newId(), prompt: 'Ask the human.', description: 'ordinary child', subagentType: 'task', cwd: childCwd, model: 'runtime-test' })
   const first = await nextQuestion
@@ -327,6 +331,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(first.request.context.originatingPrompt, null, 'direct child before any parent prompt has no invented root')
   first.answer()
   assert.equal((await ordinary).state, 'completed')
+  assert.ok(toolCompletions.some(update => update.rawOutput?.type === 'Dynamic' && update.rawOutput.value?.answer === 'ANSWER_29'), 'successful structured callback must emit a native completed tool event with its exact output')
   nextQuestion = new Promise(resolve => { receive = resolve })
   const rootTurn = session.prompt({ turnId: 'root-prompt-73', blocks: [{ type: 'text', text: 'ROOT_NATIVE_TASK_73' }] })
   const rooted = await nextQuestion
