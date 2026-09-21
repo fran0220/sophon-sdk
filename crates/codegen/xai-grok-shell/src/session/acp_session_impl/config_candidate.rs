@@ -683,6 +683,7 @@ mod tests {
                     actor.models_manager.insert_test_entry(key, entry);
                 }
                 let actor = Arc::new(actor);
+                assert_eq!(actor.effective_config_snapshot().await.unwrap().mounted_revision, None);
                 let sampler_actor = actor.clone();
                 tokio::task::spawn_local(async move {
                     while let Some(event) = sampler_rx.recv().await { sampler_actor.handle_sampling_event(event).await; }
@@ -708,6 +709,7 @@ mod tests {
                 cmd_tx.send(SessionCommand::GetCurrentModel { responds_to }).unwrap();
                 barrier.await.unwrap();
                 assert_eq!(actor.candidate_admission.mounted().unwrap().candidate.revision, "A");
+                assert_eq!(actor.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("A"));
                 assert_eq!(actor.tool_context.admission.snapshot().accepted, 2);
                 std::fs::write(&skill_path, "---\nname: frozen\ndescription: changed skill\n---\nSKILL_C").unwrap();
                 actor.reload_skills_from_disk().await;
@@ -729,6 +731,7 @@ mod tests {
                 let (c, response_c) = candidate_prompt("prompt-C", next, actor.candidate_admission.generation());
                 cmd_tx.send(c).unwrap();
                 response_c.await.unwrap().unwrap();
+                assert_eq!(actor.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("C"));
                 let requests = server.requests();
                 let inference: Vec<_> = requests.iter().filter(|request| request.path == "/v1/responses" || request.path == "/v1/chat/completions").collect();
                 assert_eq!(inference.len(), 3);

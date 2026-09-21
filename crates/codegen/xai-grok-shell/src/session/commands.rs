@@ -187,6 +187,9 @@ pub struct EffectiveModelFacts {
 pub struct SessionEffectiveConfigSnapshot {
     pub session_id: String,
     pub version: xai_prompt_queue::QueueVersion,
+    /// The actually committed native mount, never a submitted/busy candidate or
+    /// a FIFO version. Fresh process loads have no receipt until publication.
+    pub mounted_revision: Option<String>,
     pub route: EffectiveRouteFacts,
     pub model: EffectiveModelFacts,
     pub backend_search_active: bool,

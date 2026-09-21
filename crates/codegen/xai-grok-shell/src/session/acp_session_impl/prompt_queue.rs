@@ -526,6 +526,8 @@ impl SessionActor {
         Ok(crate::session::commands::SessionEffectiveConfigSnapshot {
             session_id: self.session_info.id.0.to_string(),
             version: self.tool_context.config_clock.snapshot(),
+            mounted_revision: self.candidate_admission.mounted()
+                .map(|mounted| mounted.candidate.revision.clone()),
             model,
             route: crate::session::commands::EffectiveRouteFacts {
                 base_url: sampling.base_url,
