@@ -231,3 +231,33 @@ Keep the evidence categories separate:
 A gateway admission error is a failed acceptance run, even if the standalone
 browser suite passes. Host-driven Stage transport tests do not demonstrate
 model-driven behavior, and neither demonstrates complete Origin renderer parity.
+
+`tests/decisions.mjs` is an opt-in, real-gateway comparison runner for the native
+`evaluate_decisions` tool. It requires a published account-effective schema 2
+`decision` route; absence is a blocker, not permission to guess a Jev model.
+An ordinary Agent observes a disposable page, asks one Choice over `exchange`,
+`none`, and `insufficient_evidence`, then uses the existing browser tool. The
+runner compares three cases twice against the Agent alone and explicit local
+rules, reversing method order on the second repetition. It preserves unsuccessful
+cases, full-task elapsed time (observation through effect verification, including
+Session creation for Agent methods), relay request counts, native main usage,
+and Jev distributions/usage. Browser launch and page setup are outside that timing.
+These small synthetic cases do not establish general speed or quality gains.
+
+Test-only relay barriers change the observed DOM before a decision is delivered,
+or cancel the turn while delivery is held. A stale ref or cancelled turn must
+produce no action. The relay never selects an action and never retries. It is not
+a production supervisor, second agent loop, or per-frame network consumer.
+Cancellation verifies local action suppression, not remote computation/billing
+rollback. Raw screenshots and browser identity are never sent to Jev.
+
+```sh
+SOPHON_RUNTIME="$PWD/target/debug/sophon-runtime" \
+  node crates/sophon-browser/tests/decisions.mjs
+```
+
+Set `SOPHON_SDK_MODULE` to a `file:` URL for an extracted official SDK package to
+test packed-client provenance. Set `SOPHON_BROWSER_EVIDENCE_DIR` to retain the
+sanitized comparison JSON. Credentials remain in the runner/loopback relay, never
+the fixture page or evidence. Successful execution is required before claiming
+decision-to-action acceptance; syntax checks alone establish no model behavior.

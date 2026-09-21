@@ -16,13 +16,21 @@ let nativeDefinition = false
 let nativeResult = false
 let nativeScreenshotRequested = false
 let nativeScreenshot
+let downloadId
+let downloadRequested = false
+let nativeDownload
 let providerFixtureRequests = 0
 let hostToolCallbacks = 0
 const toolResults = []
 const server = createServer(async (request, response) => {
+  if (request.url === '/download') {
+    response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="../../untrusted.exe"' })
+    response.end('runtime-download-evidence73')
+    return
+  }
   if (request.method !== 'POST') {
     response.writeHead(200, { 'content-type': 'text/html' })
-    response.end('<!doctype html><title>Native Runtime fixture</title><style>@keyframes m{to{transform:translateX(100px)}}#box{background:red;width:20px;height:20px;animation:m .4s infinite alternate}</style><h1>Native Runtime fixture</h1><input aria-label="Runtime input"><div id="box"></div>')
+    response.end('<!doctype html><title>Native Runtime fixture</title><style>@keyframes m{to{transform:translateX(100px)}}#box{background:red;width:20px;height:20px;animation:m .4s infinite alternate}</style><h1>Native Runtime fixture</h1><input aria-label="Runtime input"><div id="box"></div><a href="/download">Download evidence</a>')
     return
   }
   let body = ''
@@ -37,14 +45,17 @@ const server = createServer(async (request, response) => {
       try {
         const value = JSON.parse(text)
         if (value.artifact_id && value.mime_type === 'image/png') nativeScreenshot = value
+        if (value.artifact_id && value.mime_type === 'application/octet-stream') nativeDownload = value
       } catch { /* Other tool messages need not contain JSON. */ }
     }
   }
   const action = browser && !nativeDefinition ? 'snapshot'
-    : browser && nativeResult && !nativeScreenshotRequested ? 'screenshot' : null
+    : browser && nativeResult && !nativeScreenshotRequested ? 'screenshot'
+    : browser && downloadId && !downloadRequested ? 'download_status' : null
   if (action === 'screenshot') nativeScreenshotRequested = true
+  if (action === 'download_status') downloadRequested = true
   const delta = action
-    ? { role: 'assistant', tool_calls: [{ index: 0, id: `native-browser-${action}`, type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action, tab_id: tabId }) } }] }
+    ? { role: 'assistant', tool_calls: [{ index: 0, id: `native-browser-${action}`, type: 'function', function: { name: 'browser', arguments: JSON.stringify({ action, tab_id: tabId, ...(action === 'download_status' ? { download_id: downloadId } : {}) }) } }] }
     : { role: 'assistant', content: 'Native browser verification complete.' }
   if (browser) nativeDefinition = true
   providerFixtureRequests++
@@ -132,11 +143,29 @@ try {
   assert.deepEqual([...publishedBytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10])
   assert.deepEqual(publishedBytes, await readFile(join(workspace, published.path)))
   await assert.rejects(readFile(join(root, 'evidence', published.path)), { code: 'ENOENT' })
+  const downloadSnapshot = await agent.browser({ action: 'snapshot', tab_id: tabId })
+  const link = downloadSnapshot.nodes.find(node => node.role === 'link' && node.name === 'Download evidence')
+  await agent.browser({ action: 'click', tab_id: tabId, ref: link.ref })
+  const deadline = Date.now() + 5000
+  while (!downloadId && Date.now() < deadline) {
+    const downloads = await agent.browser({ action: 'downloads' })
+    downloadId = downloads.downloads.find(download => download.url === `${url}/download` && download.state === 'completed')?.download_id
+    if (!downloadId) await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.ok(downloadId, 'actual download must complete before publication')
+  await session.prompt({ turnId: 'native-download-publication', blocks: [{ type: 'text', text: 'Publish completed browser download evidence.' }] })
+  assert.equal(nativeDownload?.artifact?.path, `.native-browser/${downloadId}.download`)
+  assert.equal(nativeDownload.artifact.mimeType, 'application/octet-stream')
+  assert.equal(nativeDownload.reviewRequired, true)
+  const downloaded = Buffer.from((await session.readArtifact(nativeDownload.artifact.path)).base64, 'base64')
+  assert.equal(downloaded.toString(), 'runtime-download-evidence73')
+  assert.equal(downloaded.length, nativeDownload.artifact.bytes)
+  assert.deepEqual(downloaded, await readFile(join(workspace, nativeDownload.artifact.path)))
   assert.equal(hostToolCallbacks, 0, 'first-party browser must not route to a TS callback')
   await agent.browser({ action: 'stream_stop', tab_id: tabId })
   await agent.finalExit()
   exited = true
-  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, providerFixtureRequests, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, workspaceArtifact: true, recording: true, checkedRuntimeExit: true }))
+  console.log(JSON.stringify({ ok: true, nativeBrowserTool: true, hostToolCallbacks, providerFixtureRequests, realChromium: true, liveFrame: true, viewport: true, hostInput: true, probeExceptions: true, screenshot: true, workspaceArtifact: true, downloadArtifact: true, recording: true, checkedRuntimeExit: true }))
 } finally {
   if (agent && !exited) await agent.finalExit().catch(() => {})
   await new Promise(resolve => server.close(resolve))
