@@ -1297,7 +1297,7 @@ impl SessionActor {
                     percentage,
                     reason_override: None,
                 };
-                if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                if let Err(e) = Box::pin(self.run_compact_only(trigger_info, false)).await {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
@@ -1428,8 +1428,9 @@ impl SessionActor {
             if park.is_parked() && self.uncharged_401_park_eligible(am, error.credential) {
                 return Ok(self.park_uncharged_401(error.credential, true));
             }
-            if am
-                .try_recover_unauthorized(xai_grok_login::recovery::RecoverySource::Turn)
+            // Recovery nests token refresh and persistence futures. Keep that
+            // state out of every enclosing sampler/turn poll frame.
+            if Box::pin(am.try_recover_unauthorized(xai_grok_login::recovery::RecoverySource::Turn))
                 .await
             {
                 tracing::info!(session_id = %self.session_info.id.0, "auth recovery: sampler 401, recovered, retrying");
