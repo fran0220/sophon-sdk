@@ -614,7 +614,8 @@ pub(crate) fn acp_tool_update(
         | ToolOutput::Monitor(_)
         | ToolOutput::SchedulerCreate(_)
         | ToolOutput::SchedulerDelete(_)
-        | ToolOutput::SchedulerList(_) => Some(acp::ToolCallUpdate::new(
+        | ToolOutput::SchedulerList(_)
+        | ToolOutput::Dynamic(_) => Some(acp::ToolCallUpdate::new(
             acp::ToolCallId::new(Arc::from(tool_call_id)),
             acp::ToolCallUpdateFields::new()
                 .status(Some(acp::ToolCallStatus::Completed))
@@ -748,6 +749,68 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use xai_grok_tools::types::output::*;
+
+    #[test]
+    fn test_dynamic_tool_success_preserves_artifact_and_completes() {
+        let artifact = serde_json::json!({
+            "artifacts": [{
+                "path": "/worktree/media/frame.png",
+                "mimeType": "image/png",
+                "bytes": 137,
+                "dimensions": [640, 480]
+            }],
+            "output_file": "/sessions/%2Fworktree/output.json",
+            "uploaded": false
+        });
+        let output = ToolOutput::Dynamic(artifact.clone().into());
+        let rewriter = PathRewriter::new("/worktree", Some("/project")).unwrap();
+        for (rewriter, expected_artifact) in [
+            (None, artifact.clone()),
+            (
+                Some(&rewriter),
+                serde_json::json!({
+                    "artifacts": [{
+                        "path": "/project/media/frame.png",
+                        "mimeType": "image/png",
+                        "bytes": 137,
+                        "dimensions": [640, 480]
+                    }],
+                    "output_file": "/sessions/%2Fproject/output.json",
+                    "uploaded": false
+                }),
+            ),
+        ] {
+            let update = acp_tool_update(
+                &output,
+                "call-native-artifact-7",
+                rewriter,
+                Some(serde_json::json!({"private": "metadata-secret-sentinel"})),
+            )
+            .expect("successful dynamic tool must produce a terminal update");
+            assert_eq!(
+                update.tool_call_id,
+                acp::ToolCallId::new("call-native-artifact-7")
+            );
+            assert_eq!(update.fields.status, Some(acp::ToolCallStatus::Completed));
+            assert_eq!(
+                update.fields.raw_output,
+                Some(serde_json::json!({"type": "Dynamic", "value": expected_artifact}))
+            );
+            assert!(update.fields.content.is_none());
+            assert!(
+                !serde_json::to_string(&update)
+                    .unwrap()
+                    .contains("metadata-secret-sentinel")
+            );
+        }
+        let ToolOutput::Dynamic(original) = output else {
+            unreachable!();
+        };
+        assert_eq!(
+            original.value, artifact,
+            "display rewrite must not mutate output"
+        );
+    }
 
     #[test]
     fn test_acp_tool_update_send_subagent_message_outcomes_are_terminal() {
