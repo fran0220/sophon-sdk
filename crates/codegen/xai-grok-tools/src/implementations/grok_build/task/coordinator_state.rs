@@ -61,7 +61,13 @@ pub const ACTIVE_MESSAGE_FINALIZATION_TIMEOUT: std::time::Duration =
 
 /// Runtime handle retained while a child is active.
 pub trait ChildControl: 'static {
+    type Inheritance: Clone + Send + Sync + 'static;
     type ProgressFuture: Future<Output = Option<SubagentProgress>> + 'static;
+
+    /// Immutable configuration of the actual spawner, captured before reparenting.
+    fn inheritance(&self) -> Option<Self::Inheritance> {
+        None
+    }
 
     /// None when live signals are unavailable; a measured zero is Some.
     fn progress(&self) -> Self::ProgressFuture;
@@ -102,8 +108,10 @@ pub struct WakeOrigin {
 }
 
 /// Input to one runtime-specific child run.
-pub struct ChildRunRequest<C> {
+pub struct ChildRunRequest<C: ChildControl> {
     pub request: SubagentRequest,
+    /// Captured at admission, not looked up from the accounting root at dispatch.
+    pub spawner_inheritance: Option<C::Inheritance>,
     pub cancellation: CancellationToken,
     pub reporter: ChildReporter<C>,
     pub attempt_id: xai_message_delivery_core::AttemptId,

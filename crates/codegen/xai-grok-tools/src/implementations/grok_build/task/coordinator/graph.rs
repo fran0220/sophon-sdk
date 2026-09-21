@@ -3,13 +3,22 @@
 use std::collections::HashMap;
 
 /// One node per child id in any coordinator map, removed only at completed-record eviction.
-#[derive(Default)]
-pub(super) struct SpawnGraph {
-    nodes: HashMap<String, SpawnNode>,
+pub(super) struct SpawnGraph<I> {
+    nodes: HashMap<String, SpawnNode<I>>,
 }
 
-struct SpawnNode {
+impl<I> Default for SpawnGraph<I> {
+    fn default() -> Self {
+        Self {
+            nodes: HashMap::new(),
+        }
+    }
+}
+
+struct SpawnNode<I> {
     root: String,
+    /// Admission-time mount; retained for queued launches and same-record wakes.
+    inheritance: Option<I>,
     /// Spawner sessions between the root and this child, outermost first.
     spawner_chain: Vec<String>,
     /// Host capability only; independent of the lineage above.
@@ -18,8 +27,9 @@ struct SpawnNode {
     surface_to_spawner: bool,
 }
 
-pub(super) struct NestedSpawner {
+pub(super) struct NestedSpawner<I> {
     pub(super) child_id: String,
+    pub(super) inheritance: Option<I>,
     /// The pre-reparent `parent_session_id`, which lineage checks compare against.
     pub(super) session_id: String,
     pub(super) surface_completion: bool,
@@ -29,12 +39,17 @@ pub(super) struct NestedSpawner {
 #[derive(Debug)]
 pub(super) struct MissingSpawnerNode;
 
-impl SpawnGraph {
+impl<I> SpawnGraph<I> {
+    pub(super) fn inheritance(&self, child_id: &str) -> Option<&I> {
+        self.nodes.get(child_id)?.inheritance.as_ref()
+    }
+
     pub(super) fn insert_root_child(&mut self, child_id: &str, root: &str) {
         self.insert(
             child_id,
             SpawnNode {
                 root: root.to_owned(),
+                inheritance: None,
                 spawner_chain: Vec::new(),
                 advertise_to_spawner: false,
                 surface_to_spawner: false,
@@ -47,7 +62,7 @@ impl SpawnGraph {
         &mut self,
         child_id: &str,
         root: &str,
-        spawner: NestedSpawner,
+        spawner: NestedSpawner<I>,
     ) -> Result<(), MissingSpawnerNode> {
         let mut spawner_chain = self
             .nodes
@@ -60,6 +75,7 @@ impl SpawnGraph {
             child_id,
             SpawnNode {
                 root: root.to_owned(),
+                inheritance: spawner.inheritance,
                 spawner_chain,
                 advertise_to_spawner: true,
                 surface_to_spawner: spawner.surface_completion,
@@ -68,7 +84,7 @@ impl SpawnGraph {
         Ok(())
     }
 
-    fn insert(&mut self, child_id: &str, node: SpawnNode) {
+    fn insert(&mut self, child_id: &str, node: SpawnNode<I>) {
         debug_assert!(
             !self.nodes.contains_key(child_id),
             "spawn graph already holds {child_id}"

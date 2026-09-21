@@ -3,7 +3,7 @@
 use tokio::sync::oneshot;
 
 use super::super::admission::{AdmissionDecision, AdmissionError};
-use super::super::coordinator_state::PendingChild;
+use super::super::coordinator_state::{ChildControl, PendingChild};
 use super::super::types::{SubagentOwner, SubagentRequest, SubagentResult, SubagentSpawnRequest};
 use super::graph::NestedSpawner;
 use super::queue::{QueuedCaller, QueuedSpawn, StartOrigin};
@@ -304,7 +304,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     fn reparent_nested_spawn(
         &self,
         request: &mut SubagentRequest,
-    ) -> Result<Option<NestedSpawner>, SubagentResult> {
+    ) -> Result<Option<NestedSpawner<<R::Control as ChildControl>::Inheritance>>, SubagentResult>
+    {
         let Some(spawner) = self.active_child_for_session(&request.parent_session_id) else {
             return Ok(None);
         };
@@ -317,6 +318,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 true,
             ));
         }
+        let inheritance = spawner.control.inheritance();
         let root_parent = spawner.request.parent_session_id.clone();
         let spawner_session_id = std::mem::replace(&mut request.parent_session_id, root_parent);
         // The request's flag becomes root-scoped; the spawner's wish lives on the graph node.
@@ -334,6 +336,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         }
         Ok(Some(NestedSpawner {
             child_id: spawner.request.id.clone(),
+            inheritance,
             session_id: spawner_session_id,
             surface_completion,
         }))

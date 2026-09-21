@@ -31,6 +31,7 @@ pub(in crate::implementations::grok_build::task::coordinator) struct TestControl
 }
 
 impl ChildControl for TestControl {
+    type Inheritance = ();
     type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
@@ -246,6 +247,7 @@ pub(in crate::implementations::grok_build::task::coordinator) fn insert_child_wi
                     parent,
                     NestedSpawner {
                         child_id: spawner.to_owned(),
+                        inheritance: None,
                         session_id: spawner.to_owned(),
                         surface_completion: false,
                     },

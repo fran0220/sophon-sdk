@@ -87,7 +87,7 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     root_active_messages: HashMap<RootTargetKey, RootTargetLifecycle<R::RootControl>>,
     pending_wakes: HashMap<String, Vec<PendingWake>>,
     next_completion_age: u64,
-    graph: SpawnGraph,
+    graph: SpawnGraph<<R::Control as ChildControl>::Inheritance>,
     waiters: HashMap<String, Vec<BlockingWaiter>>,
     drain_waiters: HashMap<PromptScope, Vec<oneshot::Sender<SubagentOutstandingReply>>>,
     workflow_cancel_waiters: HashMap<String, Vec<oneshot::Sender<SubagentCancelOutcome>>>,
@@ -1026,6 +1026,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             subagent_id: id,
             future: Box::pin(
                 std::panic::AssertUnwindSafe(self.runner.run(ChildRunRequest {
+                    spawner_inheritance: self.graph.inheritance(&request.id).cloned(),
                     request,
                     cancellation,
                     reporter,

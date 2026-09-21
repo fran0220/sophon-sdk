@@ -90,13 +90,19 @@ struct AdmissionGate {
 
 #[derive(Clone)]
 struct TestControl {
+    inheritance: String,
     cancellation: CancellationToken,
     admission_gate: Option<AdmissionGate>,
     admitted_messages: Option<mpsc::UnboundedSender<(ActiveAgentMessageOperation, String)>>,
 }
 
 impl ChildControl for TestControl {
+    type Inheritance = String;
     type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
+
+    fn inheritance(&self) -> Option<String> {
+        Some(self.inheritance.clone())
+    }
 
     fn progress(&self) -> Self::ProgressFuture {
         std::future::ready(Some(SubagentProgress {
@@ -181,8 +187,8 @@ struct TestRunner {
     started: mpsc::UnboundedSender<String>,
     resume_sources: mpsc::UnboundedSender<SubagentResumeLookup>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
-    /// `(id, spawner_session_id)` as handed to the runner.
-    advertise_targets: mpsc::UnboundedSender<(String, Option<String>)>,
+    /// `(id, spawner_session_id, inheritance)` as handed to the runner.
+    advertise_targets: mpsc::UnboundedSender<(String, Option<String>, Option<String>)>,
     wake_runs: mpsc::UnboundedSender<WakeRun>,
     admitted_messages: Option<mpsc::UnboundedSender<(ActiveAgentMessageOperation, String)>>,
     admission_gate: Option<AdmissionGate>,
@@ -220,6 +226,7 @@ impl ChildRunner for TestRunner {
         Box::pin(async move {
             let ChildRunRequest {
                 request,
+                spawner_inheritance,
                 cancellation,
                 reporter,
                 attempt_id,
@@ -262,7 +269,11 @@ impl ChildRunner for TestRunner {
                 panic!("test panic after identity allocation");
             }
             let _ = queue_waits.send((request.id.clone(), queued_for, session_running));
-            let _ = advertise_targets.send((request.id.clone(), spawner_session_id));
+            let _ = advertise_targets.send((
+                request.id.clone(),
+                spawner_session_id,
+                spawner_inheritance,
+            ));
             let _ = requests.send(request.clone());
             if fail_wake_before_start && wake_agent_id.is_some() {
                 let _ = start.recv().await;
@@ -310,6 +321,7 @@ impl ChildRunner for TestRunner {
                 // Mock definition resolution: this type declares background.
                 definition_background: request.subagent_type == "background-default",
                 control: TestControl {
+                    inheritance: request.prompt.clone(),
                     cancellation: cancellation.clone(),
                     admission_gate: admission_gate.clone(),
                     admitted_messages: if wake_agent_id.is_some() {
@@ -489,7 +501,7 @@ pub(in crate::implementations::grok_build::task::coordinator) struct Harness {
     pub(in crate::implementations::grok_build::task::coordinator) queue_waits:
         mpsc::UnboundedReceiver<(String, Option<std::time::Duration>, usize)>,
     pub(in crate::implementations::grok_build::task::coordinator) advertise_targets:
-        mpsc::UnboundedReceiver<(String, Option<String>)>,
+        mpsc::UnboundedReceiver<(String, Option<String>, Option<String>)>,
     pub(in crate::implementations::grok_build::task::coordinator) wake_runs:
         mpsc::UnboundedReceiver<WakeRun>,
     pub(in crate::implementations::grok_build::task::coordinator) admitted_messages:
@@ -2628,7 +2640,7 @@ async fn runner_receives_direct_spawner_as_advertise_target() {
     });
     assert_eq!(
         harness.advertise_targets.recv().await,
-        Some(("child".to_owned(), None))
+        Some(("child".to_owned(), None, None))
     );
     let _ = harness.start.send(());
     assert_eq!(harness.started.recv().await.as_deref(), Some("child"));
@@ -2646,7 +2658,11 @@ async fn runner_receives_direct_spawner_as_advertise_target() {
     });
     assert_eq!(
         harness.advertise_targets.recv().await,
-        Some(("grandchild".to_owned(), Some("child".to_owned())))
+        Some((
+            "grandchild".to_owned(),
+            Some("child".to_owned()),
+            Some(request("child", true).prompt)
+        ))
     );
     harness.actor.abort();
 }
@@ -2758,6 +2774,67 @@ async fn foreign_session_cannot_reach_nested_grandchild() {
         SubagentCancelOutcome::NotFound
     ));
     assert!(foreign.list_running("foreign").await.is_empty());
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn queued_nested_inheritance_survives_spawner_exit_and_reactivation() {
+    let (config, mut notices) = limited_with_sink(1, LimitBehavior::Queue);
+    let mut harness = harness_with_config(false, config);
+    let root = parent_backend(&harness);
+    let mut child = request("mount-a-child", true);
+    child.prompt = "mount-A".into();
+    let child_spawn = tokio::spawn({
+        let root = root.clone();
+        async move { root.spawn(child, None).await }
+    });
+    harness.requests.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    assert_eq!(
+        harness.advertise_targets.recv().await.unwrap(),
+        ("mount-a-child".into(), None, None)
+    );
+    let nested = session_backend(&harness, "mount-a-child");
+    let grandchild_spawn =
+        tokio::spawn(async move { nested.spawn(request("grandchild", true), None).await });
+    let notice = notices.recv().await.unwrap();
+    assert_eq!(notice.parent_session_id, "parent");
+    await_queued(&harness.backend, 1).await;
+    assert!(harness.advertise_targets.try_recv().is_err());
+    // The actual spawner exits before queued initialization. Its immutable A
+    // mount must survive, independently of root ownership or later wake input C.
+    harness.finish_one.send("mount-a-child".into()).unwrap();
+    harness.completions.recv().await.unwrap();
+    assert!(child_spawn.await.unwrap().unwrap().success);
+    let admitted = harness.requests.recv().await.unwrap();
+    assert_eq!(admitted.parent_session_id, "parent");
+    assert_eq!(
+        harness.advertise_targets.recv().await.unwrap(),
+        (
+            "grandchild".into(),
+            Some("mount-a-child".into()),
+            Some("mount-A".into())
+        )
+    );
+    harness.started.recv().await.unwrap();
+    let attempt = root
+        .inspect("grandchild")
+        .await
+        .unwrap()
+        .attempt_id
+        .unwrap();
+    harness.finish_one.send("grandchild".into()).unwrap();
+    harness.completions.recv().await.unwrap();
+    assert!(grandchild_spawn.await.unwrap().unwrap().success);
+    let mut continuation = request("grandchild", true);
+    continuation.prompt = "new root mount-C".into();
+    let wake = tokio::spawn(async move { root.reactivate(continuation, attempt).await });
+    let inherited = harness.advertise_targets.recv().await.unwrap();
+    assert_eq!(inherited.0, "grandchild");
+    assert_eq!(inherited.2.as_deref(), Some("mount-A"));
+    harness.started.recv().await.unwrap();
+    harness.finish_one.send("grandchild".into()).unwrap();
+    assert!(wake.await.unwrap().unwrap().success);
     harness.actor.abort();
 }
 

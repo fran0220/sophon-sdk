@@ -1,14 +1,15 @@
 use super::{MissingSpawnerNode, NestedSpawner, SpawnGraph};
 
-fn spawner(child_id: &str, session_id: &str) -> NestedSpawner {
+fn spawner(child_id: &str, session_id: &str) -> NestedSpawner<()> {
     NestedSpawner {
         child_id: child_id.to_owned(),
+        inheritance: None,
         session_id: session_id.to_owned(),
         surface_completion: true,
     }
 }
 
-fn nested_graph() -> SpawnGraph {
+fn nested_graph() -> SpawnGraph<()> {
     let mut graph = SpawnGraph::default();
     graph.insert_root_child("c", "r");
     graph
@@ -19,7 +20,7 @@ fn nested_graph() -> SpawnGraph {
 
 #[test]
 fn direct_child_reachable_from_root_only() {
-    let mut graph = SpawnGraph::default();
+    let mut graph = SpawnGraph::<()>::default();
     graph.insert_root_child("c", "r");
     assert!(graph.is_reachable_from("c", "r"));
     assert!(!graph.is_reachable_from("c", "c"));
@@ -64,7 +65,7 @@ fn drop_advertise_keeps_lineage() {
 
 #[test]
 fn missing_node_is_unreachable() {
-    let graph = SpawnGraph::default();
+    let graph = SpawnGraph::<()>::default();
     assert!(!graph.is_reachable_from("nope", "r"));
     assert_eq!(graph.direct_spawner("nope"), None);
     assert_eq!(graph.advertise_target("nope"), None);
@@ -109,4 +110,34 @@ fn surface_target_reflects_ingress_flag() {
     assert_eq!(graph.surface_target("quiet"), None);
     assert_eq!(graph.surface_target("direct"), None);
     assert_eq!(graph.surface_target("missing"), None);
+}
+
+#[test]
+fn inheritance_retained_until_own_record_eviction_not_spawner_eviction() {
+    let mut graph = SpawnGraph::default();
+    graph.insert_root_child("spawner", "root-C");
+    let mount = std::sync::Arc::new("mount-A");
+    let weak = std::sync::Arc::downgrade(&mount);
+    graph
+        .insert_nested(
+            "nested",
+            "root-C",
+            NestedSpawner {
+                child_id: "spawner".into(),
+                session_id: "spawner-A".into(),
+                surface_completion: false,
+                inheritance: Some(mount),
+            },
+        )
+        .unwrap();
+    graph.remove("spawner");
+    graph.drop_advertise("nested");
+    assert_eq!(graph.root_session("nested"), Some("root-C"));
+    assert_eq!(
+        graph.inheritance("nested").map(|value| **value),
+        Some("mount-A")
+    );
+    assert!(weak.upgrade().is_some());
+    graph.remove("nested");
+    assert!(weak.upgrade().is_none());
 }

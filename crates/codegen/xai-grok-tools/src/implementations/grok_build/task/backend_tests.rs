@@ -37,6 +37,7 @@ struct BackendWithoutActiveMessages;
 struct BackendTestControl;
 
 impl super::super::coordinator::ChildControl for BackendTestControl {
+    type Inheritance = ();
     type ProgressFuture = std::future::Ready<Option<super::super::coordinator::SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {

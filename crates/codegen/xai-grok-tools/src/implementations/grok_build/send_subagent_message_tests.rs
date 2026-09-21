@@ -28,6 +28,7 @@ struct ToolTestControl {
 }
 
 impl ChildControl for ToolTestControl {
+    type Inheritance = ();
     type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
 
     fn progress(&self) -> Self::ProgressFuture {
