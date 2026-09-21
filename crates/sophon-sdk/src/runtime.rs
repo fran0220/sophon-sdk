@@ -274,7 +274,7 @@ impl Agent {
     }
 
     /// Subscribes to the one causally ordered stream of typed management and
-    /// raw Session/extension events. A lag error means this event history is
+    /// Session events. A lag error means this event history is
     /// incomplete and cannot be repaired from a current management snapshot.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
