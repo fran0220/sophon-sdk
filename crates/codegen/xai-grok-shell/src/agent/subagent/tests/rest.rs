@@ -2133,6 +2133,28 @@ fn ctx_with_parent_chat_state(
     ctx
 }
 #[tokio::test]
+async fn read_parent_sampling_config_pins_mounted_dispatch_despite_later_parent_route() {
+    let mut ctx = ctx_with_parent_chat_state("parent-B", "wire-B", "global", Default::default());
+    let mut sampling = ctx.sampling_config.clone();
+    sampling.model = "wire-A".into();
+    sampling.base_url = "https://mounted.invalid/responses".into();
+    sampling.api_key = Some("test-mount-A".into());
+    ctx.parent_mount = Some(Arc::new(crate::session::config_candidate::MountedConfig {
+        candidate: serde_json::from_value(serde_json::json!({
+            "instructions":"A", "skillDirectories":[], "externalMcpServers":[],
+            "model":"parent-A", "subjectOptions":{}, "subagentBriefs":[], "revision":"A"
+        })).unwrap(),
+        config: Default::default(), sampling, mcp_servers: vec![],
+    }));
+    let (inherited, model) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model.0.as_ref(), "parent-A");
+    assert_eq!(inherited.model, "wire-A");
+    assert_eq!(inherited.base_url, "https://mounted.invalid/responses");
+    assert_eq!(inherited.api_key.as_deref(), Some("test-mount-A"));
+    assert_eq!(ctx.parent_chat_state.as_ref().unwrap().get_sampling_config().await.unwrap().model, "wire-B");
+}
+
+#[tokio::test]
 async fn read_parent_sampling_config_keeps_catalog_threshold_when_routing_slug_is_also_key() {
     let mut models = indexmap::IndexMap::new();
     let mut entry = test_model_entry("grok-4.5");

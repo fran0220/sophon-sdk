@@ -482,6 +482,8 @@ pub struct SubagentParentSnapshot {
     pub(crate) tool_definitions: Vec<xai_grok_sampling_types::ToolSpec>,
     pub(crate) mcp_pool: Option<super::mcp_servers::SharedMcpPool>,
     pub(crate) client_hooks: crate::extensions::hooks::ClientHooks,
+    pub(crate) plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    pub(crate) hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     pub(crate) skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
 }
 

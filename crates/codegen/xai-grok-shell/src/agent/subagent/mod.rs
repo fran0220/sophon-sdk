@@ -284,6 +284,8 @@ pub(crate) struct SubagentSpawnContext {
     /// Parent session's ChatStateHandle, used to read the actual live sampling config and credentials from the parent session actor (async).
     /// Cheap Clone (mpsc sender). `None` when the parent SessionHandle is not found.
     pub parent_chat_state: Option<xai_chat_state::ChatStateHandle>,
+    /// Captured at the parent actor boundary; later parent mounts cannot retarget this dispatch.
+    pub parent_mount: Option<Arc<crate::session::config_candidate::MountedConfig>>,
     /// Parent session's resolved turn limit, for subagent inheritance.
     pub parent_max_turns: Option<usize>,
     /// All available models for resolving model IDs from overrides.
@@ -749,6 +751,9 @@ fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> a
 async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    if let Some(mounted) = &ctx.parent_mount {
+        return (mounted.sampling.clone(), acp::ModelId::new(mounted.candidate.model.clone()));
+    }
     if let Some(ref chat_state) = ctx.parent_chat_state {
         if let Some(cfg) = chat_state.get_sampling_config().await {
             let creds = chat_state.get_credentials().await;

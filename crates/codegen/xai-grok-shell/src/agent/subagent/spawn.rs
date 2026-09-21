@@ -162,6 +162,8 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 };
                 ctx.parent_mcp_pool = snapshot.mcp_pool;
                 ctx.client_hooks = snapshot.client_hooks;
+                ctx.plugin_registry = snapshot.plugin_registry;
+                ctx.hook_registry = snapshot.hook_registry;
                 ctx.parent_tool_definitions = (!snapshot.tool_definitions.is_empty()).then_some(snapshot.tool_definitions);
                 ctx.parent_skills = snapshot.skills;
                 if let Some(mounted) = snapshot.mounted {
@@ -170,6 +172,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     ctx.parent_skills_config = mounted.config.skills.clone();
                     ctx.parent_mcp_configs = mounted.mcp_servers.clone();
                     ctx.sampling_config = mounted.sampling.clone();
+                    ctx.parent_mount = Some(mounted);
                 }
                 if run.request.runtime_overrides.originating_prompt.is_none() {
                     run.request.runtime_overrides.originating_prompt =

@@ -46,6 +46,8 @@ impl SessionActor {
                 Some(crate::session::mcp_servers::SharedMcpPool::from_state(&mcp))
             },
             client_hooks: self.client_hooks.borrow().clone(),
+            plugin_registry: self.plugin_registry.borrow().clone(),
+            hook_registry: self.hook_registry.borrow().clone(),
             skills,
         }
     }

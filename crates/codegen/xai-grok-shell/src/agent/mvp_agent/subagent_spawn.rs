@@ -447,6 +447,7 @@ impl MvpAgent {
                 cwd: h.info.cwd.clone(),
             }),
             parent_chat_state,
+            parent_mount: None,
             parent_max_turns,
             available_models,
             subagent_model_overrides,
