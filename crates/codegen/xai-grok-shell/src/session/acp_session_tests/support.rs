@@ -158,6 +158,7 @@ async fn test_agent_from_config(
         owner_session_id: None,
         subagent: None,
         parent_scheduler_handle: None,
+        require_config_candidate: false,
         admission: None,
         skills: vec![],
         state_path: std::path::PathBuf::from("/tmp/tool_state.json"),

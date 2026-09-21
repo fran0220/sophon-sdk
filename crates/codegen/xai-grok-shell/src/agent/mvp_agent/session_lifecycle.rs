@@ -102,7 +102,7 @@ impl MvpAgent {
                     .closing
                     .borrow_mut()
                     .insert(id.clone(), response.clone());
-                handle.candidate_admission.cancel();
+                handle.candidate_admission.close();
                 handle
                     .cmd_tx
                     .send(SessionCommand::CloseChecked { completion })

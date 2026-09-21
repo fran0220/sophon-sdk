@@ -156,6 +156,7 @@ pub(crate) struct AgentRebuildSpec {
         Option<xai_grok_tools::types::resources::ManagedGatewayToolClient>,
     pub is_non_interactive: bool,
     pub owner_session_id: Option<String>,
+    pub require_config_candidate: bool,
     pub parent_scheduler_handle:
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
     pub admission: xai_grok_tools::management::admission::AdmissionController,
@@ -259,6 +260,7 @@ impl AgentRebuildSpec {
             managed_gateway_tool_client,
             is_non_interactive,
             owner_session_id,
+            require_config_candidate,
             parent_scheduler_handle,
             admission,
         } = self.as_ref();
@@ -308,6 +310,7 @@ impl AgentRebuildSpec {
         .with_system_prompt_label(system_prompt_label)
         .with_session_env(session_env.clone())
         .with_state_path(bridge_state_path.clone())
+        .with_required_config_candidate(*require_config_candidate)
         .with_web_search_config(web_search_config.clone())
         .with_backend_search(*backend_search)
         .with_image_gen_config(image_gen_config.clone())
@@ -535,6 +538,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         managed_gateway_tool_client: None,
         is_non_interactive: false,
         owner_session_id: Some("test-session".to_string()),
+        require_config_candidate: false,
         parent_scheduler_handle: None,
         admission: Default::default(),
     })

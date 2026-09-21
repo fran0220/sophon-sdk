@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_CANDIDATE_META_KEY: &str = "x.sophon/configCandidate";
 
+pub(crate) fn required_from_meta(
+    meta: Option<&agent_client_protocol::Meta>,
+) -> Result<bool, agent_client_protocol::Error> {
+    match meta.and_then(|meta| meta.get("x.ai/requireConfigCandidate")) {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(required)) => Ok(*required),
+        Some(_) => Err(agent_client_protocol::Error::invalid_params()
+            .data("x.ai/requireConfigCandidate must be a boolean")),
+    }
+}
+
 pub(crate) fn wrap_prompt(
     prompt: super::SessionCommand,
     candidate: Option<(u64, serde_json::Value)>,
@@ -53,6 +64,11 @@ pub(crate) struct CandidateAdmission {
 #[derive(Default)]
 struct CandidateAdmissionState {
     generation: u64,
+    required: bool,
+    closed: bool,
+    scheduler_activation: Option<
+        xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate,
+    >,
     preparing: Option<tokio_util::sync::CancellationToken>,
     mounted: Option<std::sync::Arc<MountedConfig>>,
     plugin_revision: u64,
@@ -67,6 +83,48 @@ pub(crate) struct MountedConfig {
 }
 
 impl CandidateAdmission {
+    pub(crate) fn new(
+        required: bool,
+        scheduler_activation: Option<
+            xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate,
+        >,
+    ) -> Self {
+        Self {
+            state: std::sync::Arc::new(parking_lot::Mutex::new(CandidateAdmissionState {
+                required,
+                scheduler_activation,
+                ..Default::default()
+            })),
+        }
+    }
+
+    pub(crate) fn required(&self) -> bool {
+        self.state.lock().required
+    }
+
+    pub(crate) fn activate_scheduler(&self) {
+        let state = self.state.lock();
+        if !state.closed && state.mounted.is_some()
+            && let Some(gate) = &state.scheduler_activation
+        {
+            gate.activate();
+        }
+    }
+
+    /// Permanent process-local fence. A retry may drain/flush again but cannot
+    /// admit a candidate or reopen this scheduler. Reopen builds a fresh latch.
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.generation += 1;
+        if let Some(token) = state.preparing.take() {
+            token.cancel();
+        }
+        if let Some(gate) = &state.scheduler_activation {
+            gate.close();
+        }
+    }
+
     pub(crate) fn mounted(&self) -> Option<std::sync::Arc<MountedConfig>> {
         self.state.lock().mounted.clone()
     }
@@ -117,7 +175,7 @@ impl CandidateAdmission {
         commit: impl FnOnce() -> bool,
     ) -> bool {
         let mut state = self.state.lock();
-        if cancelled.is_cancelled() || state.plugin_revision != plugin_revision || !commit() {
+        if state.closed || cancelled.is_cancelled() || state.plugin_revision != plugin_revision || !commit() {
             return false;
         }
         state.pending_plugins = None;
@@ -131,7 +189,7 @@ impl CandidateAdmission {
 
     pub(crate) fn begin(&self, generation: u64) -> Option<tokio_util::sync::CancellationToken> {
         let mut state = self.state.lock();
-        if state.generation != generation {
+        if state.closed || state.generation != generation {
             return None;
         }
         let token = tokio_util::sync::CancellationToken::new();
@@ -152,5 +210,41 @@ impl CandidateAdmission {
         if state.generation == generation {
             state.preparing = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_candidate_metadata_is_explicit_and_typed() {
+        assert!(!required_from_meta(None).unwrap());
+        for required in [false, true] {
+            let meta = serde_json::json!({"x.ai/requireConfigCandidate":required});
+            assert_eq!(required_from_meta(meta.as_object()).unwrap(), required);
+        }
+        for invalid in [serde_json::Value::Null, serde_json::json!("true"), serde_json::json!(1)] {
+            let meta = serde_json::json!({"x.ai/requireConfigCandidate":invalid});
+            assert!(required_from_meta(meta.as_object()).is_err());
+        }
+    }
+
+    #[test]
+    fn candidate_close_is_terminal_across_clones_and_finish() {
+        use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate;
+        let gate = SchedulerActivationGate::blocked();
+        let admission = CandidateAdmission::new(true, Some(gate.clone()));
+        let ticket = admission.generation();
+        let token = admission.begin(ticket).unwrap();
+        admission.activate_scheduler();
+        assert!(!gate.is_active());
+        admission.clone().close();
+        assert!(token.is_cancelled());
+        admission.finish(ticket);
+        admission.cancel();
+        assert!(admission.begin(admission.generation()).is_none());
+        gate.activate();
+        assert!(!gate.is_active());
     }
 }

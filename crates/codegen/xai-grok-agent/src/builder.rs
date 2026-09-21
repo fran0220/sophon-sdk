@@ -32,6 +32,7 @@ pub struct AgentBuilder {
     fs_backend: Arc<dyn AsyncFileSystem>,
     notification_handle: ToolNotificationHandle,
     owner_session_id: Option<String>,
+    require_config_candidate: bool,
     parent_scheduler_handle:
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
     admission: Option<xai_grok_tools::management::admission::AdmissionController>,
@@ -172,6 +173,7 @@ impl AgentBuilder {
             fs_backend: Arc::new(xai_grok_tools::computer::local::LocalFs),
             notification_handle,
             owner_session_id: None,
+            require_config_candidate: false,
             parent_scheduler_handle: None,
             admission: None,
             definition: None,
@@ -381,6 +383,11 @@ impl AgentBuilder {
     /// Set the session ID that owns processes spawned by this session's tools.
     pub fn with_owner_session_id(mut self, id: String) -> Self {
         self.owner_session_id = Some(id);
+        self
+    }
+    /// Hold recovered scheduler work until the session publishes its first mount.
+    pub fn with_required_config_candidate(mut self, required: bool) -> Self {
+        self.require_config_candidate = required;
         self
     }
     /// Share the parent's scheduler handle so scheduled tasks survive subagent exit.
@@ -1130,6 +1137,7 @@ impl AgentBuilder {
                 owner_session_id: self.owner_session_id.clone(),
                 subagent: None,
                 parent_scheduler_handle: self.parent_scheduler_handle.take(),
+                require_config_candidate: self.require_config_candidate,
                 admission: self.admission.take(),
                 skills: skill_info.clone(),
                 state_path,

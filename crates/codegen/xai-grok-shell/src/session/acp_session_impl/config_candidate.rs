@@ -59,7 +59,20 @@ impl SessionActor {
         &self,
         command: SessionCommand,
     ) -> Option<SessionCommand> {
-        if self.candidate_admission.mounted().is_some() {
+        let mounted = self.candidate_admission.mounted().is_some();
+        if self.candidate_admission.required() && !mounted {
+            match command {
+                SessionCommand::Prompt { respond_to, .. } => {
+                    let _ = respond_to.send(Err(candidate_error("session requires a configuration candidate before execution")));
+                    return None;
+                }
+                // Dropping the reply rejects child admission at its existing
+                // snapshot boundary, rather than supplying an unmounted parent.
+                SessionCommand::SnapshotSubagentParent { .. } => return None,
+                _ => {}
+            }
+        }
+        if mounted || self.candidate_admission.required() {
             let error =
                 || candidate_error("mounted configuration must be replaced by a prompt candidate");
             match command {
@@ -78,8 +91,9 @@ impl SessionActor {
                     let _ = respond_to.send(Err(error()));
                     return None;
                 }
-                SessionCommand::OverrideModelName { .. } => {
-                    tracing::warn!("ignored standalone model override for mounted session");
+                SessionCommand::OverrideModelName { .. }
+                | SessionCommand::ReplaceSystemPrompt { .. } => {
+                    tracing::warn!("ignored standalone configuration override for mounted session");
                     return None;
                 }
                 _ => {}
@@ -533,6 +547,9 @@ impl SessionActor {
         self.apply_skill_update_effects(skill_effects).await;
         let version = self.tool_context.config_clock.bump();
         self.broadcast_effective_config_changed(version);
+        // Publication, actor-local hook/skill adoption and config-clock advance
+        // have all completed. Close serializes with this activation and is terminal.
+        self.candidate_admission.activate_scheduler();
         Ok(permit)
     }
 }
@@ -564,12 +581,181 @@ mod tests {
         ))
     }
 
+    fn candidate_prompt(
+        id: &str,
+        candidate: serde_json::Value,
+        generation: u64,
+    ) -> (
+        SessionCommand,
+        tokio::sync::oneshot::Receiver<crate::session::PromptTurnResult>,
+    ) {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        let prompt = SessionCommand::Prompt {
+            prompt_id: id.into(),
+            prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(id))],
+            prompt_mode: Default::default(),
+            artifact_upload_ctx: None,
+            client_identifier: None,
+            screen_mode: None,
+            verbatim: false,
+            traceparent: None,
+            json_schema: None,
+            send_now: false,
+            admission: None,
+            agent_admission: None,
+            tool_overrides_update: None,
+            respond_to,
+            prompt_admitted: None,
+            persist_ack: None,
+            parsed_prompt_tx: None,
+        };
+        (
+            SessionCommand::PromptCandidate {
+                candidate,
+                generation,
+                prompt: Box::new(prompt),
+            },
+            response,
+        )
+    }
+
+    // Allocate the real loop separately so its large construction temporary is
+    // not retained in the fixture's async state machine.
+    fn spawn_fifo_loop(
+        actor: Arc<SessionActor>,
+        commands: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+        chat: tokio::sync::mpsc::UnboundedReceiver<xai_chat_state::ChatStateEvent>,
+        events: tokio::sync::mpsc::UnboundedReceiver<crate::session::replay_events::SessionEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn_local(super::super::run_session(
+            actor,
+            commands,
+            chat,
+            events,
+            None,
+            Arc::new(parking_lot::Mutex::new(
+                xai_grok_workspace::file_system::CodebaseIndexManager::new(),
+            )),
+            std::path::PathBuf::from("/tmp"),
+            crate::session::fs_watch::FsWatchCapabilities::none(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn native_fifo_mount_keeps_queued_route_and_skills_then_switches_idle_protocol() {
+        tokio::task::LocalSet::new().run_until(Box::pin(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let server = xai_grok_test_support::MockInferenceServer::start().await.unwrap();
+                server.set_response("done");
+                server.hold_agent_completions();
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = gateway_rx.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+                let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel::<crate::session::persistence::PersistenceMsg>();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = persistence_rx.recv().await {
+                        if let crate::session::persistence::PersistenceMsg::FlushAndAck { respond_to }
+                        | crate::session::persistence::PersistenceMsg::FlushForExit { respond_to } = message {
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
+                let (mut actor, events) = crate::session::acp_session::support::create_test_actor_ex(
+                    0, 256_000, 85, gateway_tx, persistence_tx,
+                ).await;
+                let (sampler_tx, mut sampler_rx) = tokio::sync::mpsc::unbounded_channel();
+                actor.sampler_handle = xai_grok_sampler::SamplerActor::spawn(Default::default(), Default::default(), sampler_tx);
+                for (key, wire, backend) in [
+                    ("route-a", "wire-A", xai_grok_sampling_types::ApiBackend::Responses),
+                    ("route-c", "wire-C", xai_grok_sampling_types::ApiBackend::ChatCompletions),
+                ] {
+                    let mut entry = crate::agent::config::ModelEntry::fallback(wire, &Default::default());
+                    entry.info.agent_type = actor.agent.borrow().definition().name.clone();
+                    entry.info.base_url = server.url();
+                    entry.info.api_backend = backend;
+                    entry.info.max_retries = Some(0);
+                    entry.api_key = Some("test-fifo-key".into());
+                    actor.models_manager.insert_test_entry(key, entry);
+                }
+                let actor = Arc::new(actor);
+                let sampler_actor = actor.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(event) = sampler_rx.recv().await { sampler_actor.handle_sampling_event(event).await; }
+                });
+                let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (_chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
+                let run = spawn_fifo_loop(actor.clone(), cmd_rx, chat_rx, events);
+                let skills = tempfile::tempdir().unwrap();
+                let skill_path = skills.path().join("SKILL.md");
+                std::fs::write(&skill_path, "---\nname: frozen\ndescription: frozen skill\n---\nSKILL_A").unwrap();
+                let candidate = serde_json::json!({
+                    "instructions":"INSTRUCTIONS_A", "skillDirectories":[skills.path()],
+                    "externalMcpServers":[], "model":"route-a", "subjectOptions":{}, "subagentBriefs":[], "revision":"A"
+                });
+                let (a, response_a) = candidate_prompt("prompt-A", candidate.clone(), actor.candidate_admission.generation());
+                cmd_tx.send(a).unwrap();
+                while server.request_count() == 0 { tokio::task::yield_now().await; }
+                // A busy candidate is ignored, not decoded or partially applied.
+                let (b, response_b) = candidate_prompt("prompt-B", serde_json::json!({"invalid":true}), actor.candidate_admission.generation());
+                cmd_tx.send(b).unwrap();
+                cmd_tx.send(SessionCommand::ReplaceSystemPrompt { system_prompt: "MUST_NOT_INSTALL".into() }).unwrap();
+                let (responds_to, barrier) = tokio::sync::oneshot::channel();
+                cmd_tx.send(SessionCommand::GetCurrentModel { responds_to }).unwrap();
+                barrier.await.unwrap();
+                assert_eq!(actor.candidate_admission.mounted().unwrap().candidate.revision, "A");
+                assert_eq!(actor.tool_context.admission.snapshot().accepted, 2);
+                std::fs::write(&skill_path, "---\nname: frozen\ndescription: changed skill\n---\nSKILL_C").unwrap();
+                actor.reload_skills_from_disk().await;
+                let old = actor.snapshot_subagent_parent().await;
+                assert_eq!(old.skills.unwrap().iter().find(|skill| skill.name == "frozen").unwrap().body.as_deref(), Some("SKILL_A"));
+                server.release_agent_completions();
+                response_a.await.unwrap().unwrap();
+                response_b.await.unwrap().unwrap();
+                loop {
+                    let state = actor.state.lock().await;
+                    if state.running_task.is_none() && state.pending_inputs.is_empty() { break; }
+                    drop(state);
+                    tokio::task::yield_now().await;
+                }
+                let mut next = candidate;
+                next["model"] = serde_json::json!("route-c");
+                next["instructions"] = serde_json::json!("INSTRUCTIONS_C");
+                next["revision"] = serde_json::json!("C");
+                let (c, response_c) = candidate_prompt("prompt-C", next, actor.candidate_admission.generation());
+                cmd_tx.send(c).unwrap();
+                response_c.await.unwrap().unwrap();
+                let requests = server.requests();
+                let inference: Vec<_> = requests.iter().filter(|request| request.path == "/v1/responses" || request.path == "/v1/chat/completions").collect();
+                assert_eq!(inference.len(), 3);
+                assert_eq!(inference.iter().map(|request| request.body.as_ref().unwrap()["model"].as_str().unwrap()).collect::<Vec<_>>(), vec!["wire-A", "wire-A", "wire-C"]);
+                assert_eq!(inference.iter().map(|request| request.path.as_str()).collect::<Vec<_>>(), vec!["/v1/responses", "/v1/responses", "/v1/chat/completions"]);
+                assert!(inference[1].body.as_ref().unwrap().to_string().contains("INSTRUCTIONS_A"));
+                assert!(!inference[1].body.as_ref().unwrap().to_string().contains("MUST_NOT_INSTALL"));
+                assert!(inference[2].body.as_ref().unwrap().to_string().contains("INSTRUCTIONS_C"));
+                let current = actor.snapshot_subagent_parent().await;
+                assert_eq!(current.skills.unwrap().iter().find(|skill| skill.name == "frozen").unwrap().body.as_deref(), Some("SKILL_C"));
+                let (respond_to, shutdown) = tokio::sync::oneshot::channel();
+                cmd_tx.send(SessionCommand::ShutdownChecked { respond_to }).unwrap();
+                shutdown.await.unwrap().unwrap();
+                run.await.unwrap();
+            }).await.expect("native FIFO mount test timed out");
+        })).await;
+    }
+
     #[tokio::test]
     async fn native_candidate_mount_failure_and_cancel_preserve_complete_old_snapshot() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let actor =
+                let mut actor =
                     crate::session::acp_session::support::actor_with_persistence_drain().await;
+                let activation = xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate::blocked();
+                Arc::get_mut(&mut actor).unwrap().candidate_admission =
+                    crate::session::config_candidate::CandidateAdmission::new(true, Some(activation.clone()));
                 let mut model = crate::agent::config::ModelEntry::fallback(
                     "candidate-wire",
                     &crate::agent::config::EndpointsConfig::default(),
@@ -587,11 +773,24 @@ mod tests {
                     "model":"candidate", "subjectOptions":{}, "subagentBriefs":[], "revision":"A",
                 });
                 let toolset = actor.agent.borrow().tool_bridge().toolset();
+                let cancelled = tokio_util::sync::CancellationToken::new();
+                cancelled.cancel();
+                assert!(actor.mount_candidate(candidate.clone(), cancelled).await.is_err());
+                assert!(!activation.is_active());
+                let (command, response) = candidate_prompt("unmounted", candidate.clone(), 0);
+                let SessionCommand::PromptCandidate { prompt, .. } = command else { unreachable!() };
+                assert!(actor.admit_candidate_command(*prompt).await.is_none());
+                assert!(response.await.unwrap().is_err());
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                assert!(actor.admit_candidate_command(SessionCommand::SnapshotSubagentParent { respond_to }).await.is_none());
+                assert!(response.await.is_err());
+                assert_eq!(actor.tool_context.admission.snapshot().accepted, 0);
                 let permit = actor
                     .mount_candidate(candidate.clone(), Default::default())
                     .await
                     .unwrap();
                 drop(permit);
+                assert!(activation.is_active());
                 let before = actor.chat_state_handle.snapshot().await.unwrap();
                 assert_eq!(before.sampling_config.model, "candidate-wire");
                 assert!(actor.tool_metadata_snapshot.lock().unwrap().mcp_initialized);
@@ -695,6 +894,16 @@ mod tests {
                 let inherited_skills = inherited.skills.unwrap();
                 assert!(inherited_skills.iter().any(|skill| skill.name == "mounted-skill-a"));
                 assert!(!inherited_skills.iter().any(|skill| skill.name == "mounted-skill-b"));
+                actor.candidate_admission.close();
+                assert!(!activation.is_active());
+                let closed_snapshot = actor.chat_state_handle.snapshot().await.unwrap();
+                assert!(actor.mount_candidate(serde_json::json!({
+                    "instructions":"closed", "skillDirectories":[], "externalMcpServers":[],
+                    "model":"candidate", "subjectOptions":{}, "subagentBriefs":[], "revision":"closed"
+                }), Default::default()).await.is_err());
+                activation.activate();
+                assert!(!activation.is_active());
+                assert_eq!(serde_json::to_value(actor.chat_state_handle.snapshot().await.unwrap()).unwrap(), serde_json::to_value(closed_snapshot).unwrap());
             })
             .await;
     }

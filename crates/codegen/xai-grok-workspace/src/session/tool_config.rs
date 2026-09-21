@@ -447,6 +447,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
             owner_session_id: Some(session_id.to_string()),
             subagent: None,
             parent_scheduler_handle: None,
+            require_config_candidate: false,
             admission: None,
             skills: vec![],
             state_path: self.resolve_state_path(session_id),
@@ -578,6 +579,7 @@ pub mod test_support {
                 owner_session_id: None,
                 subagent: None,
                 parent_scheduler_handle: None,
+                require_config_candidate: false,
                 admission: None,
                 skills: vec![],
                 state_path: if self.tool_state {

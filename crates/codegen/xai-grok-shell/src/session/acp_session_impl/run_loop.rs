@@ -2831,6 +2831,7 @@ pub(super) async fn run_session(
                                 SessionCommand::ShutdownChecked { respond_to } => (crate::session::ShutdownKind::Graceful, Some(respond_to), None),
                                 SessionCommand::CloseChecked { completion } => {
                                     closing = true;
+                                    session.candidate_admission.close();
                                     (crate::session::ShutdownKind::CancelRunningTurn, None, Some(completion))
                                 }
                                 _ => unreachable!(),

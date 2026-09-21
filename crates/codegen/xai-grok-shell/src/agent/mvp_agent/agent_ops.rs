@@ -4341,6 +4341,7 @@ impl MvpAgent {
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
+        let require_config_candidate = crate::session::config_candidate::required_from_meta(session_meta)?;
         let spawn_remote_settings = self.cfg.borrow().remote_settings.clone();
         let mut prefetch = match prefetch {
             Some(prefetch) => prefetch,
@@ -4426,7 +4427,8 @@ impl MvpAgent {
             );
             std::sync::Arc::new(TerminalRunner::new(notifier, session_info.id.clone()))
         };
-        let startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
+        let mut startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
+        startup_hints.require_config_candidate = require_config_candidate;
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities

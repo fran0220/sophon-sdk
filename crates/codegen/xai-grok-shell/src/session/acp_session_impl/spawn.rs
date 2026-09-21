@@ -1187,6 +1187,9 @@ pub(crate) async fn spawn_session_actor(
         managed_gateway_tool_client: managed_gateway_tool_client.clone(),
         is_non_interactive: startup_hints.non_interactive,
         owner_session_id: Some(session_info.id.0.to_string()),
+        // Children execute a captured valid parent snapshot; no host mounts a
+        // separate child. Their scheduler handle is the parent's authority.
+        require_config_candidate: startup_hints.require_config_candidate && !startup_hints.is_subagent,
         parent_scheduler_handle: if startup_hints.is_subagent {
             parent_scheduler_handle
         } else {
@@ -1472,7 +1475,12 @@ pub(crate) async fn spawn_session_actor(
     .map(|p| p.to_string_lossy().to_string())
     .unwrap_or_else(|| session_info.cwd.clone());
     let current_prompt_id = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let candidate_admission = crate::session::config_candidate::CandidateAdmission::default();
+    let candidate_admission = crate::session::config_candidate::CandidateAdmission::new(
+        startup_hints.require_config_candidate && !startup_hints.is_subagent,
+        agent.tool_bridge().read_resource::<
+            xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate,
+        >().await,
+    );
     agent.tool_bridge().toolset().set_native_invocation_context(
         session_info.id.to_string(),
         current_prompt_id.clone(),

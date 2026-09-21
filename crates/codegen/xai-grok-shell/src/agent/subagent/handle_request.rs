@@ -254,7 +254,7 @@ async fn close_child_checked(
 ) {
     loop {
         let (completion, mut response) = tokio::sync::watch::channel(None);
-        child.candidate_admission.cancel();
+        child.candidate_admission.close();
         let closed = async {
             child
                 .cmd_tx

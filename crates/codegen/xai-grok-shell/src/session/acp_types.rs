@@ -657,6 +657,10 @@ pub struct FeedbackContext {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupHints {
+    /// Native create/load contract only; cannot be supplied through startupHints
+    /// or changed by a later attach-policy update.
+    #[serde(skip)]
+    pub require_config_candidate: bool,
     #[serde(default)]
     pub non_interactive: bool,
     #[serde(default)]

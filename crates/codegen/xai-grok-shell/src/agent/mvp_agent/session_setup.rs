@@ -972,6 +972,14 @@ impl MvpAgent {
             ..
         } = arguments;
         let policy = AttachPolicy::resolve(op, request_meta.as_ref(), self.restore_code);
+        let required = crate::session::config_candidate::required_from_meta(request_meta.as_ref())?;
+        if let Some(handle) = self.resident_handle(&session_id)
+            && handle.candidate_admission.required() != required
+        {
+            return Err(acp::Error::invalid_params().data(
+                "requireConfigCandidate cannot change on a resident session; close and reopen it",
+            ));
+        }
         let SessionWorkspace {
             cwd,
             remote_settings,
