@@ -758,7 +758,11 @@ pub(super) async fn run_session(
                         return;
                     };
 
+                    let Some(cmd) = session.admit_candidate_command(cmd).await else {
+                        continue;
+                    };
                     match cmd {
+                        SessionCommand::PromptCandidate { .. } => unreachable!("candidate admission unwraps prompts"),
                         SessionCommand::ManageWorkflow { action, respond_to } => {
                             let _ = respond_to.send(session.workflow_management(action).await);
                         }

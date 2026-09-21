@@ -140,6 +140,8 @@ mod queue_mutation;
 use queue_mutation::{InputOrigin, QueueMutationPolicy};
 #[path = "acp_session_impl/prompt_queue.rs"]
 mod prompt_queue;
+#[path = "acp_session_impl/config_candidate.rs"]
+mod config_candidate;
 pub(super) use prompt_queue::QueueInputRequest;
 #[cfg(test)]
 use tool_calls::BridgeToolSuccess;
@@ -777,6 +779,7 @@ pub(crate) struct SessionActor {
     pub(crate) chat_state_handle: xai_chat_state::ChatStateHandle,
     /// Current running prompt/turn id, shared with SessionHandle.
     pub(crate) current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) candidate_admission: super::config_candidate::CandidateAdmission,
     pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) unattributed_background_usage: std::sync::atomic::AtomicBool,
     /// Open blocking reverse-requests (permission / question / plan-approval), keyed by `tool_call_id`.

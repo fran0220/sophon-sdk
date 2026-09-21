@@ -1200,6 +1200,7 @@ fn make_test_handle(
         persistence_tx,
         registry_write_order: Default::default(),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        candidate_admission: Default::default(),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

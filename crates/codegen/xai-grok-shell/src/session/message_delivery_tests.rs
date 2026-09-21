@@ -6,6 +6,7 @@ fn human_unsupported_operation_rejects_without_command() {
     let handle = MessageDeliveryHandle::new(cmd_tx, "resident".to_owned());
     let (respond_to, _) = oneshot::channel();
     let content = HumanPromptContent {
+        config_candidate: None,
         prompt_blocks: vec![agent_client_protocol::ContentBlock::Text(
             agent_client_protocol::TextContent::new("hello"),
         )],

@@ -246,8 +246,10 @@ impl MvpAgent {
         let parent_sid = acp::SessionId::new(parent_session_id);
         let parent_handle = self.resident_handle(&parent_sid);
         let ps = parent_handle.as_ref();
-        let parent_model_id = ps
-            .map(|h| h.model_id.clone())
+        let mounted = ps.and_then(|handle| handle.candidate_admission.mounted());
+        let parent_model_id = mounted.as_ref()
+            .map(|mounted| acp::ModelId::new(mounted.candidate.model.clone()))
+            .or_else(|| ps.map(|h| h.model_id.clone()))
             .unwrap_or_else(|| self.models_manager.current_model_id());
         let parent_chat_state = ps.map(|h| h.chat_state_handle.clone());
         let parent_cmd_tx = ps.map(|h| h.cmd_tx.clone());
@@ -545,6 +547,14 @@ impl MvpAgent {
             parent_scheduler_handle: parent_scheduler_handle.clone(),
             subagent_sampling_semaphore: self.subagent_sampling_semaphore.clone(),
         };
+        if let Some(mounted) = mounted {
+            // The parent's admitted snapshot, not later global settings, owns
+            // fixed profile resolution and its inherited skills/model defaults.
+            ctx.agent_config = Some(mounted.config.clone());
+            ctx.parent_skills_config = mounted.config.skills.clone();
+            ctx.parent_mcp_configs = mounted.mcp_servers.clone();
+            ctx.sampling_config = mounted.sampling.clone();
+        }
         ctx.parent_compaction =
             crate::agent::subagent::SubagentSpawnContext::snapshot_parent_compaction_pins(
                 ctx.resolve_compaction_mode(),

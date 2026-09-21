@@ -128,6 +128,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
+                candidate_admission: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-idle-resume"),
                     cwd: cwd.as_str().to_string(),

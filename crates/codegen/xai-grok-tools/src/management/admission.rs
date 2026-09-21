@@ -159,6 +159,17 @@ impl AdmissionController {
         snapshot(&state)
     }
 
+    /// Wake provisional native admission when quiesce closes the shared fence.
+    pub async fn wait_until_closed(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            if self.snapshot().state != AdmissionState::Open {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Reserve an idle admission boundary without irreversibly quiescing.
     /// The guard must follow the operation to its actor, not its caller future.
     pub fn try_exclusive(&self) -> Option<ExclusiveAdmission> {

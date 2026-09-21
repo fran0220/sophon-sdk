@@ -603,7 +603,7 @@ impl SessionActor {
             .await;
     }
     /// A refresh that never publishes once `generation` is replaced.
-    async fn refresh_mcp_snapshot_for(&self, generation: &crate::session::mcp_servers::Generation) {
+    pub(super) async fn refresh_mcp_snapshot_for(&self, generation: &crate::session::mcp_servers::Generation) {
         let disabled_gateway_tools = crate::util::config::get_all_mcp_disabled_tools(
             std::path::Path::new(&self.session_info.cwd),
         );

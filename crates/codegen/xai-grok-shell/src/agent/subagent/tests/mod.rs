@@ -223,6 +223,7 @@ fn wedged_child_handle() -> (
         persistence_tx,
         registry_write_order: Default::default(),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        candidate_admission: Default::default(),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         info: SessionInfo {

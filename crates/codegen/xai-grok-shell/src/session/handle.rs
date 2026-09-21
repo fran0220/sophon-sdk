@@ -55,6 +55,7 @@ pub struct SessionHandle {
     pub(crate) persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
     /// Shared with the actor so external cancellation can target subagents launched by the active turn only.
     pub current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) candidate_admission: super::config_candidate::CandidateAdmission,
     /// Shared `Arc` with the actor (insert on issue, remove on resolve); never persisted.
     pub pending_interactions: crate::session::pending_interaction::PendingInteractions,
     pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,

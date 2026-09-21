@@ -512,6 +512,13 @@ pub enum SessionCommand {
     SetToolOverrides {
         overrides: xai_grok_sampling_types::ToolOverrides,
     },
+    /// Provisional prompt in the same native mailbox/FIFO. Only an idle actor
+    /// decodes/prepares the candidate; busy admission discards it entirely.
+    PromptCandidate {
+        candidate: serde_json::Value,
+        generation: u64,
+        prompt: Box<SessionCommand>,
+    },
     Prompt {
         prompt_id: String,
         prompt_blocks: Vec<acp::ContentBlock>,

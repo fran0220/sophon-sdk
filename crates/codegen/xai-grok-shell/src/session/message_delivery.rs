@@ -29,6 +29,7 @@ pub(crate) fn human_delivery_identity(prompt_id: String) -> HumanDeliveryIdentit
 }
 
 pub(crate) struct HumanPromptContent {
+    pub(crate) config_candidate: Option<(u64, serde_json::Value)>,
     pub(crate) prompt_blocks: Vec<agent_client_protocol::ContentBlock>,
     pub(crate) prompt_mode: crate::session::plan_mode::PromptMode,
     pub(crate) artifact_upload_ctx: Option<crate::upload::manifest::ArtifactUploadContext>,
@@ -45,7 +46,7 @@ pub(crate) struct HumanPromptContent {
 
 impl HumanPromptContent {
     fn into_command(self, prompt_id: String) -> SessionCommand {
-        SessionCommand::Prompt {
+        super::config_candidate::wrap_prompt(SessionCommand::Prompt {
             prompt_id,
             prompt_blocks: self.prompt_blocks,
             prompt_mode: self.prompt_mode,
@@ -63,7 +64,7 @@ impl HumanPromptContent {
             prompt_admitted: None,
             persist_ack: None,
             parsed_prompt_tx: self.parsed_prompt_tx,
-        }
+        }, self.config_candidate)
     }
 }
 

@@ -1472,6 +1472,7 @@ pub(crate) async fn spawn_session_actor(
     .map(|p| p.to_string_lossy().to_string())
     .unwrap_or_else(|| session_info.cwd.clone());
     let current_prompt_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let candidate_admission = crate::session::config_candidate::CandidateAdmission::default();
     agent.tool_bridge().toolset().set_native_invocation_context(
         session_info.id.to_string(),
         current_prompt_id.clone(),
@@ -1786,6 +1787,7 @@ pub(crate) async fn spawn_session_actor(
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: current_prompt_id.clone(),
+        candidate_admission: candidate_admission.clone(),
         active_work: active_work.clone(),
         pending_interactions: pending_interactions.clone(),
         telemetry_enabled,
@@ -2388,6 +2390,7 @@ pub(crate) async fn spawn_session_actor(
         cmd_tx,
         persistence_tx: persistence.tx.clone(),
         current_prompt_id,
+        candidate_admission,
         registry_write_order: Default::default(),
         pending_interactions,
         active_work: active_work.clone(),

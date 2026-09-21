@@ -90,6 +90,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
+                candidate_admission: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -633,6 +634,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
+                candidate_admission: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -977,6 +979,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
+                candidate_admission: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
                     cwd: cwd.as_str().to_string(),
@@ -2545,6 +2548,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
+                candidate_admission: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
                     cwd: cwd.as_str().to_string(),

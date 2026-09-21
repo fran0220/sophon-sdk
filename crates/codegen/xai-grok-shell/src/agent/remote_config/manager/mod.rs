@@ -1011,6 +1011,48 @@ impl ModelsManager {
             .store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn native_config_snapshot(&self) -> config::Config {
+        self.inner.cfg.read().clone()
+    }
+
+    /// Prepare an exact published route without modifying global/session model selection.
+    pub(crate) fn prepare_published_model(
+        &self,
+        model_id: &str,
+        effort: Option<&str>,
+    ) -> Result<(ModelEntry, SamplingConfig), acp::Error> {
+        let cfg = self.inner.cfg.read().clone();
+        let entry = self.models().get(model_id).cloned().ok_or_else(|| {
+            acp::Error::invalid_params().data("candidate model must be an exact configured published ID")
+        })?;
+        if let Some(reason) = self.task_model_error(model_id) {
+            return Err(acp::Error::invalid_params().data(reason));
+        }
+        let auth = self.inner.auth_manager.current_or_expired();
+        let credentials = config::resolve_credentials_enforced(
+            &entry,
+            auth.as_ref().map(|auth| auth.key.as_str()),
+            cfg.grok_com_config.api_key_auth_disabled(),
+        );
+        if credentials.api_key.is_none() {
+            return Err(acp::Error::invalid_params().data("candidate model credentials unavailable"));
+        }
+        let mut sampling = sampling_config_for_model(
+            &entry, credentials, cfg.endpoints.alpha_test_key.clone(), cfg.client_version.clone(),
+            crate::managed_config::resolve_deployment_id(cfg.endpoints.deployment_key.as_deref()), None,
+        );
+        if let Some(effort) = effort {
+            let effort: ReasoningEffort = serde_json::from_value(serde_json::Value::String(effort.to_owned()))
+                .map_err(|_| acp::Error::invalid_params().data("invalid candidate reasoning effort"))?;
+            if !self.model_supports_reasoning_effort_value(model_id, effort) {
+                return Err(acp::Error::invalid_params().data("candidate reasoning effort is unsupported by the configured model"));
+            }
+            sampling.reasoning_effort = Some(effort);
+            sampling.model = entry.info().model_at(effort).to_owned();
+        }
+        Ok((entry, sampling))
+    }
+
     /// Build a `SamplingConfig` from the current model and auth state.
     pub fn sampling_config(&self) -> SamplingConfig {
         let config = self.inner.cfg.read().clone();

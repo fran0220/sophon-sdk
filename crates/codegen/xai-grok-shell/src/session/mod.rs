@@ -3,6 +3,7 @@ pub mod announcement_state;
 pub(crate) mod auto_mode;
 pub mod commands;
 pub(crate) mod compaction_config;
+pub mod config_candidate;
 pub(crate) mod doom_loop_telemetry;
 pub(crate) mod fork_status;
 pub mod handle;

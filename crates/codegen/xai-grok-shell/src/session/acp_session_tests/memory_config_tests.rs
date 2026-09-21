@@ -149,6 +149,7 @@ pub(super) async fn create_test_actor_with_memory(
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
         status_wake: Default::default(),
+        candidate_admission: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
             cwd: cwd.as_str().to_string(),

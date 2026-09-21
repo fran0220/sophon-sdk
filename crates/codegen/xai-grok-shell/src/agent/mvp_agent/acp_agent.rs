@@ -1362,10 +1362,13 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .map(|ctx| ctx.artifact_upload_context());
         let traceparent = xai_grok_otel::current_traceparent();
+        let config_candidate = arguments.meta.as_ref()
+            .and_then(|meta| meta.get(crate::session::config_candidate::CONFIG_CANDIDATE_META_KEY))
+            .cloned().map(|candidate| (handle.candidate_admission.generation(), candidate));
         let dispatch_result: Result<(), acp::Error> = if send_now {
             handle
                 .cmd_tx
-                .send(SessionCommand::Prompt {
+                .send(crate::session::config_candidate::wrap_prompt(SessionCommand::Prompt {
                     prompt_id: prompt_id.clone(),
                     prompt_blocks,
                     prompt_mode,
@@ -1383,7 +1386,7 @@ impl acp::Agent for MvpAgent {
                     prompt_admitted: None,
                     persist_ack: None,
                     parsed_prompt_tx,
-                })
+                }, config_candidate))
                 .map_err(|e| {
                     acp::Error::internal_error()
                         .data(format!("failed to dispatch prompt to session: {e}"))
@@ -1392,6 +1395,7 @@ impl acp::Agent for MvpAgent {
             let envelope = xai_message_delivery_core::DeliveryEnvelope::from_human(
                 xai_message_delivery_core::Operation::Queue,
                 crate::session::message_delivery::HumanPromptContent {
+                    config_candidate,
                     prompt_blocks,
                     prompt_mode,
                     artifact_upload_ctx,
@@ -1919,6 +1923,7 @@ impl acp::Agent for MvpAgent {
             } else {
                 crate::session::CancelHistoryDisposition::Keep
             };
+            handle.candidate_admission.cancel();
             let dispatch_lock = self.dispatch_lock(&args.session_id);
             let _dispatch_guard = dispatch_lock.lock().await;
             let user_initiated = cancel_trigger

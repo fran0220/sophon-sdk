@@ -71,6 +71,7 @@ async fn create_test_actor(
         transient_episode_start: std::cell::Cell::new(None),
         status_wake: Default::default(),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        candidate_admission: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-auto-compact"),
             cwd: cwd.as_str().to_string(),
@@ -499,6 +500,7 @@ async fn create_test_actor_with_memory(
         transient_episode_start: std::cell::Cell::new(None),
         status_wake: Default::default(),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        candidate_admission: Default::default(),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-memory"),
             cwd: cwd.as_str().to_string(),
