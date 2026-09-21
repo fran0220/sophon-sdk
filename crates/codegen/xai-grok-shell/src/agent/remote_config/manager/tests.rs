@@ -142,6 +142,62 @@ impl ModelsEndpoint for CountingEndpoint {
     }
 }
 
+#[tokio::test]
+async fn registered_catalog_survives_auth_refresh_and_late_remote_publication() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("primary".into());
+    let mut primary = ModelEntry::fallback("main-wire", &cfg.endpoints);
+    primary.info.base_url = "https://primary.example/v1".into();
+    primary.api_key = Some("primary-fixture-key".into());
+    let mut refiner = ModelEntry::fallback("distill-wire", &cfg.endpoints);
+    refiner.info.base_url = "https://distillation.example/v1".into();
+    refiner.api_key = Some("refiner-fixture-key".into());
+    cfg.registered_models = Some(IndexMap::from([
+        ("primary".into(), primary),
+        ("distillation".into(), refiner),
+    ]));
+    let remote = IndexMap::from([(
+        "remote-only".into(),
+        ModelEntry::fallback("remote-wire", &cfg.endpoints),
+    )]);
+    let mut mgr = ModelsManager::from_config(&cfg, Some(remote.clone()), auth).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut mgr.inner).unwrap().endpoint = Arc::new(CountingEndpoint {
+        calls: calls.clone(),
+    });
+    let generation = mgr.inner.catalog.read().generation;
+
+    // An auth refresh followed by an already-captured remote result used to
+    // erase registered routes. Exercise both boundaries without sleeps.
+    mgr.on_auth_changed().await;
+    assert!(!mgr.apply_catalog_fenced(&cfg, remote, Some("remote-etag".into()), Some(generation)));
+    mgr.fetch_and_apply_inner(true).await;
+    mgr.spawn_fetch_inner(None, true);
+    let notifier = Arc::new(tokio::sync::Notify::new());
+    mgr.start_auth_refresh_watcher(notifier.clone());
+    notifier.notify_one();
+    tokio::task::yield_now().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(mgr.inner.catalog.read().generation, generation);
+    mgr.apply_config(config::Config::default());
+
+    let models = mgr.models();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models["primary"].info.model, "main-wire");
+    assert_eq!(
+        models["primary"].info.base_url,
+        "https://primary.example/v1"
+    );
+    assert_eq!(models["distillation"].info.model, "distill-wire");
+    assert_eq!(
+        models["distillation"].info.base_url,
+        "https://distillation.example/v1"
+    );
+    assert!(mgr.inner.cfg.read().registered_models.is_some());
+}
+
 struct SlowEndpoint {
     catalog: IndexMap<String, ModelEntry>,
     delay: std::time::Duration,

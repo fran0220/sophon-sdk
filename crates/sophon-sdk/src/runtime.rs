@@ -1743,7 +1743,7 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
         .video_gen
         .pin(video_generation, RequirementSource::Unknown);
 
-    let models = config
+    let models: IndexMap<String, ModelEntry> = config
         .models
         .iter()
         .map(|model| {
@@ -1789,6 +1789,7 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
             (model.id.clone(), entry)
         })
         .collect();
+    grok.registered_models = Some(models.clone());
     Ok((grok, models))
 }
 

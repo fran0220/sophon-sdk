@@ -265,13 +265,17 @@ impl ModelsManager {
             auth_manager.current_or_expired().as_ref(),
         );
         let mut cached_etag = None;
-        let prefetched_models = prefetched_models.or_else(|| {
-            let cache = ModelsCacheManager::new();
-            cache.load_fresh(&scope).map(|c| {
-                cached_etag = c.etag;
-                c.models
-            })
-        });
+        let prefetched_models = cfg
+            .registered_models
+            .clone()
+            .or(prefetched_models)
+            .or_else(|| {
+                let cache = ModelsCacheManager::new();
+                cache.load_fresh(&scope).map(|c| {
+                    cached_etag = c.etag;
+                    c.models
+                })
+            });
         let has_prefetched = prefetched_models.is_some();
         let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
 
@@ -315,7 +319,11 @@ impl ModelsManager {
     }
 
     /// Swap config, rebuild catalog, and reselect the model.
-    pub(crate) fn apply_config(&self, new_config: config::Config) {
+    pub(crate) fn apply_config(&self, mut new_config: config::Config) {
+        // A disk/config reload cannot remove in-process registration ownership.
+        if let Some(registered) = &self.inner.cfg.read().registered_models {
+            new_config.registered_models = Some(registered.clone());
+        }
         if let Err(e) = new_config.validate_model_filters() {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
@@ -713,6 +721,9 @@ impl ModelsManager {
     /// Auth identity changed: invalidate the disk cache and refresh the catalog.
     pub(crate) async fn on_auth_changed(&self) {
         let config = self.inner.cfg.read().clone();
+        if config.registered_models.is_some() {
+            return;
+        }
         crate::agent::init::update_telemetry_config(&config, &self.inner.auth_manager);
         self.inner.cache.invalidate();
         // Fetches and the etag from the previous identity are stale now.
@@ -803,6 +814,9 @@ impl ModelsManager {
     }
 
     fn reload_from_cache_manager(&self, cache: &ModelsCacheManager) {
+        if self.inner.cfg.read().registered_models.is_some() {
+            return;
+        }
         let Some(cached) = cache.load_fresh(&self.cache_scope()) else {
             tracing::debug!("models cache changed on disk but is not loadable; ignoring");
             return;
@@ -936,6 +950,9 @@ impl ModelsManager {
 
     /// Refresh the model catalog on every auth token refresh.
     pub fn start_auth_refresh_watcher(&self, notify: Arc<tokio::sync::Notify>) {
+        if self.inner.cfg.read().registered_models.is_some() {
+            return;
+        }
         let mgr = self.clone();
         let had_catalog_at_start = self.inner.catalog.read().has_fetched_real_catalog;
         xai_grok_telemetry::unified_log::info(
@@ -1132,6 +1149,9 @@ impl ModelsManager {
     }
 
     fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
+        if self.inner.cfg.read().registered_models.is_some() {
+            return;
+        }
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
@@ -1185,6 +1205,9 @@ impl ModelsManager {
     }
 
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
+        if self.inner.cfg.read().registered_models.is_some() {
+            return;
+        }
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
@@ -1249,6 +1272,9 @@ impl ModelsManager {
         new_etag: Option<String>,
         generation: Option<u64>,
     ) -> bool {
+        if self.inner.cfg.read().registered_models.is_some() {
+            return false;
+        }
         let (first_real_catalog, excludes_all) = {
             let mut cat = self.inner.catalog.write();
             if let Some(generation) = generation

@@ -1245,6 +1245,10 @@ pub struct Config {
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
+    /// In-process authoritative catalog. Unlike prefetched remote models, these
+    /// routes must not be replaced by auth refresh, disk discovery, or defaults.
+    #[serde(skip)]
+    pub registered_models: Option<IndexMap<String, ModelEntry>>,
     #[serde(skip)]
     pub config_warnings: Vec<super::config_model_override_parse::ConfigWarning>,
     pub grok_com_config: GrokComConfig,
@@ -1672,6 +1676,7 @@ impl Default for Config {
             prompt_suggestions: crate::util::config::PromptSuggestConfig::default(),
             feature_values: BTreeMap::new(),
             config_models: IndexMap::new(),
+            registered_models: None,
             config_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
             login_device_flow: None,
@@ -3374,6 +3379,9 @@ pub(crate) fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
+    if let Some(registered) = &cfg.registered_models {
+        return registered.clone();
+    }
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(

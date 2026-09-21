@@ -767,6 +767,31 @@ pub(crate) async fn run_shell_child(
     if request.fork_context {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
     }
+    let registered_catalog = ctx
+        .agent_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.registered_models.is_some());
+    let requested_model = effective_runtime
+        .model
+        .as_deref()
+        .or_else(|| {
+            ctx.subagent_model_overrides
+                .get(&request.subagent_type)
+                .map(String::as_str)
+        })
+        .or_else(|| match &definition.model {
+            ModelOverride::Override(id) => Some(id.as_str()),
+            _ => None,
+        });
+    if registered_catalog
+        && let Some(model) = requested_model
+        && (!ctx.available_models.contains_key(model)
+            || resolve_model_override_to_config(model, &ctx).is_none())
+    {
+        let error =
+            format!("Requested subagent model '{model}' is unavailable in the registered catalog");
+        return child_run_output(failure_result(&request, &error), completion_data, None);
+    }
     let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
         effective_runtime.model.as_deref(),
         &request.subagent_type,
@@ -785,6 +810,12 @@ pub(crate) async fn run_shell_child(
                 .values()
                 .any(|e| e.info().has_model_id(model_str));
         if model_unknown {
+            if registered_catalog {
+                let error = format!(
+                    "Resolved subagent model '{model_str}' is unavailable in the registered catalog"
+                );
+                return child_run_output(failure_result(&request, &error), completion_data, None);
+            }
             let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
             tracing::warn!(
                 subagent_id = %request.id,

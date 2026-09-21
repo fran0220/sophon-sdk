@@ -128,6 +128,13 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   assert.equal(refinement.model, 'distill-wire', JSON.stringify(requests.map(request => ({ model: request.model, tools: request.tools?.length ?? 0, baseline: JSON.stringify(request.messages).includes('BASELINE_REFINEMENT_73') }))))
   assert.match(JSON.stringify(refinement.messages), /EVIDENCE_29/)
   assert.equal(refinement.tools?.length ?? 0, 0)
+  const count = requests.length
+  for (const model of ['missing-route', 'distill-wire']) {
+    const refused = await session.subagents.start({ id: await session.subagents.newId(), prompt: 'Must not infer.', description: 'unpublished route', subagentType: 'refiner', cwd: null, model })
+    assert.equal(refused.state, 'failed')
+    assert.match(refused.error ?? refused.output, /registered catalog/)
+    assert.equal(requests.length, count, 'unpublished IDs and wire aliases must not fall back to primary')
+  }
   await agent.finalExit()
 })
 
@@ -140,7 +147,8 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     for await (const chunk of request) body += chunk
     const payload = JSON.parse(body)
     const answered = payload.messages?.some(message => message.role === 'tool' && JSON.stringify(message.content).includes('ANSWER_29'))
-    const ask = payload.tools?.some(tool => tool.function?.name === 'ask_user') && !answered
+    const isChild = JSON.stringify(payload.messages).includes('Ask the user then finish.')
+    const ask = isChild && payload.tools?.some(tool => tool.function?.name === 'ask_user') && !answered
     const delta = ask ? { role: 'assistant', tool_calls: [{ index: 0, id: 'question29', type: 'function', function: { name: 'ask_user', arguments: '{"question":"Choose 29?"}' } }] } : { role: 'assistant', content: 'CHILD_COMPLETE_73' }
     const chunk = (delta, finish_reason) => ({ id: 'child-fixture', object: 'chat.completion.chunk', created: 1, model: 'child-wire', choices: [{ index: 0, delta, finish_reason }] })
     response.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -149,7 +157,9 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
   config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'child-wire', headers: {}, queryParams: {} }
-  config.subagents.push({ name: 'task', description: 'Fixed task worker', instructions: 'Ask the user then finish.', model: 'runtime-test', tools: null })
+  for (const name of ['task', 'general-purpose']) {
+    config.subagents.push({ name, description: 'Fixed task worker', instructions: 'Ask the user then finish.', model: 'runtime-test', tools: null })
+  }
   let receive
   let nextQuestion = new Promise(resolve => { receive = resolve })
   const agent = await Agent.spawn({ executable, config, env, onCallback: request => new Promise(resolve => {
@@ -165,6 +175,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.notEqual(first.request.context.sessionId, session.id)
   assert.equal(first.request.context.cwd, childCwd)
   assert.equal(first.request.context.scheduledInvocation, null)
+  assert.equal(first.request.context.originatingPrompt, null, 'direct child before any parent prompt has no invented root')
   first.answer()
   assert.equal((await ordinary).state, 'completed')
   for (const cancel of [false, true]) {
@@ -172,7 +183,7 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     let fired
     const child = new Promise(resolve => { fired = resolve })
     const unsubscribe = session.subscribe(event => {
-      if (event.type === 'scheduler' && event.occurrence.type === 'fired') fired(event.occurrence.subagentId)
+      if (event.type === 'scheduler' && event.occurrence.type === 'fired') fired(event)
     })
     const before = await session.scheduler.list()
     const at = new Date(Date.now() - 1000).toISOString()
@@ -186,7 +197,11 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     assert.equal(context.scheduledInvocation.sessionId, session.id)
     assert.equal(context.scheduledInvocation.taskId, created.value.id)
     assert.equal(Date.parse(context.scheduledInvocation.occurrence), Date.parse(at))
-    const id = await child
+    assert.equal(context.originatingPrompt, null, 'scheduled invocation must not become a human root')
+    const event = await child
+    assert.equal(event.taskId, context.scheduledInvocation.taskId)
+    assert.equal(event.occurrence.occurrence, context.scheduledInvocation.occurrence)
+    const id = event.occurrence.subagentId
     unsubscribe()
     if (cancel) {
       const aborted = new Promise(resolve => question.request.signal.addEventListener('abort', resolve, { once: true }))
@@ -195,6 +210,58 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     } else question.answer()
     assert.equal((await session.subagents.wait(id, 10000)).state, cancel ? 'cancelled' : 'completed')
   }
+  const fires = []
+  let twoFires
+  let recurringId
+  let skipped
+  const skipUpdate = new Promise(resolve => { skipped = resolve })
+  const firedTwice = new Promise(resolve => { twoFires = resolve })
+  const unsubscribe = session.subscribe(event => {
+    if (event.type === 'scheduler' && event.occurrence.type === 'fired') {
+      fires.push(event)
+      if (fires.length === 2) twoFires()
+    }
+    if (event.type === 'scheduler' && event.taskId === recurringId && event.occurrence.type === 'upserted') skipped()
+  })
+  nextQuestion = new Promise(resolve => { receive = resolve })
+  const before = await session.scheduler.list()
+  const recurring = await session.scheduler.create('overlap', before.version, { cadence: { kind: 'interval', everySecs: 2, anchor: new Date(Date.now() - 2000).toISOString() }, prompt: 'Ask the human before finishing.', durable: true })
+  assert.equal(recurring.type, 'committed')
+  const earlier = await nextQuestion
+  recurringId = recurring.value.id
+  await skipUpdate
+  const advanced = await session.scheduler.list()
+  const skippedTask = advanced.tasks.find(task => task.id === recurringId)
+  assert.equal(skippedTask.lastDispatch.status, 'skipped')
+  assert.notEqual(skippedTask.lastDispatch.occurrence, earlier.request.context.scheduledInvocation.occurrence)
+  assert.equal(skippedTask.lastDispatch.subagentId, null)
+  assert.equal(fires.length, 1, 'skipped occurrence must not emit Fired or launch a second child')
+  assert.equal(earlier.request.signal.aborted, false)
+  nextQuestion = new Promise(resolve => { receive = resolve })
+  const independent = await session.scheduler.create('independent-task', advanced.version, { cadence: { kind: 'once', at: new Date(Date.now() - 1000).toISOString() }, prompt: 'Ask the human before finishing.', durable: true })
+  assert.equal(independent.type, 'committed')
+  const later = await nextQuestion
+  assert.notEqual(later.request.context.scheduledInvocation.taskId, recurringId)
+  await firedTwice
+  unsubscribe()
+  const current = await session.scheduler.list()
+  assert.equal((await session.scheduler.delete('stop-future', current.version, recurring.value.id)).type, 'committed')
+  const childFor = question => {
+    const source = question.request.context.scheduledInvocation
+    const event = fires.find(event => event.sessionId === source.sessionId && event.taskId === source.taskId && event.occurrence.occurrence === source.occurrence)
+    assert.ok(event, 'exact native fired association must exist')
+    return event.occurrence.subagentId
+  }
+  const earlierId = childFor(earlier)
+  const laterId = childFor(later)
+  assert.notEqual(earlierId, laterId)
+  const aborted = new Promise(resolve => earlier.request.signal.addEventListener('abort', resolve, { once: true }))
+  assert.equal((await session.subagents.cancelId(earlierId)).fenced, true)
+  await aborted
+  assert.equal((await session.subagents.wait(earlierId, 10000)).state, 'cancelled')
+  assert.equal(later.request.signal.aborted, false, 'stopping earlier occurrence must not cancel later question')
+  later.answer()
+  assert.equal((await session.subagents.wait(laterId, 10000)).state, 'completed')
   await agent.finalExit()
 })
 
@@ -220,6 +287,7 @@ test('live provider dispatches native OS and explicit product tools with native 
   assert.equal(calls[0].context.sessionId, session.id)
   assert.equal(calls[0].context.ownerSessionId, session.id)
   assert.equal(calls[0].context.promptId, 'turn-native-37')
+  assert.deepEqual(calls[0].context.originatingPrompt, { sessionId: session.id, promptId: 'turn-native-37' })
   assert.equal(calls[0].params.code, 29)
   assert.ok(events.some(event => event.type === 'history_record' && event.record.promptId === 'turn-native-37'))
   assert.equal(JSON.stringify(events).includes(process.env.OG_API_KEY), false)
