@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { createServer } from 'node:http'
 import { Agent } from '../dist/index.js'
+import { StdioTransport } from '../dist/stdio.js'
 
 const executable = process.env.SOPHON_RUNTIME ?? resolve('../../target/debug/sophon-runtime')
 
@@ -278,6 +279,31 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   later.answer()
   assert.equal((await session.subagents.wait(laterId, 10000)).state, 'completed')
   await agent.finalExit()
+})
+
+test('native exit errors flush a structured receipt before process closure', { timeout: 30000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  const transport = new StdioTransport({ executable, env })
+  const agent = await Agent.connect(transport, config)
+  await agent.createSession({ workspace: { id: 'exit-error', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  await assert.rejects(agent.finalExit(0), error => error.code === 'operation_failed' && /timed out/i.test(error.message))
+  assert.deepEqual(await transport.closed, { code: 1, signal: null })
+})
+
+test('idle newly created Session exits with a checked native receipt', { timeout: 40000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  let diagnostics = ''
+  const transport = new StdioTransport({ executable, env, onStderr: chunk => { diagnostics += chunk } })
+  const agent = await Agent.connect(transport, config)
+  await agent.createSession({ workspace: { id: 'unbound-product-identity', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  // Product identity persistence can fail after native creation. Admit no
+  // prompt, do not dispose first, and do not retry an uncertain final exit.
+  try { await agent.finalExit() }
+  catch (cause) {
+    const closed = await transport.closed
+    const reason = diagnostics.split('\n').filter(line => line.startsWith('Sophon Runtime stopped:') || /panicked at|fatal runtime error|stack overflow|double free|corrupt|malloc|Thread Local|AccessError|already borrowed/.test(line)).join('\n')
+    throw new Error(`Idle exit failed: ${JSON.stringify(closed)} ${reason}`, { cause })
+  }
 })
 
 test('live provider dispatches native OS and explicit product tools with native prompt identity', { timeout: 180000, skip: !process.env.OG_API_KEY }, async t => {

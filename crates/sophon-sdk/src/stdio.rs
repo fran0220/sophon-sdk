@@ -18,23 +18,40 @@ use crate::{
 type Result<T> = std::result::Result<T, Error>;
 type PendingCallbacks = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
 
+struct OutboundFrame {
+    frame: p::ServerFrame,
+    flushed: Option<oneshot::Sender<()>>,
+}
+
+impl From<p::ServerFrame> for OutboundFrame {
+    fn from(frame: p::ServerFrame) -> Self {
+        Self {
+            frame,
+            flushed: None,
+        }
+    }
+}
+
 struct Callbacks {
-    output: mpsc::UnboundedSender<p::ServerFrame>,
+    output: mpsc::UnboundedSender<OutboundFrame>,
     pending: PendingCallbacks,
 }
 
 struct CallbackGuard {
     id: String,
-    output: mpsc::UnboundedSender<p::ServerFrame>,
+    output: mpsc::UnboundedSender<OutboundFrame>,
     pending: PendingCallbacks,
 }
 
 impl Drop for CallbackGuard {
     fn drop(&mut self) {
         if self.pending.lock().unwrap().remove(&self.id).is_some() {
-            let _ = self.output.send(p::ServerFrame::CallbackCancelled {
-                id: self.id.clone(),
-            });
+            let _ = self.output.send(
+                p::ServerFrame::CallbackCancelled {
+                    id: self.id.clone(),
+                }
+                .into(),
+            );
         }
     }
 }
@@ -55,12 +72,15 @@ impl Callbacks {
             pending: self.pending.clone(),
         };
         self.output
-            .send(p::ServerFrame::Callback {
-                id,
-                method,
-                params,
-                context,
-            })
+            .send(
+                p::ServerFrame::Callback {
+                    id,
+                    method,
+                    params,
+                    context,
+                }
+                .into(),
+            )
             .map_err(|_| Error::RuntimeStopped)?;
         rx.await.map_err(|_| Error::RuntimeStopped)?
     }
@@ -760,7 +780,11 @@ fn event(event: crate::Event) -> Option<p::RuntimeEvent> {
     }
 }
 
-fn respond(output: &mpsc::UnboundedSender<p::ServerFrame>, id: String, result: Result<Value>) {
+async fn respond(
+    output: &mpsc::UnboundedSender<OutboundFrame>,
+    id: String,
+    result: Result<Value>,
+) -> Result<()> {
     let frame = match result {
         Ok(result) => p::ServerFrame::Response { id, result },
         Err(error) => p::ServerFrame::Error {
@@ -777,7 +801,28 @@ fn respond(output: &mpsc::UnboundedSender<p::ServerFrame>, id: String, result: R
             },
         },
     };
-    let _ = output.send(frame);
+    let (flushed, receipt) = oneshot::channel();
+    output
+        .send(OutboundFrame {
+            frame,
+            flushed: Some(flushed),
+        })
+        .map_err(|_| Error::RuntimeStopped)?;
+    receipt.await.map_err(|_| Error::RuntimeStopped)
+}
+
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    stdout: &mut W,
+    frame: OutboundFrame,
+) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(&frame.frame).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    stdout.write_all(&bytes).await?;
+    stdout.flush().await?;
+    if let Some(flushed) = frame.flushed {
+        let _ = flushed.send(());
+    }
+    Ok(())
 }
 
 /// Runs one Agent over inherited private stdin/stdout. EOF invokes checked exit;
@@ -797,24 +842,24 @@ pub async fn run() -> Result<()> {
             let frame = tokio::select! {
                 biased;
                 frame = outgoing.recv(), if control_open => match frame { Some(frame)=>frame,None=>{control_open=false;continue;} },
-                frame = terminal_rx.recv(), if terminal_open => match frame {Some(frame)=>frame,None=>{terminal_open=false;continue;}},
+                frame = terminal_rx.recv(), if terminal_open => match frame {Some(frame)=>OutboundFrame::from(frame),None=>{terminal_open=false;continue;}},
                 changed = frame_rx.changed() => {
                     if changed.is_err() { break; }
                     let frame = frame_rx.borrow_and_update().clone();
-                    match frame {Some(frame)=>p::ServerFrame::BrowserFrame {frame},None=>continue}
+                    match frame {Some(frame)=>p::ServerFrame::BrowserFrame {frame}.into(),None=>continue}
                 }
             };
-            let mut bytes = serde_json::to_vec(&frame).map_err(std::io::Error::other)?;
-            bytes.push(b'\n');
-            stdout.write_all(&bytes).await?;
-            stdout.flush().await?;
+            write_frame(&mut stdout, frame).await?;
         }
         Ok::<_, std::io::Error>(())
     });
     output
-        .send(p::ServerFrame::Ready {
-            protocol_version: p::PROTOCOL_VERSION,
-        })
+        .send(
+            p::ServerFrame::Ready {
+                protocol_version: p::PROTOCOL_VERSION,
+            }
+            .into(),
+        )
         .map_err(|_| Error::RuntimeStopped)?;
     let callbacks = Arc::new(Callbacks {
         output: output.clone(),
@@ -943,7 +988,9 @@ pub async fn run() -> Result<()> {
                                 };
                                 if let Some(event) = next {
                                     sequence += 1;
-                                    if out.send(p::ServerFrame::Event { sequence, event }).is_err()
+                                    if out
+                                        .send(p::ServerFrame::Event { sequence, event }.into())
+                                        .is_err()
                                     {
                                         break;
                                     }
@@ -959,14 +1006,14 @@ pub async fn run() -> Result<()> {
                             native_specs,
                             terminal,
                         }));
-                        respond(&output, id, Ok(initial));
+                        respond(&output, id, Ok(initial)).await?;
                     }
-                    Err(error) => respond(&output, id, Err(error)),
+                    Err(error) => respond(&output, id, Err(error)).await?,
                 }
             }
             p::ClientFrame::Request { id, request } => {
                 if exit_requested {
-                    respond(&output, id, Err(Error::RuntimeStopped));
+                    respond(&output, id, Err(Error::RuntimeStopped)).await?;
                     continue;
                 }
                 if let Some(runtime) = &runtime {
@@ -984,7 +1031,9 @@ pub async fn run() -> Result<()> {
                         } else {
                             None
                         };
-                        respond(&out, id, result);
+                        // A failed final exit still terminates the process. Its
+                        // structured error must reach stdout before that return.
+                        respond(&out, id, result).await?;
                         match exit_error {
                             Some(error) => Err(error),
                             None => Ok(()),
@@ -998,7 +1047,8 @@ pub async fn run() -> Result<()> {
                         &output,
                         id,
                         Err(Error::Operation("initialize required".into())),
-                    );
+                    )
+                    .await?;
                 }
             }
         }
@@ -1036,6 +1086,57 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn final_error_response_waits_for_actual_writer_flush() {
+        use tokio::io::AsyncReadExt;
+        let (output, mut outgoing) = mpsc::unbounded_channel();
+        let responding = tokio::spawn(async move {
+            respond(
+                &output,
+                "exit-73".into(),
+                Err(Error::Operation("native exit failed at flush".into())),
+            )
+            .await
+        });
+        let frame = outgoing.recv().await.unwrap();
+        assert!(
+            !responding.is_finished(),
+            "queueing a response is not a write receipt"
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let writing = tokio::spawn(async move { write_frame(&mut writer, frame).await });
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        writing.await.unwrap().unwrap();
+        responding.await.unwrap().unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], "exit-73");
+        assert_eq!(value["error"]["code"], "operation_failed");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("native exit failed at flush")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_write_failure_never_acknowledges_flush() {
+        let (output, mut outgoing) = mpsc::unbounded_channel();
+        let responding =
+            tokio::spawn(async move { respond(&output, "exit-29".into(), Ok(Value::Null)).await });
+        let frame = outgoing.recv().await.unwrap();
+        let (mut writer, reader) = tokio::io::duplex(8);
+        drop(reader);
+        assert!(write_frame(&mut writer, frame).await.is_err());
+        assert!(matches!(
+            responding.await.unwrap(),
+            Err(Error::RuntimeStopped)
+        ));
+    }
 
     #[tokio::test]
     async fn browser_artifacts_use_invocation_workspace_and_never_clobber() {

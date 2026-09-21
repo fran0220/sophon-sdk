@@ -719,9 +719,20 @@ fn run_worker(
             return;
         }
     };
+    // Native detached tasks borrow MvpAgent through LocalRef. Keep the owner
+    // alive until LocalSet has destroyed every task, including on startup failure.
+    // Declaration order also preserves this invariant during unwinding.
+    let mut agent_owner = None;
     let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(async move {
-        let result = start_worker(config, commands, events, management.clone()).await;
+    runtime.block_on(local.run_until(async {
+        let result = start_worker(
+            config,
+            commands,
+            events,
+            management.clone(),
+            &mut agent_owner,
+        )
+        .await;
         match result {
             Ok((
                 agent,
@@ -782,6 +793,7 @@ async fn start_worker(
     commands: mpsc::UnboundedReceiver<Command>,
     events: broadcast::Sender<Event>,
     management: ManagementEmitter,
+    agent_owner: &mut Option<Rc<MvpAgent>>,
 ) -> Result<
     (
         Rc<MvpAgent>,
@@ -812,6 +824,7 @@ async fn start_worker(
         )
         .map_err(|error| Error::Start(error.to_string()))?,
     );
+    *agent_owner = Some(agent.clone());
     let (exit_callbacks, retired) = watch::channel(false);
     let client = EmbeddedClient {
         events,
