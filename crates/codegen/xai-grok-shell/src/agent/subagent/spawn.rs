@@ -146,34 +146,36 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     "subagent.parent_snapshot",
                     parent_session_id = %parent_sid,
                 ));
-                let (pool, hooks, definitions, toolset) = tokio::join!(
-                    handle.snapshot_mcp_pool(),
-                    handle.snapshot_client_hooks(),
-                    handle.snapshot_tool_definitions(),
-                    this.session_toolset(&handle.info.id)
-                );
-                let toolset = match toolset {
-                    Ok(toolset) => toolset,
-                    Err(error) => {
+                let snapshot = match handle.snapshot_subagent_parent().await {
+                    Some(snapshot) => snapshot,
+                    None => {
                         return coordinator::ChildRunOutput {
                             result: SubagentResult::failed(
                                 run.request.id.clone(),
                                 run.request.id,
-                                format!("Parent native tool snapshot unavailable: {error}"),
+                                "Parent native inheritance snapshot unavailable",
                             ),
                             completion_data: Default::default(),
                             snapshot_ref: None,
                         };
                     }
                 };
-                ctx.parent_mcp_pool = pool;
-                ctx.client_hooks = hooks;
-                ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+                ctx.parent_mcp_pool = snapshot.mcp_pool;
+                ctx.client_hooks = snapshot.client_hooks;
+                ctx.parent_tool_definitions = (!snapshot.tool_definitions.is_empty()).then_some(snapshot.tool_definitions);
+                ctx.parent_skills = snapshot.skills;
+                if let Some(mounted) = snapshot.mounted {
+                    ctx.model_id = acp::ModelId::new(mounted.candidate.model.clone());
+                    ctx.agent_config = Some(mounted.config.clone());
+                    ctx.parent_skills_config = mounted.config.skills.clone();
+                    ctx.parent_mcp_configs = mounted.mcp_servers.clone();
+                    ctx.sampling_config = mounted.sampling.clone();
+                }
                 if run.request.runtime_overrides.originating_prompt.is_none() {
                     run.request.runtime_overrides.originating_prompt =
-                        toolset.native_originating_prompt(run.request.parent_prompt_id.as_deref());
+                        snapshot.toolset.native_originating_prompt(run.request.parent_prompt_id.as_deref());
                 }
-                ctx.parent_toolset = Some(toolset);
+                ctx.parent_toolset = Some(snapshot.toolset);
             }
             if let Some(spawner) = spawner_session_id.as_deref() {
                 if this.is_resident(&acp::SessionId::new(spawner)) {

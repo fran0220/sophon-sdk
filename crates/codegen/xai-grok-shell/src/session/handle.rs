@@ -472,6 +472,12 @@ impl SessionHandle {
         }
         rx.await.ok().flatten()
     }
+    /// One actor request captures all mounted child inheritance inputs.
+    pub(crate) async fn snapshot_subagent_parent(&self) -> Option<super::commands::SubagentParentSnapshot> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx.send(SessionCommand::SnapshotSubagentParent { respond_to: tx }).ok()?;
+        rx.await.ok()
+    }
     /// Snapshot the session's live MCP client pool for subagent inheritance.
     pub(crate) async fn snapshot_mcp_pool(
         &self,

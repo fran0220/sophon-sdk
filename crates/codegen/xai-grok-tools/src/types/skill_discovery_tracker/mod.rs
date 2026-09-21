@@ -442,7 +442,9 @@ impl SkillManager {
             .iter()
             .map(|s| (s.path.clone(), s.enabled))
             .collect();
+        let previous = self.startup_skills.clone();
         let unconditional = self.conditional.take_unconditional(new_skills);
+        let catalog_changed = previous != unconditional;
         self.startup_skills = unconditional;
         let current_keys: HashSet<String> = self
             .slash_skills()
@@ -458,8 +460,9 @@ impl SkillManager {
                 s.enabled
                     && !s.disable_model_invocation
                     && is_listable(s)
-                    && !self.announced_names.contains(&s.dedup_key())
-                    && !old_enabled.get(&s.path).copied().unwrap_or(false)
+                    && (previous.iter().any(|old| old.path == s.path && old != *s)
+                        || (!self.announced_names.contains(&s.dedup_key())
+                            && !old_enabled.get(&s.path).copied().unwrap_or(false)))
             })
             .cloned()
             .collect();
@@ -484,7 +487,7 @@ impl SkillManager {
         };
         reconcile_queued(&mut queued, &self.startup_skills);
         queued.extend(added);
-        self.pending = (!queued.is_empty() || removed || catalog_added)
+        self.pending = (!queued.is_empty() || removed || catalog_added || catalog_changed)
             .then_some(PendingKind::BaselineAdded(queued));
     }
 
@@ -1269,6 +1272,22 @@ mod tests {
         prepared.set_baseline_frozen(false);
         assert_eq!(prepared.slash_skills()[0].name, "latest");
         assert_eq!(mounted.slash_skills()[0].name, "old");
+    }
+
+    #[test]
+    fn same_path_metadata_refresh_updates_runtime_and_listing() {
+        let mut original = make_skill("same-name", "/same/SKILL.md");
+        original.description = "old description".into();
+        let mut manager = drained(vec![original.clone()]);
+        let mut updated = original;
+        updated.description = "replacement description".into();
+        updated.allowed_tools = Some(vec!["read_file".into()]);
+        manager.update_startup_baseline(vec![updated.clone()]);
+        let (runtime, effects) = manager.take_pending().expect("metadata refresh is pending");
+        assert_eq!(runtime, vec![updated]);
+        assert!(effects.system_reminder.unwrap().contains("replacement description"));
+        assert!(effects.send_available_commands);
+        assert!(manager.take_pending().is_none());
     }
 
     /// Names announced by the next drain, or `None` when it carries no reminder.

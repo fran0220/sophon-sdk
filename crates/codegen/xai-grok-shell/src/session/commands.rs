@@ -475,6 +475,16 @@ pub struct CurrentModel {
     pub id: String,
     pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
+/// One parent-actor boundary for child configuration and runtime inheritance.
+pub struct SubagentParentSnapshot {
+    pub(crate) mounted: Option<std::sync::Arc<super::config_candidate::MountedConfig>>,
+    pub(crate) toolset: std::sync::Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    pub(crate) tool_definitions: Vec<xai_grok_sampling_types::ToolSpec>,
+    pub(crate) mcp_pool: Option<super::mcp_servers::SharedMcpPool>,
+    pub(crate) client_hooks: crate::extensions::hooks::ClientHooks,
+    pub(crate) skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
+}
+
 pub enum SessionCommand {
     ManageWorkflow {
         action: crate::extensions::workflow::Action,
@@ -815,6 +825,11 @@ pub enum SessionCommand {
     /// Snapshot the session's live MCP client pool for subagent inheritance.
     SnapshotMcpPool {
         respond_to: oneshot::Sender<Option<crate::session::mcp_servers::SharedMcpPool>>,
+    },
+    /// Capture mounted config and child runtime inputs without another prompt
+    /// or candidate admission interleaving between separate snapshot requests.
+    SnapshotSubagentParent {
+        respond_to: oneshot::Sender<SubagentParentSnapshot>,
     },
     /// Snapshot the session's client-registered hooks so a subagent inherits the same PreToolUse gate and observe hooks over the parent's connection.
     SnapshotClientHooks {

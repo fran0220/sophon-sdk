@@ -25,6 +25,25 @@ fn candidate_error(message: impl Into<String>) -> acp::Error {
 }
 
 impl SessionActor {
+    pub(super) async fn snapshot_subagent_parent(&self) -> crate::session::commands::SubagentParentSnapshot {
+        let definitions = self.prepare_tool_definitions_inner().await;
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        let skills = bridge.read_resource::<AvailableSkills>().await.map(|skills| skills.0);
+        let mcp = self.mcp_state.lock().await;
+        crate::session::commands::SubagentParentSnapshot {
+            mounted: self.candidate_admission.mounted(),
+            toolset: bridge.toolset(),
+            tool_definitions: self.turn_base_tool_specs(&definitions),
+            mcp_pool: if mcp.owned_clients.is_empty() && mcp.shared_clients.is_empty() {
+                None
+            } else {
+                Some(crate::session::mcp_servers::SharedMcpPool::from_state(&mcp))
+            },
+            client_hooks: self.client_hooks.borrow().clone(),
+            skills,
+        }
+    }
+
     pub(super) async fn admit_candidate_command(
         &self,
         command: SessionCommand,
@@ -428,8 +447,10 @@ mod tests {
                 model.info.agent_type = actor.agent.borrow().definition().name.clone();
                 model.api_key = Some("test-only-candidate-key".into());
                 actor.models_manager.insert_test_entry("candidate", model);
+                let skill_dir = tempfile::tempdir().unwrap();
+                std::fs::write(skill_dir.path().join("SKILL.md"), "---\nname: mounted-skill-a\ndescription: First mounted skill\n---\nA instructions\n").unwrap();
                 let candidate = serde_json::json!({
-                    "instructions":"mounted A", "skillDirectories":[], "externalMcpServers":[],
+                    "instructions":"mounted A", "skillDirectories":[skill_dir.path()], "externalMcpServers":[],
                     "model":"candidate", "subjectOptions":{}, "subagentBriefs":[], "revision":"A",
                 });
                 let toolset = actor.agent.borrow().tool_bridge().toolset();
@@ -455,6 +476,9 @@ mod tests {
                 ));
                 let definitions = serde_json::to_value(toolset.tool_definitions()).unwrap();
                 let generation = actor.mcp_state.lock().await.current_generation();
+                let inherited = actor.snapshot_subagent_parent().await;
+                assert!(inherited.skills.as_ref().unwrap().iter().any(|skill| skill.name == "mounted-skill-a"));
+                assert!(Arc::ptr_eq(&inherited.toolset, &toolset));
                 for failure in ["cancel", "unknown-option", "invalid-directory"] {
                     let mut next = candidate.clone();
                     next["instructions"] = serde_json::json!("must never publish");
@@ -493,6 +517,20 @@ mod tests {
                     assert_eq!(actor.tool_context.admission.snapshot().active, 0);
                     assert_eq!(actor.tool_context.admission.snapshot().accepted, 1);
                 }
+                std::fs::write(skill_dir.path().join("SKILL.md"), "---\nname: mounted-skill-b\ndescription: Replacement mounted skill\n---\nB instructions\n").unwrap();
+                let mut next = candidate;
+                next["instructions"] = serde_json::json!("mounted B");
+                next["revision"] = serde_json::json!("B");
+                drop(actor.mount_candidate(next, Default::default()).await.unwrap());
+                let replacement = actor.snapshot_subagent_parent().await;
+                assert_eq!(replacement.mounted.unwrap().candidate.revision, "B");
+                let replacement_skills = replacement.skills.unwrap();
+                assert!(replacement_skills.iter().any(|skill| skill.name == "mounted-skill-b"));
+                assert!(!replacement_skills.iter().any(|skill| skill.name == "mounted-skill-a"));
+                assert_eq!(inherited.mounted.unwrap().candidate.revision, "A");
+                let inherited_skills = inherited.skills.unwrap();
+                assert!(inherited_skills.iter().any(|skill| skill.name == "mounted-skill-a"));
+                assert!(!inherited_skills.iter().any(|skill| skill.name == "mounted-skill-b"));
             })
             .await;
     }
