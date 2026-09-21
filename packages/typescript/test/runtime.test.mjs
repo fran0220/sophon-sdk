@@ -278,6 +278,18 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(later.request.signal.aborted, false, 'stopping earlier occurrence must not cancel later question')
   later.answer()
   assert.equal((await session.subagents.wait(laterId, 10000)).state, 'completed')
+  const unrelated = await agent.createSession({ workspace: { id: 'unrelated-close-owner', cwd: childCwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [] })
+  nextQuestion = new Promise(resolve => { receive = resolve })
+  const beforeClose = await session.scheduler.list()
+  const closeTask = await session.scheduler.create('pending-at-dispose', beforeClose.version, { cadence: { kind: 'once', at: new Date(Date.now() - 1000).toISOString() }, prompt: 'Ask the human before finishing.', durable: true })
+  assert.equal(closeTask.type, 'committed')
+  const pendingAtClose = await nextQuestion
+  assert.equal(pendingAtClose.request.context.scheduledInvocation.taskId, closeTask.value.id)
+  assert.equal(pendingAtClose.request.signal.aborted, false)
+  await session.dispose()
+  assert.equal(pendingAtClose.request.signal.aborted, true, 'checked dispose must abort owned callback before acknowledging close')
+  assert.equal((await unrelated.prompt({ turnId: 'unrelated-after-close', blocks: [{ type: 'text', text: 'Complete independently.' }], metadata: {} })).stopReason, 'end_turn')
+  await unrelated.dispose()
   await agent.finalExit()
 })
 
