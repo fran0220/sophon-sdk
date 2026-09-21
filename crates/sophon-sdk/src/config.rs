@@ -428,12 +428,27 @@ pub struct ModelRetryConfig {
     pub inference_idle_timeout_secs: Option<u64>,
 }
 
+/// Canonical gateway effort values, declared by the route catalog, never
+/// inferred from a model name. Capability does not select a request default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
 /// A public model ID mapped to an explicit provider route.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     pub id: String,
     pub provider: ProviderConfig,
     pub context_window: NonZeroU64,
+    pub supported_reasoning: Vec<ReasoningEffort>,
     pub behavior: ModelBehaviorConfig,
     pub retry: ModelRetryConfig,
 }
@@ -444,6 +459,7 @@ impl ModelConfig {
             id: id.into(),
             provider,
             context_window: NonZeroU64::new(200_000).expect("constant is non-zero"),
+            supported_reasoning: Vec::new(),
             behavior: ModelBehaviorConfig::default(),
             retry: ModelRetryConfig::default(),
         }

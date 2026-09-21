@@ -35,6 +35,9 @@ pub enum ProviderProtocol {
 pub struct RuntimeModel {
     pub id: String,
     pub provider: ProviderRoute,
+    /// Authoritative canonical effort capabilities. Omission grants none.
+    #[serde(default)]
+    pub supported_reasoning: Vec<crate::ReasoningEffort>,
     #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]

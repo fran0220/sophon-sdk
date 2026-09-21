@@ -157,7 +157,8 @@ test('official candidate ingress publishes native receipts and keeps busy prompt
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
   config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'mount-a-wire', headers: {}, queryParams: {} }
-  config.models.push({ ...config.models[0], id: 'mount-c', provider: { ...config.models[0].provider, model: 'mount-c-wire' } })
+  config.models[0].supportedReasoning = ['medium']
+  config.models.push({ ...config.models[0], id: 'mount-c', supportedReasoning: ['high'], provider: { ...config.models[0].provider, model: 'mount-c-wire' } })
   const agent = await Agent.spawn({ executable, config, env })
   t.after(() => agent.finalExit().catch(() => {}))
   const options = { workspace: { id: 'official-mount', cwd }, requireConfigCandidate: true, model: 'runtime-test', mcpServers: [], tools: [] }
@@ -167,9 +168,10 @@ test('official candidate ingress publishes native receipts and keeps busy prompt
   const prompt = (turnId, text, configCandidate, sendNow = false) => session.prompt({ turnId, blocks: [{ type: 'text', text }], configCandidate, sendNow })
   assert.equal((await session.effectiveConfig()).mountedRevision, null)
   await assert.rejects(prompt('cold-invalid', 'Must not infer.', candidate('invalid', 'missing-route')))
+  await assert.rejects(prompt('cold-unsupported-effort', 'Must not infer.', { ...candidate('invalid-effort', 'runtime-test'), reasoningEffort: 'high' }), /reasoning effort is unsupported/)
   assert.equal(requests.length, 0)
   assert.equal((await session.effectiveConfig()).mountedRevision, null)
-  const first = prompt('mount-first', 'SDK_MOUNT_FIRST_29', candidate('A', 'runtime-test'))
+  const first = prompt('mount-first', 'SDK_MOUNT_FIRST_29', { ...candidate('A', 'runtime-test'), reasoningEffort: 'medium' })
   await Promise.race([firstEntered, first.then(() => { throw new Error('First prompt completed before its provider barrier') })])
   assert.equal((await session.effectiveConfig()).mountedRevision, 'A')
   let queued
@@ -188,9 +190,10 @@ test('official candidate ingress publishes native receipts and keeps busy prompt
   await assert.rejects(prompt('idle-invalid', 'Must not infer either.', candidate('invalid-idle', 'missing-route')))
   assert.equal(requests.length, count)
   assert.equal((await session.effectiveConfig()).mountedRevision, 'A')
-  assert.equal((await prompt('mount-idle', 'SDK_MOUNT_IDLE_73', candidate('C', 'mount-c'), true)).stopReason, 'end_turn')
+  assert.equal((await prompt('mount-idle', 'SDK_MOUNT_IDLE_73', { ...candidate('C', 'mount-c'), reasoningEffort: 'high' }, true)).stopReason, 'end_turn')
   assert.equal((await session.effectiveConfig()).mountedRevision, 'C')
   assert.deepEqual(requests.map(request => request.model), ['mount-a-wire', 'mount-a-wire', 'mount-c-wire'])
+  assert.deepEqual(requests.map(request => request.reasoning_effort), ['medium', 'medium', 'high'])
   assert.match(JSON.stringify(requests[0].messages), /BASELINE_A/)
   assert.match(JSON.stringify(requests[1].messages), /BASELINE_A/)
   assert.match(JSON.stringify(requests[2].messages), /BASELINE_C/)
@@ -458,8 +461,21 @@ test('idle newly created Session exits with a checked native receipt', { timeout
   }
 })
 
-test('live provider dispatches native OS and explicit product tools with native prompt identity', { timeout: 180000, skip: !process.env.OG_API_KEY }, async t => {
+test('live provider dispatches native OS and explicit product tools with native prompt identity', { timeout: 180000, skip: process.env.SOPHON_LIVE_GATEWAY !== '1' }, async t => {
   const { cwd, config, env } = await setup(t)
+  const origin = process.env.OG_AI_GATEWAY.replace(/\/$/, '')
+  const headers = { authorization: `Bearer ${process.env.OG_API_KEY}` }
+  const effectiveResponse = await fetch(`${origin}/api/v1/product-config/effective`, { headers, signal: AbortSignal.timeout(15000) })
+  assert.equal(effectiveResponse.status, 200)
+  const route = (await effectiveResponse.json()).routes.deep
+  assert.equal(route.status, 'available')
+  assert.equal(route.endpoint, 'openai-response')
+  const catalogResponse = await fetch(`${origin}/v1/models`, { headers, signal: AbortSignal.timeout(15000) })
+  assert.equal(catalogResponse.status, 200)
+  const model = (await catalogResponse.json()).data.find(model => model.id === route.model)
+  assert.ok(model.supported_reasoning.includes(route.reasoning_effort))
+  Object.assign(config.models[0], { contextWindow: model.limit.context, supportedReasoning: model.supported_reasoning })
+  Object.assign(config.models[0].provider, { protocol: 'openai_responses', baseUrl: `${origin}/v1`, model: route.model })
   const calls = []
   const agent = await Agent.spawn({ executable, config, env, onToolCall: async request => {
     assert.equal(request.name, 'product_echo')
@@ -472,7 +488,7 @@ test('live provider dispatches native OS and explicit product tools with native 
   const session = await agent.createSession({ workspace: { id: 'native-tools', cwd }, model: 'runtime-test', mcpServers: [], tools: [
     { name: 'product_echo', description: 'Return a product-service test receipt. Call with code 29.', inputSchema: { type: 'object', properties: { code: { type: 'integer' } }, required: ['code'], additionalProperties: false } },
   ] })
-  const receipt = await session.prompt({ turnId: 'turn-native-37', blocks: [{ type: 'text', text: 'Use a native file or shell tool to write exactly NATIVE_FILE_37 to file probe.txt in the current workspace. Then invoke product_echo with code 29. Do both tool calls. Reply with the product receipt after success.' }] })
+  const receipt = await session.prompt({ turnId: 'turn-native-37', blocks: [{ type: 'text', text: 'Use a native file or shell tool to write exactly NATIVE_FILE_37 to file probe.txt in the current workspace. Then invoke product_echo with code 29. Do both tool calls. Reply with the product receipt after success.' }], configCandidate: { ...candidate('live-tools', 'runtime-test'), reasoningEffort: route.reasoning_effort } })
   assert.equal(receipt.stopReason, 'end_turn')
   assert.equal(receipt.promptId, 'turn-native-37')
   assert.equal((await readFile(join(cwd, 'probe.txt'), 'utf8')).trim(), 'NATIVE_FILE_37')

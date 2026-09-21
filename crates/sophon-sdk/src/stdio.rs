@@ -540,6 +540,7 @@ fn agent_config(config: p::RuntimeConfig, callbacks: Arc<Callbacks>) -> Result<A
         provider.headers = route.headers;
         provider.query_params = route.query_params;
         let mut native = ModelConfig::new(model.id, provider);
+        native.supported_reasoning = model.supported_reasoning;
         if let Some(tokens) = model.context_window {
             native.context_window = NonZeroU64::new(tokens.into())
                 .ok_or_else(|| Error::invalid_config("contextWindow must be positive"))?;

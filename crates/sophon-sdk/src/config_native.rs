@@ -83,6 +83,14 @@ pub(crate) fn apply_runtime_config(config: &AgentConfig, native: &mut Config) {
 pub(crate) fn apply_model_config(config: &ModelConfig, entry: &mut ModelEntry) {
     let behavior = &config.behavior;
     let info = &mut entry.info;
+    // Both enums accept the same canonical strings. Native menu membership
+    // remains the validator; an empty declaration never grants legacy support.
+    info.reasoning_efforts = serde_json::from_value(
+        serde_json::to_value(&config.supported_reasoning).expect("effort serialization"),
+    )
+    .expect("SDK canonical efforts match native efforts");
+    info.supports_reasoning_effort = !info.reasoning_efforts.is_empty();
+    info.reasoning_effort = None;
     if let Some(value) = behavior.use_concise {
         info.use_concise = value;
     }
@@ -193,6 +201,7 @@ mod tests {
         second.api_key = Some("second-key".into());
         let first_route = first.base_url.clone();
         let mut model = config().models.remove(0);
+        model.supported_reasoning = vec![crate::ReasoningEffort::None, crate::ReasoningEffort::Max];
         model.behavior = ModelBehaviorConfig {
             use_concise: Some(true),
             agent_type: Some("codex".into()),
@@ -206,10 +215,29 @@ mod tests {
             inference_idle_timeout_secs: Some(20),
         };
         apply_model_config(&model, &mut first);
+        model.supported_reasoning.clear();
         model.behavior.use_concise = Some(false);
         model.retry.max_retries = Some(7);
         model.retry.inference_idle_timeout_secs = Some(90);
         apply_model_config(&model, &mut second);
+        assert_eq!(
+            serde_json::to_value(
+                first
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::json!(["none", "max"])
+        );
+        assert!(first.supports_reasoning_effort);
+        assert!(
+            first.reasoning_effort.is_none(),
+            "capability must not invent a requested default"
+        );
+        assert!(!second.supports_reasoning_effort);
+        assert!(second.reasoning_efforts.is_empty());
         assert!(first.use_concise);
         assert!(!second.use_concise);
         assert_eq!(first.max_retries, Some(0));

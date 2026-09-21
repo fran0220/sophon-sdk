@@ -41,8 +41,8 @@ pub use config::{
     MemoryFlushSettings, MemoryGcSettings, MemoryIndexSettings, MemoryInitialInjectionSettings,
     MemoryMode, MemorySearchSettings, MemorySessionSettings, MemoryV2Rollout, MemoryV2Settings,
     MemoryWatcherSettings, MmrSettings, ModelBehaviorConfig, ModelConfig, ModelRetryConfig,
-    PermissionPolicy, ProviderConfig, ProviderProtocol, PruningSettings, SubagentDefinition,
-    TemporalDecaySettings,
+    PermissionPolicy, ProviderConfig, ProviderProtocol, PruningSettings, ReasoningEffort,
+    SubagentDefinition, TemporalDecaySettings,
 };
 pub use event::{
     Event, HistoryRecord, HistorySnapshot, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
