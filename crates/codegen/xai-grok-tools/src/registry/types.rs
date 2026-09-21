@@ -1469,6 +1469,16 @@ impl FinalizedToolset {
             .map(|t| t.definition.clone())
             .collect()
     }
+    /// Build the future schema without installing staged MCP clients.
+    pub fn prepared_mcp_definitions(&self, prepared: &[PreparedMcpTool]) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .iter()
+            .filter(|tool| !tool.external_mcp)
+            .map(|tool| tool.definition.clone())
+            .chain(prepared.iter().map(|tool| tool.0.definition.clone()))
+            .collect()
+    }
     /// Client-facing name of the (first) enabled tool of `kind`, honoring `name_override` / preset
     /// renames — `None` if no tool of that kind is enabled. Mirrors `${{ tools.by_kind.<kind> }}`
     /// template resolution; used
@@ -3496,6 +3506,15 @@ mod tests {
             )
         };
         let original = serde_json::to_value(toolset.tool_definitions()).unwrap();
+        let staged = vec![prepare("new")];
+        assert_eq!(
+            toolset
+                .prepared_mcp_definitions(&staged)
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["native", "new"]
+        );
         drop(toolset.prepare_mcp_install(vec![prepare("new")]).unwrap());
         assert_eq!(
             serde_json::to_value(toolset.tool_definitions()).unwrap(),

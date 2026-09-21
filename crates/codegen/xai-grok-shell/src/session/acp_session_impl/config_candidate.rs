@@ -16,6 +16,7 @@ struct PreparedCandidate {
     mcp_generation: crate::session::mcp_servers::Generation,
     mcp: McpState,
     tools: Vec<PreparedMcpTool>,
+    catalog: super::mcp_snapshot::McpCatalog,
 }
 
 fn candidate_error(message: impl Into<String>) -> acp::Error {
@@ -25,10 +26,15 @@ fn candidate_error(message: impl Into<String>) -> acp::Error {
 }
 
 impl SessionActor {
-    pub(super) async fn snapshot_subagent_parent(&self) -> crate::session::commands::SubagentParentSnapshot {
+    pub(super) async fn snapshot_subagent_parent(
+        &self,
+    ) -> crate::session::commands::SubagentParentSnapshot {
         let definitions = self.prepare_tool_definitions_inner().await;
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let skills = bridge.read_resource::<AvailableSkills>().await.map(|skills| skills.0);
+        let skills = bridge
+            .read_resource::<AvailableSkills>()
+            .await
+            .map(|skills| skills.0);
         let mcp = self.mcp_state.lock().await;
         crate::session::commands::SubagentParentSnapshot {
             mounted: self.candidate_admission.mounted(),
@@ -48,6 +54,32 @@ impl SessionActor {
         &self,
         command: SessionCommand,
     ) -> Option<SessionCommand> {
+        if self.candidate_admission.mounted().is_some() {
+            let error =
+                || candidate_error("mounted configuration must be replaced by a prompt candidate");
+            match command {
+                SessionCommand::SetSessionModel { responds_to, .. }
+                | SessionCommand::SetReasoningEffort { responds_to, .. } => {
+                    let _ = responds_to.send(Err(error()));
+                    return None;
+                }
+                SessionCommand::RebuildAgentForDefinition { responds_to, .. } => {
+                    let _ = responds_to.send(Err(error()));
+                    return None;
+                }
+                SessionCommand::UpdateMcpServers { respond_to, .. }
+                | SessionCommand::ToggleMcpServer { respond_to, .. }
+                | SessionCommand::ToggleMcpTool { respond_to, .. } => {
+                    let _ = respond_to.send(Err(error()));
+                    return None;
+                }
+                SessionCommand::OverrideModelName { .. } => {
+                    tracing::warn!("ignored standalone model override for mounted session");
+                    return None;
+                }
+                _ => {}
+            }
+        }
         let (mut prompt, candidate, generation) = match command {
             SessionCommand::PromptCandidate {
                 prompt,
@@ -79,7 +111,7 @@ impl SessionActor {
                 // mount_candidate cancels preparation itself. Once chat install
                 // is submitted, it must finish the native publication tail;
                 // dropping that future could expose a partial snapshot.
-                Ok(()) => self.mount_candidate(candidate, cancelled).await,
+                Ok(()) => Box::pin(self.mount_candidate(candidate, cancelled)).await,
                 Err(error) => Err(error),
             }
         } else {
@@ -187,7 +219,13 @@ impl SessionActor {
         skills.update_startup_baseline(baseline);
         let (runtime_skills, skill_effects) = match skills.take_pending() {
             Some((skills, effects)) => (AvailableSkills(skills), effects),
-            None => (bridge.read_resource::<AvailableSkills>().await.unwrap_or_else(|| AvailableSkills(vec![])), Default::default()),
+            None => (
+                bridge
+                    .read_resource::<AvailableSkills>()
+                    .await
+                    .unwrap_or_else(|| AvailableSkills(vec![])),
+                Default::default(),
+            ),
         };
         skills.set_baseline_frozen(true);
 
@@ -255,6 +293,29 @@ impl SessionActor {
             }
             mcp.owned_clients.insert(name, client);
         }
+        let gateway_catalog = {
+            let state = self.managed_mcp_handle.lock().await;
+            if state.gateway_tools_active {
+                match &state.gateway_tool_cache {
+                    crate::session::managed_mcp::GatewayToolCatalogCache::Ready(catalog) => {
+                        Some(catalog.clone())
+                    }
+                    _ => return Err(candidate_error("managed MCP catalog is not ready")),
+                }
+            } else {
+                None
+            }
+        };
+        let disabled_gateway_tools = crate::util::config::get_all_mcp_disabled_tools(cwd);
+        let catalog = super::mcp_snapshot::prepare_mcp_catalog(
+            bridge.toolset().prepared_mcp_definitions(&tools),
+            mcp.all_clients()
+                .map(|(name, client)| (name.clone(), client.clone()))
+                .collect(),
+            gateway_catalog.as_ref(),
+            &disabled_gateway_tools,
+        )
+        .await;
         Ok(PreparedCandidate {
             mounted: MountedConfig {
                 candidate,
@@ -272,6 +333,7 @@ impl SessionActor {
             mcp_generation,
             mcp,
             tools,
+            catalog,
         })
     }
 
@@ -288,7 +350,8 @@ impl SessionActor {
             biased;
             () = cancelled.cancelled() => return Err(candidate_error("candidate cancelled")),
             () = self.tool_context.admission.wait_until_closed() => return Err(candidate_error("agent admission closed during preparation")),
-            prepared = self.prepare_candidate(candidate) => prepared?,
+            // Keep the detached discovery state off every caller's actor/test future.
+            prepared = Box::pin(self.prepare_candidate(candidate)) => prepared?,
         };
         let toolset = self.agent.borrow().tool_bridge().toolset();
         // Lock producers before checking generations. No old MCP completion or
@@ -368,6 +431,8 @@ impl SessionActor {
         let admission = self.tool_context.admission.clone();
         let config_clock = self.tool_context.config_clock.clone();
         let commit_cancelled = cancelled.clone();
+        let tool_metadata_snapshot = self.tool_metadata_snapshot.clone();
+        let mcp_reminder_dirty = self.mcp_reminder_dirty.clone();
         let installed = self
             .chat_state_handle
             .install_prepared_config_with_commit(
@@ -400,10 +465,27 @@ impl SessionActor {
                         let event_tx = live_mcp.client_event_tx();
                         live_mcp.set_client_event_tx(event_tx);
                         live_mcp.complete_init();
+                        live_mcp.freeze_mounted_snapshot();
                         install.commit();
                         resources.insert(prepared.skills);
                         resources.insert(prepared.runtime_skills);
-                        *commit_result.lock() = Some((permit, live_mcp.current_generation()));
+                        resources.insert(
+                            xai_grok_tools::types::resources::ManagedGatewayToolCatalog(
+                                prepared
+                                    .catalog
+                                    .gateway_resource_entries
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        );
+                        *tool_metadata_snapshot.lock().unwrap() =
+                            crate::session::tool_index::ToolMetadataSnapshot {
+                                tools: prepared.catalog.tools,
+                                servers: prepared.catalog.servers,
+                                mcp_initialized: true,
+                            };
+                        mcp_reminder_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        *commit_result.lock() = Some(permit);
                         true
                     })
                 },
@@ -414,7 +496,7 @@ impl SessionActor {
                 "candidate cancelled, superseded, or publication refused",
             ));
         }
-        let (permit, generation) = committed.lock().take().expect("acknowledged native commit");
+        let permit = committed.lock().take().expect("acknowledged native commit");
         *self.explicit_system_prompt.borrow_mut() = Some(instructions);
         self.supports_backend_search
             .set(sampling.supports_backend_search);
@@ -423,7 +505,6 @@ impl SessionActor {
         self.compaction_at_tokens.set(sampling.compaction_at_tokens);
         self.invalidate_model_auth_memo();
         self.apply_skill_update_effects(skill_effects).await;
-        self.refresh_mcp_snapshot_for(&generation).await;
         let version = self.tool_context.config_clock.bump();
         self.broadcast_effective_config_changed(version);
         Ok(permit)
@@ -461,6 +542,7 @@ mod tests {
                 drop(permit);
                 let before = actor.chat_state_handle.snapshot().await.unwrap();
                 assert_eq!(before.sampling_config.model, "candidate-wire");
+                assert!(actor.tool_metadata_snapshot.lock().unwrap().mcp_initialized);
                 assert_eq!(
                     actor
                         .candidate_admission
@@ -476,6 +558,24 @@ mod tests {
                 ));
                 let definitions = serde_json::to_value(toolset.tool_definitions()).unwrap();
                 let generation = actor.mcp_state.lock().await.current_generation();
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                assert!(actor.admit_candidate_command(SessionCommand::ToggleMcpTool {
+                    server_name: "native".into(), tool_name: "native".into(),
+                    enabled: false, is_managed_gateway: false, respond_to,
+                }).await.is_none());
+                assert!(response.await.unwrap().is_err());
+                let (responds_to, response) = tokio::sync::oneshot::channel();
+                assert!(actor.admit_candidate_command(SessionCommand::SetReasoningEffort {
+                    effort: xai_grok_sampling_types::ReasoningEffort::High, responds_to,
+                }).await.is_none());
+                assert!(response.await.unwrap().is_err());
+                // Even producers capturing the new generation cannot change a mounted baseline.
+                use crate::session::mcp_servers::SharedMcpState;
+                assert!(actor.mcp_state.write_if_current(&generation, |_| panic!("mounted writer ran")).await.is_err());
+                assert!(actor.mcp_state.write_if_slot_is("new-server", None, &generation, |_| panic!("mounted slot writer ran")).await.is_err());
+                actor.mcp_reminder_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+                actor.refresh_mcp_snapshot_and_schedule_reminder().await;
+                assert!(!actor.mcp_reminder_dirty.load(std::sync::atomic::Ordering::Relaxed));
                 let inherited = actor.snapshot_subagent_parent().await;
                 assert!(inherited.skills.as_ref().unwrap().iter().any(|skill| skill.name == "mounted-skill-a"));
                 assert!(Arc::ptr_eq(&inherited.toolset, &toolset));

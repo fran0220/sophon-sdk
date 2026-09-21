@@ -402,6 +402,8 @@ pub struct McpState {
     /// Init lifecycle behind the [`InitProgress`] state machine, which rules out nonsensical combinations like "initialized AND initializing".
     /// Private on purpose: external callers must go through the typed transition methods, not poke the variant directly.
     init_progress: InitProgress,
+    /// Mounted sessions publish replacements only through their atomic candidate commit.
+    mounted_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Maps qualified tool name to its `_meta` from MCP tools/list. Populated during init.
     pub mcp_tool_meta: HashMap<String, serde_json::Value>,
     /// Maps qualified tool name to its protocol `icons` from MCP tools/list.
@@ -447,6 +449,7 @@ impl McpState {
             shared_clients: HashMap::new(),
             acp_mcp: None,
             init_progress: InitProgress::default(),
+            mounted_snapshot: Default::default(),
             mcp_tool_meta: HashMap::new(),
             mcp_tool_icons: HashMap::new(),
             auth_required: std::collections::HashSet::new(),
@@ -466,6 +469,23 @@ impl McpState {
 
     pub fn init_wait_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
         std::sync::Arc::clone(&self.init_signal)
+    }
+
+    pub fn has_mounted_snapshot(&self) -> bool {
+        self.mounted_snapshot
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Recheck while holding the tool resources lock, without taking the MCP lock in reverse order.
+    pub fn mounted_snapshot_fence(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.mounted_snapshot.clone()
+    }
+
+    /// Called under the publication lock after the prepared clients and tools are installed.
+    pub fn freeze_mounted_snapshot(&mut self) {
+        self.mounted_snapshot
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.unreachable_retry.clear();
     }
 
     pub fn notify_init_waiters(&self) {
@@ -917,6 +937,9 @@ impl McpState {
         &mut self,
         now: std::time::Instant,
     ) -> Vec<(McpServerName, u64)> {
+        if self.has_mounted_snapshot() {
+            return Vec::new();
+        }
         let configured: std::collections::HashSet<&str> =
             self.configs.iter().map(mcp_server_name).collect();
         let due: Vec<McpServerName> = self
@@ -953,10 +976,11 @@ impl McpState {
 
     /// True when `name` currently holds an in-flight attempt with `token`.
     fn owns_unreachable_attempt(&self, name: &str, token: u64) -> bool {
-        matches!(
-            self.unreachable_retry.get(name),
-            Some(UnreachableRetry::InFlight { token: t, .. }) if *t == token
-        )
+        !self.has_mounted_snapshot()
+            && matches!(
+                self.unreachable_retry.get(name),
+                Some(UnreachableRetry::InFlight { token: t, .. }) if *t == token
+            )
     }
 
     /// Settle an attempt as recovered. Returns whether the attempt still owns the server (token match).

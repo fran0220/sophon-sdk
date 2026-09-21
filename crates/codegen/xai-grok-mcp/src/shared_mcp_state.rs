@@ -49,7 +49,7 @@ impl SharedMcpState for Arc<Mutex<McpState>> {
         write: impl FnOnce(&mut McpState) -> R,
     ) -> Result<R, Superseded> {
         let mut state = self.lock().await;
-        if !state.is_current(generation) {
+        if state.has_mounted_snapshot() || !state.is_current(generation) {
             return Err(Superseded);
         }
         Ok(write(&mut state))
@@ -62,7 +62,7 @@ impl SharedMcpState for Arc<Mutex<McpState>> {
         write: impl FnOnce(&mut McpState) -> R,
     ) -> Result<R, Superseded> {
         let mut state = self.lock().await;
-        if !state.has_client(name, client) {
+        if state.has_mounted_snapshot() || !state.has_client(name, client) {
             return Err(Superseded);
         }
         Ok(write(&mut state))
@@ -84,7 +84,7 @@ impl SharedMcpState for Arc<Mutex<McpState>> {
                     && !state.is_server_pending(name)
             }
         };
-        if !unchanged {
+        if state.has_mounted_snapshot() || !unchanged {
             return Err(Superseded);
         }
         Ok(write(&mut state))
@@ -96,7 +96,7 @@ impl SharedMcpState for Arc<Mutex<McpState>> {
         write: impl FnOnce(&mut McpState, InitClaimGuard) -> R,
     ) -> Result<R, Superseded> {
         let mut state = self.lock().await;
-        if !state.owns_init(&claim) {
+        if state.has_mounted_snapshot() || !state.owns_init(&claim) {
             return Err(Superseded);
         }
         Ok(write(&mut state, claim))

@@ -69,6 +69,14 @@ impl CandidateAdmission {
         self.state.lock().mounted.clone()
     }
 
+    /// Serialize synchronous legacy writers with the first mounted publication.
+    pub(crate) fn while_unmounted(&self, write: impl FnOnce()) {
+        let state = self.state.lock();
+        if state.mounted.is_none() {
+            write();
+        }
+    }
+
     pub(crate) fn publish(
         &self,
         cancelled: &tokio_util::sync::CancellationToken,

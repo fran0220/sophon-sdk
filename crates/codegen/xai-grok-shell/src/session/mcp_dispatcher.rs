@@ -458,6 +458,9 @@ pub(crate) async fn drop_dead_clients(
         return stale;
     }
     let mut state = mcp_state.lock().await;
+    if state.has_mounted_snapshot() {
+        return dead.iter().map(|client| client.server.clone()).collect();
+    }
     for d in dead {
         let Some(current) = state.owned_clients.get(&d.server) else {
             // Nothing registered: nothing to evict, and the death status is still accurate, so don't mark stale

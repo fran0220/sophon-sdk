@@ -603,7 +603,10 @@ impl SessionActor {
             .await;
     }
     /// A refresh that never publishes once `generation` is replaced.
-    pub(super) async fn refresh_mcp_snapshot_for(&self, generation: &crate::session::mcp_servers::Generation) {
+    pub(super) async fn refresh_mcp_snapshot_for(
+        &self,
+        generation: &crate::session::mcp_servers::Generation,
+    ) {
         let disabled_gateway_tools = crate::util::config::get_all_mcp_disabled_tools(
             std::path::Path::new(&self.session_info.cwd),
         );
@@ -931,28 +934,30 @@ impl SessionActor {
     }
     /// Sync, so the bridge and the searchable snapshot lose the server before the caller can yield.
     pub(crate) fn unregister_server_tools(&self, server: &str) {
-        let prefix = format!(
-            "{}{}",
-            server,
-            crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
-        );
-        let removed = self
-            .agent
-            .borrow()
-            .tool_bridge()
-            .unregister_tools_by_prefix(&prefix);
-        {
-            let mut snapshot = self.tool_metadata_snapshot.lock().unwrap();
-            snapshot.tools.retain(|t| t.server_name != server);
-            snapshot.servers.retain(|s| s.name != server);
-        }
-        if removed > 0 {
-            tracing::info!(
-                server = %server,
-                tools_removed = removed,
-                "unregistered MCP server tools",
+        self.candidate_admission.while_unmounted(|| {
+            let prefix = format!(
+                "{}{}",
+                server,
+                crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
             );
-        }
+            let removed = self
+                .agent
+                .borrow()
+                .tool_bridge()
+                .unregister_tools_by_prefix(&prefix);
+            {
+                let mut snapshot = self.tool_metadata_snapshot.lock().unwrap();
+                snapshot.tools.retain(|t| t.server_name != server);
+                snapshot.servers.retain(|s| s.name != server);
+            }
+            if removed > 0 {
+                tracing::info!(
+                    server = %server,
+                    tools_removed = removed,
+                    "unregistered MCP server tools",
+                );
+            }
+        });
     }
     /// Stdio-only restart: handshake, start the liveness watcher, then atomically install the new `Arc<McpClient>`.
     /// Wire `set_event_tx` after `ensure_initialized` so a restart emits only `RestartSucceeded`, not a second `Initialized` from `Ready`.

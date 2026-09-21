@@ -153,7 +153,7 @@ impl SnapshotRefresher {
         }
         // Refreshes serialize on this gate so the last write is the latest read.
         let _refresh_serialized = refresh_gate.lock().await;
-        if self.is_superseded() {
+        if self.is_superseded() || mcp_state.lock().await.has_mounted_snapshot() {
             return;
         }
 
@@ -235,12 +235,15 @@ impl SnapshotRefresher {
                 disabled_gateway_tools,
             )
             .await;
+            let mounted = mcp_state.lock().await.mounted_snapshot_fence();
             // `search_tool` and `use_tool` read under the bridge's resource lock, so both publications land in one
             // critical section.
             let mut published = Err(Superseded);
             tool_bridge
                 .update_resources_with(|resources| {
-                    if generation.is_cancelled() {
+                    if generation.is_cancelled()
+                        || mounted.load(std::sync::atomic::Ordering::Acquire)
+                    {
                         return;
                     }
                     resources.insert(xai_grok_tools::types::resources::ManagedGatewayToolCatalog(
@@ -280,8 +283,12 @@ async fn build_mcp_catalog(
     disabled_gateway_tools: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> McpCatalog {
     let all_defs = tool_bridge.tool_definitions().await;
-    let clients = mcp_state.lock().await.all_clients()
-        .map(|(name, client)| (name.clone(), client.clone())).collect();
+    let clients = mcp_state
+        .lock()
+        .await
+        .all_clients()
+        .map(|(name, client)| (name.clone(), client.clone()))
+        .collect();
     prepare_mcp_catalog(all_defs, clients, gateway_catalog, disabled_gateway_tools).await
 }
 
@@ -348,7 +355,10 @@ pub(super) async fn prepare_mcp_catalog(
     let servers_with_tools: std::collections::HashSet<&str> =
         tools.iter().map(|t| t.server_name.as_str()).collect();
     let mut servers = Vec::new();
-    for (name, client) in clients.into_iter().filter(|(name, _)| servers_with_tools.contains(name.as_str())) {
+    for (name, client) in clients
+        .into_iter()
+        .filter(|(name, _)| servers_with_tools.contains(name.as_str()))
+    {
         servers.push(ServerMetadata {
             description: client.server_instructions().await,
             name,

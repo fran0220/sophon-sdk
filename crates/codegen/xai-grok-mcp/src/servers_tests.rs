@@ -5247,6 +5247,28 @@ async fn write_on_a_replaced_premise_is_refused() {
     );
 }
 
+#[tokio::test]
+async fn mounted_snapshot_refuses_even_current_background_writers() {
+    use crate::shared_mcp_state::SharedMcpState;
+    let state = Arc::new(Mutex::new(McpState::new(vec![])));
+    let client = Arc::new(McpClient::stub("native"));
+    let (generation, claim) = {
+        let mut state = state.lock().await;
+        state.owned_clients.insert("native".into(), client.clone());
+        (state.current_generation(), state.try_start_init().unwrap())
+    };
+    assert!(state.write_if_current(&generation, |_| ()).await.is_ok());
+    assert!(state.write_if_installed("native", &client, |_| ()).await.is_ok());
+    assert!(state.write_if_slot_is("native", Some(&client), &generation, |_| ()).await.is_ok());
+    state.lock().await.freeze_mounted_snapshot();
+    assert!(!generation.is_cancelled(), "freeze must also fence new-generation writers");
+    assert!(state.write_if_current(&generation, |_| panic!("current writer ran")).await.is_err());
+    assert!(state.write_if_installed("native", &client, |_| panic!("installed writer ran")).await.is_err());
+    assert!(state.write_if_slot_is("native", Some(&client), &generation, |_| panic!("slot writer ran")).await.is_err());
+    assert!(state.write_if_owner(claim, |_, _| panic!("owner writer ran")).await.is_err());
+    assert!(Arc::ptr_eq(state.lock().await.owned_clients.get("native").unwrap(), &client));
+}
+
 /// A scripted MCP server over an in-memory duplex that answers `initialize`, records every
 /// message it receives, and answers `tools/call` only when `reply` is set.
 async fn recording_service(
