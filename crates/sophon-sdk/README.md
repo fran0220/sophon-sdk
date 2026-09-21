@@ -570,6 +570,33 @@ Packaged hosts must supply their verified executable outside ASAR, validate its
 hash/dependencies/codecs, and keep the bundle immutable. Runtime path validation
 does not replace those checks or claim that an arbitrary file is usable FFmpeg.
 
+`RuntimeConfig.decision` optionally binds the native `evaluate_decisions` tool:
+`{ endpoint: "system-one", model, baseUrl, bearerToken }`. The host supplies the
+published model and existing relay's `/v1` base and bearer; no model-name lookup,
+chat fallback, vendor credential, or reverse-MCP server is involved. Absence
+leaves the tool unavailable. This auxiliary resource is immutable for the Agent's
+lifetime: changes require quiesce, checked final exit, and replacement, never a
+mutation of an admitted FIFO batch or its inherited child tools.
+
+The tool accepts `DecisionRequest { state, questions }`: string/object/array
+state and independent tagged `noul`, `choice`, and `score` questions. Instructions
+and descriptions may be structured; Choice supports null descriptions and up to
+255 candidates, Score requires 2–10 ordered levels, and Noul criteria use `true`
+and `false`. Empty instructions/IDs and invalid types refuse before submission.
+One POST to `/v1/systemone` has a 60-second deadline and 2 MiB request/response
+limits, with no redirects or automatic retries. Response validation requires
+exact IDs/types/candidate keys, finite probabilities summing to one (1e-6
+tolerance), a maximal Choice, and Score range, legend, and weighted mean (0.005001
+rounding tolerance). Usage and actual model are required, not fabricated.
+`DecisionResult` includes all distributions, actual and requested models, token
+usage, elapsed milliseconds, a local request UUID, and native tool-call ID.
+Route credentials are not added to tool arguments/results; raw remote error
+bodies are not exposed. Standard native
+tool failure/completion events carry the outcome; cancellation stops the local
+wait but cannot establish remote cancellation or zero billing. Unknown outcomes
+must not be blindly replayed. Judgments are advisory, not permission, successful
+execution, or hidden history/memory rewriting. Concrete tools execute actions.
+
 One declared upstream feature is not part of this usable public-source
 baseline: Grok Build declares Cargo feature `local-workspace`, but the public
 snapshot omits its `gateway_bridge` module and the feature does not compile.

@@ -66,6 +66,10 @@ pub struct RuntimeConfig {
     pub browser: Option<BrowserConfig>,
     #[serde(default)]
     pub media: Option<crate::native_media::NativeMediaConfig>,
+    /// Immutable Agent-wide auxiliary route. Changes require checked replacement.
+    #[serde(default)]
+    #[ts(optional)]
+    pub decision: Option<crate::decisions::DecisionConfig>,
     #[serde(default)]
     pub subagents: Vec<crate::SubagentDefinition>,
 }
@@ -533,6 +537,8 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     ServerFrame::export_all(&config)?;
     SessionDescriptor::export_all(&config)?;
     HistorySnapshot::export_all(&config)?;
+    crate::decisions::DecisionRequest::export_all(&config)?;
+    crate::decisions::DecisionResult::export_all(&config)?;
     crate::subagent::SubagentResult::export_all(&config)?;
     crate::subagent::SubagentSnapshot::export_all(&config)?;
     crate::subagent::SubagentCancelIdResult::export_all(&config)?;

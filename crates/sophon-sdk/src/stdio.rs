@@ -96,12 +96,20 @@ struct RuntimeTools {
     callbacks: Arc<Callbacks>,
     browser: Option<Arc<sophon_browser::BrowserService>>,
     media: Option<crate::native_media::NativeMediaService>,
+    decision: Option<crate::decisions::DecisionService>,
 }
 
 #[async_trait::async_trait]
 impl crate::native_tools::NativeToolHandler for RuntimeTools {
     async fn execute(&self, name: &str, args: Value, context: p::CallbackContext) -> Result<Value> {
         match name {
+            "evaluate_decisions" => {
+                self.decision
+                    .as_ref()
+                    .ok_or_else(|| Error::Operation("decision route is not configured".into()))?
+                    .execute(args, context.tool_call_id)
+                    .await
+            }
             "browser" => {
                 let browser = self
                     .browser
@@ -141,6 +149,7 @@ async fn publish_browser_artifact(cwd: &str, id: &str, artifact: Value) -> Resul
     let extension = match mime {
         "image/png" => "png",
         "video/mp4" => "mp4",
+        "application/octet-stream" => "download",
         _ => return Err(Error::Operation("unsupported browser artifact MIME".into())),
     };
     let bytes = base64::engine::general_purpose::STANDARD
@@ -170,7 +179,19 @@ async fn publish_browser_artifact(cwd: &str, id: &str, artifact: Value) -> Resul
         let mut staging = tempfile::NamedTempFile::new_in(directory).map_err(operation)?;
         staging.write_all(&bytes).map_err(operation)?;
         staging.as_file().sync_all().map_err(operation)?;
-        staging.persist_noclobber(destination).map_err(operation)?;
+        if let Err(error) = staging.persist_noclobber(&destination) {
+            // Repeated download_status is a read, not a second publication.
+            // Never replace a modified file, symlink, or other existing entry.
+            let unchanged_download = extension == "download"
+                && error.error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(&destination).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.len() == bytes.len() as u64
+                })
+                && std::fs::read(&destination).is_ok_and(|existing| existing == bytes);
+            if !unchanged_download {
+                return Err(operation(error));
+            }
+        }
         Ok(result)
     })
     .await
@@ -831,6 +852,18 @@ pub async fn run() -> Result<()> {
                 id,
                 request: p::Request::Initialize { config },
             } if runtime.is_none() => {
+                let decision = match config
+                    .decision
+                    .clone()
+                    .map(crate::decisions::DecisionService::new)
+                    .transpose()
+                {
+                    Ok(service) => service,
+                    Err(error) => {
+                        respond(&output, id, Err(error)).await?;
+                        continue;
+                    }
+                };
                 let ffmpeg_executable = match ffmpeg_executable(config.ffmpeg_executable.as_deref())
                 {
                     Ok(path) => path,
@@ -852,6 +885,9 @@ pub async fn run() -> Result<()> {
                     ))
                 });
                 let mut native_specs = Vec::new();
+                if decision.is_some() {
+                    native_specs.push(crate::decisions::DecisionService::tool_spec());
+                }
                 if browser.is_some() {
                     native_specs.extend(
                         sophon_browser::BrowserService::tool_specs()
@@ -878,6 +914,7 @@ pub async fn run() -> Result<()> {
                 let handlers = Arc::new(RuntimeTools {
                     callbacks: callbacks.clone(),
                     browser: browser.clone(),
+                    decision,
                     media: config.media.clone().map(|config| {
                         crate::native_media::NativeMediaService::new(config, ffmpeg_executable)
                     }),
@@ -1085,6 +1122,38 @@ mod tests {
             responding.await.unwrap(),
             Err(Error::RuntimeStopped)
         ));
+    }
+
+    #[tokio::test]
+    async fn download_artifacts_use_inert_suffix_and_ignore_remote_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "01995175-3b18-7001-8ac1-3ac1a7e80d12";
+        let input = json!({"mime_type":"application/octet-stream","suggested_filename":"../../unsafe.exe","base64":base64::engine::general_purpose::STANDARD.encode(b"download-73")});
+        let result = publish_browser_artifact(root.path().to_str().unwrap(), id, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["path"], format!(".native-browser/{id}.download"));
+        assert_eq!(result["mimeType"], "application/octet-stream");
+        assert_eq!(
+            std::fs::read(root.path().join(result["path"].as_str().unwrap())).unwrap(),
+            b"download-73"
+        );
+        assert_eq!(
+            publish_browser_artifact(root.path().to_str().unwrap(), id, input.clone())
+                .await
+                .unwrap(),
+            result
+        );
+        std::fs::write(
+            root.path().join(result["path"].as_str().unwrap()),
+            b"user-change",
+        )
+        .unwrap();
+        assert!(
+            publish_browser_artifact(root.path().to_str().unwrap(), id, input)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

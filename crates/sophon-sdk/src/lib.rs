@@ -11,6 +11,7 @@
 mod client;
 mod config;
 mod config_native;
+pub mod decisions;
 mod event;
 pub mod management;
 pub mod mcp;
