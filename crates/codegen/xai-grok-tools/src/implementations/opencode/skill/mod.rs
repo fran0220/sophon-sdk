@@ -118,6 +118,9 @@ fn find_skill<'a>(name: &str, skills: &'a [SkillInfo]) -> FindSkillResult<'a> {
 
 /// Load skill content from its SKILL.md file, stripping YAML frontmatter.
 async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
+    if skill.body.is_some() {
+        return crate::implementations::skills::skill::load_skill_content(skill).await;
+    }
     let path = Path::new(&skill.path);
     match tokio::fs::read_to_string(path).await {
         Ok(content) => Ok(extract_skill_body(&content)),
@@ -525,6 +528,46 @@ mod tests {
         assert!(!output.success);
         assert!(output.tool_result.contains("not found"));
         assert!(output.tool_result.contains("none"));
+    }
+
+    #[tokio::test]
+    async fn captured_skill_body_survives_external_edit_in_tool_and_preloader() {
+        use crate::implementations::skills::skill::load_skill_with_body;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        for original in ["CAPTURED_A", ""] {
+            std::fs::write(&path, format!("---\nname: frozen\n---\n{original}")).unwrap();
+            let skill = make_test_skill("frozen", SkillScope::Local, path.to_str().unwrap());
+            let captured = load_skill_with_body(&skill).await.unwrap();
+            std::fs::write(&path, "MUTATED_B").unwrap();
+            assert_eq!(
+                load_skill_with_body(&captured)
+                    .await
+                    .unwrap()
+                    .body
+                    .as_deref(),
+                Some(original)
+            );
+            let mut resources = Resources::new();
+            resources.insert(AvailableSkills(vec![captured]));
+            let output = xai_tool_runtime::Tool::run(
+                &SkillTool,
+                test_ctx(resources.into_shared()),
+                SkillInput {
+                    name: "frozen".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(output.success);
+            let message = output.skill_message.unwrap();
+            assert!(!message.contains("MUTATED_B"));
+            assert!(message.contains(original));
+            assert_eq!(
+                load_skill_with_body(&skill).await.unwrap().body.as_deref(),
+                Some("MUTATED_B")
+            );
+        }
     }
 
     #[tokio::test]

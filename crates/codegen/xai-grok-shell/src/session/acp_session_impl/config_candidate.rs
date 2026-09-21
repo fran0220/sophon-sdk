@@ -217,7 +217,7 @@ impl SessionActor {
             config.remote_settings.as_ref(),
             false,
         );
-        let baseline = xai_grok_agent::prompt::skills::list_skills_with_plugins(
+        let mut baseline = xai_grok_agent::prompt::skills::list_skills_with_plugins(
             Some(&self.session_info.cwd),
             &config.skills,
             plugin_registry.as_deref(),
@@ -225,6 +225,11 @@ impl SessionActor {
             project_trusted,
         )
         .await;
+        for skill in &mut baseline {
+            *skill = xai_grok_tools::implementations::skills::skill::load_skill_with_body(skill)
+                .await
+                .map_err(candidate_error)?;
+        }
         skills.update_startup_baseline(baseline);
         let (runtime_skills, skill_effects) = match skills.take_pending() {
             Some((skills, effects)) => (AvailableSkills(skills), effects),
@@ -669,6 +674,8 @@ mod tests {
                     assert_eq!(actor.tool_context.admission.snapshot().accepted, 1);
                 }
                 std::fs::write(skill_dir.path().join("SKILL.md"), "---\nname: mounted-skill-b\ndescription: Replacement mounted skill\n---\nB instructions\n").unwrap();
+                let captured_skill = inherited.skills.as_ref().unwrap().iter().find(|skill| skill.name == "mounted-skill-a").unwrap();
+                assert_eq!(xai_grok_tools::implementations::skills::skill::load_skill_content(captured_skill).await.unwrap(), "A instructions\n");
                 let mut next = candidate;
                 next["instructions"] = serde_json::json!("mounted B");
                 next["revision"] = serde_json::json!("B");
@@ -681,6 +688,7 @@ mod tests {
                 assert!(Arc::ptr_eq(inherited.plugin_registry.as_ref().unwrap(), &plugins_a));
                 assert_eq!(replacement.mounted.unwrap().candidate.revision, "B");
                 let replacement_skills = replacement.skills.unwrap();
+                assert_eq!(replacement_skills.iter().find(|skill| skill.name == "mounted-skill-b").unwrap().body.as_deref(), Some("B instructions\n"));
                 assert!(replacement_skills.iter().any(|skill| skill.name == "mounted-skill-b"));
                 assert!(!replacement_skills.iter().any(|skill| skill.name == "mounted-skill-a"));
                 assert_eq!(inherited.mounted.unwrap().candidate.revision, "A");

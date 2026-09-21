@@ -444,12 +444,16 @@ pub fn extract_skill_body(content: &str) -> String {
 }
 
 /// Load skill content from its file, stripping YAML frontmatter. Public entrypoint for the shell
-/// crate to load skill content at prompt-assembly time (the new zero-round-trip path). The private
-/// `load_skill_content` in `opencode/skill/mod.rs` is a duplicate of this.
+/// crate to load skill content at prompt-assembly time. Captured local bodies,
+/// including empty files, are authoritative across subsequent filesystem edits.
 pub async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
     // Producers strip frontmatter before setting `body`. Re-strip would drop a
     // leading Markdown HR (`---`) and skip link resolution for disk skills.
-    if let Some(body) = skill.body.as_ref().filter(|b| !b.is_empty()) {
+    if let Some(body) = skill
+        .body
+        .as_ref()
+        .filter(|b| !b.is_empty() || !skill.path.contains("://"))
+    {
         return Ok(body.clone());
     }
     // Synthetic product paths are never on disk; empty body is authoritative.
@@ -474,17 +478,9 @@ pub async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
 
 /// Load skill body into SkillInfo.
 pub async fn load_skill_with_body(skill: &SkillInfo) -> Result<SkillInfo, String> {
-    let path = std::path::Path::new(&skill.path);
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| format!("Failed to read {}: {}", skill.path, e))?;
-    let body = extract_skill_body(&content);
-    let body = match path.parent() {
-        Some(skill_dir) => resolve_skill_internal_links(&body, skill_dir),
-        None => body,
-    };
+    let body = load_skill_content(skill).await?;
     let mut loaded = skill.clone();
-    loaded.body = if body.is_empty() { None } else { Some(body) };
+    loaded.body = Some(body);
     Ok(loaded)
 }
 
