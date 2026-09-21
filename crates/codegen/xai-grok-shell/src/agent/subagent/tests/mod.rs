@@ -583,14 +583,17 @@ async fn subagent_inherits_session_cli_overrides() {
 async fn subagent_no_tools_survives_parent_overrides_and_native_build() {
     for parent_tools in [None, Some(vec!["read_file".into()])] {
         let mut profile = xai_grok_agent::config::AgentDefinition::general_purpose();
-        profile.name = "no-tools-native-probe".into();
+        let profile_name = profile.name.clone(); // Collides with the real builtin.
+        profile.prompt_body = Some("fixed registered instructions".into());
         profile.session_tools_allowlist = Some(vec![]);
         let mut config = crate::agent::config::Config::default();
-        config.cli_agents = vec![profile];
+        config.registered_subagents = vec![profile];
         config.cli_agent_overrides.tools = parent_tools;
         let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
         ctx.agent_config = Some(config);
-        let definition = resolve_agent_definition("no-tools-native-probe", &ctx).unwrap();
+        let definition = resolve_agent_definition(&profile_name, &ctx).unwrap();
+        assert_eq!(definition.prompt_body.as_deref(), Some("fixed registered instructions"));
+        assert!(available_agent_names(&ctx).contains(&profile_name));
         assert_eq!(definition.session_tools_allowlist, Some(vec![]));
         let agent = xai_grok_agent::AgentBuilder::new(
             std::env::temp_dir(),

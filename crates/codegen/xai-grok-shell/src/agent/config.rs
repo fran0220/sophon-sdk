@@ -1402,6 +1402,10 @@ pub struct Config {
     pub remote_settings: Option<crate::util::config::RemoteSettings>,
     #[serde(skip)]
     pub cli_agents: Vec<xai_grok_agent::config::AgentDefinition>,
+    /// In-process fixed definitions registered by the embedding application.
+    /// Filesystem/plugin discovery cannot replace these definitions.
+    #[serde(skip)]
+    pub registered_subagents: Vec<xai_grok_agent::config::AgentDefinition>,
     #[serde(skip)]
     pub cli_agent_overrides: CliAgentOverrides,
     /// Whether subagent (task tool) support is enabled.
@@ -1725,6 +1729,7 @@ impl Default for Config {
             mode: AgentMode::default(),
             remote_settings: None,
             cli_agents: Vec::new(),
+            registered_subagents: Vec::new(),
             cli_agent_overrides: CliAgentOverrides::default(),
             subagents_enabled: true,
             subagents_max_depth: crate::config::SubagentsConfig::DEFAULT_MAX_DEPTH,

@@ -1516,10 +1516,22 @@ fn resolve_agent_definition(
         toggles: &ctx.subagent_toggle,
         allowed_types: ctx.allowed_subagent_types.as_deref(),
     };
-    let mut def = xai_grok_subagent_resolution::discover_agent_definition(
-        subagent_type,
-        &resolution_context,
-    )?;
+    let mut def = ctx
+        .agent_config
+        .as_ref()
+        .and_then(|config| {
+            config
+                .registered_subagents
+                .iter()
+                .find(|definition| definition.name == subagent_type)
+        })
+        .cloned()
+        .or_else(|| {
+            xai_grok_subagent_resolution::discover_agent_definition(
+                subagent_type,
+                &resolution_context,
+            )
+        })?;
     ctx.apply_session_cli_overrides(&mut def);
     Some(def)
 }
@@ -1527,13 +1539,20 @@ fn available_agent_names(ctx: &SubagentSpawnContext) -> Vec<String> {
     let cli_agents = ctx
         .agent_config
         .as_ref()
-        .map(|config| config.cli_agents.as_slice())
+        .map(|config| {
+            config
+                .cli_agents
+                .iter()
+                .chain(&config.registered_subagents)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     xai_grok_subagent_resolution::available_agent_names(
         &xai_grok_subagent_resolution::DefinitionResolutionContext {
             cwd: &ctx.parent_cwd,
             plugins: ctx.plugin_registry.as_deref(),
-            cli_agents,
+            cli_agents: &cli_agents,
             toggles: &ctx.subagent_toggle,
             allowed_types: ctx.allowed_subagent_types.as_deref(),
         },
