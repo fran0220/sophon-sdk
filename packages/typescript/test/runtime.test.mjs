@@ -149,10 +149,15 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
     const answered = payload.messages?.some(message => message.role === 'tool' && JSON.stringify(message.content).includes('ANSWER_29'))
     const isChild = JSON.stringify(payload.messages).includes('Ask the user then finish.')
     const ask = isChild && payload.tools?.some(tool => tool.function?.name === 'ask_user') && !answered
-    const delta = ask ? { role: 'assistant', tool_calls: [{ index: 0, id: 'question29', type: 'function', function: { name: 'ask_user', arguments: '{"question":"Choose 29?"}' } }] } : { role: 'assistant', content: 'CHILD_COMPLETE_73' }
+    const delegate = !isChild && JSON.stringify(payload.messages).includes('ROOT_NATIVE_TASK_73') && !payload.messages.some(message => message.role === 'tool' && message.tool_call_id === 'root-task-73')
+    const taskTool = payload.tools?.find(tool => ['task', 'Task', 'spawn_subagent'].includes(tool.function?.name))
+    if (delegate) assert.ok(taskTool, `root must use advertised native TaskTool: ${payload.tools?.map(tool => tool.function?.name).join(',')}`)
+    const delta = delegate
+      ? { role: 'assistant', tool_calls: [{ index: 0, id: 'root-task-73', type: 'function', function: { name: taskTool.function.name, arguments: JSON.stringify({ prompt: 'Ask the human.', description: 'Root attribution check', subagent_type: 'task', run_in_background: false }) } }] }
+      : ask ? { role: 'assistant', tool_calls: [{ index: 0, id: 'question29', type: 'function', function: { name: 'ask_user', arguments: '{"question":"Choose 29?"}' } }] } : { role: 'assistant', content: 'CHILD_COMPLETE_73' }
     const chunk = (delta, finish_reason) => ({ id: 'child-fixture', object: 'chat.completion.chunk', created: 1, model: 'child-wire', choices: [{ index: 0, delta, finish_reason }] })
     response.writeHead(200, { 'content-type': 'text/event-stream' })
-    response.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, ask ? 'tool_calls' : 'stop'))}\n\ndata: [DONE]\n\n`)
+    response.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, ask || delegate ? 'tool_calls' : 'stop'))}\n\ndata: [DONE]\n\n`)
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
@@ -178,6 +183,16 @@ test('ordinary and scheduled children retain callback owner, workspace, source a
   assert.equal(first.request.context.originatingPrompt, null, 'direct child before any parent prompt has no invented root')
   first.answer()
   assert.equal((await ordinary).state, 'completed')
+  nextQuestion = new Promise(resolve => { receive = resolve })
+  const rootTurn = session.prompt({ turnId: 'root-prompt-73', blocks: [{ type: 'text', text: 'ROOT_NATIVE_TASK_73' }], metadata: {} })
+  const rooted = await nextQuestion
+  assert.equal(rooted.request.context.ownerSessionId, session.id)
+  assert.notEqual(rooted.request.context.sessionId, session.id)
+  assert.notEqual(rooted.request.context.promptId, 'root-prompt-73')
+  assert.deepEqual(rooted.request.context.originatingPrompt, { sessionId: session.id, promptId: 'root-prompt-73' })
+  assert.equal(rooted.request.context.scheduledInvocation, null)
+  rooted.answer()
+  assert.equal((await rootTurn).stopReason, 'end_turn')
   for (const cancel of [false, true]) {
     nextQuestion = new Promise(resolve => { receive = resolve })
     let fired
