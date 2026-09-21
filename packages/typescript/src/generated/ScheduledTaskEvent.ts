@@ -2,4 +2,14 @@
 import type { ScheduledTaskRemovalReason } from "./ScheduledTaskRemovalReason.js";
 import type { SubagentId } from "./SubagentId.js";
 
-export type ScheduledTaskEvent = { "type": "upserted" } | { "type": "fired", subagentId: SubagentId | null, } | { "type": "removed", reason: ScheduledTaskRemovalReason, };
+export type ScheduledTaskEvent =
+  | { type: "upserted" }
+  | {
+      type: "fired";
+      /**
+       * Exact consumed cursor, not dispatch time or the next occurrence.
+       */
+      occurrence: string;
+      subagentId: SubagentId | null;
+    }
+  | { type: "removed"; reason: ScheduledTaskRemovalReason };

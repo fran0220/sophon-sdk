@@ -1016,6 +1016,8 @@ pub enum ScheduledTaskEvent {
     /// The upstream notification is emitted for both create and update.
     Upserted,
     Fired {
+        /// Exact consumed cursor, not dispatch time or the next occurrence.
+        occurrence: String,
         subagent_id: Option<SubagentId>,
     },
     Removed {

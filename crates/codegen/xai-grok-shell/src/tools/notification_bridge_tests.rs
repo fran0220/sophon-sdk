@@ -1339,6 +1339,7 @@ async fn scheduled_fire_presentation_never_reinjects_foreground_work() {
             ToolNotification::ScheduledTaskFired(
                 xai_grok_tools::notification::types::ScheduledTaskFired {
                     task_id: "sdk-fire".into(),
+                    occurrence: "2026-09-21T03:00:00+00:00".into(),
                     prompt: "check deploy".into(),
                     human_schedule: "once".into(),
                     next_fire_at: None,
@@ -1374,6 +1375,7 @@ async fn scheduled_task_fired_is_not_persisted() {
     let notification = ToolNotification::ScheduledTaskFired(
         xai_grok_tools::notification::types::ScheduledTaskFired {
             task_id: "loop-1".into(),
+            occurrence: "2025-12-31T23:55:00+00:00".into(),
             prompt: "check deploy".into(),
             human_schedule: "every 5 minutes".into(),
             next_fire_at: Some("2026-01-01T00:00:00Z".into()),
@@ -1398,6 +1400,8 @@ async fn scheduled_task_fired_is_not_persisted() {
         panic!("expected scheduler fire notification");
     };
     let value: serde_json::Value = serde_json::from_str(fired.request.params.get()).unwrap();
+    assert_eq!(value["update"]["occurrence"], "2025-12-31T23:55:00+00:00");
+    assert_eq!(value["update"]["subagentId"], "subagent-1");
     assert_eq!(
         value
             .get("_meta")

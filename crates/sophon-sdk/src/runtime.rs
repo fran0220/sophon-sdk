@@ -1689,7 +1689,7 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
             definition.mcp_inheritance = xai_grok_agent::config::McpInheritance::None;
             definition.allowed_subagent_types = Some(Vec::new());
         }
-        grok.cli_agents.push(definition);
+        grok.registered_subagents.push(definition);
     }
     grok.web_search_model = config.web_search_model.clone().unwrap_or_default();
     grok.strict_auxiliary_routes = true;
@@ -2277,6 +2277,7 @@ fn management_session_event(
             task_id: mgmt::ScheduledTaskId::new(string_field(update, &["taskId", "task_id"])?),
             version: management_event_version(metadata)?,
             occurrence: mgmt::ScheduledTaskEvent::Fired {
+                occurrence: string_field(update, &["occurrence"])?,
                 subagent_id: string_field(update, &["subagentId", "subagent_id"])
                     .map(crate::subagent::SubagentId::new),
             },
@@ -3167,6 +3168,25 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_profiles_use_immutable_native_registration() {
+        let mut config = config();
+        config.subagents.push(crate::config::SubagentDefinition {
+            name: "general-purpose".into(),
+            description: "Fixed registered profile".into(),
+            instructions: "BASELINE_73".into(),
+            model: Some("default".into()),
+            tools: Some(Vec::new()),
+        });
+        let (grok, _) = grok_config(&config).expect("registered configuration");
+        assert!(grok.cli_agents.is_empty());
+        assert_eq!(grok.registered_subagents.len(), 1);
+        let profile = &grok.registered_subagents[0];
+        assert_eq!(profile.name, "general-purpose");
+        assert_eq!(profile.prompt_body.as_deref(), Some("BASELINE_73"));
+        assert_eq!(profile.session_tools_allowlist, Some(Vec::new()));
+    }
+
+    #[test]
     fn auxiliary_agent_work_can_use_independent_catalog_models() {
         let config = config()
             .model(ModelConfig::new(
@@ -3394,6 +3414,47 @@ mod tests {
                 ..
             }) if task_id.as_str() == "task-1"
         ));
+    }
+
+    #[test]
+    fn scheduler_fire_preserves_consumed_occurrence_without_latest_snapshot() {
+        let metadata = serde_json::json!({
+            "x.ai/schedulerGeneration": "generation-29",
+            "x.ai/schedulerRevision": 73,
+        });
+        for (occurrence, child) in [
+            ("2026-09-21T03:00:00+00:00", "earlier-child"),
+            ("2026-09-21T03:05:00+00:00", "later-child"),
+        ] {
+            let mut update = serde_json::json!({
+                "sessionUpdate": "scheduled_task_fired", "taskId": "same-task",
+                "occurrence": occurrence, "subagentId": child,
+                "nextFireAt": "2026-09-21T03:10:00+00:00",
+            });
+            let projected = management_session_event(
+                &SessionId::from("scheduler-owner"),
+                &update,
+                metadata.as_object(),
+            );
+            assert!(
+                matches!(projected, Some(mgmt::ManagementEventKind::Scheduler {
+                session_id, task_id,
+                occurrence: mgmt::ScheduledTaskEvent::Fired { occurrence: actual, subagent_id: Some(id) },
+                ..
+            }) if session_id.as_str() == "scheduler-owner" && task_id.as_str() == "same-task"
+                && actual == occurrence && id.as_str() == child)
+            );
+            update.as_object_mut().unwrap().remove("occurrence");
+            assert!(
+                management_session_event(
+                    &SessionId::from("scheduler-owner"),
+                    &update,
+                    metadata.as_object(),
+                )
+                .is_none(),
+                "missing occurrence must not be inferred from nextFireAt"
+            );
+        }
     }
 
     #[test]

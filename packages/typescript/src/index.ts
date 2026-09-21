@@ -38,6 +38,7 @@ export type { CompactionUpdate } from './generated/CompactionUpdate.js'
 export type { SchedulerCadence } from './generated/SchedulerCadence.js'
 export type { SchedulerDispatch } from './generated/SchedulerDispatch.js'
 export type { ScheduledInvocation } from './generated/ScheduledInvocation.js'
+export type { NativePromptOrigin } from './generated/NativePromptOrigin.js'
 export type { TurnCompletion } from './generated/TurnCompletion.js'
 export type { TurnUsage } from './generated/TurnUsage.js'
 export type { QueueSnapshot }

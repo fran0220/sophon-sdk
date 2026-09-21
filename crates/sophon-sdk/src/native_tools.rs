@@ -80,6 +80,12 @@ impl Tool for RegisteredTool {
                     occurrence: source.occurrence.to_rfc3339(),
                 }
             }),
+            originating_prompt: invocation.originating_prompt.as_ref().map(|source| {
+                crate::protocol::NativePromptOrigin {
+                    session_id: source.session_id.clone(),
+                    prompt_id: source.prompt_id.clone(),
+                }
+            }),
         };
         self.tool
             .handler

@@ -706,6 +706,7 @@ async fn handle_notification(
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::ScheduledTaskFired {
                     task_id: fired.task_id,
+                    occurrence: fired.occurrence,
                     prompt: fired.prompt,
                     human_schedule: fired.human_schedule,
                     next_fire_at: fired.next_fire_at,

@@ -874,6 +874,7 @@ pub enum SessionUpdate {
     },
     ScheduledTaskFired {
         task_id: String,
+        occurrence: String,
         prompt: String,
         human_schedule: String,
         next_fire_at: Option<String>,

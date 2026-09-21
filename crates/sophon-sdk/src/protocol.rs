@@ -311,6 +311,14 @@ pub struct CallbackContext {
     /// Actual invocation workspace on the runtime machine (including children).
     pub cwd: String,
     pub scheduled_invocation: Option<ScheduledInvocation>,
+    pub originating_prompt: Option<NativePromptOrigin>,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePromptOrigin {
+    pub session_id: String,
+    pub prompt_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]

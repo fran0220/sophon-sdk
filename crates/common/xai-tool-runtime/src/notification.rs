@@ -230,6 +230,8 @@ pub struct LspServerFailed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledTaskFired {
     pub task_id: String,
+    /// RFC 3339 timestamp of the consumed occurrence, not dispatch time.
+    pub occurrence: String,
     pub prompt: String,
     pub human_schedule: String,
     /// RFC 3339 timestamp of the next fire, when the task is recurring.

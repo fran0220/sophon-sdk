@@ -194,6 +194,7 @@ fn lsp_lifecycle_variants_round_trip() {
 fn scheduled_task_variants_round_trip() {
     let fired = ToolNotification::ScheduledTaskFired(ScheduledTaskFired {
         task_id: "s-1".into(),
+        occurrence: "2024-12-31T23:55:00Z".into(),
         prompt: "do thing".into(),
         human_schedule: "every 5 minutes".into(),
         next_fire_at: Some("2025-01-01T00:00:00Z".into()),
@@ -318,6 +319,7 @@ fn variant_count_matches_variant_name() {
         }),
         ToolNotification::ScheduledTaskFired(ScheduledTaskFired {
             task_id: String::new(),
+            occurrence: "2026-09-21T03:00:00Z".into(),
             prompt: String::new(),
             human_schedule: String::new(),
             next_fire_at: None,
