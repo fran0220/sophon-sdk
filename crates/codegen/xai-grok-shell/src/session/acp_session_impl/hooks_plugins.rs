@@ -833,6 +833,11 @@ impl SessionActor {
             .apply_plugin_registry_snapshot(new_registry_snapshot)
             .await;
 
+        if self.candidate_admission.mounted().is_some() {
+            return format!(
+                "Plugin registry rebuilt: {count} plugin(s); session adoption deferred until the next configuration mount."
+            );
+        }
         let mcp_status = if mcp_changed {
             "MCP refreshed"
         } else {
@@ -873,6 +878,65 @@ impl SessionActor {
         handle.build_for_cwd(session_cwd, &disk_cfg, &dirs, project_trusted)
     }
 
+    /// Build plugin hook contributions without changing the running session.
+    pub(super) fn prepare_plugin_hook_registry(
+        &self,
+        plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    ) -> (Option<Arc<xai_grok_hooks::discovery::HookRegistry>>, usize) {
+        let mut specs = Vec::new();
+        if let Some(plugins) = plugins {
+            for plugin in plugins.active_plugins() {
+                if let Some(path) = &plugin.hooks_path {
+                    let (found, warnings) =
+                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
+                            path,
+                            &plugin.name,
+                            &plugin.root_str(),
+                            &plugin.data_dir_str(),
+                        );
+                    for warning in warnings {
+                        tracing::warn!("{warning}");
+                    }
+                    specs.extend(found);
+                }
+                if let Some(value) = &plugin.inline_hooks {
+                    let (found, warnings) =
+                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
+                            value,
+                            &plugin.name,
+                            &plugin.root_str(),
+                            &plugin.data_dir_str(),
+                        );
+                    for warning in warnings {
+                        tracing::warn!("{warning}");
+                    }
+                    specs.extend(found);
+                }
+            }
+        }
+        let count = specs.len();
+        let mut registry = self.hook_registry.borrow().clone();
+        if registry.is_none() && !specs.is_empty() {
+            let cwd = std::path::Path::new(&self.session_info.cwd);
+            let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok();
+            let trusted = crate::agent::folder_trust::resolve_and_record(cwd, None, false);
+            registry = Some(Arc::new(
+                crate::util::hooks::discover_hooks(
+                    git_root.as_deref(),
+                    &self.rebuild_spec.compat,
+                    trusted,
+                )
+                .0,
+            ));
+        }
+        if let Some(registry) = &mut registry {
+            let registry = Arc::make_mut(registry);
+            registry.remove_by_prefix("plugin/");
+            registry.append_specs(specs);
+        }
+        (registry, count)
+    }
+
     /// Apply a pre-built plugin registry snapshot to this session.
     /// Called by `reload_plugins_impl` in the originating session and by the `ReloadPlugins` command when plugins change in another session.
     /// Returns `(hooks_reloaded, mcp_changed, skill_count)`.
@@ -880,6 +944,14 @@ impl SessionActor {
         self: &Arc<Self>,
         new_registry_snapshot: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     ) -> (usize, bool, usize) {
+        // These callers run on the actor command loop. Preserve the whole old
+        // contribution set until the next candidate prepares and commits it.
+        if self
+            .candidate_admission
+            .defer_plugins_if_mounted(new_registry_snapshot.clone())
+        {
+            return (0, false, 0);
+        }
         let sid = self.session_info.id.0.as_ref();
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 
@@ -887,63 +959,9 @@ impl SessionActor {
 
         // Reload hooks in the current session
         let t_hooks = std::time::Instant::now();
-        let mut hooks_reloaded = 0usize;
-        if let Some(ref new_registry) = new_registry_snapshot {
-            let mut new_specs = Vec::new();
-            for plugin in new_registry.active_plugins() {
-                // File-based hooks
-                if let Some(ref hooks_path) = plugin.hooks_path {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
-                            hooks_path,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    new_specs.extend(specs);
-                }
-                // Inline hooks
-                if let Some(ref inline_value) = plugin.inline_hooks {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
-                            inline_value,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    new_specs.extend(specs);
-                }
-            }
-            hooks_reloaded = new_specs.len();
-            {
-                let mut reg = self.hook_registry.borrow_mut();
-                if let Some(ref mut arc_reg) = *reg {
-                    let hook_reg = Arc::make_mut(arc_reg);
-                    hook_reg.remove_by_prefix("plugin/");
-                    hook_reg.append_specs(new_specs);
-                } else if !new_specs.is_empty() {
-                    // No registry yet: bootstrap config-layer and file hooks the way reload_hooks_impl does
-                    // Starting from empty sources instead would let a plugin-first snapshot drop config hooks
-                    let git_root =
-                        xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
-                    let is_trusted =
-                        crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
-                    let (mut new_reg, _errs) = crate::util::hooks::discover_hooks(
-                        git_root.as_deref(),
-                        &self.rebuild_spec.compat,
-                        is_trusted,
-                    );
-                    new_reg.append_specs(new_specs);
-                    *reg = Some(Arc::new(new_reg));
-                }
-            }
-        }
+        let (registry, hooks_reloaded) =
+            self.prepare_plugin_hook_registry(new_registry_snapshot.as_deref());
+        *self.hook_registry.borrow_mut() = registry;
 
         xai_grok_telemetry::unified_log::info(
             "reload_plugins_impl: hooks done",

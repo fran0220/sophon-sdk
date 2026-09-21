@@ -10,6 +10,9 @@ struct PreparedCandidate {
     sampling: crate::sampling::SamplerConfig,
     config_version: xai_prompt_queue::QueueVersion,
     skill_revision: u64,
+    plugin_revision: u64,
+    plugin_registry: Option<Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>>,
     skills: SkillManager,
     runtime_skills: AvailableSkills,
     skill_effects: xai_grok_tools::types::skill_discovery_tracker::SkillUpdateEffects,
@@ -150,6 +153,10 @@ impl SessionActor {
             ));
         }
         let config_version = self.tool_context.config_clock.snapshot();
+        let (plugin_revision, plugin_registry) = self
+            .candidate_admission
+            .plugins_for_preparation(self.plugin_registry.borrow().clone());
+        let (hook_registry, _) = self.prepare_plugin_hook_registry(plugin_registry.as_deref());
         let (model, sampling) = self
             .models_manager
             .prepare_published_model(&candidate.model, candidate.reasoning_effort.as_deref())?;
@@ -213,7 +220,7 @@ impl SessionActor {
         let baseline = xai_grok_agent::prompt::skills::list_skills_with_plugins(
             Some(&self.session_info.cwd),
             &config.skills,
-            self.plugin_registry.borrow().as_deref(),
+            plugin_registry.as_deref(),
             self.rebuild_spec.compat,
             project_trusted,
         )
@@ -234,7 +241,7 @@ impl SessionActor {
         let configs = crate::session::managed_mcp::merge_managed_mcp_servers(
             candidate.external_mcp_servers.clone(),
             cwd,
-            self.plugin_registry.borrow().as_deref(),
+            plugin_registry.as_deref(),
             &self.rebuild_spec.compat,
         );
         let (mcp_generation, meta, disabled_tools) = {
@@ -329,6 +336,9 @@ impl SessionActor {
             sampling,
             config_version,
             skill_revision,
+            plugin_revision,
+            plugin_registry,
+            hook_registry,
             skills,
             runtime_skills,
             skill_effects,
@@ -427,6 +437,8 @@ impl SessionActor {
         };
         let instructions = prepared.mounted.candidate.instructions.clone();
         let skill_effects = prepared.skill_effects.clone();
+        let plugin_registry = prepared.plugin_registry.clone();
+        let hook_registry = prepared.hook_registry.clone();
         let committed = Arc::new(parking_lot::Mutex::new(None));
         let commit_result = committed.clone();
         let candidate_admission = self.candidate_admission.clone();
@@ -443,53 +455,58 @@ impl SessionActor {
                 credentials,
                 cancelled,
                 move || {
-                    candidate_admission.publish(&commit_cancelled, prepared.mounted, || {
-                        if config_clock.snapshot() != prepared.config_version {
-                            return false;
-                        }
-                        // Acquire the synchronous registry lock only inside this
-                        // no-await commit, never while waiting on the chat actor.
-                        let Ok(install) = toolset.prepare_mcp_install(prepared.tools) else {
-                            return false;
-                        };
-                        let Ok(permit) = admission.try_admit(
-                            xai_grok_tools::management::admission::AdmissionSource::Human,
-                        ) else {
-                            return false;
-                        };
-                        let _claim = live_mcp.restart_init();
-                        live_mcp.update_configs(prepared.mcp.configs);
-                        live_mcp.owned_clients = prepared.mcp.owned_clients;
-                        live_mcp.mcp_tool_meta = prepared.mcp.mcp_tool_meta;
-                        live_mcp.mcp_tool_icons = prepared.mcp.mcp_tool_icons;
-                        live_mcp.disabled_tool_registrations =
-                            prepared.mcp.disabled_tool_registrations;
-                        let event_tx = live_mcp.client_event_tx();
-                        live_mcp.set_client_event_tx(event_tx);
-                        live_mcp.complete_init();
-                        live_mcp.freeze_mounted_snapshot();
-                        install.commit();
-                        resources.insert(prepared.skills);
-                        resources.insert(prepared.runtime_skills);
-                        resources.insert(
-                            xai_grok_tools::types::resources::ManagedGatewayToolCatalog(
-                                prepared
-                                    .catalog
-                                    .gateway_resource_entries
-                                    .into_iter()
-                                    .collect(),
-                            ),
-                        );
-                        *tool_metadata_snapshot.lock().unwrap() =
-                            crate::session::tool_index::ToolMetadataSnapshot {
-                                tools: prepared.catalog.tools,
-                                servers: prepared.catalog.servers,
-                                mcp_initialized: true,
+                    candidate_admission.publish(
+                        &commit_cancelled,
+                        prepared.plugin_revision,
+                        prepared.mounted,
+                        || {
+                            if config_clock.snapshot() != prepared.config_version {
+                                return false;
+                            }
+                            // Acquire the synchronous registry lock only inside this
+                            // no-await commit, never while waiting on the chat actor.
+                            let Ok(install) = toolset.prepare_mcp_install(prepared.tools) else {
+                                return false;
                             };
-                        mcp_reminder_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        *commit_result.lock() = Some(permit);
-                        true
-                    })
+                            let Ok(permit) = admission.try_admit(
+                                xai_grok_tools::management::admission::AdmissionSource::Human,
+                            ) else {
+                                return false;
+                            };
+                            let _claim = live_mcp.restart_init();
+                            live_mcp.update_configs(prepared.mcp.configs);
+                            live_mcp.owned_clients = prepared.mcp.owned_clients;
+                            live_mcp.mcp_tool_meta = prepared.mcp.mcp_tool_meta;
+                            live_mcp.mcp_tool_icons = prepared.mcp.mcp_tool_icons;
+                            live_mcp.disabled_tool_registrations =
+                                prepared.mcp.disabled_tool_registrations;
+                            let event_tx = live_mcp.client_event_tx();
+                            live_mcp.set_client_event_tx(event_tx);
+                            live_mcp.complete_init();
+                            live_mcp.freeze_mounted_snapshot();
+                            install.commit();
+                            resources.insert(prepared.skills);
+                            resources.insert(prepared.runtime_skills);
+                            resources.insert(
+                                xai_grok_tools::types::resources::ManagedGatewayToolCatalog(
+                                    prepared
+                                        .catalog
+                                        .gateway_resource_entries
+                                        .into_iter()
+                                        .collect(),
+                                ),
+                            );
+                            *tool_metadata_snapshot.lock().unwrap() =
+                                crate::session::tool_index::ToolMetadataSnapshot {
+                                    tools: prepared.catalog.tools,
+                                    servers: prepared.catalog.servers,
+                                    mcp_initialized: true,
+                                };
+                            mcp_reminder_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            *commit_result.lock() = Some(permit);
+                            true
+                        },
+                    )
                 },
             )
             .await;
@@ -499,6 +516,8 @@ impl SessionActor {
             ));
         }
         let permit = committed.lock().take().expect("acknowledged native commit");
+        *self.plugin_registry.borrow_mut() = plugin_registry;
+        *self.hook_registry.borrow_mut() = hook_registry;
         *self.explicit_system_prompt.borrow_mut() = Some(instructions);
         self.supports_backend_search
             .set(sampling.supports_backend_search);
@@ -517,6 +536,29 @@ impl SessionActor {
 mod tests {
     use super::*;
 
+    fn plugins_with_hook(
+        name: &str,
+        root: &std::path::Path,
+    ) -> Arc<xai_grok_agent::plugins::PluginRegistry> {
+        use xai_grok_agent::plugins::discovery::{
+            DiscoveredPlugin, PluginId, PluginOrigin, PluginScope,
+        };
+        let discovered = DiscoveredPlugin {
+            manifest: serde_json::from_value(serde_json::json!({
+                "name": name, "hooks": {"hooks": {"SessionStart": [{"hooks": [{"type":"command", "command":"true"}]}]}}
+            })).unwrap(),
+            id: PluginId(name.into()), root: root.into(), canonical_root: root.into(),
+            scope: PluginScope::CliOverride, origin: PluginOrigin::CliOverride, trusted: true,
+            skill_dirs: vec![], command_dirs: vec![], agent_dirs: vec![],
+            hooks_path: None, mcp_config_path: None, lsp_config_path: None, conflict: None,
+        };
+        Arc::new(xai_grok_agent::plugins::PluginRegistry::from_discovered(
+            vec![discovered],
+            &[],
+            &[name.into()],
+        ))
+    }
+
     #[tokio::test]
     async fn native_candidate_mount_failure_and_cancel_preserve_complete_old_snapshot() {
         tokio::task::LocalSet::new()
@@ -531,6 +573,9 @@ mod tests {
                 model.api_key = Some("test-only-candidate-key".into());
                 actor.models_manager.insert_test_entry("candidate", model);
                 let skill_dir = tempfile::tempdir().unwrap();
+                let plugins_a = plugins_with_hook("mount-a", skill_dir.path());
+                let plugins_b = plugins_with_hook("mount-b", skill_dir.path());
+                *actor.plugin_registry.borrow_mut() = Some(plugins_a.clone());
                 std::fs::write(skill_dir.path().join("SKILL.md"), "---\nname: mounted-skill-a\ndescription: First mounted skill\n---\nA instructions\n").unwrap();
                 let candidate = serde_json::json!({
                     "instructions":"mounted A", "skillDirectories":[skill_dir.path()], "externalMcpServers":[],
@@ -581,6 +626,8 @@ mod tests {
                 let inherited = actor.snapshot_subagent_parent().await;
                 assert!(inherited.skills.as_ref().unwrap().iter().any(|skill| skill.name == "mounted-skill-a"));
                 assert!(Arc::ptr_eq(&inherited.toolset, &toolset));
+                assert!(inherited.hook_registry.as_ref().unwrap().all_hooks().iter().any(|hook| hook.name.starts_with("plugin/mount-a/")));
+                assert_eq!(actor.apply_plugin_registry_snapshot(Some(plugins_b.clone())).await, (0, false, 0));
                 for failure in ["cancel", "unknown-option", "invalid-directory"] {
                     let mut next = candidate.clone();
                     next["instructions"] = serde_json::json!("must never publish");
@@ -597,6 +644,8 @@ mod tests {
                         _ => unreachable!(),
                     }
                     assert!(actor.mount_candidate(next, cancelled).await.is_err());
+                    assert!(Arc::ptr_eq(actor.plugin_registry.borrow().as_ref().unwrap(), &plugins_a));
+                    assert!(actor.hook_registry.borrow().as_ref().unwrap().all_hooks().iter().any(|hook| hook.name.starts_with("plugin/mount-a/")));
                     assert_eq!(
                         serde_json::to_value(actor.chat_state_handle.snapshot().await.unwrap())
                             .unwrap(),
@@ -625,6 +674,11 @@ mod tests {
                 next["revision"] = serde_json::json!("B");
                 drop(actor.mount_candidate(next, Default::default()).await.unwrap());
                 let replacement = actor.snapshot_subagent_parent().await;
+                assert!(Arc::ptr_eq(replacement.plugin_registry.as_ref().unwrap(), &plugins_b));
+                let replacement_hooks = replacement.hook_registry.as_ref().unwrap().all_hooks();
+                assert!(replacement_hooks.iter().any(|hook| hook.name.starts_with("plugin/mount-b/")));
+                assert!(!replacement_hooks.iter().any(|hook| hook.name.starts_with("plugin/mount-a/")));
+                assert!(Arc::ptr_eq(inherited.plugin_registry.as_ref().unwrap(), &plugins_a));
                 assert_eq!(replacement.mounted.unwrap().candidate.revision, "B");
                 let replacement_skills = replacement.skills.unwrap();
                 assert!(replacement_skills.iter().any(|skill| skill.name == "mounted-skill-b"));

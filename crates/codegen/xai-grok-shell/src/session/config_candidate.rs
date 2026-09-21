@@ -55,6 +55,8 @@ struct CandidateAdmissionState {
     generation: u64,
     preparing: Option<tokio_util::sync::CancellationToken>,
     mounted: Option<std::sync::Arc<MountedConfig>>,
+    plugin_revision: u64,
+    pending_plugins: Option<Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>>,
 }
 
 pub(crate) struct MountedConfig {
@@ -69,6 +71,36 @@ impl CandidateAdmission {
         self.state.lock().mounted.clone()
     }
 
+    pub(crate) fn defer_plugins_if_mounted(
+        &self,
+        plugins: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if state.mounted.is_none() {
+            return false;
+        }
+        state.pending_plugins = Some(plugins);
+        state.plugin_revision += 1;
+        if let Some(token) = &state.preparing {
+            token.cancel();
+        }
+        true
+    }
+
+    pub(crate) fn plugins_for_preparation(
+        &self,
+        current: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    ) -> (
+        u64,
+        Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
+    ) {
+        let state = self.state.lock();
+        (
+            state.plugin_revision,
+            state.pending_plugins.clone().unwrap_or(current),
+        )
+    }
+
     /// Serialize synchronous legacy writers with the first mounted publication.
     pub(crate) fn while_unmounted(&self, write: impl FnOnce()) {
         let state = self.state.lock();
@@ -80,13 +112,15 @@ impl CandidateAdmission {
     pub(crate) fn publish(
         &self,
         cancelled: &tokio_util::sync::CancellationToken,
+        plugin_revision: u64,
         mounted: MountedConfig,
         commit: impl FnOnce() -> bool,
     ) -> bool {
         let mut state = self.state.lock();
-        if cancelled.is_cancelled() || !commit() {
+        if cancelled.is_cancelled() || state.plugin_revision != plugin_revision || !commit() {
             return false;
         }
+        state.pending_plugins = None;
         state.mounted = Some(std::sync::Arc::new(mounted));
         true
     }
