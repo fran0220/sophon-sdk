@@ -281,6 +281,8 @@ pub struct LspServerFailed {
 pub struct ScheduledTaskFired {
     /// The scheduled task's unique ID.
     pub task_id: String,
+    /// Exact consumed occurrence cursor in RFC3339, not notification arrival time.
+    pub occurrence: String,
     /// The prompt to execute.
     pub prompt: String,
     /// Human-readable schedule description, e.g. "every 5 minutes".

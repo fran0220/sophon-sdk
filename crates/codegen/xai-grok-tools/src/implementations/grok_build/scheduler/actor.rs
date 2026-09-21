@@ -624,6 +624,7 @@ impl SchedulerActor {
                 self.notification_handle
                     .send_scheduled_task_fired(ScheduledTaskFired {
                         task_id,
+                        occurrence: previous_occurrence.to_rfc3339(),
                         prompt,
                         human_schedule,
                         next_fire_at,
@@ -1561,10 +1562,8 @@ mod tests {
         });
         actor.fire_next_task().await;
         let (mut requests, claimed_state) = observer.await.unwrap();
-        assert!(matches!(
-            next_event(&mut notifications).await,
-            ToolNotification::ScheduledTaskFired(_)
-        ));
+        let fired = notification!(next_event(&mut notifications).await, ScheduledTaskFired);
+        assert_eq!(fired.occurrence, anchor.to_rfc3339());
         actor.fire_next_task().await;
         assert!(
             requests.try_recv().is_err(),
@@ -3109,12 +3108,13 @@ mod tests {
 
         let first = next_subagent_spawn(&mut subagent_rx).await;
         let first_id = first.id.clone();
-        let old_generation = loop {
+        let first_fired = loop {
             if let ToolNotification::ScheduledTaskFired(fired) = next_event(&mut notif_rx).await {
                 assert_eq!(fired.revision, u64::MAX);
-                break fired.generation;
+                break fired;
             }
         };
+        let old_generation = first_fired.generation.clone();
         answer_subagent_query(
             &mut subagent_rx,
             &first_id,
@@ -3191,6 +3191,15 @@ mod tests {
         assert_eq!(second_source.session_id, first_source.session_id);
         assert_eq!(second_source.task_id, first_source.task_id);
         assert!(second_source.occurrence > first_source.occurrence);
+        // Keep both events after the live cursor has advanced: neither mapping
+        // depends on the latest task snapshot or notification arrival time.
+        assert_eq!(first_fired.task_id, first_source.task_id);
+        assert_eq!(first_fired.occurrence, first_source.occurrence.to_rfc3339());
+        assert_eq!(first_fired.subagent_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(fired.task_id, second_source.task_id);
+        assert_eq!(fired.occurrence, second_source.occurrence.to_rfc3339());
+        assert_eq!(fired.subagent_id.as_deref(), Some(second.id.as_str()));
+        assert_ne!(first_fired.occurrence, fired.occurrence);
         assert!(first.parent_prompt_id.is_none() && second.parent_prompt_id.is_none());
 
         cancel.cancel();
