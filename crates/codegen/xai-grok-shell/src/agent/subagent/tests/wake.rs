@@ -618,15 +618,20 @@ async fn ordinary_spawn_disposes_worktree_when_only_remote_settings_enable_snaps
 /// ahead of the first turn, and teardown releases it.
 #[tokio::test(flavor = "current_thread")]
 async fn ordinary_spawn_binds_the_child_workspace_session_before_its_first_turn() {
-    exercise_child_workspace_teardown(false).await;
+    exercise_child_workspace_teardown(false, false).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn checked_close_stops_real_child_waiting_for_provider() {
-    exercise_child_workspace_teardown(true).await;
+    exercise_child_workspace_teardown(true, false).await;
 }
 
-async fn exercise_child_workspace_teardown(close_while_running: bool) {
+#[tokio::test(flavor = "current_thread")]
+async fn mounted_child_seals_parent_snapshot_before_explicit_route_inference() {
+    exercise_child_workspace_teardown(false, true).await;
+}
+
+async fn exercise_child_workspace_teardown(close_while_running: bool, mounted: bool) {
     use xai_grok_tools::implementations::grok_build::task::backend::{
         ChannelBackend, SubagentBackend,
     };
@@ -653,6 +658,24 @@ async fn exercise_child_workspace_teardown(close_while_running: bool) {
                 RunShellChildHarnessConfig::new(meta_dir.clone(), InitialAttemptBehavior::Normal),
             );
             ctx.parent_cwd = temp.path().to_path_buf();
+            if mounted {
+                let mut entry = test_model_entry("child-wire");
+                entry.info.base_url = server.url();
+                entry.info.api_backend = crate::sampling::ApiBackend::Responses;
+                entry.api_key = Some("test-child-route-key".into());
+                ctx.available_models.insert("child-route".into(), entry);
+                let mut config = crate::agent::config::Config::default();
+                config.registered_models = Some(ctx.available_models.clone());
+                ctx.agent_config = Some(config.clone());
+                ctx.parent_mount = Some(Arc::new(crate::session::config_candidate::MountedConfig {
+                    candidate: serde_json::from_value(serde_json::json!({
+                        "instructions":"parent A", "skillDirectories":[], "externalMcpServers":[],
+                        "model":"test-model", "subjectOptions":{}, "subagentBriefs":[], "revision":"A"
+                    })).unwrap(),
+                    config, sampling: ctx.sampling_config.clone(), mcp_servers: vec![],
+                    hook_disabled: Arc::new(Default::default()),
+                }));
+            }
             let workspace_ops = ctx.workspace_ops.clone();
             let (parent_cmd_tx, parent_cmd_rx) = mpsc::unbounded_channel();
             ctx.parent_cmd_tx = Some(parent_cmd_tx);
@@ -669,7 +692,10 @@ async fn exercise_child_workspace_teardown(close_while_running: bool) {
                 .run(),
             );
             let backend = ChannelBackend::for_coordinator_session(command_tx, "setup-parent");
-            let request = auto_wake_test_request(&id);
+            let mut request = auto_wake_test_request(&id);
+            if mounted {
+                request.runtime_overrides.model = Some("child-route".into());
+            }
             let spawn_backend = backend.clone();
             let spawned =
                 tokio::task::spawn_local(async move { spawn_backend.spawn(request, None).await });
@@ -684,6 +710,11 @@ async fn exercise_child_workspace_teardown(close_while_running: bool) {
             let workspace = workspace_ops
                 .workspace_handle()
                 .expect("local workspace ops");
+            if mounted {
+                let requests = server.requests();
+                let inference = requests.iter().find(|request| request.path == "/v1/responses").unwrap();
+                assert_eq!(inference.body.as_ref().unwrap()["model"], "child-wire");
+            }
             assert!(
                 workspace.session(&id).is_some(),
                 "the child's toolset is bound before its first turn dispatches"
