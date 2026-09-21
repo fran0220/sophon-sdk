@@ -232,14 +232,15 @@ impl ChatStateActor {
                 config,
                 credentials,
                 cancelled,
+                commit,
                 reply,
             } => {
-                if cancelled.is_cancelled() || reply.is_closed() {
+                if cancelled.is_cancelled() || reply.is_closed() || !commit() {
                     let _ = reply.send(false);
                 } else {
                     // No await: requests can observe only the old bundle or the
-                    // complete replacement. Cancellation after this point loses
-                    // to publication; the session must finish its matching swap.
+                    // complete replacement. The matching native commit has run
+                    // synchronously; cancellation now loses to publication.
                     self.state.sampling_config = *config;
                     self.state.credentials = credentials;
                     self.replace_system_head(&prompt);

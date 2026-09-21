@@ -242,12 +242,29 @@ impl ChatStateHandle {
         credentials: crate::Credentials,
         cancelled: tokio_util::sync::CancellationToken,
     ) -> Option<bool> {
+        self.install_prepared_config_with_commit(prompt, config, credentials, cancelled, || true)
+            .await
+    }
+
+    /// Join an external prepared snapshot to the chat actor's publication point.
+    /// `commit` must either return false without effects, or synchronously publish
+    /// its complete snapshot and return true. It must not panic or await. No chat
+    /// command can observe the new route/head before that publication completes.
+    pub async fn install_prepared_config_with_commit(
+        &self,
+        prompt: String,
+        config: SamplingConfig,
+        credentials: crate::Credentials,
+        cancelled: tokio_util::sync::CancellationToken,
+        commit: impl FnOnce() -> bool + Send + 'static,
+    ) -> Option<bool> {
         self.query("InstallPreparedConfig", |reply| {
             ChatStateCommand::InstallPreparedConfig {
                 prompt,
                 config: Box::new(config),
                 credentials,
                 cancelled,
+                commit: Box::new(commit),
                 reply,
             }
         })

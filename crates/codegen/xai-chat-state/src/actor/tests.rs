@@ -1407,6 +1407,43 @@ async fn update_sampling_config_is_queryable() {
 }
 
 #[tokio::test]
+async fn prepared_config_commit_runs_before_chat_publication_and_can_refuse() {
+    for (cancel, accept) in [(false, false), (true, true), (false, true)] {
+        let h = TestHarness::with_conversation(vec![ConversationItem::system("old")]);
+        let before = h.handle.snapshot().await.unwrap();
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let token = tokio_util::sync::CancellationToken::new();
+        if cancel {
+            token.cancel();
+        }
+        let result = h.handle.install_prepared_config_with_commit(
+            "new".into(), test_config_with_window(32_000), Default::default(), token,
+            {
+                let published = published.clone();
+                let called = called.clone();
+                move || {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if accept {
+                        published.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    accept
+                }
+            },
+        ).await;
+        assert_eq!(result, Some(!cancel && accept));
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), !cancel);
+        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), !cancel && accept);
+        let after = h.handle.snapshot().await.unwrap();
+        if !cancel && accept {
+            assert_eq!(after.sampling_config.context_window.get(), 32_000);
+        } else {
+            assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
 async fn prepared_config_installs_head_route_and_credentials_or_nothing() {
     for cancel in [false, true] {
         let h = TestHarness::with_conversation(vec![

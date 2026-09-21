@@ -144,6 +144,7 @@ pub enum ChatStateCommand {
         config: Box<SamplingConfig>,
         credentials: crate::Credentials,
         cancelled: tokio_util::sync::CancellationToken,
+        commit: Box<dyn FnOnce() -> bool + Send>,
         reply: oneshot::Sender<bool>,
     },
 
