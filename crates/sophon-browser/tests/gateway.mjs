@@ -64,7 +64,7 @@ const calls = new Map()
 try {
   agent = await Agent.spawn({ executable: process.env.SOPHON_RUNTIME,
     env: { ...process.env, GROK_HOME: join(root, 'home'), GROK_AUTH: '', GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_FEEDBACK_ENABLED: 'false', GROK_TURN_SUMMARY: 'false' },
-    config: { models: [{ id: dial, provider: { protocol: 'openai_responses', baseUrl: `${gateway}/v1`, apiKey: process.env.OG_API_KEY, model: route.model, headers: {}, queryParams: {} }, contextWindow, maxCompletionTokens }], defaultModel: dial, webSearchModel: null, sessionSummaryModel: null, compactionModel: null, imageDescriptionModel: null, media: null, subagents: [], browser: { executable: process.env.SOPHON_CHROMIUM ?? '/usr/bin/chromium', dataDir: join(root, 'identity'), artifactDir: join(root, 'evidence'), headless: true, noSandbox: true } },
+    config: { models: [{ id: dial, provider: { protocol: 'openai_responses', baseUrl: `${gateway}/v1`, apiKey: process.env.OG_API_KEY, model: route.model, headers: {}, queryParams: {} }, supportedReasoning, contextWindow, maxCompletionTokens }], defaultModel: dial, webSearchModel: null, sessionSummaryModel: null, compactionModel: null, imageDescriptionModel: null, media: null, subagents: [], browser: { executable: process.env.SOPHON_CHROMIUM ?? '/usr/bin/chromium', dataDir: join(root, 'identity'), artifactDir: join(root, 'evidence'), headless: true, noSandbox: true } },
     onCallback: async () => { callbacks++; throw new Error('Unexpected client callback') },
   })
   agent.subscribe(event => {

@@ -64,7 +64,7 @@ try {
     executable: process.env.SOPHON_RUNTIME,
     env: { ...process.env, GROK_HOME: join(root, 'home'), GROK_AUTH: '', GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_FEEDBACK_ENABLED: 'false', GROK_TURN_SUMMARY: 'false' },
     config: {
-      models: [{ id: 'fixture', provider: { protocol: 'openai_chat', baseUrl: url, apiKey: 'local-fixture-no-secret', model: 'fixture', headers: {}, queryParams: {} }, contextWindow: 32768, maxCompletionTokens: 1024 }],
+      models: [{ id: 'fixture', provider: { protocol: 'openai_chat', baseUrl: url, apiKey: 'local-fixture-no-secret', model: 'fixture', headers: {}, queryParams: {} }, supportedReasoning: [], contextWindow: 32768, maxCompletionTokens: 1024 }],
       defaultModel: 'fixture', webSearchModel: null, sessionSummaryModel: null, compactionModel: null, imageDescriptionModel: null, media: null, subagents: [],
       browser: { executable: process.env.SOPHON_CHROMIUM ?? '/usr/bin/chromium', dataDir: join(root, 'identity'), artifactDir: join(root, 'evidence'), headless: true, noSandbox: true },
     },
