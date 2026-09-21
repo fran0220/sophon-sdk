@@ -95,6 +95,9 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     /// to finish. While an entry exists, spawn admission stays closed and [`SubagentEvent::OpenSpawnAdmission`] cannot reopen it (a racing
     /// next-turn open would reopen Task spawns mid-delete).
     teardown_drains: HashMap<String, TeardownDrain>,
+    /// Checked close fences survive caller cancellation and never expire into success.
+    close_drains: HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>,
+    child_close_failures: HashMap<String, (String, String, oneshot::Sender<()>)>,
     /// Parent sessions that received `ParentSession` cancel. Non-workflow spawns are rejected until
     /// [`SubagentEvent::OpenSpawnAdmission`] (next turn) or teardown drain completes, so a detached
     /// late `TaskTool` spawn cannot outrun Stop / delete.
@@ -295,6 +298,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             drain_waiters: HashMap::new(),
             workflow_cancel_waiters: HashMap::new(),
             teardown_drains: HashMap::new(),
+            close_drains: HashMap::new(),
+            child_close_failures: HashMap::new(),
             spawn_blocked_sessions: HashSet::new(),
             cancelled_ids: HashSet::new(),
             usage_not_applied_prompts: HashSet::new(),
@@ -528,11 +533,78 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     }
                 }
             }
+            SubagentEvent::CloseSession {
+                parent_session_id,
+                respond_to,
+            } => {
+                if !self.close_drains.contains_key(&parent_session_id)
+                    && self.close_drains.len() >= 4096
+                {
+                    let _ = respond_to.send(Err("session close fence capacity exhausted".into()));
+                    return;
+                }
+                let waiters = self
+                    .close_drains
+                    .entry(parent_session_id.clone())
+                    .or_default();
+                waiters.retain(|waiter| !waiter.is_closed());
+                waiters.push(respond_to);
+                let failed: Vec<_> = self
+                    .child_close_failures
+                    .iter()
+                    .filter(|(_, (parent, _, _))| parent == &parent_session_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in failed {
+                    if let Some((_, _, retry)) = self.child_close_failures.remove(&id) {
+                        let _ = retry.send(());
+                    }
+                }
+                self.spawn_blocked_sessions
+                    .insert(parent_session_id.clone());
+                self.pending_completions
+                    .retain(|completion| completion.parent_session_id != parent_session_id);
+                self.teardown_session_children(&parent_session_id);
+                self.resolve_teardown_drain_waiters(&parent_session_id);
+            }
+            SubagentEvent::ChildCloseFailed {
+                parent_session_id,
+                subagent_id,
+                error,
+                retry,
+            } => {
+                if self
+                    .active
+                    .get(&subagent_id)
+                    .is_some_and(|child| child.request.parent_session_id == parent_session_id)
+                    || self
+                        .pending
+                        .get(&subagent_id)
+                        .is_some_and(|child| child.request.parent_session_id == parent_session_id)
+                {
+                    if let Some(waiters) = self.close_drains.get_mut(&parent_session_id) {
+                        for waiter in waiters.drain(..) {
+                            let _ = waiter
+                                .send(Err(format!("child {subagent_id} teardown failed: {error}")));
+                        }
+                    }
+                    self.child_close_failures
+                        .insert(subagent_id, (parent_session_id, error, retry));
+                }
+            }
+            SubagentEvent::ReleaseClosedSession { parent_session_id } => {
+                if !self.session_has_children(&parent_session_id) {
+                    self.close_drains.remove(&parent_session_id);
+                    self.spawn_blocked_sessions.remove(&parent_session_id);
+                }
+            }
             SubagentEvent::OpenSpawnAdmission { parent_session_id } => {
                 // Next-turn reopen after Stop is intentional even while cancelled
                 // children finish — but not while a delete-path TeardownSession
                 // is draining.
-                if !self.teardown_drains.contains_key(&parent_session_id) {
+                if !self.teardown_drains.contains_key(&parent_session_id)
+                    && !self.close_drains.contains_key(&parent_session_id)
+                {
                     self.spawn_blocked_sessions.remove(&parent_session_id);
                 }
             }
@@ -1557,7 +1629,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     /// Clear a delete-path hold: reopen the session's spawn admission and
     /// resolve every parked drain responder.
     fn clear_teardown_drain(&mut self, parent_session_id: &str) {
-        self.spawn_blocked_sessions.remove(parent_session_id);
+        if !self.close_drains.contains_key(parent_session_id) {
+            self.spawn_blocked_sessions.remove(parent_session_id);
+        }
         if let Some(drain) = self.teardown_drains.remove(parent_session_id) {
             for respond_to in drain.waiters {
                 let _ = respond_to.send(());
@@ -1566,6 +1640,15 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 
     fn resolve_teardown_drain_waiters(&mut self, parent_session_id: &str) {
+        if self.close_drains.contains_key(parent_session_id)
+            && !self.session_has_children(parent_session_id)
+        {
+            if let Some(waiters) = self.close_drains.get_mut(parent_session_id) {
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Ok(()));
+                }
+            }
+        }
         // Cheap precondition (one lookup) before the three-collection scan on
         // every child completion: only a delete-path teardown holds a drain.
         if !self.teardown_drains.contains_key(parent_session_id) {

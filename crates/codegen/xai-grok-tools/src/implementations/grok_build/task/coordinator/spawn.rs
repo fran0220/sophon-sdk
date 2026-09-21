@@ -174,10 +174,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             return;
         }
         // Late Task spawn after user Stop (detached TaskTool background).
-        if !request.owner.is_workflow()
-            && self
-                .spawn_blocked_sessions
-                .contains(&request.parent_session_id)
+        if self.close_drains.contains_key(&request.parent_session_id)
+            || (!request.owner.is_workflow()
+                && self
+                    .spawn_blocked_sessions
+                    .contains(&request.parent_session_id))
         {
             let _ = result_tx.send(rejected_spawn_result(
                 &request.id,

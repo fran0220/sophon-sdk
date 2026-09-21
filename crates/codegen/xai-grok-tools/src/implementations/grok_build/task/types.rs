@@ -979,6 +979,23 @@ pub enum SubagentEvent {
         parent_session_id: String,
         respond_to: Option<oneshot::Sender<()>>,
     },
+    /// Checked close: fence admission until explicitly released; acknowledge
+    /// only after every owned child has completed terminalization.
+    CloseSession {
+        parent_session_id: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    ReleaseClosedSession {
+        parent_session_id: String,
+    },
+    /// A runner retains ownership on teardown failure. Only an explicit close
+    /// retry resumes its teardown; reporting an error is not child completion.
+    ChildCloseFailed {
+        parent_session_id: String,
+        subagent_id: String,
+        error: String,
+        retry: oneshot::Sender<()>,
+    },
     /// Re-open Task spawns for a parent session after a prior ParentSession stop.
     /// Emitted at the start of each user turn so Stop's late-spawn gate does not
     /// permanently block the next prompt.

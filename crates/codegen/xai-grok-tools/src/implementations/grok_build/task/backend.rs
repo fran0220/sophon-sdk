@@ -371,6 +371,20 @@ impl ChannelBackend {
         }
     }
 
+    /// Cancellation of this waiter does not release the session admission fence.
+    pub async fn close_session_and_drain(&self, parent_session_id: &str) -> Result<(), String> {
+        let (respond_to, response) = oneshot::channel();
+        self.tx
+            .send(SubagentEvent::CloseSession {
+                parent_session_id: parent_session_id.to_owned(),
+                respond_to,
+            })
+            .map_err(|_| "subagent coordinator channel closed".to_owned())?;
+        response
+            .await
+            .map_err(|_| "subagent close acknowledgement dropped".to_owned())?
+    }
+
     pub async fn inspect(&self, id: &str) -> Option<SubagentInspection> {
         let (respond_to, response_rx) = oneshot::channel();
         self.tx

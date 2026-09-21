@@ -1685,6 +1685,107 @@ async fn teardown_session_children_spares_other_sessions() {
     harness.actor.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn checked_close_retains_fence_until_real_child_exit() {
+    let mut harness = harness_with_options(
+        RunnerBehavior {
+            wait_before_start: true,
+            wait_after_cancel: true,
+            ..Default::default()
+        },
+        CoordinatorConfig::default(),
+    );
+    let keep = spawn_session_child(&mut harness, "keep", "other").await;
+    let active = spawn_session_child(&mut harness, "active", "parent").await;
+    let _ = harness.start.send(());
+    harness.started.recv().await.unwrap();
+    harness.started.recv().await.unwrap();
+    let pending = spawn_session_child(&mut harness, "pending", "parent").await;
+    let (respond_to, mut response) = tokio::sync::oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::CloseSession {
+            parent_session_id: "parent".into(),
+            respond_to,
+        })
+        .unwrap();
+    tokio::time::advance(TEARDOWN_DRAIN_MAX + std::time::Duration::from_secs(1)).await;
+    assert!(
+        response.try_recv().is_err(),
+        "deadline must not fabricate child exit"
+    );
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::OpenSpawnAdmission {
+            parent_session_id: "parent".into(),
+        })
+        .unwrap();
+    let mut late = request("late", false);
+    late.parent_session_id = "parent".into();
+    assert!(harness.backend.spawn(late, None).await.unwrap().cancelled);
+    assert!(!keep.is_finished(), "unrelated session remains live");
+    let (retry, retried) = tokio::sync::oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::ChildCloseFailed {
+            parent_session_id: "parent".into(),
+            subagent_id: "active".into(),
+            error: "injected fsync failure".into(),
+            retry,
+        })
+        .unwrap();
+    assert!(
+        response
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("injected fsync failure")
+    );
+    assert!(
+        !active.is_finished(),
+        "failed teardown retains active child ownership"
+    );
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::CloseSession {
+            parent_session_id: "parent".into(),
+            respond_to,
+        })
+        .unwrap();
+    retried
+        .await
+        .expect("explicit close retries failed native teardown");
+    let _ = harness.finish.send(());
+    response.await.unwrap().unwrap();
+    assert!(active.await.unwrap().unwrap().cancelled);
+    assert!(pending.await.unwrap().unwrap().cancelled);
+    assert!(keep.await.unwrap().unwrap().success);
+    let mut late = request("after-drain", false);
+    late.parent_session_id = "parent".into();
+    assert!(
+        harness.backend.spawn(late, None).await.unwrap().cancelled,
+        "drain ACK does not reopen admission"
+    );
+    harness
+        .backend
+        .close_session_and_drain("parent")
+        .await
+        .unwrap();
+    harness.actor.abort();
+    assert!(
+        harness
+            .backend
+            .close_session_and_drain("parent")
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn teardown_holds_admission_until_children_drain_then_reopens() {
     // The child stays active after cancellation, so admission remains blocked until teardown finishes.
