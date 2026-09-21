@@ -263,10 +263,10 @@ impl SnapshotRefresher {
     }
 }
 
-struct McpCatalog {
-    tools: Vec<crate::session::tool_index::ToolMetadata>,
-    servers: Vec<crate::session::tool_index::ServerMetadata>,
-    gateway_resource_entries: Vec<(
+pub(super) struct McpCatalog {
+    pub(super) tools: Vec<crate::session::tool_index::ToolMetadata>,
+    pub(super) servers: Vec<crate::session::tool_index::ServerMetadata>,
+    pub(super) gateway_resource_entries: Vec<(
         String,
         xai_grok_tools::types::resources::ManagedGatewayToolSource,
     )>,
@@ -279,11 +279,23 @@ async fn build_mcp_catalog(
     gateway_catalog: Option<&crate::session::managed_mcp::GatewayToolCatalog>,
     disabled_gateway_tools: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> McpCatalog {
+    let all_defs = tool_bridge.tool_definitions().await;
+    let clients = mcp_state.lock().await.all_clients()
+        .map(|(name, client)| (name.clone(), client.clone())).collect();
+    prepare_mcp_catalog(all_defs, clients, gateway_catalog, disabled_gateway_tools).await
+}
+
+/// Detached catalog construction shared by refresh and atomic candidate preparation.
+pub(super) async fn prepare_mcp_catalog(
+    all_defs: Vec<xai_grok_tools::types::definition::ToolDefinition>,
+    clients: Vec<(String, Arc<crate::session::mcp_servers::McpClient>)>,
+    gateway_catalog: Option<&crate::session::managed_mcp::GatewayToolCatalog>,
+    disabled_gateway_tools: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> McpCatalog {
     use crate::session::tool_index::{
         ServerMetadata, ToolMetadata, extract_parameter_names, split_qualified_name,
     };
 
-    let all_defs = tool_bridge.tool_definitions().await;
     let mut seen_tools = std::collections::HashSet::new();
     let mut tools: Vec<ToolMetadata> = all_defs
         .iter()
@@ -335,16 +347,8 @@ async fn build_mcp_catalog(
 
     let servers_with_tools: std::collections::HashSet<&str> =
         tools.iter().map(|t| t.server_name.as_str()).collect();
-    let clients_with_tools: Vec<(String, Arc<crate::session::mcp_servers::McpClient>)> = {
-        let mcp_state = mcp_state.lock().await;
-        mcp_state
-            .all_clients()
-            .filter(|(name, _)| servers_with_tools.contains(name.as_str()))
-            .map(|(n, c)| (n.clone(), Arc::clone(c)))
-            .collect()
-    };
     let mut servers = Vec::new();
-    for (name, client) in clients_with_tools {
+    for (name, client) in clients.into_iter().filter(|(name, _)| servers_with_tools.contains(name.as_str())) {
         servers.push(ServerMetadata {
             description: client.server_instructions().await,
             name,
