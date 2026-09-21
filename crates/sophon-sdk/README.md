@@ -561,6 +561,15 @@ account, UI, diagnostic, and experimental upstream routes remain private.
 Use the named typed operations for supported lifecycle and management features;
 there is no compatibility bypass around their native actor invariants.
 
+The private stdio `RuntimeConfig.ffmpegExecutable` is an optional absolute
+trusted-host path shared by browser recording and native media decoding.
+Initialization rejects relative, missing, and non-file configured paths. Every
+FFmpeg preflight, encode, and decode uses that exact path; execution failures
+never fall back to `PATH`. Omission retains development `ffmpeg` lookup.
+Packaged hosts must supply their verified executable outside ASAR, validate its
+hash/dependencies/codecs, and keep the bundle immutable. Runtime path validation
+does not replace those checks or claim that an arbitrary file is usable FFmpeg.
+
 One declared upstream feature is not part of this usable public-source
 baseline: Grok Build declares Cargo feature `local-workspace`, but the public
 snapshot omits its `gateway_bridge` module and the feature does not compile.

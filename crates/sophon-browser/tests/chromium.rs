@@ -12,6 +12,7 @@ fn config(root: &std::path::Path) -> BrowserConfig {
         executable: PathBuf::from(
             std::env::var("SOPHON_CHROMIUM").unwrap_or_else(|_| "/usr/bin/chromium".into()),
         ),
+        ffmpeg_executable: PathBuf::from("ffmpeg"),
         data_dir: root.join("identity"),
         artifact_dir: root.join("evidence"),
         headless: true,

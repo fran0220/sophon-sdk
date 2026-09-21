@@ -1,7 +1,7 @@
 //! Explicit gateway media protocols. No inference, ambient credentials, retries,
 //! redirects, or remote-URL downloads. Outputs are decoded before publication.
 //!
-//! Requires `ffmpeg` on PATH. Output parents must already exist inside the
+//! Uses the Runtime's selected FFmpeg executable. Output parents must already exist inside the
 //! workspace; existing files are never overwritten. Dropping execution kills
 //! decoding and stops polling, but does NOT cancel a remote paid job. Video
 //! receipts in `.native-media` survive cancellation; an `outcome_unknown`
@@ -76,6 +76,7 @@ pub enum MediaEndpoint {
 
 pub struct NativeMediaService {
     config: NativeMediaConfig,
+    ffmpeg_executable: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -147,8 +148,11 @@ fn revision(bytes: &[u8]) -> String {
 }
 
 impl NativeMediaService {
-    pub fn new(config: NativeMediaConfig) -> Self {
-        Self { config }
+    pub fn new(config: NativeMediaConfig, ffmpeg_executable: PathBuf) -> Self {
+        Self {
+            config,
+            ffmpeg_executable,
+        }
     }
 
     pub fn tool_specs() -> Vec<ToolSpec> {
@@ -177,7 +181,7 @@ impl NativeMediaService {
             .as_ref()
             .ok_or_else(|| fail("Media route is not configured"))?;
         route.validate(endpoint)?;
-        decoder_available().await?;
+        decoder_available(&self.ffmpeg_executable).await?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -233,7 +237,7 @@ impl NativeMediaService {
                 if bytes.len() > 32 * 1024 * 1024 || revision(&bytes) != reference.revision {
                     return Err(fail("Image reference exceeds limit or revision changed"));
                 }
-                decode(&bytes, "png").await?;
+                decode(&self.ffmpeg_executable, &bytes, "png").await?;
                 let part = reqwest::multipart::Part::bytes(bytes)
                     .file_name("reference.png")
                     .mime_str("image/png")
@@ -261,7 +265,7 @@ impl NativeMediaService {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| fail("Invalid image base64"))?;
-        decode(&bytes, "png").await?;
+        decode(&self.ffmpeg_executable, &bytes, "png").await?;
         // PNG's mandatory first chunk is IHDR. Read its dimensions only after
         // the complete image has passed the actual decoder, not from API claims.
         let header = bytes
@@ -317,7 +321,7 @@ impl NativeMediaService {
             .await
             .map_err(|_| fail("Speech submission outcome unknown; not retried"))?;
         let bytes = response_bytes(response, 64 * 1024 * 1024).await?;
-        decode(&bytes, "mp3").await?;
+        decode(&self.ffmpeg_executable, &bytes, "mp3").await?;
         publish(&output, &args.output_path, &bytes, "audio/mpeg")
     }
 
@@ -399,7 +403,7 @@ impl NativeMediaService {
                             fail("Video content fetch failed; resume persisted task_id")
                         })?;
                     let bytes = response_bytes(response, 256 * 1024 * 1024).await?;
-                    decode(&bytes, "mp4").await?;
+                    decode(&self.ffmpeg_executable, &bytes, "mp4").await?;
                     let artifact = publish(&output, &args.output_path, &bytes, "video/mp4")?;
                     result
                         .as_object_mut()
@@ -620,8 +624,8 @@ fn write_receipt(path: &Path, value: &Value) -> Result<(), Error> {
         .map_err(|_| fail("Cannot publish video receipt"))?;
     Ok(())
 }
-async fn decoder_available() -> Result<(), Error> {
-    let status = tokio::process::Command::new("ffmpeg")
+async fn decoder_available(executable: &Path) -> Result<(), Error> {
+    let status = tokio::process::Command::new(executable)
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -636,7 +640,7 @@ async fn decoder_available() -> Result<(), Error> {
     }
     Ok(())
 }
-async fn decode(bytes: &[u8], kind: &str) -> Result<(), Error> {
+async fn decode(executable: &Path, bytes: &[u8], kind: &str) -> Result<(), Error> {
     let valid = match kind {
         "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "mp3" => {
@@ -654,7 +658,7 @@ async fn decode(bytes: &[u8], kind: &str) -> Result<(), Error> {
     let mut file = tempfile::NamedTempFile::new().map_err(|_| fail("Cannot stage media decode"))?;
     file.write_all(bytes)
         .map_err(|_| fail("Cannot stage media decode"))?;
-    let mut command = tokio::process::Command::new("ffmpeg");
+    let mut command = tokio::process::Command::new(executable);
     command
         .args([
             "-nostdin",
@@ -696,4 +700,34 @@ async fn decode(bytes: &[u8], kind: &str) -> Result<(), Error> {
         return Err(fail("Media failed actual decoder validation"));
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn selected_ffmpeg_handles_preflight_and_decode_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("selected ffmpeg");
+        let calls = root.path().join("calls");
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nif [ \"$1\" = '-version' ]; then exit 0; fi\nexit 23\n",
+            calls.display()
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        decoder_available(&executable).await.unwrap();
+        assert!(
+            decode(&executable, b"\x89PNG\r\n\x1a\n", "png")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "-version\n-nostdin\n"
+        );
+        std::fs::remove_file(&executable).unwrap();
+        assert!(decoder_available(&executable).await.is_err());
+    }
 }

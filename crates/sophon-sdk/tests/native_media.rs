@@ -89,11 +89,14 @@ fn service(base: &str) -> NativeMediaService {
         bearer_token: Some("fixture-secret".into()),
         headers: BTreeMap::from([("x-route".into(), "explicit".into())]),
     };
-    NativeMediaService::new(NativeMediaConfig {
-        image: Some(route(MediaEndpoint::ImageGeneration)),
-        speech: Some(route(MediaEndpoint::AudioTts)),
-        video: Some(route(MediaEndpoint::OpenaiVideo)),
-    })
+    NativeMediaService::new(
+        NativeMediaConfig {
+            image: Some(route(MediaEndpoint::ImageGeneration)),
+            speech: Some(route(MediaEndpoint::AudioTts)),
+            video: Some(route(MediaEndpoint::OpenaiVideo)),
+        },
+        "ffmpeg".into(),
+    )
 }
 fn fixture(root: &Path, kind: &str) -> Vec<u8> {
     let path = root.join(format!("fixture.{kind}"));
@@ -523,16 +526,19 @@ async fn workspace_symlinks_existing_outputs_and_endpoint_mismatch_fail_before_s
         b"preserve"
     );
     assert!(!outside.path().join("out.png").exists());
-    let wrong = NativeMediaService::new(NativeMediaConfig {
-        image: Some(MediaRoute {
-            endpoint: MediaEndpoint::OpenaiVideo,
-            model: "declared".into(),
-            base_url: base,
-            bearer_token: None,
-            headers: BTreeMap::new(),
-        }),
-        ..Default::default()
-    });
+    let wrong = NativeMediaService::new(
+        NativeMediaConfig {
+            image: Some(MediaRoute {
+                endpoint: MediaEndpoint::OpenaiVideo,
+                model: "declared".into(),
+                base_url: base,
+                bearer_token: None,
+                headers: BTreeMap::new(),
+            }),
+            ..Default::default()
+        },
+        "ffmpeg".into(),
+    );
     assert!(
         wrong
             .execute(

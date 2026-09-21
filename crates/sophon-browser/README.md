@@ -9,9 +9,13 @@ Network domains and the SDK's existing `xai-tty-utils::ProcessScope` cleanup.
 ## Ownership and identity
 
 Create **one `BrowserService` per account/Runtime**, shared across Games. Construct
-it using `BrowserConfig { executable, data_dir, artifact_dir, headless,
+it using `BrowserConfig { executable, ffmpeg_executable, data_dir, artifact_dir, headless,
 no_sandbox }`. `new` does not launch Chromium; the first browser operation does.
 
+- `ffmpeg_executable` selects both recording preflight and encoding. A failed
+  selected executable never falls back to another installation. The SDK's typed
+  `RuntimeConfig.ffmpegExecutable` validates packaged absolute paths; direct Rust
+  callers must supply a trusted path themselves (`ffmpeg` permits development PATH lookup).
 - `data_dir/profile` is persistent browser identity; an exclusive lock rejects
   competing services. Closing a session/Game must not close this service or delete
   this profile. `close()` terminates the service, not its saved identity.

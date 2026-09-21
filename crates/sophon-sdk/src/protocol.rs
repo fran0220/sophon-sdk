@@ -57,6 +57,11 @@ pub struct RuntimeConfig {
     pub compaction_model: Option<String>,
     #[serde(default)]
     pub image_description_model: Option<String>,
+    /// Absolute trusted-host executable shared by recording and media decoding.
+    /// Omission uses development PATH lookup; a configured path never falls back.
+    #[serde(default)]
+    #[ts(optional)]
+    pub ffmpeg_executable: Option<String>,
     #[serde(default)]
     pub browser: Option<BrowserConfig>,
     #[serde(default)]

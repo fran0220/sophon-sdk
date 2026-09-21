@@ -62,6 +62,17 @@ test('supplied old Runtime executable is rejected', { timeout: 10000, skip: !pro
   await assert.rejects(Agent.spawn({ executable: process.env.SOPHON_OLD_RUNTIME, config, env }), error => error.code === 'protocol_version' && /expected 2/.test(error.message))
 })
 
+test('configured FFmpeg is absolute and present before Runtime initialization', { timeout: 10000 }, async t => {
+  const { root, config, env } = await setup(t)
+  for (const ffmpegExecutable of ['ffmpeg', '', join(root, 'missing ffmpeg'), root]) {
+    await assert.rejects(Agent.spawn({ executable, config: { ...config, ffmpegExecutable }, env }), /ffmpegExecutable/)
+  }
+  // Initialization checks custody/path shape, not codec capabilities. Tool
+  // preflight and execution must use the selected binary without a fallback.
+  const agent = await Agent.spawn({ executable, config: { ...config, ffmpegExecutable: process.execPath }, env })
+  await agent.finalExit()
+})
+
 test('real stdio Runtime creates, snapshots, schedules, reloads and checks process exit', { timeout: 60000 }, async t => {
   const { cwd, config, env } = await setup(t)
   const agent = await Agent.spawn({ executable, config, env })

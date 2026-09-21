@@ -42,6 +42,8 @@ const AGENT_ACTIONS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
     pub executable: PathBuf,
+    /// Trusted Runtime-selected executable; never replaced by a PATH fallback.
+    pub ffmpeg_executable: PathBuf,
     /// Dedicated account/Runtime directory, shared across Games. Never delete on
     /// Game removal and never point at a user's default Chrome profile.
     pub data_dir: PathBuf,
@@ -429,6 +431,7 @@ impl BrowserService {
                     Recording::start(
                         tab.into(),
                         self.config.artifact_dir.clone(),
+                        self.config.ffmpeg_executable.clone(),
                         self.subscribe_frames(),
                         self.process_scope.clone(),
                         initial,

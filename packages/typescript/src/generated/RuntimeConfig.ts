@@ -4,4 +4,19 @@ import type { NativeMediaConfig } from "./NativeMediaConfig.js";
 import type { RuntimeModel } from "./RuntimeModel.js";
 import type { SubagentDefinition } from "./SubagentDefinition.js";
 
-export type RuntimeConfig = { models: Array<RuntimeModel>, defaultModel: string, webSearchModel: string | null, sessionSummaryModel: string | null, compactionModel: string | null, imageDescriptionModel: string | null, browser: BrowserConfig | null, media: NativeMediaConfig | null, subagents: Array<SubagentDefinition>, };
+export type RuntimeConfig = {
+  models: Array<RuntimeModel>;
+  defaultModel: string;
+  webSearchModel: string | null;
+  sessionSummaryModel: string | null;
+  compactionModel: string | null;
+  imageDescriptionModel: string | null;
+  /**
+   * Absolute trusted-host executable shared by recording and media decoding.
+   * Omission uses development PATH lookup; a configured path never falls back.
+   */
+  ffmpegExecutable?: string;
+  browser: BrowserConfig | null;
+  media: NativeMediaConfig | null;
+  subagents: Array<SubagentDefinition>;
+};

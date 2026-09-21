@@ -522,6 +522,22 @@ impl Runtime {
     }
 }
 
+fn ffmpeg_executable(configured: Option<&str>) -> Result<std::path::PathBuf> {
+    let Some(configured) = configured else {
+        return Ok("ffmpeg".into());
+    };
+    let path = std::path::PathBuf::from(configured);
+    if !path.is_absolute() {
+        return Err(Error::invalid_config("ffmpegExecutable must be absolute"));
+    }
+    if !path.is_file() {
+        return Err(Error::invalid_config(
+            "ffmpegExecutable must name an existing file",
+        ));
+    }
+    Ok(path)
+}
+
 fn agent_config(config: p::RuntimeConfig, callbacks: Arc<Callbacks>) -> Result<AgentConfig> {
     let mut models = Vec::new();
     for model in config.models {
@@ -815,10 +831,19 @@ pub async fn run() -> Result<()> {
                 id,
                 request: p::Request::Initialize { config },
             } if runtime.is_none() => {
+                let ffmpeg_executable = match ffmpeg_executable(config.ffmpeg_executable.as_deref())
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        respond(&output, id, Err(error)).await?;
+                        continue;
+                    }
+                };
                 let browser = config.browser.as_ref().map(|config| {
                     Arc::new(sophon_browser::BrowserService::new(
                         sophon_browser::BrowserConfig {
                             executable: config.executable.clone().into(),
+                            ffmpeg_executable: ffmpeg_executable.clone(),
                             data_dir: config.data_dir.clone().into(),
                             artifact_dir: config.artifact_dir.clone().into(),
                             headless: config.headless,
@@ -853,10 +878,9 @@ pub async fn run() -> Result<()> {
                 let handlers = Arc::new(RuntimeTools {
                     callbacks: callbacks.clone(),
                     browser: browser.clone(),
-                    media: config
-                        .media
-                        .clone()
-                        .map(crate::native_media::NativeMediaService::new),
+                    media: config.media.clone().map(|config| {
+                        crate::native_media::NativeMediaService::new(config, ffmpeg_executable)
+                    }),
                 });
                 let started = match agent_config(config, callbacks.clone()) {
                     Ok(config) => Agent::start(config).await,

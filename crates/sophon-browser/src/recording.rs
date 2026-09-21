@@ -28,11 +28,12 @@ impl Recording {
     pub async fn start(
         tab: String,
         root: PathBuf,
+        ffmpeg_executable: PathBuf,
         mut frames: broadcast::Receiver<Value>,
         scope: ProcessScope,
         mut initial: Option<Value>,
     ) -> Result<Self, Error> {
-        let status = Command::new("ffmpeg")
+        let status = Command::new(&ffmpeg_executable)
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -100,7 +101,7 @@ impl Recording {
             }
             manifest.push_str(&format!("file '{}.jpg'\n", timestamps.len() - 1));
             tokio::fs::write(directory.join("frames.ffconcat"), manifest).await?;
-            let mut command = Command::new("ffmpeg");
+            let mut command = Command::new(&ffmpeg_executable);
             command
                 .args([
                     "-nostdin", "-v", "error", "-f", "concat", "-safe", "1", "-i",
@@ -196,5 +197,60 @@ impl Drop for Recording {
         if let Some(task) = &self.task {
             task.abort();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn selected_ffmpeg_handles_preflight_and_encoding_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("selected ffmpeg");
+        let calls = root.path().join("calls");
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nif [ \"$1\" = '-version' ]; then exit 0; fi\nexit 23\n",
+            calls.display()
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_frames, rx) = broadcast::channel(1);
+        let mut recording = Recording::start(
+            "tab".into(),
+            root.path().into(),
+            executable.clone(),
+            rx,
+            ProcessScope::new(),
+            Some(serde_json::json!({"tab_id":"tab","base64":"eA=="})),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !recording.dir.join("0.jpg").is_file() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(recording.finish().await, Err(Error::Protocol(_))));
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "-version\n-nostdin\n"
+        );
+        std::fs::remove_file(&executable).unwrap();
+        let (_frames, rx) = broadcast::channel(1);
+        assert!(matches!(
+            Recording::start(
+                "tab".into(),
+                root.path().into(),
+                executable,
+                rx,
+                ProcessScope::new(),
+                None,
+            )
+            .await,
+            Err(Error::Unsupported(_))
+        ));
     }
 }
