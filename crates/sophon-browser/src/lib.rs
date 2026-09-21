@@ -1,5 +1,6 @@
 //! Runtime-local, Electron-independent browser execution. No CLI, MCP or agent loop.
 mod cdp;
+mod downloads;
 mod recording;
 
 use std::collections::HashMap;
@@ -37,6 +38,9 @@ const AGENT_ACTIONS: &[&str] = &[
     "events",
     "record_start",
     "record_stop",
+    "downloads",
+    "download_status",
+    "download_cancel",
 ];
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,7 @@ struct Running {
     cdp: Option<Arc<Cdp>>,
     pages: HashMap<String, Page>,
     recording: Option<Recording>,
+    download_dir: PathBuf,
     _profile_lock: File,
 }
 
@@ -157,6 +162,7 @@ impl BrowserService {
                 "action":{"type":"string","enum":AGENT_ACTIONS},
                 "tab_id":{"type":["string","null"]},
                 "frame_id":{"type":["string","null"],"description":"Snapshot only: null selects the top frame; otherwise use an ID from frames."},
+                "download_id":{"type":["string","null"],"description":"GUID from downloads, for download_status or download_cancel; never a filename."},
                 "url":{"type":["string","null"],"description":"HTTP(S) URL for navigate/new_tab; null creates about:blank for new_tab."},
                 "ref":{"type":["string","null"]},"text":{"type":["string","null"]},"key":{"type":["string","null"]},"delta_x":{"type":["number","null"]},"delta_y":{"type":["number","null"]},"milliseconds":{"type":["integer","null"],"minimum":0,"maximum":10000}
             },"additionalProperties":false}),
@@ -196,7 +202,7 @@ impl BrowserService {
         let action = string(&args, "action")?;
         if action == "capabilities" {
             return Ok(
-                json!({"engine":"chromium-cdp","persistent_profile":true,"semantic_snapshots":true,"frame_snapshots":true,"screenshots":true,"input":true,"console":true,"network_metadata":true,"streaming":true,"audio":false,"recording":"requires_ffmpeg","cross_origin_frame_snapshots":false}),
+                json!({"engine":"chromium-cdp","persistent_profile":true,"semantic_snapshots":true,"frame_snapshots":true,"screenshots":true,"input":true,"console":true,"network_metadata":true,"streaming":true,"downloads":true,"audio":false,"recording":"requires_ffmpeg","cross_origin_frame_snapshots":false}),
             );
         }
         if matches!(action, "stream" | "audio" | "record" | "recording") {
@@ -263,7 +269,10 @@ impl BrowserService {
             // clear and repopulate storage. Other origins' saved data is kept.
             *guard = Some(self.launch_with_lock(lock).await?);
             let running = guard.as_mut().expect("restarted");
-            running.cdp = Some(self.connect(&mut running.child).await?);
+            running.cdp = Some(
+                self.connect(&mut running.child, &running.download_dir)
+                    .await?,
+            );
             let cdp = running.cdp.as_ref().expect("connected");
             let target = cdp
                 .call(None, "Target.createTarget", json!({"url":"about:blank"}))
@@ -291,10 +300,46 @@ impl BrowserService {
         }
         let running = guard.as_mut().expect("launched");
         if running.cdp.is_none() {
-            running.cdp = Some(self.connect(&mut running.child).await?);
+            running.cdp = Some(
+                self.connect(&mut running.child, &running.download_dir)
+                    .await?,
+            );
         }
         let connection = running.cdp.as_ref().expect("connected");
         match action {
+            "downloads" => return Ok(connection.downloads.lock().expect("download lock").list()),
+            "download_status" | "download_cancel" => {
+                let id = string(&args, "download_id")?;
+                if action == "download_cancel" {
+                    let cancel = connection.downloads.lock().expect("download lock").cancel(id)?;
+                    if cancel { connection.call(None, "Browser.cancelDownload", json!({"guid":id})).await?; }
+                }
+                let (mut status, directory) = {
+                    let downloads = connection.downloads.lock().expect("download lock");
+                    (downloads.get(id)?, downloads.directory.clone())
+                };
+                if status["state"] == "completed" {
+                    let destination = self.config.artifact_dir.join(format!("{id}.download"));
+                    let source = if tokio::fs::try_exists(&destination).await? { destination.clone() } else { directory.join(id) };
+                    let metadata = tokio::fs::symlink_metadata(&source).await?;
+                    if !metadata.is_file() || metadata.len() > downloads::MAX_BYTES {
+                        return Err(Error::Invalid("download is not a regular file within the size limit".into()));
+                    }
+                    if source != destination { tokio::fs::rename(source, &destination).await?; }
+                    status["artifact_id"] = json!(id);
+                    status["mime_type"] = json!("application/octet-stream");
+                    status["bytes"] = json!(metadata.len());
+                } else if status["state"] == "canceled" {
+                    for path in [directory.join(id), directory.join(format!("{id}.crdownload"))] {
+                        match tokio::fs::remove_file(path).await {
+                            Ok(()) => {},
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                return Ok(status);
+            }
             "tabs" => return connection.call(None, "Target.getTargets", json!({})).await.map(|v| json!({"tabs":v["targetInfos"].as_array().into_iter().flatten().filter(|t|t["type"] == "page").cloned().collect::<Vec<_>>()})),
             "new_tab" => {
                 let url = args["url"].as_str().unwrap_or("about:blank");
@@ -766,11 +811,15 @@ impl BrowserService {
             cdp: None,
             pages: HashMap::new(),
             recording: None,
+            download_dir: self
+                .config
+                .artifact_dir
+                .join(format!(".downloads-{}", Uuid::new_v4())),
             _profile_lock: lock,
         })
     }
 
-    async fn connect(&self, child: &mut Child) -> Result<Arc<Cdp>, Error> {
+    async fn connect(&self, child: &mut Child, downloads: &PathBuf) -> Result<Arc<Cdp>, Error> {
         let port_file = self.config.data_dir.join("profile/DevToolsActivePort");
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -785,13 +834,16 @@ impl BrowserService {
                         && port.parse::<u16>().is_ok()
                         && path.starts_with("/devtools/browser/")
                     {
+                        tokio::fs::create_dir_all(downloads).await?;
                         let cdp = Arc::new(
                             Cdp::connect(
                                 &format!("ws://127.0.0.1:{port}{path}"),
                                 self.frames.clone(),
+                                downloads.clone(),
                             )
                             .await?,
                         );
+                        cdp.call(None, "Browser.setDownloadBehavior", json!({"behavior":"allowAndName","downloadPath":downloads,"eventsEnabled":true})).await?;
                         *self.connection.write().expect("connection lock") = Some(cdp.clone());
                         return Ok(cdp);
                     }
@@ -818,7 +870,11 @@ impl BrowserService {
     async fn artifact_path(&self, id: &str) -> Result<(PathBuf, &'static str), Error> {
         let id =
             Uuid::parse_str(id).map_err(|_| Error::Invalid("artifact ID must be UUID".into()))?;
-        for (extension, mime) in [("png", "image/png"), ("mp4", "video/mp4")] {
+        for (extension, mime) in [
+            ("png", "image/png"),
+            ("mp4", "video/mp4"),
+            ("download", "application/octet-stream"),
+        ] {
             let path = self.config.artifact_dir.join(format!("{id}.{extension}"));
             if tokio::fs::try_exists(&path).await? {
                 return Ok((path, mime));
@@ -862,6 +918,11 @@ async fn stop_running(running: &mut Running) -> Result<(), Error> {
         cdp.stop().await;
     }
     running.cdp.take();
+    match tokio::fs::remove_dir_all(&running.download_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 

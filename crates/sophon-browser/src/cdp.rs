@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::Error;
+use crate::downloads::Downloads;
 
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
@@ -21,10 +22,15 @@ pub(crate) struct Cdp {
     pub events: Arc<Mutex<VecDeque<Value>>>,
     pub tabs: Arc<Mutex<HashMap<String, String>>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Value>>>,
+    pub downloads: Arc<Mutex<Downloads>>,
 }
 
 impl Cdp {
-    pub async fn connect(url: &str, frames: broadcast::Sender<Value>) -> Result<Self, Error> {
+    pub async fn connect(
+        url: &str,
+        frames: broadcast::Sender<Value>,
+        download_dir: std::path::PathBuf,
+    ) -> Result<Self, Error> {
         let (socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
@@ -36,13 +42,24 @@ impl Cdp {
         let tab_ids = tabs.clone();
         let latest_frames = Arc::new(Mutex::new(HashMap::new()));
         let latest = latest_frames.clone();
+        let downloads = Arc::new(Mutex::new(Downloads::new(download_dir)));
+        let download_events = downloads.clone();
         let task = tokio::spawn(async move {
             let mut pending: HashMap<u64, Reply> = HashMap::new();
             let mut next = 0u64;
             let mut sequence = 0u64;
+            let mut deadlines = tokio::time::interval(Duration::from_secs(1));
             loop {
                 pending.retain(|_, reply| !reply.is_closed());
                 tokio::select! {
+                    _ = deadlines.tick() => {
+                        let commands = download_events.lock().expect("download lock").expired();
+                        for mut command in commands {
+                            next += 1;
+                            command["id"] = json!(next);
+                            if writer.send(Message::Text(command.to_string().into())).await.is_err() { return; }
+                        }
+                    }
                     command = rx.recv() => {
                         let Some((mut command, reply)) = command else { break };
                         if reply.is_closed() { continue; }
@@ -61,6 +78,13 @@ impl Cdp {
                                     Err(Error::Protocol(value["error"].to_string()))
                                 } else { Ok(value["result"].clone()) };
                                 let _ = reply.send(result);
+                            }
+                        } else if value["method"] == "Browser.downloadWillBegin" || value["method"] == "Browser.downloadProgress" {
+                            let commands = download_events.lock().expect("download lock").event(&value);
+                            for mut command in commands {
+                                next += 1;
+                                command["id"] = json!(next);
+                                if writer.send(Message::Text(command.to_string().into())).await.is_err() { return; }
                             }
                         } else if value["method"] == "Page.screencastFrame" {
                             // Frame traffic never shares the control-response queue or event log.
@@ -103,6 +127,7 @@ impl Cdp {
             events,
             tabs,
             latest_frames,
+            downloads,
         })
     }
 

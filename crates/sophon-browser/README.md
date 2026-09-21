@@ -55,6 +55,9 @@ Runtime registers it directly with its local tool registry. Use
 | `events` | `tab_id`; bounded recent console, exception and network metadata |
 | `record_start` | `tab_id`; `recording_id`, `audio: false`; requires FFmpeg |
 | `record_stop` | `tab_id`; finishes video and returns MP4 `artifact_id` |
+| `downloads` | Browser-wide bounded download metadata including `download_id`, URL, originating `frame_id`, state and received/total bytes |
+| `download_status` | `download_id`; complete regular files publish UUID `artifact_id`, `application/octet-stream`, `bytes`; pending/cancelled states never publish |
+| `download_cancel` | `download_id`; sends cancellation once, reports observed state; `cancel_requested` is not proof the network has stopped |
 
 Refs belong to one snapshot of one tab/frame. A new snapshot, navigation, input,
 or observed DOM mutation invalidates them. A ref used in another tab or after
@@ -117,6 +120,26 @@ minutes, 128 MiB of input frames, one active recording, and a 45-second encoder
 deadline. A static page can record its last received frame. Missing FFmpeg,
 encoding failure, or no captured frames is an error, never fabricated success.
 Audio capture/playback is unsupported. macOS and Windows execution is unverified.
+
+Downloads use native `Browser.setDownloadBehavior(allowAndName)` and CDP progress
+events, separately from the lossy console log. The browser downloads into a unique
+Runtime staging directory using GUID names. Suggested filenames are descriptive
+only; never concatenate them into a destination or infer executable MIME types.
+`download_status` publishes completed files by rename as `<UUID>.download`.
+The SDK must associate the requesting invocation/workspace with the returned
+artifact just as it does screenshots. Frame IDs and URLs identify the origin of
+the download; no tab or Game ownership is inferred.
+
+Limits are 32 retained download records per browser launch (further downloads
+denied), four concurrent downloads, 60 seconds per transfer and 32 MiB per
+published artifact. Progress events request cancellation on oversize or timeout;
+completed bytes are checked independently before publication. This is not a disk
+quota: Chromium can temporarily write beyond the progress threshold before
+cancellation arrives. Hosts needing a hard disk bound must provide a filesystem
+quota. Cancellation wins over a racing completion, never publishes partial bytes,
+and never replays a request. Checked close stops Chromium before removing all
+download staging; published files persist. Host crashes can leave staging for
+explicit retention cleanup. Downloaded bytes are inert evidence, never executed.
 
 PNG and MP4 files are published by rename only when complete and remain readable
 after service restart. No Electron-local path is returned. `close()` cancels an
@@ -199,7 +222,7 @@ Keep the evidence categories separate:
 | Frames | Same-origin frame snapshots/scaled clicks tested; cross-origin/OOPIF automation unsupported |
 | Live display | Native CDP screencast, bounded lag and reliable control responses tested; not audio |
 | Console/network | Bounded console/exception and network metadata; no response-body capture or interception API |
-| Downloads | No download lifecycle, progress, cancellation or workspace publication API implemented |
+| Downloads | Native CDP progress, GUID artifacts, size/concurrency/deadline cancellation and checked cleanup; actual Chromium completion/oversize/cancel/reopen tests |
 | Recording | Silent H.264 through FFmpeg; elapsed duration, static frames and interrupted capture tested |
 | Cancellation | Pending-call cancellation and exactly-once issued effects tested; cancellation is not rollback |
 | Identity | Persistent Runtime profile locking/reopen and origin clearing tested; never tied to Game deletion |
