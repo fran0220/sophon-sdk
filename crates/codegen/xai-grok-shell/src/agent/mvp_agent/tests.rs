@@ -6266,53 +6266,133 @@ fn sdk_041_cancel_target_metadata_and_rewind_compatibility() {
     });
 }
 #[test]
-fn native_config_candidate_rejects_before_any_session_command() {
+fn native_candidate_prompt_admission_preserves_fifo_and_cancellation() {
     use acp::Agent as _;
-    run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
-        let sid = acp::SessionId::new("candidate-must-not-run-old-config");
-        let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-        agent.insert_resident(&sid, handle);
-        for candidate in [
-            serde_json::json!({
-                "instructions": "must replace bootstrap instructions",
-                "model": "different-published-model",
-                "skillDirectories": ["/different/skills"],
-                "externalMcpServers": [],
-                "subjectOptions": {},
-                "subagentBriefs": [],
-                "revision": "new-revision",
-            }),
-            serde_json::Value::Null,
-        ] {
-            let meta = serde_json::json!({
-                "promptId": "candidate-prompt",
-                "x.sophon/configCandidate": candidate,
+    use xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerActivationGate;
+    fn candidate(model: &str, revision: &str) -> serde_json::Value {
+        serde_json::json!({"instructions":format!("MOUNT_{revision}"), "model":model,
+            "skillDirectories":[], "externalMcpServers":[], "subjectOptions":{},
+            "subagentBriefs":[], "revision":revision})
+    }
+    fn prompt(sid: &acp::SessionId, id: &str, candidate: serde_json::Value, send_now: bool) -> acp::PromptRequest {
+        acp::PromptRequest::new(sid.clone(), vec![acp::ContentBlock::from(id)])
+            .meta(serde_json::json!({"promptId":id, "sendNow":send_now, "x.sophon/configCandidate":candidate}).as_object().cloned())
+    }
+    run_local_for_bridge_test(|| Box::pin(async {
+        let phase = std::cell::Cell::new("create required session");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let cwd = tempfile::tempdir().unwrap();
+            let server = xai_grok_test_support::MockInferenceServer::start().await.unwrap();
+            server.set_response("done");
+            let mut cfg = crate::agent::config::Config::default();
+            // Official prompt tracing must not fetch live account settings in
+            // this local-provider fixture.
+            cfg.remote_settings = Some(Default::default());
+            cfg.telemetry.trace_upload = Some(false);
+            let mut models = indexmap::IndexMap::new();
+            for (key, wire) in [("test-model", "wire-A"), ("route-c", "wire-C")] {
+                let mut entry = crate::agent::config::ModelEntry::fallback(wire, &Default::default());
+                entry.info.base_url = server.url();
+                entry.info.api_backend = crate::sampling::ApiBackend::Responses;
+                entry.info.max_retries = Some(0);
+                entry.api_key = Some("test-ingress-key".into());
+                models.insert(key.into(), entry);
+            }
+            cfg.registered_models = Some(models);
+            cfg.default_model_override = Some("test-model".into());
+            let auth = Arc::new(xai_grok_login::AuthManager::new(cwd.path(), Default::default()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(message) = rx.recv().await {
+                    match message {
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args) => { let _ = args.response_tx.send(Ok(())); }
+                        _ => {}
+                    }
+                }
             });
-            let error = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                agent.prompt(
-                    acp::PromptRequest::new(
-                        sid.clone(),
-                        vec![acp::ContentBlock::from("do not execute")],
-                    )
-                    .meta(meta.as_object().cloned()),
-                ),
-            )
-            .await
-            .expect("candidate refusal cannot wait for actor/provider")
-            .unwrap_err();
-            assert_eq!(error.code, acp::Error::invalid_params().code);
-            assert_eq!(
-                error.data.unwrap()["code"],
-                "config_candidate_not_implemented"
-            );
-            assert!(
-                cmd_rx.try_recv().is_err(),
-                "no model mutation, FIFO intake, or provider dispatch is allowed"
-            );
-        }
-    });
+            let agent = std::rc::Rc::new(MvpAgent::new(GatewaySender::new(tx), &cfg, auth, None, None).unwrap());
+            agent.start_subagent_coordinator();
+            agent.set_auth_method(acp::AuthMethodId::new("cached_token"));
+            agent.initialize_request.set(acp::InitializeRequest::new(acp::ProtocolVersion::V1)).unwrap();
+            let sid = agent.new_session_inner(acp::NewSessionRequest::new(cwd.path().to_path_buf())
+                .meta(serde_json::json!({"modelId":"test-model", "x.ai/requireConfigCandidate":true}).as_object().cloned())).await.unwrap().session_id;
+            let handle = agent.resident_handle(&sid).unwrap();
+            let toolset = workspace_toolset(&agent, &sid);
+            let gate = toolset.resources.lock().await.get::<SchedulerActivationGate>().unwrap().clone();
+            assert!(!gate.is_active());
+            assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision, None);
+            agent.session_registry.set_unavailable_model(&sid, acp::ModelId::new("retired-bootstrap-route"));
+            phase.set("reject invalid cold candidates");
+            for send_now in [false, true] {
+                assert!(agent.prompt(prompt(&sid, "invalid", serde_json::Value::Null, send_now)).await.is_err());
+                assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision, None);
+                assert!(!gate.is_active());
+            }
+            assert_eq!(server.requests().iter().filter(|r| r.conversation.is_some()).count(), 0);
+            phase.set("first normal candidate reaches provider");
+            server.hold_agent_completions();
+            let first_agent = agent.clone();
+            let request = prompt(&sid, "first", candidate("test-model", "A"), false);
+            let first = tokio::task::spawn_local(async move { first_agent.prompt(request).await });
+            while !server.requests().iter().any(|r| r.conversation.is_some() && r.header("x-grok-session-id") == Some(sid.0.as_ref())) { tokio::task::yield_now().await; }
+            assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("A"));
+            assert!(gate.is_active());
+            assert!(Arc::ptr_eq(&toolset, &workspace_toolset(&agent, &sid)));
+            phase.set("busy normal candidate queues");
+            let queued_agent = agent.clone();
+            let request = prompt(&sid, "queued", serde_json::Value::Null, false);
+            let queued = tokio::task::spawn_local(async move { queued_agent.prompt(request).await });
+            while handle.tool_context.admission.snapshot().accepted < 2 { tokio::task::yield_now().await; }
+            phase.set("send-now reaches provider");
+            let now_agent = agent.clone();
+            let request = prompt(&sid, "now", serde_json::Value::Null, true);
+            let now = tokio::task::spawn_local(async move { now_agent.prompt(request).await });
+            while server.requests().iter().filter(|r| r.conversation.is_some()).count() < 2 { tokio::task::yield_now().await; }
+            assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("A"));
+            assert!(server.requests().iter().filter(|r| r.conversation.is_some()).all(|r| r.body.as_ref().unwrap()["model"] == "wire-A"));
+            phase.set("cancel drains prompt responses");
+            agent.cancel(acp::CancelNotification::new(sid.clone())).await.unwrap();
+            server.release_agent_completions();
+            first.await.unwrap().unwrap();
+            queued.await.unwrap().unwrap();
+            now.await.unwrap().unwrap();
+            phase.set("idle after cancel");
+            while handle.queue_snapshot().await.unwrap().running_prompt_id.is_some() { tokio::task::yield_now().await; }
+            let before = handle.effective_config_snapshot().await.unwrap();
+            phase.set("invalid idle candidate preserves A");
+            assert!(agent.prompt(prompt(&sid, "failed", candidate("missing", "B"), false)).await.is_err());
+            let after = handle.effective_config_snapshot().await.unwrap();
+            assert_eq!(after.mounted_revision, before.mounted_revision);
+            assert_eq!(after.route.model, before.route.model);
+            // Poll both private adapter calls while intake is parked: cancel
+            // must invalidate the ticket captured before the preamble lock.
+            phase.set("cancel parked candidate intake");
+            for send_now in [false, true] {
+                let lock = agent.dispatch_lock(&sid);
+                let guard = lock.lock().await;
+                let mut proposed = Box::pin(agent.prompt(prompt(&sid, "cancel-before-intake", candidate("route-c", "cancelled"), send_now)));
+                assert!(futures::poll!(&mut proposed).is_pending());
+                let mut cancellation = Box::pin(agent.cancel(acp::CancelNotification::new(sid.clone())));
+                assert!(futures::poll!(&mut cancellation).is_pending());
+                drop(guard);
+                let (result, cancelled) = tokio::join!(proposed, cancellation);
+                cancelled.unwrap();
+                assert!(result.is_err());
+                assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("A"));
+            }
+            phase.set("idle send-now mounts C");
+            agent.prompt(prompt(&sid, "replacement", candidate("route-c", "C"), true)).await.unwrap();
+            assert_eq!(handle.effective_config_snapshot().await.unwrap().mounted_revision.as_deref(), Some("C"));
+            assert_eq!(handle.effective_config_snapshot().await.unwrap().route.model, "wire-C");
+            phase.set("checked close");
+            drive_close(&agent, sid.0.as_ref()).await.unwrap();
+            assert!(!gate.is_active());
+            gate.activate();
+            assert!(!gate.is_active());
+            assert!(agent.prompt(prompt(&sid, "closed", candidate("test-model", "D"), false)).await.is_err());
+        }).await.unwrap_or_else(|_| panic!("native prompt admission timed out: {}", phase.get()));
+    }));
 }
 
 /// Regression (post-cancel slot hang, first bad release 0.2.101; see `dispatch_lock`).

@@ -996,15 +996,6 @@ impl acp::Agent for MvpAgent {
         mut arguments: acp::PromptRequest,
     ) -> Result<acp::PromptResponse, acp::Error> {
         use crate::session::plan_mode::PromptMode;
-        // Fail closed until the native FIFO owns staged candidate installation.
-        // Do not silently run this request with bootstrap/previous configuration.
-        // Replace this gate with actor admission, never a chain of live setters.
-        if arguments.meta.as_ref().is_some_and(|meta| meta.contains_key("x.sophon/configCandidate")) {
-            return Err(acp::Error::invalid_params().data(serde_json::json!({
-                "code": "config_candidate_not_implemented",
-                "message": "native atomic configuration admission is not implemented",
-            })));
-        }
         if let Some(meta) = arguments.meta.as_ref() {
             xai_grok_otel::link_current_span_to_meta(
                 &serde_json::Value::Object(meta.clone()),
@@ -1025,7 +1016,12 @@ impl acp::Agent for MvpAgent {
             .session_handle_waiting_for_load(&arguments.session_id)
             .await
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-        if self.models_manager.allowlist_excludes_all() {
+        // Fence at native ingress, before preamble awaits or dispatch-lock
+        // contention. Cancellation during either must invalidate this ticket.
+        let config_candidate = arguments.meta.as_ref()
+            .and_then(|meta| meta.get(crate::session::config_candidate::CONFIG_CANDIDATE_META_KEY))
+            .cloned().map(|candidate| (handle.candidate_admission.generation(), candidate));
+        if config_candidate.is_none() && self.models_manager.allowlist_excludes_all() {
             let deny = crate::agent::remote_config::allowlist_excludes_all_message(
                 &self.cfg.borrow(),
             );
@@ -1041,7 +1037,9 @@ impl acp::Agent for MvpAgent {
         let latched_model = self
             .session_registry
             .unavailable_model(&arguments.session_id);
-        if let Some(unavailable_model) = latched_model {
+        if let Some(unavailable_model) = latched_model.filter(|_| {
+            config_candidate.is_none() && handle.candidate_admission.mounted().is_none()
+        }) {
             let models = self.models_manager.models();
             let available = self.models_manager.available();
             let restore_model_id = selectable_catalog_key_for_persisted(
@@ -1362,9 +1360,6 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .map(|ctx| ctx.artifact_upload_context());
         let traceparent = xai_grok_otel::current_traceparent();
-        let config_candidate = arguments.meta.as_ref()
-            .and_then(|meta| meta.get(crate::session::config_candidate::CONFIG_CANDIDATE_META_KEY))
-            .cloned().map(|candidate| (handle.candidate_admission.generation(), candidate));
         let dispatch_result: Result<(), acp::Error> = if send_now {
             handle
                 .cmd_tx

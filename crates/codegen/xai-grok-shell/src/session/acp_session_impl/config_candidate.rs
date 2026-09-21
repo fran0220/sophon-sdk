@@ -167,6 +167,14 @@ impl SessionActor {
         if respond_to.is_closed() {
             return None;
         }
+        // Busy candidates ignore their payload, not the ingress cancellation
+        // ticket: a request parked before cancel cannot re-enter the FIFO.
+        if self.candidate_admission.generation() != generation {
+            if let SessionCommand::Prompt { respond_to, .. } = prompt {
+                let _ = respond_to.send(Err(candidate_error("candidate superseded by cancellation")));
+            }
+            return None;
+        }
         {
             let state = self.state.lock().await;
             if state.running_task.is_some() || !state.pending_inputs.is_empty() {
@@ -789,6 +797,11 @@ mod tests {
                 let (a, response_a) = candidate_prompt("prompt-A", candidate.clone(), actor.candidate_admission.generation());
                 cmd_tx.send(a).unwrap();
                 while server.request_count() == 0 { tokio::task::yield_now().await; }
+                let stale_generation = actor.candidate_admission.generation();
+                actor.candidate_admission.cancel();
+                let (stale, rejected) = candidate_prompt("stale-busy", candidate.clone(), stale_generation);
+                cmd_tx.send(stale).unwrap();
+                assert!(rejected.await.unwrap().is_err());
                 // A busy candidate is ignored, not decoded or partially applied.
                 let (b, response_b) = candidate_prompt("prompt-B", serde_json::json!({"invalid":true}), actor.candidate_admission.generation());
                 cmd_tx.send(b).unwrap();
