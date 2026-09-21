@@ -476,7 +476,8 @@ mod startup_task_tests {
                     persistence_tx,
                 )
                 .await;
-                let (callback_owned, callback_aborted) = tokio::sync::oneshot::channel::<()>();
+                let toolset = actor.tool_bridge_handle().toolset();
+                let (callback_owned, mut callback_aborted) = tokio::sync::oneshot::channel::<()>();
                 let callback = tokio::task::spawn_local(async move {
                     let _ownership = callback_owned;
                     std::future::pending::<()>().await;
@@ -541,10 +542,29 @@ mod startup_task_tests {
                     fs_watch::FsWatchCapabilities::none(),
                 ));
                 for fail in [true, false] {
+                    // Keep scheduler completion pending across a caller timeout.
+                    // Cancellation and child drain must not overtake that barrier.
+                    let scheduler_resources = if fail {
+                        Some(toolset.resources.lock().await)
+                    } else {
+                        None
+                    };
                     let (completion, mut response) = tokio::sync::watch::channel(None);
                     commands
                         .send(SessionCommand::CloseChecked { completion })
                         .unwrap();
+                    if fail {
+                        assert!(tokio::time::timeout(
+                            Duration::from_millis(20),
+                            response.wait_for(|value| value.is_some()),
+                        ).await.is_err());
+                        assert!(matches!(callback_aborted.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                            "turn cancellation must wait for scheduler completion");
+                        assert!(!task.is_finished(), "caller timeout retains actor");
+                        assert_eq!(chat_state.try_get_session_usage().await.unwrap().totals.total_tokens(), 0,
+                            "child drain cannot overtake scheduler completion");
+                    }
+                    drop(scheduler_resources);
                     tokio::time::timeout(
                         Duration::from_secs(5),
                         response.wait_for(|value| value.is_some()),
@@ -2941,6 +2961,14 @@ pub(super) async fn run_session(
                             // only when this loop finally returns after hooks and persistence.
                             drop(startup_tasks.take());
                             if let Some(completion) = &close_reply {
+                                // The gate is already closed. Settle the owned scheduler
+                                // before cancelling the turn/children it may have admitted.
+                                // Keep this wait in the actor so caller timeout cannot detach it.
+                                let toolset = session.tool_bridge_handle().toolset();
+                                if let Err(error) = toolset.close_scheduler_checked().await {
+                                    completion.send_replace(Some(Err(error)));
+                                    continue;
+                                }
                                 session.abort_turn_summary();
                                 session.abort_title_refresh();
                                 if let Some(notification) = replay_buffer.flush() {
