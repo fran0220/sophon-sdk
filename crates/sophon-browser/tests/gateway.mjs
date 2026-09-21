@@ -29,7 +29,10 @@ const contextWindow = model.limit?.context
 const maxCompletionTokens = model.limit?.output
 assert.ok(Number.isSafeInteger(contextWindow) && contextWindow > 0)
 assert.ok(Number.isSafeInteger(maxCompletionTokens) && maxCompletionTokens > 0)
-if (route.reasoning_effort !== null) assert.ok(model.reasoning_options.some(option => option.type === 'effort' && option.values.includes(route.reasoning_effort)))
+const supportedReasoning = model.supported_reasoning
+assert.ok(Array.isArray(supportedReasoning))
+assert.ok(supportedReasoning.every(effort => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)))
+if (route.reasoning_effort !== null) assert.ok(supportedReasoning.includes(route.reasoning_effort))
 console.log(JSON.stringify({ phase: 'discovery', revision: effective.revision, dial, model: route.model, endpoint: route.endpoint, reasoning: route.reasoning_effort }))
 
 const root = await mkdtemp(join(tmpdir(), 'sophon-browser-gateway-'))
