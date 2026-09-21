@@ -728,15 +728,19 @@ fn session_bearer_resolver(
         )
     })
 }
-/// [`session_bearer_resolver`] for an inherited config, where only the model string is known: BYOK comes from the catalog memo.
+/// Inherited auth follows the same captured catalog as routing. Re-reading the
+/// disk catalog here can disagree with a registered SDK route or parent mount.
 fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
     base_url: &str,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
-        .0
-        .byok;
+    use crate::agent::auth_method::ModelByok;
+    let byok = ctx.available_models.get(ctx.model_id.0.as_ref())
+        .or_else(|| crate::agent::config::find_model_by_id(&ctx.available_models, model))
+        .map_or(ModelByok::Unknown, |entry| {
+            if entry.has_own_credentials() { ModelByok::Byok } else { ModelByok::NotByok }
+        });
     session_bearer_resolver(ctx, byok, base_url)
 }
 fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> acp::ModelId {
@@ -763,8 +767,9 @@ async fn read_parent_sampling_config(
                 creds.alpha_test_key.as_deref(),
                 &cfg.base_url,
             );
-            let auth_scheme = crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                .map(|r| r.auth_scheme)
+            let auth_scheme = ctx.available_models.get(ctx.model_id.0.as_ref())
+                .or_else(|| crate::agent::config::find_model_by_id(&ctx.available_models, &cfg.model))
+                .map(|entry| entry.info.auth_scheme)
                 .unwrap_or_default();
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());

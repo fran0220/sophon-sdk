@@ -2145,6 +2145,7 @@ async fn read_parent_sampling_config_pins_mounted_dispatch_despite_later_parent_
             "model":"parent-A", "subjectOptions":{}, "subagentBriefs":[], "revision":"A"
         })).unwrap(),
         config: Default::default(), sampling, mcp_servers: vec![],
+        hook_disabled: Arc::new(Default::default()),
     }));
     let (inherited, model) = read_parent_sampling_config(&ctx).await;
     assert_eq!(model.0.as_ref(), "parent-A");

@@ -2341,6 +2341,9 @@ pub(super) async fn run_session(
                         SessionCommand::SnapshotSubagentParent { respond_to } => {
                             let _ = respond_to.send(session.snapshot_subagent_parent().await);
                         }
+                        SessionCommand::SealInheritedConfig { mounted, respond_to } => {
+                            let _ = respond_to.send(session.seal_inherited_config(*mounted).await);
+                        }
                         SessionCommand::SnapshotMcpPool { respond_to } => {
                             let mcp_state = session.mcp_state.lock().await;
                             let pool = if mcp_state.owned_clients.is_empty() && mcp_state.shared_clients.is_empty() {

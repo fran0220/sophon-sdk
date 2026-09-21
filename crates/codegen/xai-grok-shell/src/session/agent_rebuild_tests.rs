@@ -16,6 +16,7 @@ struct SenderProbeControl;
 
 impl ChildControl for SenderProbeControl {
     type ProgressFuture = std::future::Ready<Option<SubagentProgress>>;
+    type Inheritance = ();
     fn progress(&self) -> Self::ProgressFuture {
         std::future::ready(None)
     }

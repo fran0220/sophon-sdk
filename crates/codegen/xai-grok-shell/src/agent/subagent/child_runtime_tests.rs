@@ -30,6 +30,7 @@ async fn progress_preserves_missing_zero_and_measured_signals() {
             "child".into(),
         ),
         child_cmd_tx,
+        inherited_snapshot: None,
         active_message_target_session_id: "child".into(),
         active_message_target_agent_id: xai_message_delivery_core::AgentId::parse("ag1.c1")
             .expect("test child id"),
@@ -84,6 +85,7 @@ struct SnapshotProbeControl {
 
 impl ChildControl for SnapshotProbeControl {
     type ProgressFuture = LocalBoxFuture<Option<SubagentProgress>>;
+    type Inheritance = ();
 
     fn progress(&self) -> Self::ProgressFuture {
         self.runtime.progress()
@@ -150,6 +152,7 @@ impl ChildRunner for SnapshotProbeRunner {
                                     handle_target_session_id,
                                 ),
                             child_cmd_tx,
+                            inherited_snapshot: None,
                             active_message_target_session_id: run.request.id.clone(),
                             active_message_target_agent_id:
                                 xai_message_delivery_core::AgentId::parse("ag1.c1")

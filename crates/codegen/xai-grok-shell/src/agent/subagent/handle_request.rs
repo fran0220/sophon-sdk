@@ -396,6 +396,7 @@ pub(crate) async fn run_shell_child(
         session_running,
         agent_address,
         spawner_session_id: _,
+        spawner_inheritance: _,
     } = run;
     let is_wake = wake_origin.is_some();
     let (wake_message_source, wake_message_id) = match wake_origin {
@@ -1605,6 +1606,20 @@ pub(crate) async fn run_shell_child(
         .chain(definition.session_tools_denylist.iter().flatten())
         .cloned()
         .collect();
+    let inherited_mount = ctx.parent_mount.as_ref().map(|parent| {
+        let mut mounted = Box::new((**parent).clone());
+        // Preserve the external owner's baseline and fixed profiles, but a
+        // descendant's model inheritance follows this child's explicit route.
+        mounted.candidate.model = effective_model_id.0.to_string();
+        mounted.candidate.reasoning_effort = effective_sampling_config.reasoning_effort.map(|effort| effort.to_string());
+        mounted.sampling = effective_sampling_config.clone();
+        mounted.config.skills = if inherit_skills {
+            ctx.parent_skills_config.clone()
+        } else {
+            Default::default()
+        };
+        mounted
+    });
     let spawn_result = session::spawn_session_on_thread(
         child_session_info,
         gateway.clone(),
@@ -1833,6 +1848,34 @@ pub(crate) async fn run_shell_child(
         .set_native_scheduled_invocation(request.runtime_overrides.scheduled_invocation.clone());
     child_toolset
         .set_native_originating_prompt(request.runtime_overrides.originating_prompt.clone());
+    let inherited_snapshot = if let Some(mut mounted) = inherited_mount {
+        mounted.mcp_servers = child_handle.mcp_servers.clone();
+        let (respond_to, response) = oneshot::channel();
+        let sealed = match child_handle.cmd_tx.send(SessionCommand::SealInheritedConfig { mounted, respond_to }) {
+            Err(_) => Err("Child actor unavailable during configuration inheritance".to_owned()),
+            Ok(()) => tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => Err("Child configuration inheritance cancelled".to_owned()),
+                reply = response => reply
+                    .map_err(|_| "Child configuration inheritance reply dropped".to_owned())
+                    .and_then(|result| result.map_err(|error| error.to_string())),
+            },
+        };
+        match sealed {
+            Ok(snapshot) => Some(Arc::new(snapshot)),
+            Err(error) => {
+                close_child_checked(&child_handle, &child_thread, &request, &ctx.subagent_event_tx).await;
+                let result = if cancel_token.is_cancelled() {
+                    cancelled_result(&request, &error)
+                } else {
+                    failure_result(&request, &error)
+                };
+                return child_run_output(result, completion_data, None);
+            }
+        }
+    } else {
+        None
+    };
     session::bind_installed_toolset(
         &ctx.workspace_ops,
         &child_handle.info.id,
@@ -1906,6 +1949,7 @@ pub(crate) async fn run_shell_child(
                 definition_background,
                 control: ShellChildRuntime {
                     child_cmd_tx: child_handle.cmd_tx.clone(),
+                    inherited_snapshot,
                     message_delivery: child_handle.message_delivery(),
                     active_message_target_session_id: child_session_id.0.to_string(),
                     active_message_target_agent_id: agent_id.clone(),

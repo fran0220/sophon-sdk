@@ -11,6 +11,7 @@ use crate::session::{SessionCommand, SessionThread};
 /// Shell runtime handle retained while a child is active.
 pub(crate) struct ShellChildRuntime {
     pub(crate) child_cmd_tx: mpsc::UnboundedSender<SessionCommand>,
+    pub(crate) inherited_snapshot: Option<std::sync::Arc<crate::session::commands::SubagentParentSnapshot>>,
     pub(crate) message_delivery: crate::session::message_delivery::MessageDeliveryHandle,
     pub(crate) active_message_target_session_id: String,
     pub(crate) active_message_target_agent_id: xai_message_delivery_core::AgentId,
@@ -29,6 +30,11 @@ pub(crate) struct ShellChildRuntime {
 
 impl ChildControl for ShellChildRuntime {
     type ProgressFuture = LocalBoxFuture<Option<SubagentProgress>>;
+    type Inheritance = std::sync::Arc<crate::session::commands::SubagentParentSnapshot>;
+
+    fn inheritance(&self) -> Option<Self::Inheritance> {
+        self.inherited_snapshot.clone()
+    }
 
     fn progress(&self) -> Self::ProgressFuture {
         let signals = self.child_signals.clone();

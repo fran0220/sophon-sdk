@@ -695,6 +695,9 @@ impl SessionActor {
     /// Reload hooks mid-session: re-discovers global and project hooks, re-evaluates project trust, and re-appends plugin-contributed hooks.
     /// `pub(super)` so the `SessionCommand::ReloadHooks` arm in `run_session` (parent module) can call it after an interactive folder-trust grant.
     pub(super) async fn reload_hooks_impl(self: &std::sync::Arc<Self>) -> String {
+        if self.candidate_admission.mounted().is_some() {
+            return "Hooks reload deferred until the next configuration candidate.".into();
+        }
         let git_root = xai_grok_workspace::session::git::find_git_root_from_path(
             std::path::Path::new(&self.session_info.cwd),
         )
@@ -882,6 +885,7 @@ impl SessionActor {
     pub(super) fn prepare_plugin_hook_registry(
         &self,
         plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+        mut registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>>,
     ) -> (Option<Arc<xai_grok_hooks::discovery::HookRegistry>>, usize) {
         let mut specs = Vec::new();
         if let Some(plugins) = plugins {
@@ -915,7 +919,6 @@ impl SessionActor {
             }
         }
         let count = specs.len();
-        let mut registry = self.hook_registry.borrow().clone();
         if registry.is_none() && !specs.is_empty() {
             let cwd = std::path::Path::new(&self.session_info.cwd);
             let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok();
@@ -960,7 +963,7 @@ impl SessionActor {
         // Reload hooks in the current session
         let t_hooks = std::time::Instant::now();
         let (registry, hooks_reloaded) =
-            self.prepare_plugin_hook_registry(new_registry_snapshot.as_deref());
+            self.prepare_plugin_hook_registry(new_registry_snapshot.as_deref(), self.hook_registry.borrow().clone());
         *self.hook_registry.borrow_mut() = registry;
 
         xai_grok_telemetry::unified_log::info(

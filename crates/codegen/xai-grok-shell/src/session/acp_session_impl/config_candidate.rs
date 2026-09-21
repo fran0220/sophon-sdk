@@ -13,6 +13,8 @@ struct PreparedCandidate {
     plugin_revision: u64,
     plugin_registry: Option<Arc<xai_grok_agent::plugins::PluginRegistry>>,
     hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>>,
+    hook_load_errors: Vec<String>,
+    client_hooks: crate::extensions::hooks::ClientHooks,
     skills: SkillManager,
     runtime_skills: AvailableSkills,
     skill_effects: xai_grok_tools::types::skill_discovery_tracker::SkillUpdateEffects,
@@ -29,6 +31,38 @@ fn candidate_error(message: impl Into<String>) -> acp::Error {
 }
 
 impl SessionActor {
+    pub(super) async fn seal_inherited_config(&self, mounted: MountedConfig) -> Result<crate::session::commands::SubagentParentSnapshot, acp::Error> {
+        if !self.startup_hints.is_subagent {
+            return Err(candidate_error("only a native child can inherit a mounted configuration"));
+        }
+        let generation = self.candidate_admission.generation();
+        let cancelled = self.candidate_admission.begin(generation)
+            .ok_or_else(|| candidate_error("child admission closed"))?;
+        let ready = tokio::select! {
+            biased;
+            () = cancelled.cancelled() => Err(candidate_error("child inheritance cancelled")),
+            () = self.ensure_prefix_ready() => Ok(()),
+        };
+        self.candidate_admission.finish(generation);
+        ready?;
+        let toolset = self.agent.borrow().tool_bridge().toolset();
+        let mut mcp = self.mcp_state.lock().await;
+        let mut resources = toolset.resources.lock().await;
+        let hook_disabled = mounted.hook_disabled.clone();
+        if !self.candidate_admission.inherit(generation, mounted, || {
+            *self.hook_disabled.borrow_mut() = hook_disabled;
+            mcp.freeze_mounted_snapshot();
+            if let Some(skills) = resources.get_mut::<SkillManager>() {
+                skills.set_baseline_frozen(true);
+            }
+        }) {
+            return Err(candidate_error("child configuration already sealed or closed"));
+        }
+        drop(resources);
+        drop(mcp);
+        Ok(self.snapshot_subagent_parent().await)
+    }
+
     pub(super) async fn snapshot_subagent_parent(
         &self,
     ) -> crate::session::commands::SubagentParentSnapshot {
@@ -89,6 +123,24 @@ impl SessionActor {
                 | SessionCommand::ToggleMcpServer { respond_to, .. }
                 | SessionCommand::ToggleMcpTool { respond_to, .. } => {
                     let _ = respond_to.send(Err(error()));
+                    return None;
+                }
+                SessionCommand::SetClientHooks { hooks } if mounted => {
+                    self.candidate_admission.defer_client_hooks_if_mounted(hooks);
+                    return None;
+                }
+                SessionCommand::McpAuthTrigger { respond_to, .. } => {
+                    let _ = respond_to.send(Err("MCP authentication changes require a new configuration candidate".into()));
+                    return None;
+                }
+                SessionCommand::RetryAuthRequiredServers { .. } => return None,
+                SessionCommand::HooksAction { respond_to, .. } => {
+                    let _ = respond_to.send(xai_hooks_plugins_types::ActionOutcome {
+                        status: xai_hooks_plugins_types::OutcomeStatus::ValidationError,
+                        message: "Mounted hooks can only change through a configuration candidate".into(),
+                        requires_reload: false,
+                        requires_restart: false,
+                    });
                     return None;
                 }
                 SessionCommand::OverrideModelName { .. }
@@ -170,7 +222,8 @@ impl SessionActor {
         let (plugin_revision, plugin_registry) = self
             .candidate_admission
             .plugins_for_preparation(self.plugin_registry.borrow().clone());
-        let (hook_registry, _) = self.prepare_plugin_hook_registry(plugin_registry.as_deref());
+        let client_hooks = self.candidate_admission
+            .client_hooks_for_preparation(self.client_hooks.borrow().clone());
         let (model, sampling) = self
             .models_manager
             .prepare_published_model(&candidate.model, candidate.reasoning_effort.as_deref())?;
@@ -231,6 +284,15 @@ impl SessionActor {
             config.remote_settings.as_ref(),
             false,
         );
+        let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok();
+        let (native_hooks, hook_errors) = crate::util::hooks::discover_hooks(
+            git_root.as_deref(), &self.rebuild_spec.compat, project_trusted,
+        );
+        let (hook_registry, _) = self.prepare_plugin_hook_registry(
+            plugin_registry.as_deref(), Some(Arc::new(native_hooks)),
+        );
+        let hook_load_errors = hook_errors.iter().map(ToString::to_string).collect();
+        let hook_disabled = Arc::new(xai_grok_hooks::trust::DisabledHooks::load());
         let mut baseline = xai_grok_agent::prompt::skills::list_skills_with_plugins(
             Some(&self.session_info.cwd),
             &config.skills,
@@ -263,16 +325,17 @@ impl SessionActor {
             plugin_registry.as_deref(),
             &self.rebuild_spec.compat,
         );
-        let (mcp_generation, meta, disabled_tools) = {
+        let (mcp_generation, meta) = {
             let live = self.mcp_state.lock().await;
             (
                 live.current_generation(),
                 live.meta_config_map.clone(),
-                live.disabled_tools.clone(),
             )
         };
         let mut mcp = McpState::new_with_meta(configs.clone(), meta.clone());
-        mcp.disabled_tools = disabled_tools;
+        // A mounted baseline stays frozen; the next candidate reads fresh
+        // native policy instead of retaining a stale prior-mount copy.
+        mcp.disabled_tools = crate::util::config::get_all_mcp_disabled_tools(cwd);
         let oauth = self.spawn_oauth_config_map(cwd);
         let events = self.events.writer();
         let spawn_context = crate::session::mcp_servers::McpSpawnCtx::for_session(
@@ -350,6 +413,7 @@ impl SessionActor {
                 config,
                 sampling: sampling.clone(),
                 mcp_servers: mcp.configs.clone(),
+                hook_disabled,
             },
             model,
             sampling,
@@ -358,6 +422,8 @@ impl SessionActor {
             plugin_revision,
             plugin_registry,
             hook_registry,
+            hook_load_errors,
+            client_hooks,
             skills,
             runtime_skills,
             skill_effects,
@@ -458,6 +524,9 @@ impl SessionActor {
         let skill_effects = prepared.skill_effects.clone();
         let plugin_registry = prepared.plugin_registry.clone();
         let hook_registry = prepared.hook_registry.clone();
+        let hook_disabled = prepared.mounted.hook_disabled.clone();
+        let hook_load_errors = prepared.hook_load_errors.clone();
+        let client_hooks = prepared.client_hooks.clone();
         let committed = Arc::new(parking_lot::Mutex::new(None));
         let commit_result = committed.clone();
         let candidate_admission = self.candidate_admission.clone();
@@ -497,6 +566,7 @@ impl SessionActor {
                             live_mcp.owned_clients = prepared.mcp.owned_clients;
                             live_mcp.mcp_tool_meta = prepared.mcp.mcp_tool_meta;
                             live_mcp.mcp_tool_icons = prepared.mcp.mcp_tool_icons;
+                            live_mcp.disabled_tools = prepared.mcp.disabled_tools;
                             live_mcp.disabled_tool_registrations =
                                 prepared.mcp.disabled_tool_registrations;
                             let event_tx = live_mcp.client_event_tx();
@@ -537,6 +607,9 @@ impl SessionActor {
         let permit = committed.lock().take().expect("acknowledged native commit");
         *self.plugin_registry.borrow_mut() = plugin_registry;
         *self.hook_registry.borrow_mut() = hook_registry;
+        *self.hook_disabled.borrow_mut() = hook_disabled;
+        *self.hook_load_errors.borrow_mut() = hook_load_errors;
+        *self.client_hooks.borrow_mut() = client_hooks;
         *self.explicit_system_prompt.borrow_mut() = Some(instructions);
         self.supports_backend_search
             .set(sampling.supports_backend_search);

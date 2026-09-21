@@ -73,13 +73,16 @@ struct CandidateAdmissionState {
     mounted: Option<std::sync::Arc<MountedConfig>>,
     plugin_revision: u64,
     pending_plugins: Option<Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>>,
+    pending_client_hooks: Option<crate::extensions::hooks::ClientHooks>,
 }
 
-pub(crate) struct MountedConfig {
-    pub candidate: ConfigCandidate,
-    pub config: crate::agent::config::Config,
-    pub sampling: crate::sampling::SamplerConfig,
-    pub mcp_servers: Vec<agent_client_protocol::McpServer>,
+#[derive(Clone)]
+pub struct MountedConfig {
+    pub(crate) candidate: ConfigCandidate,
+    pub(crate) config: crate::agent::config::Config,
+    pub(crate) sampling: crate::sampling::SamplerConfig,
+    pub(crate) mcp_servers: Vec<agent_client_protocol::McpServer>,
+    pub(crate) hook_disabled: std::sync::Arc<xai_grok_hooks::trust::DisabledHooks>,
 }
 
 impl CandidateAdmission {
@@ -100,6 +103,16 @@ impl CandidateAdmission {
 
     pub(crate) fn required(&self) -> bool {
         self.state.lock().required
+    }
+
+    pub(crate) fn inherit(&self, generation: u64, mounted: MountedConfig, commit: impl FnOnce()) -> bool {
+        let mut state = self.state.lock();
+        if state.closed || state.generation != generation || state.required || state.mounted.is_some() {
+            return false;
+        }
+        commit();
+        state.mounted = Some(std::sync::Arc::new(mounted));
+        true
     }
 
     pub(crate) fn activate_scheduler(&self) {
@@ -127,6 +140,21 @@ impl CandidateAdmission {
 
     pub(crate) fn mounted(&self) -> Option<std::sync::Arc<MountedConfig>> {
         self.state.lock().mounted.clone()
+    }
+
+    pub(crate) fn defer_client_hooks_if_mounted(&self, hooks: crate::extensions::hooks::ClientHooks) -> bool {
+        let mut state = self.state.lock();
+        if state.mounted.is_none() {
+            return false;
+        }
+        state.pending_client_hooks = Some(hooks);
+        state.plugin_revision += 1;
+        if let Some(token) = &state.preparing { token.cancel(); }
+        true
+    }
+
+    pub(crate) fn client_hooks_for_preparation(&self, current: crate::extensions::hooks::ClientHooks) -> crate::extensions::hooks::ClientHooks {
+        self.state.lock().pending_client_hooks.clone().unwrap_or(current)
     }
 
     pub(crate) fn defer_plugins_if_mounted(
@@ -179,6 +207,7 @@ impl CandidateAdmission {
             return false;
         }
         state.pending_plugins = None;
+        state.pending_client_hooks = None;
         state.mounted = Some(std::sync::Arc::new(mounted));
         true
     }

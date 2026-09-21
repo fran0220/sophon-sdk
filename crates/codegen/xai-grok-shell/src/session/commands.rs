@@ -479,6 +479,7 @@ pub struct CurrentModel {
     pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
 /// One parent-actor boundary for child configuration and runtime inheritance.
+#[derive(Clone)]
 pub struct SubagentParentSnapshot {
     pub(crate) mounted: Option<std::sync::Arc<super::config_candidate::MountedConfig>>,
     pub(crate) toolset: std::sync::Arc<xai_grok_tools::registry::types::FinalizedToolset>,
@@ -839,6 +840,12 @@ pub enum SessionCommand {
     /// or candidate admission interleaving between separate snapshot requests.
     SnapshotSubagentParent {
         respond_to: oneshot::Sender<SubagentParentSnapshot>,
+    },
+    /// Seal a child's captured parent configuration after native bootstrap,
+    /// before its first prompt. Ownership stays with the root coordinator.
+    SealInheritedConfig {
+        mounted: Box<super::config_candidate::MountedConfig>,
+        respond_to: oneshot::Sender<Result<SubagentParentSnapshot, acp::Error>>,
     },
     /// Snapshot the session's client-registered hooks so a subagent inherits the same PreToolUse gate and observe hooks over the parent's connection.
     SnapshotClientHooks {

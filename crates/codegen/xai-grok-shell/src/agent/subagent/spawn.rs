@@ -140,14 +140,23 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 };
             };
             let parent_handle = this.resident_handle(&acp::SessionId::new(parent_sid.clone()));
-            if let Some(handle) = parent_handle {
+            // Root ownership does not determine inheritance. The coordinator
+            // captures the actual spawner's sealed snapshot before queueing.
+            let snapshot = if let Some(snapshot) = run.spawner_inheritance.as_ref() {
+                Some((**snapshot).clone())
+            } else if let Some(handle) = parent_handle {
                 let _region = Region::from_span(tracing::info_span!(
                     parent: root_parent.clone(),
                     "subagent.parent_snapshot",
                     parent_session_id = %parent_sid,
                 ));
-                let snapshot = match handle.snapshot_subagent_parent().await {
-                    Some(snapshot) => snapshot,
+                let snapshot = if spawner_session_id.is_some() && handle.candidate_admission.mounted().is_some() {
+                    None // A pre-mount/unknown child cannot adopt a newer root mount.
+                } else {
+                    handle.snapshot_subagent_parent().await
+                };
+                match snapshot {
+                    Some(snapshot) => Some(snapshot),
                     None => {
                         return coordinator::ChildRunOutput {
                             result: SubagentResult::failed(
@@ -159,7 +168,11 @@ impl coordinator::ChildRunner for ShellChildRunner {
                             snapshot_ref: None,
                         };
                     }
-                };
+                }
+            } else {
+                None
+            };
+            if let Some(snapshot) = snapshot {
                 ctx.parent_mcp_pool = snapshot.mcp_pool;
                 ctx.client_hooks = snapshot.client_hooks;
                 ctx.plugin_registry = snapshot.plugin_registry;
