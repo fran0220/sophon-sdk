@@ -125,9 +125,76 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   assert.match(result.output, /REFINEMENT_73/)
   const refinement = requests.find(request => JSON.stringify(request.messages).includes('BASELINE_REFINEMENT_73'))
   assert.ok(refinement, 'actual inference must receive the fixed baseline')
-  assert.equal(refinement.model, 'distill-wire')
+  assert.equal(refinement.model, 'distill-wire', JSON.stringify(requests.map(request => ({ model: request.model, tools: request.tools?.length ?? 0, baseline: JSON.stringify(request.messages).includes('BASELINE_REFINEMENT_73') }))))
   assert.match(JSON.stringify(refinement.messages), /EVIDENCE_29/)
   assert.equal(refinement.tools?.length ?? 0, 0)
+  await agent.finalExit()
+})
+
+test('ordinary and scheduled children retain callback owner, workspace, source and cancellation', { timeout: 60000 }, async t => {
+  const { root, cwd, config, env } = await setup(t)
+  const childCwd = join(root, 'child-workspace')
+  await mkdir(childCwd)
+  const server = createServer(async (request, response) => {
+    let body = ''
+    for await (const chunk of request) body += chunk
+    const payload = JSON.parse(body)
+    const answered = payload.messages?.some(message => message.role === 'tool' && JSON.stringify(message.content).includes('ANSWER_29'))
+    const ask = payload.tools?.some(tool => tool.function?.name === 'ask_user') && !answered
+    const delta = ask ? { role: 'assistant', tool_calls: [{ index: 0, id: 'question29', type: 'function', function: { name: 'ask_user', arguments: '{"question":"Choose 29?"}' } }] } : { role: 'assistant', content: 'CHILD_COMPLETE_73' }
+    const chunk = (delta, finish_reason) => ({ id: 'child-fixture', object: 'chat.completion.chunk', created: 1, model: 'child-wire', choices: [{ index: 0, delta, finish_reason }] })
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    response.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, ask ? 'tool_calls' : 'stop'))}\n\ndata: [DONE]\n\n`)
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
+  config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'child-wire', headers: {}, queryParams: {} }
+  config.subagents.push({ name: 'task', description: 'Fixed task worker', instructions: 'Ask the user then finish.', model: 'runtime-test', tools: null })
+  let receive
+  let nextQuestion = new Promise(resolve => { receive = resolve })
+  const agent = await Agent.spawn({ executable, config, env, onCallback: request => new Promise(resolve => {
+    assert.equal(request.method, 'tool/ask_user')
+    receive({ request, answer: () => resolve({ answer: 'ANSWER_29' }) })
+    request.signal.addEventListener('abort', () => resolve({ cancelled: true }), { once: true })
+  }) })
+  t.after(() => agent.finalExit().catch(() => {}))
+  const session = await agent.createSession({ workspace: { id: 'callback-parent', cwd }, model: 'runtime-test', metadata: {}, mcpServers: [], tools: [{ name: 'ask_user', description: 'Ask a human question', inputSchema: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] } }] })
+  const ordinary = session.subagents.start({ id: await session.subagents.newId(), prompt: 'Ask the human.', description: 'ordinary child', subagentType: 'task', cwd: childCwd, model: 'runtime-test' })
+  const first = await nextQuestion
+  assert.equal(first.request.context.ownerSessionId, session.id)
+  assert.notEqual(first.request.context.sessionId, session.id)
+  assert.equal(first.request.context.cwd, childCwd)
+  assert.equal(first.request.context.scheduledInvocation, null)
+  first.answer()
+  assert.equal((await ordinary).state, 'completed')
+  for (const cancel of [false, true]) {
+    nextQuestion = new Promise(resolve => { receive = resolve })
+    let fired
+    const child = new Promise(resolve => { fired = resolve })
+    const unsubscribe = session.subscribe(event => {
+      if (event.type === 'scheduler' && event.occurrence.type === 'fired') fired(event.occurrence.subagentId)
+    })
+    const before = await session.scheduler.list()
+    const at = new Date(Date.now() - 1000).toISOString()
+    const created = await session.scheduler.create(`question-${cancel}`, before.version, { cadence: { kind: 'once', at }, prompt: 'Ask the human before finishing.', durable: true })
+    assert.equal(created.type, 'committed')
+    const question = await nextQuestion
+    const context = question.request.context
+    assert.equal(context.ownerSessionId, session.id)
+    assert.notEqual(context.sessionId, session.id)
+    assert.equal(context.cwd, cwd)
+    assert.equal(context.scheduledInvocation.sessionId, session.id)
+    assert.equal(context.scheduledInvocation.taskId, created.value.id)
+    assert.equal(Date.parse(context.scheduledInvocation.occurrence), Date.parse(at))
+    const id = await child
+    unsubscribe()
+    if (cancel) {
+      const aborted = new Promise(resolve => question.request.signal.addEventListener('abort', resolve, { once: true }))
+      assert.equal((await session.subagents.cancelId(id)).fenced, true)
+      await aborted
+    } else question.answer()
+    assert.equal((await session.subagents.wait(id, 10000)).state, cancel ? 'cancelled' : 'completed')
+  }
   await agent.finalExit()
 })
 
