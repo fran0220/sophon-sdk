@@ -73,6 +73,10 @@ pub struct SkillUpdateEffects {
 /// dynamic discovery, projections, announcements, compaction, and /clear.
 #[derive(Debug, Clone, Default)]
 pub struct SkillManager {
+    baseline_frozen: bool,
+    baseline_revision: u64,
+    deferred_baseline: Option<Vec<SkillInfo>>,
+    deferred_plugin_skills: Option<Vec<SkillInfo>>,
     /// Skills loaded at session start (or refreshed on plugin reload).
     /// This is the non-dynamic baseline.
     startup_skills: Vec<SkillInfo>,
@@ -339,6 +343,11 @@ impl SkillManager {
     }
 
     pub fn update_plugin_skills(&mut self, plugin_skills: Vec<SkillInfo>) {
+        self.baseline_revision += 1;
+        if self.baseline_frozen {
+            self.deferred_plugin_skills = Some(plugin_skills);
+            return;
+        }
         let old_plugin: HashMap<PathBuf, &SkillInfo> = self
             .startup_skills
             .iter()
@@ -420,6 +429,12 @@ impl SkillManager {
     /// Only unannounced names are queued. Removals forget the name so a later re-add can list it
     /// again, and refresh slash commands without a reminder.
     pub fn update_startup_baseline(&mut self, new_skills: Vec<SkillInfo>) {
+        self.baseline_revision += 1;
+        if self.baseline_frozen {
+            self.deferred_baseline = Some(new_skills);
+            self.deferred_plugin_skills = None;
+            return;
+        }
         let old_paths: HashSet<String> =
             self.startup_skills.iter().map(|s| s.path.clone()).collect();
         let old_enabled: HashMap<String, bool> = self
@@ -517,6 +532,9 @@ impl SkillManager {
     /// side-effects. `runtime_skills` must be written into `AvailableSkills` by the caller (the bridge's
     /// `apply_pending_skill_update` method). `effects` contains only conversation/UI side-effects the session must perform.
     pub fn take_pending(&mut self) -> Option<(Vec<SkillInfo>, SkillUpdateEffects)> {
+        if self.baseline_frozen {
+            return None;
+        }
         let pending = self.pending.take();
         if pending.is_none() && !self.has_pending_discovery {
             return None;
@@ -586,9 +604,27 @@ impl SkillManager {
         })
     }
 
+    /// Detect baseline/plugin changes while a native candidate is prepared asynchronously.
+    pub fn baseline_revision(&self) -> u64 {
+        self.baseline_revision
+    }
+
+    /// Called by native idle admission on a detached clone during preparation,
+    /// then frozen again before publication. Busy updates retain the old baseline.
+    pub fn set_baseline_frozen(&mut self, frozen: bool) {
+        self.baseline_frozen = frozen;
+        if !frozen {
+            if let Some(baseline) = self.deferred_baseline.take() {
+                self.update_startup_baseline(baseline);
+            }
+            if let Some(plugin_skills) = self.deferred_plugin_skills.take() {
+                self.update_plugin_skills(plugin_skills);
+            }
+        }
+    }
+
     /// Get the display-deduped skill list for slash commands. Combines startup + discovered,
-    /// deduplicates by canonical path and name (discovered wins). This is the authoritative source
-    /// for slash command advertisement.
+    /// deduplicates by canonical path and name (discovered wins).
     pub fn slash_skills(&self) -> Vec<SkillInfo> {
         dedupe_by_canonical_path_and_name(&self.discovered_skills, &self.startup_skills)
     }
@@ -1196,6 +1232,43 @@ mod tests {
         mgr.seed(None, None, skills, None, None, None);
         let _ = mgr.take_pending_reconciliation();
         mgr
+    }
+
+    #[test]
+    fn native_frozen_baseline_defers_updates_and_stages_without_publication() {
+        let mut mounted = drained(vec![make_skill("mounted", "/mounted/SKILL.md")]);
+        mounted.set_baseline_frozen(true);
+        let revision = mounted.baseline_revision();
+        mounted.update_startup_baseline(vec![make_skill("next", "/next/SKILL.md")]);
+        assert_ne!(mounted.baseline_revision(), revision);
+        assert!(mounted.take_pending().is_none());
+        assert_eq!(mounted.slash_skills()[0].name, "mounted");
+        let mut prepared = mounted.clone();
+        prepared.set_baseline_frozen(false);
+        let (runtime, _) = prepared.take_pending().unwrap();
+        assert_eq!(runtime[0].name, "next");
+        assert_eq!(mounted.slash_skills()[0].name, "mounted");
+        prepared.set_baseline_frozen(true);
+        mounted = prepared;
+        assert_eq!(mounted.slash_skills()[0].name, "next");
+        assert!(mounted.take_pending().is_none());
+    }
+
+    #[test]
+    fn native_frozen_plugin_and_full_baseline_updates_preserve_order() {
+        let mut mounted = drained(vec![plugin_skill("old", false)]);
+        mounted.set_baseline_frozen(true);
+        mounted.update_plugin_skills(vec![plugin_skill("stale", false)]);
+        mounted.update_startup_baseline(vec![plugin_skill("full", false)]);
+        assert_eq!(mounted.slash_skills()[0].name, "old");
+        let mut prepared = mounted.clone();
+        prepared.set_baseline_frozen(false);
+        assert_eq!(prepared.slash_skills()[0].name, "full");
+        mounted.update_plugin_skills(vec![plugin_skill("latest", false)]);
+        let mut prepared = mounted.clone();
+        prepared.set_baseline_frozen(false);
+        assert_eq!(prepared.slash_skills()[0].name, "latest");
+        assert_eq!(mounted.slash_skills()[0].name, "old");
     }
 
     /// Names announced by the next drain, or `None` when it carries no reminder.

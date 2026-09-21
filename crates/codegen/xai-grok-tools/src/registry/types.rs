@@ -399,7 +399,41 @@ struct FinalizedTool {
     /// Built-ins are reconstructed from their definition instead.
     register_runtime_instance:
         Option<Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>>,
+    external_mcp: bool,
 }
+/// A detached registration with no live registry/resource/persistence effects.
+pub struct PreparedMcpTool(FinalizedTool);
+
+/// Locks the resident registry across the native configuration publication.
+/// Dropping without `commit` leaves the original complete registry untouched.
+pub struct McpToolInstall<'a> {
+    tools: parking_lot::RwLockWriteGuard<'a, Vec<FinalizedTool>>,
+    registry: &'a xai_computer_hub_sdk::LocalRegistry,
+    prepared: Vec<PreparedMcpTool>,
+}
+
+impl McpToolInstall<'_> {
+    pub fn commit(mut self) {
+        self.tools.retain(|tool| {
+            if tool.external_mcp {
+                if let Ok(id) = xai_tool_protocol::ToolId::new(&tool.registry_id) {
+                    self.registry.unregister(&id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for PreparedMcpTool(tool) in self.prepared {
+            (tool
+                .register_runtime_instance
+                .as_ref()
+                .expect("prepared runtime tool"))(self.registry);
+            self.tools.push(tool);
+        }
+    }
+}
+
 /// The originating native prompt, distinct from a child's own current prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePromptOrigin {
@@ -1183,6 +1217,7 @@ impl ToolRegistryBuilder {
                 parse_input: Arc::from(entry.parse_input),
                 contract_version,
                 register_runtime_instance: None,
+                external_mcp: false,
             });
         }
         let native_tool_names: std::collections::HashSet<String> = tools
@@ -1910,20 +1945,77 @@ impl FinalizedToolset {
         T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
         T::Output: serde::Serialize,
     {
+        let prepared =
+            Self::prepare_runtime_tool(name, tool, input_schema_override, !inherit_instance);
         let mut tools = self.tools.write();
-        if tools.iter().any(|t| t.client_name == name) {
+        if tools.iter().any(|t| t.client_name == prepared.client_name) {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-                "Tool already registered: {name}"
+                "Tool already registered: {}",
+                prepared.client_name
             )));
         }
+        (prepared
+            .register_runtime_instance
+            .as_ref()
+            .expect("prepared runtime tool"))(&self.local_registry);
+        tools.push(prepared);
+        Ok(())
+    }
+
+    pub fn prepare_mcp_tool<T>(name: String, tool: T, schema: serde_json::Value) -> PreparedMcpTool
+    where
+        T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
+        T::Output: serde::Serialize,
+    {
+        PreparedMcpTool(Self::prepare_runtime_tool(name, tool, Some(schema), true))
+    }
+
+    pub fn prepare_mcp_install(
+        &self,
+        prepared: Vec<PreparedMcpTool>,
+    ) -> Result<McpToolInstall<'_>, xai_tool_runtime::ToolError> {
+        let tools = self.tools.write();
+        let mut names = std::collections::HashSet::new();
+        let mut ids = std::collections::HashSet::new();
+        for PreparedMcpTool(tool) in &prepared {
+            if !names.insert(&tool.client_name)
+                || !ids.insert(&tool.registry_id)
+                || tools.iter().any(|existing| {
+                    !existing.external_mcp
+                        && (existing.client_name == tool.client_name
+                            || existing.registry_id == tool.registry_id)
+                })
+            {
+                return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                    "MCP registration collision: {}",
+                    tool.client_name
+                )));
+            }
+        }
+        Ok(McpToolInstall {
+            tools,
+            registry: &self.local_registry,
+            prepared,
+        })
+    }
+
+    fn prepare_runtime_tool<T>(
+        name: String,
+        tool: T,
+        input_schema_override: Option<serde_json::Value>,
+        external_mcp: bool,
+    ) -> FinalizedTool
+    where
+        T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
+        T::Output: serde::Serialize,
+    {
         let description = tool.description_template().to_string();
         let kind = tool.kind();
         let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
         let input_schema = input_schema_override.unwrap_or_else(generate_schema_cached::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
         let tool = Arc::new(tool);
-        self.local_registry.register_arc(Arc::clone(&tool));
-        tools.push(FinalizedTool {
+        FinalizedTool {
             namespace: ToolNamespace::MCP.to_string(),
             id: name.clone(),
             registry_id,
@@ -1949,14 +2041,13 @@ impl FinalizedToolset {
                 }))
             }),
             contract_version: None,
-            register_runtime_instance: inherit_instance.then(|| {
-                Arc::new(move |registry: &xai_computer_hub_sdk::LocalRegistry| {
+            register_runtime_instance: Some(Arc::new(
+                move |registry: &xai_computer_hub_sdk::LocalRegistry| {
                     registry.register_arc(Arc::clone(&tool));
-                })
-                    as Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>
-            }),
-        });
-        Ok(())
+                },
+            )),
+            external_mcp,
+        }
     }
     /// Copy selected native runtime registrations into a child or replacement toolset.
     /// MCP clients are excluded and follow the native MCP inheritance policy.
@@ -1973,7 +2064,11 @@ impl FinalizedToolset {
             .tools
             .read()
             .iter()
-            .filter(|tool| tool.register_runtime_instance.is_some() && include(&tool.client_name))
+            .filter(|tool| {
+                !tool.external_mcp
+                    && tool.register_runtime_instance.is_some()
+                    && include(&tool.client_name)
+            })
             .cloned()
             .collect();
         let mut tools = self.tools.write();
@@ -3369,6 +3464,93 @@ mod tests {
                 native.cwd.display()
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn native_mcp_stage_aborts_or_replaces_whole_registry_preserving_handlers() {
+        let toolset = Arc::new(FinalizedToolset::empty_for_test());
+        toolset.set_native_invocation_context(
+            "session".into(),
+            Arc::new(std::sync::Mutex::new(None)),
+            "/cwd".into(),
+        );
+        toolset
+            .register_tool("native".into(), NativeContextProbe::default(), None)
+            .unwrap();
+        toolset
+            .register_mcp_tool(
+                "old".into(),
+                FakeMcpTool {
+                    description: "old".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let prepare = |name: &str| {
+            FinalizedToolset::prepare_mcp_tool(
+                name.into(),
+                FakeMcpTool {
+                    description: name.into(),
+                },
+                serde_json::json!({"type":"object"}),
+            )
+        };
+        let original = serde_json::to_value(toolset.tool_definitions()).unwrap();
+        drop(toolset.prepare_mcp_install(vec![prepare("new")]).unwrap());
+        assert_eq!(
+            serde_json::to_value(toolset.tool_definitions()).unwrap(),
+            original
+        );
+        assert!(
+            toolset
+                .prepare_mcp_install(vec![prepare("native")])
+                .is_err()
+        );
+        assert!(
+            toolset
+                .prepare_mcp_install(vec![prepare("one"), prepare("two")])
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(toolset.tool_definitions()).unwrap(),
+            original
+        );
+        assert_eq!(
+            toolset
+                .call("native", serde_json::json!({}), "before", None)
+                .await
+                .unwrap()
+                .prompt_text,
+            "0:session:none:/cwd"
+        );
+        toolset
+            .prepare_mcp_install(vec![prepare("new")])
+            .unwrap()
+            .commit();
+        assert!(
+            toolset
+                .call("old", serde_json::json!({}), "old", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            toolset
+                .call("new", serde_json::json!({}), "new", None)
+                .await
+                .unwrap()
+                .prompt_text,
+            "ok"
+        );
+        assert_eq!(
+            toolset
+                .call("native", serde_json::json!({}), "after", None)
+                .await
+                .unwrap()
+                .prompt_text,
+            "1:session:none:/cwd"
+        );
+        toolset.prepare_mcp_install(vec![]).unwrap().commit();
+        assert_eq!(toolset.tool_definitions().len(), 1);
     }
 
     #[test]
