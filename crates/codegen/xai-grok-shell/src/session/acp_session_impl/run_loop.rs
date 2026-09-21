@@ -400,7 +400,7 @@ mod startup_task_tests {
                         }
                     }
                 });
-                let (actor, events) = super::super::support::create_test_actor_ex(
+                let (mut actor, events) = super::super::support::create_test_actor_ex(
                     0,
                     256_000,
                     85,
@@ -423,6 +423,44 @@ mod startup_task_tests {
                     .push_back(super::super::support::user_item("held-callback", "owner"));
                 *actor.current_prompt_id.lock().unwrap() = Some("held-callback".into());
                 let (commands, receiver) = mpsc::unbounded_channel();
+                let chat_state = actor.chat_state_handle.clone();
+                let (coordinator_tx, mut coordinator_rx) = mpsc::unbounded_channel();
+                actor.tool_context.subagent_event_tx = Some(coordinator_tx);
+                let parent_commands = commands.clone();
+                tokio::task::spawn_local(async move {
+                    use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+                    let mut child_finishing = true;
+                    while let Some(event) = coordinator_rx.recv().await {
+                        match event {
+                            SubagentEvent::CloseSession { respond_to, .. } if child_finishing => {
+                                child_finishing = false;
+                                let commands = parent_commands.clone();
+                                tokio::task::spawn_local(async move {
+                                    let (reply, acknowledged) = tokio::sync::oneshot::channel();
+                                    commands.send(SessionCommand::RecordSubagentUsage {
+                                        by_model: vec![("child-model".into(), xai_chat_state::UsageTotals {
+                                            input_tokens: 17, output_tokens: 5, ..Default::default()
+                                        })],
+                                        parent_prompt_id: None,
+                                        incomplete: false,
+                                        respond_to: reply,
+                                    }).unwrap();
+                                    // Match a real child: coordinator ownership cannot
+                                    // drain until its parent has applied the usage fold.
+                                    acknowledged.await.unwrap();
+                                    let _ = respond_to.send(Ok(()));
+                                });
+                            }
+                            SubagentEvent::CloseSession { respond_to, .. } => {
+                                let _ = respond_to.send(Ok(()));
+                            }
+                            SubagentEvent::MarkUsageNotApplied(request) => {
+                                let _ = request.respond_to.send(());
+                            }
+                            _ => {}
+                        }
+                    }
+                });
                 let (_chat, chat_rx) = mpsc::unbounded_channel();
                 let task = tokio::task::spawn_local(run_session(
                     Arc::new(actor),
@@ -448,6 +486,8 @@ mod startup_task_tests {
                     .unwrap();
                     assert_eq!(response.borrow().as_ref().unwrap().is_err(), fail);
                     if fail {
+                        assert_eq!(chat_state.try_get_session_usage().await.unwrap().totals.total_tokens(), 22,
+                            "child accounting is applied before close flush, not dropped to break the drain cycle");
                         assert!(
                             !task.is_finished(),
                             "flush failure must retain actor for retry"
@@ -531,6 +571,54 @@ mod startup_task_tests {
     }
 }
 
+/// Child completion folds usage through this actor before releasing coordinator
+/// ownership. Keep that accounting live while admission is closed, otherwise
+/// waiting for the coordinator also prevents the child from finishing.
+async fn drain_owned_children_for_close(
+    session: &SessionActor,
+    commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    deferred: &mut std::collections::VecDeque<SessionCommand>,
+) -> Result<(), String> {
+    let drain = async {
+        session
+            .workflow_manager
+            .lock()
+            .await
+            .cancel_all_and_drain(std::time::Duration::from_secs(7))
+            .await
+            .map_err(|runs| format!("session workflows still running: {runs:?}"))?;
+        if let Some(tx) = session.tool_context.subagent_event_tx.clone() {
+            xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_session(tx, session.session_id_string())
+                .close_session_and_drain(&session.session_id_string()).await?;
+        }
+        Ok(())
+    };
+    tokio::pin!(drain);
+    loop {
+        tokio::select! {
+            result = &mut drain => return result,
+            Some(command) = commands.recv() => match command {
+                SessionCommand::RecordSubagentUsage { by_model, parent_prompt_id, incomplete, respond_to } => {
+                    session.handle_record_subagent_usage_command(
+                        &by_model, parent_prompt_id.as_deref(), incomplete, respond_to,
+                    ).await;
+                }
+                SessionCommand::MarkSubagentUsageNotApplied { parent_prompt_id, respond_to } => {
+                    session.handle_mark_subagent_usage_not_applied_command(
+                        parent_prompt_id.as_deref(), respond_to,
+                    ).await;
+                }
+                command @ (SessionCommand::CloseChecked { .. }
+                    | SessionCommand::PrepareFinalExit { .. }
+                    | SessionCommand::ShutdownChecked { .. }
+                    | SessionCommand::Shutdown(_)) => deferred.push_back(command),
+                // As in the closing gate below, never acknowledge new work.
+                _ => {}
+            },
+        }
+    }
+}
+
 pub(super) async fn run_session(
     session: Arc<SessionActor>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -542,6 +630,7 @@ pub(super) async fn run_session(
     fs_watch_caps: fs_watch::FsWatchCapabilities,
 ) {
     let mut closing = false;
+    let mut deferred_close_commands = std::collections::VecDeque::new();
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<super::turn_task::TurnCompletionMsg>();
     let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
@@ -831,7 +920,12 @@ pub(super) async fn run_session(
                         }
                     }
                 }
-                maybe_cmd = cmd_rx.recv() => {
+                maybe_cmd = async {
+                    match deferred_close_commands.pop_front() {
+                        Some(command) => Some(command),
+                        None => cmd_rx.recv().await,
+                    }
+                } => {
                     let Some(cmd) = maybe_cmd else {
                         drop(startup_tasks.take());
                         session
@@ -2757,12 +2851,7 @@ pub(super) async fn run_session(
                                     ..Default::default()
                                 }).await;
                                 let result = async {
-                                    session.workflow_manager.lock().await.cancel_all_and_drain(std::time::Duration::from_secs(7))
-                                        .await.map_err(|runs| format!("session workflows still running: {runs:?}"))?;
-                                    if let Some(tx) = session.tool_context.subagent_event_tx.clone() {
-                                        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_session(tx, session.session_id_string())
-                                            .close_session_and_drain(&session.session_id_string()).await?;
-                                    }
+                                    drain_owned_children_for_close(&session, &mut cmd_rx, &mut deferred_close_commands).await?;
                                     flush_for_exit(&session).await.map_err(|e| e.to_string())
                                 }.await;
                                 if let Err(error) = result {
