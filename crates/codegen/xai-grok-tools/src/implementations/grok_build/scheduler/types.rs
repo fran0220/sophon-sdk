@@ -4,6 +4,66 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use super::cadence::SchedulerCadence;
 
+/// One-way activation of the existing native scheduler after candidate commit.
+/// This is a runtime resource, never persisted with task records.
+#[derive(Debug, Clone)]
+pub struct SchedulerActivationGate {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    activated: tokio_util::sync::CancellationToken,
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl SchedulerActivationGate {
+    pub fn blocked() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            activated: tokio_util::sync::CancellationToken::new(),
+            closed: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn activate(&self) {
+        if self
+            .state
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.activated.cancel();
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) == 1
+    }
+
+    /// Terminal for this session owner. Reopening requires a new gate.
+    pub fn close(&self) {
+        self.state.store(2, std::sync::atomic::Ordering::SeqCst);
+        self.closed.cancel();
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.closed.cancelled().await;
+    }
+
+    pub(crate) async fn activated(&self) {
+        self.activated.cancelled().await;
+    }
+}
+
+impl Default for SchedulerActivationGate {
+    fn default() -> Self {
+        let gate = Self::blocked();
+        gate.activate();
+        gate
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerVersion {
@@ -171,6 +231,9 @@ impl Default for SchedulerClock {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SchedulerError {
+    #[error("scheduler requires a committed configuration candidate")]
+    ActivationRequired,
+
     #[error("invalid scheduler version: {0}")]
     InvalidVersion(String),
 
@@ -207,6 +270,7 @@ pub enum SchedulerError {
 
 pub fn scheduler_tool_error(error: SchedulerError) -> xai_tool_runtime::ToolError {
     let code = match &error {
+        SchedulerError::ActivationRequired => "scheduler_activation_required",
         SchedulerError::InvalidVersion(_)
         | SchedulerError::InvalidInterval(_)
         | SchedulerError::TaskLimitReached(_)
@@ -626,6 +690,23 @@ impl SchedulerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_close_is_terminal_across_clones() {
+        for initially_active in [false, true] {
+            let gate = SchedulerActivationGate::blocked();
+            let commit_handle = gate.clone();
+            if initially_active {
+                gate.activate();
+            }
+            assert_eq!(gate.is_active(), initially_active);
+            gate.close();
+            commit_handle.activate();
+            assert!(!gate.is_active());
+            assert!(!commit_handle.is_active());
+        }
+        assert!(SchedulerActivationGate::default().is_active());
+    }
 
     #[test]
     fn new_recurring_task_has_ttl_expiry() {

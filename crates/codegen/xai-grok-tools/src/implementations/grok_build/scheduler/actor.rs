@@ -23,9 +23,9 @@ use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::ToolKind;
 
 use super::types::{
-    LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerCadence,
-    SchedulerClock, SchedulerCommand, SchedulerDispatch, SchedulerDispatchStatus, SchedulerError,
-    SchedulerMutationResult, SchedulerSnapshot, SchedulerState, SchedulerVersion,
+    LOOP_COMPLETION_OUTPUT_CAP, LOOP_FRESH_CHAIN_EVERY, ScheduledTask, SchedulerActivationGate,
+    SchedulerCadence, SchedulerClock, SchedulerCommand, SchedulerDispatch, SchedulerDispatchStatus,
+    SchedulerError, SchedulerMutationResult, SchedulerSnapshot, SchedulerState, SchedulerVersion,
 };
 
 const MAX_SCHEDULED_TASKS: usize = 50;
@@ -218,10 +218,20 @@ impl SchedulerActor {
     }
 
     pub async fn run(mut self) {
-        self.await_subagent_wiring_for_due_tasks().await;
+        let gate = self
+            .resources
+            .lock()
+            .await
+            .get::<SchedulerActivationGate>()
+            .cloned()
+            .unwrap_or_default();
+        if gate.is_active() {
+            self.await_subagent_wiring_for_due_tasks().await;
+        }
         self.announce_existing_tasks().await;
 
         loop {
+            let active = gate.is_active();
             let next_fire = self.compute_next_fire_delay().await;
 
             tokio::select! {
@@ -232,16 +242,21 @@ impl SchedulerActor {
                     break;
                 }
 
+                _ = gate.closed() => break,
+
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd).await;
                 }
 
-                _ = tokio::time::sleep(next_fire), if self.pending_removal.is_none() => {
+                _ = gate.activated(), if !active => {}
+
+                _ = tokio::time::sleep(next_fire), if active && self.pending_removal.is_none() => {
                     self.fire_next_task().await;
                 }
             }
         }
 
+        gate.close();
         let task_ids: Vec<String> = {
             let res = self.resources.lock().await;
             res.get::<State<SchedulerState>>()
@@ -325,6 +340,12 @@ impl SchedulerActor {
         debug_assert!(self.pending_removal.is_none());
         let now = Utc::now();
         let mut res = self.resources.lock().await;
+        if res
+            .get::<SchedulerActivationGate>()
+            .is_some_and(|gate| !gate.is_active())
+        {
+            return;
+        }
         let admission = res
             .get::<crate::management::admission::AdmissionController>()
             .cloned();
@@ -1203,6 +1224,33 @@ impl SchedulerActor {
     }
 
     async fn handle_command(&mut self, cmd: SchedulerCommand) {
+        let blocked = self
+            .resources
+            .lock()
+            .await
+            .get::<SchedulerActivationGate>()
+            .is_some_and(|gate| !gate.is_active());
+        if blocked {
+            match cmd {
+                SchedulerCommand::List { reply } => {
+                    let _ = reply.send(self.scheduler_snapshot().await);
+                }
+                SchedulerCommand::Create { reply, .. } | SchedulerCommand::Update { reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                }
+                SchedulerCommand::Delete { reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                }
+                SchedulerCommand::CreateManaged { reply, .. }
+                | SchedulerCommand::UpdateManaged { reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                }
+                SchedulerCommand::DeleteManaged { reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::ActivationRequired));
+                }
+            }
+            return;
+        }
         match cmd {
             SchedulerCommand::Create { task, reply } => {
                 let _ = reply.send(self.create_task(task).await.map(|(task, _)| task));

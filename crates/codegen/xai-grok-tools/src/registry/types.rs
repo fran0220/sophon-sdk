@@ -209,6 +209,8 @@ pub struct SessionContext {
     /// subagent exit.
     pub parent_scheduler_handle:
         Option<crate::implementations::grok_build::scheduler::types::SchedulerHandle>,
+    /// Keep the owned scheduler read-only until configuration candidate commit.
+    pub require_config_candidate: bool,
     /// Agent-wide admission authority for scheduler fires.
     pub admission: Option<crate::management::admission::AdmissionController>,
     /// Available skills for the Skill tool and description templates.
@@ -1258,20 +1260,26 @@ impl ToolRegistryBuilder {
         }
         let renderer_arc = Arc::new(renderer.clone());
         resources.insert(renderer);
-        let (scheduler_cmd_rx, scheduler_cancel_token) =
-            if let Some(parent_handle) = ctx.parent_scheduler_handle {
-                resources.insert(parent_handle);
-                (None, None)
-            } else {
-                let (scheduler_cmd_tx, scheduler_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-                let cancel_token = tokio_util::sync::CancellationToken::new();
-                resources.insert(
-                    crate::implementations::grok_build::scheduler::types::SchedulerHandle(
-                        scheduler_cmd_tx,
-                    ),
-                );
-                (Some(scheduler_cmd_rx), Some(cancel_token))
-            };
+        let (scheduler_cmd_rx, scheduler_cancel_token) = if let Some(parent_handle) =
+            ctx.parent_scheduler_handle
+        {
+            resources.insert(parent_handle);
+            (None, None)
+        } else {
+            let (scheduler_cmd_tx, scheduler_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            resources.insert(if ctx.require_config_candidate {
+                    crate::implementations::grok_build::scheduler::types::SchedulerActivationGate::blocked()
+                } else {
+                    crate::implementations::grok_build::scheduler::types::SchedulerActivationGate::default()
+                });
+            resources.insert(
+                crate::implementations::grok_build::scheduler::types::SchedulerHandle(
+                    scheduler_cmd_tx,
+                ),
+            );
+            (Some(scheduler_cmd_rx), Some(cancel_token))
+        };
         let shared_resources = resources.into_shared();
         if let (Some(cmd_rx), Some(cancel_token)) = (scheduler_cmd_rx, &scheduler_cancel_token) {
             let actor = crate::implementations::grok_build::scheduler::actor::SchedulerActor {
@@ -2428,6 +2436,7 @@ mod tests {
             owner_session_id: None,
             subagent: None,
             parent_scheduler_handle: None,
+            require_config_candidate: false,
             admission: None,
             skills: vec![],
             state_path: tmp.path().join("state.json"),
@@ -4409,6 +4418,156 @@ mod tests {
             "GrokBuild:run_terminal_cmd",
         ]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduler_candidate_gate_preserves_restored_due_and_expired_tasks() {
+        use crate::implementations::grok_build::scheduler::types::{
+            ScheduledTask, SchedulerActivationGate, SchedulerCommand, SchedulerError,
+            SchedulerHandle,
+        };
+        use crate::implementations::grok_build::task::types::{
+            SessionIdResource, SubagentEvent, SubagentEventSender,
+        };
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("resources_state.json");
+        let due = ScheduledTask::with_fire_immediately(137, "due".into(), true, true, true);
+        let mut expired = due.clone();
+        expired.id = "expired".into();
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "state":{"grok_build.Scheduler":{"tasks":[due, expired]}}
+        }))
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut context = test_session_context(&tmp);
+        context.require_config_candidate = true;
+        let (notifications, mut notification_rx) =
+            crate::notification::ToolNotificationHandle::channel();
+        context.notification_handle = notifications;
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: Vec::new(),
+                    behavior_preset: None,
+                },
+                context,
+            )
+            .unwrap();
+        let (events, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, gate) = {
+            let mut resources = toolset.resources.lock().await;
+            resources.insert(SubagentEventSender(events));
+            resources.insert(SessionIdResource("parent-session".into()));
+            (
+                resources.get::<SchedulerHandle>().unwrap().clone(),
+                resources.get::<SchedulerActivationGate>().unwrap().clone(),
+            )
+        };
+        assert!(!gate.is_active());
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), handle.snapshot())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.tasks.len(), 2);
+        for create in [true, false] {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            let command = if create {
+                SchedulerCommand::Create {
+                    task: due.clone(),
+                    reply,
+                }
+            } else {
+                SchedulerCommand::Update {
+                    id: due.id.clone(),
+                    prompt: Some("changed".into()),
+                    interval_secs: None,
+                    reply,
+                }
+            };
+            handle.0.send(command).unwrap();
+            assert!(matches!(
+                result.await.unwrap(),
+                Err(SchedulerError::ActivationRequired)
+            ));
+        }
+        assert!(matches!(
+            handle
+                .update(
+                    "update".into(),
+                    "update".into(),
+                    snapshot.version,
+                    due.id.clone(),
+                    Some("changed".into()),
+                    None
+                )
+                .await,
+            Err(SchedulerError::ActivationRequired)
+        ));
+        assert!(matches!(
+            handle
+                .delete(
+                    "delete".into(),
+                    "delete".into(),
+                    snapshot.version,
+                    due.id.clone()
+                )
+                .await,
+            Err(SchedulerError::ActivationRequired)
+        ));
+        let (reply, result) = tokio::sync::oneshot::channel();
+        handle
+            .0
+            .send(SchedulerCommand::Delete {
+                id: due.id.clone(),
+                reply,
+            })
+            .unwrap();
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(SchedulerError::ActivationRequired)
+        ));
+        assert!(matches!(
+            handle
+                .create(
+                    "blocked".into(),
+                    "blocked".into(),
+                    snapshot.version,
+                    due.clone()
+                )
+                .await,
+            Err(SchedulerError::ActivationRequired)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(requests.try_recv().is_err());
+        while let Ok(notification) = notification_rx.try_recv() {
+            assert!(matches!(
+                notification,
+                crate::notification::ToolNotification::ScheduledTaskCreated(_)
+            ));
+        }
+        assert_eq!(handle.snapshot().await.unwrap().tasks.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        gate.activate();
+        gate.activate(); // Idempotent: wakes the existing actor, not another owner.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SubagentEvent::Spawn(mut spawn) = event else {
+            panic!("expected native spawn")
+        };
+        assert_eq!(
+            spawn
+                .request
+                .runtime_overrides
+                .scheduled_invocation
+                .as_ref()
+                .unwrap()
+                .occurrence,
+            due.next_run_at.unwrap()
+        );
+        spawn.registered_tx.take().unwrap().send(()).unwrap();
     }
 
     #[tokio::test]
