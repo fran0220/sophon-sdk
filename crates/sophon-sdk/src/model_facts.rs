@@ -6,7 +6,8 @@
 //! are reported by the route from the same actor snapshot.
 
 /// Resolved sampling, active harness, and retry behavior for a session.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionModelFacts {
     /// `None` means omitted from the provider request, not a guessed provider default.
     pub max_completion_tokens: Option<u32>,

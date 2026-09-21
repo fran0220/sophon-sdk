@@ -83,6 +83,10 @@ test('candidate-required create, load and resume keep scheduler inspection read-
     if (attach === 'resume') session = await agent.resumeSession(id, options)
     const before = await session.scheduler.list()
     assert.deepEqual(before.tasks, [])
+    const effective = await session.effectiveConfig()
+    assert.equal(effective.sessionId, session.id)
+    assert.equal(effective.mountedRevision, null, 'cold attachment is not a successful candidate mount')
+    assert.equal(typeof effective.version.generation, 'string')
     await assert.rejects(session.prompt({ turnId: `unmounted-${attach}`, blocks: [{ type: 'text', text: 'Must not infer.' }], metadata: {} }), /requires a configuration candidate before execution/)
     await assert.rejects(session.scheduler.create(`blocked-${attach}`, before.version, {
       cadence: { kind: 'once', at: new Date(Date.now() - 60000).toISOString() },
@@ -90,6 +94,7 @@ test('candidate-required create, load and resume keep scheduler inspection read-
     }), /requires a committed configuration candidate/)
     await assert.rejects(session.scheduler.delete(`blocked-delete-${attach}`, before.version, 'unmounted-task'), /requires a committed configuration candidate/)
     assert.deepEqual(await session.scheduler.list(), before, 'refused writes must not alter scheduler state')
+    assert.equal((await session.effectiveConfig()).mountedRevision, null)
     await session.dispose()
   }
   await agent.finalExit()

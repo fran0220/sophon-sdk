@@ -275,6 +275,13 @@ impl Runtime {
                     .map_err(operation)?;
                 encode(queue)
             }
+            EffectiveConfig { session_id } => encode(
+                self.session(&session_id)
+                    .await?
+                    .effective_config_snapshot()
+                    .await
+                    .map_err(operation)?,
+            ),
             Dispose { session_id } => {
                 self.session(&session_id).await?.close().await?;
                 self.sessions.lock().await.remove(&session_id);

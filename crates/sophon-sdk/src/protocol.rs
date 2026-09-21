@@ -442,6 +442,9 @@ pub enum Request {
     Queue {
         session_id: String,
     },
+    EffectiveConfig {
+        session_id: String,
+    },
     Dispose {
         session_id: String,
     },
@@ -535,6 +538,7 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
     TerminalOpenResult::export_all(&config)?;
     TerminalCloseResult::export_all(&config)?;
     crate::management::SchedulerSnapshot::export_all(&config)?;
+    crate::management::SessionEffectiveConfigSnapshot::export_all(&config)?;
     crate::management::SchedulerMutationResult::<crate::management::ScheduledTask>::export_all(
         &config,
     )?;

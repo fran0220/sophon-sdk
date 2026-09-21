@@ -25,9 +25,11 @@ import type { TerminalEvent } from './generated/TerminalEvent.js'
 import type { TerminalOpenResult } from './generated/TerminalOpenResult.js'
 import type { TerminalCloseResult } from './generated/TerminalCloseResult.js'
 import type { QueueSnapshot } from './generated/QueueSnapshot.js'
+import type { SessionEffectiveConfigSnapshot } from './generated/SessionEffectiveConfigSnapshot.js'
 import type { SubagentCancelIdResult } from './generated/SubagentCancelIdResult.js'
 import type { SubagentCancelOutcome } from './generated/SubagentCancelOutcome.js'
 
+export type { SessionEffectiveConfigSnapshot }
 export type { ClientFrame, ServerFrame, Request, RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue }
 export type { SubagentStart, SubagentResult, SubagentSnapshot, SubagentHandle, SchedulerSnapshot, ScheduledTask, ScheduledTaskCreate, ScheduledTaskUpdate, SchedulerMutationResult, Version }
 export type { NativeMediaConfig } from './generated/NativeMediaConfig.js'
@@ -279,6 +281,8 @@ export class Session {
   async cancel(turnId: string | null = null): Promise<void> { await this.agent.request({ method: 'cancel', sessionId: this.id, turnId }) }
   async dispose(): Promise<void> { await this.agent.request({ method: 'dispose', sessionId: this.id }) }
   async queue(): Promise<QueueSnapshot> { return await this.agent.request({ method: 'queue', sessionId: this.id }) as unknown as QueueSnapshot }
+  /** Current native mount receipt; version is only an invalidation token. */
+  async effectiveConfig(): Promise<SessionEffectiveConfigSnapshot> { return await this.agent.request({ method: 'effective_config', sessionId: this.id }) as unknown as SessionEffectiveConfigSnapshot }
   readArtifact(path: string): Promise<JsonValue> { return this.agent.request({ method: 'read_artifact', sessionId: this.id, path }) }
   async setModel(model: string, metadata: Record<string, JsonValue> = {}): Promise<void> { await this.agent.request({ method: 'set_model', sessionId: this.id, model, metadata }) }
   extension(name: string, params: JsonValue): Promise<JsonValue> { return this.agent.request({ method: 'extension', sessionId: this.id, name, params }) }

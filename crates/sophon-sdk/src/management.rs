@@ -577,7 +577,9 @@ pub enum RewindExecutionResult {
 
 // ── Credential-free effective configuration ───────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "EffectiveProviderProtocol")]
 #[non_exhaustive]
 pub enum ProviderProtocol {
     OpenAiChatCompletions,
@@ -655,7 +657,8 @@ pub struct ResolvedMemoryFacts {
     pub pruning: xai_grok_config_types::PruningConfig,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchOverrideFacts {
     pub x_search_from_date: Option<String>,
     pub x_search_to_date: Option<String>,
@@ -663,7 +666,8 @@ pub struct SearchOverrideFacts {
     pub web_excluded_domains: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRouteFacts {
     pub base_url: String,
     pub model: String,
@@ -675,9 +679,13 @@ pub struct SessionRouteFacts {
     pub environment_header_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionEffectiveConfigSnapshot {
     pub session_id: SessionId,
+    /// Current actor-published candidate, absent until native mount succeeds.
+    pub mounted_revision: Option<String>,
+    /// Configuration invalidation token, not proof of candidate publication.
     pub version: Version,
     pub route: SessionRouteFacts,
     pub model: crate::SessionModelFacts,
@@ -1402,6 +1410,7 @@ pub(crate) fn effective_config_snapshot(
 ) -> SessionEffectiveConfigSnapshot {
     SessionEffectiveConfigSnapshot {
         session_id: SessionId(snapshot.session_id),
+        mounted_revision: snapshot.mounted_revision,
         version: Version {
             generation: snapshot.version.generation,
             revision: snapshot.version.revision,
