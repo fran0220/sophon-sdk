@@ -348,6 +348,9 @@ pub struct ScheduledInvocation {
 pub struct RpcError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub details: Option<crate::ErrorDetails>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]

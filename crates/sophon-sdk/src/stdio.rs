@@ -761,6 +761,7 @@ async fn respond(
                 }
                 .into(),
                 message: error.to_string(),
+                details: Some(error.details()),
             },
         },
     };
@@ -1072,6 +1073,68 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_details_distinguish_sdk_variants_without_messages() {
+        use crate::management::{
+            AdmissionSnapshot, AdmissionState, AgentDrainSnapshot, QuiesceReport,
+        };
+        let fence = AdmissionSnapshot {
+            generation: 1,
+            state: AdmissionState::Quiescing,
+            active: 1,
+            accepted: 1,
+            rejected: 0,
+        };
+        let report = QuiesceReport {
+            fence,
+            admission: fence,
+            initial: AgentDrainSnapshot::default(),
+            final_snapshot: AgentDrainSnapshot::default(),
+            polls: 1,
+            elapsed: std::time::Duration::from_millis(7),
+            timed_out: true,
+        };
+        for (error, kind) in [
+            (Error::Operation("secret-operation".into()), "operation"),
+            (Error::Start("secret-start".into()), "start"),
+            (
+                Error::UnsupportedClientRequest("secret-request".into()),
+                "unsupported_client_request",
+            ),
+            (
+                Error::QuiesceTimedOut(Box::new(report)),
+                "quiesce_timed_out",
+            ),
+        ] {
+            let (output, mut outgoing) = mpsc::unbounded_channel();
+            let responding =
+                tokio::spawn(async move { respond(&output, "test".into(), Err(error)).await });
+            let frame = outgoing.recv().await.unwrap();
+            let wire = serde_json::to_value(frame.frame).unwrap();
+            assert_eq!(wire["error"]["code"], "operation_failed");
+            assert_eq!(
+                wire["error"]["details"],
+                serde_json::json!({
+                    "kind":kind,"acpCode":null,"httpStatus":null,"nativeCode":null,"hasPromptUsage":false,
+                })
+            );
+            assert!(!wire["error"]["details"].to_string().contains("secret"));
+            frame.flushed.unwrap().send(()).unwrap();
+            responding.await.unwrap().unwrap();
+        }
+        let legacy: p::RpcError = serde_json::from_value(
+            serde_json::json!({"code":"operation_failed","message":"legacy"}),
+        )
+        .unwrap();
+        assert!(legacy.details.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("details")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn final_error_response_waits_for_actual_writer_flush() {

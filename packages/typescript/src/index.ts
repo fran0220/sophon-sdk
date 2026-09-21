@@ -1,5 +1,6 @@
 import type { ClientFrame } from './generated/ClientFrame.js'
 import type { ServerFrame } from './generated/ServerFrame.js'
+import type { ErrorDetails } from './generated/ErrorDetails.js'
 import type { Request } from './generated/Request.js'
 import type { RuntimeConfig } from './generated/RuntimeConfig.js'
 import type { RuntimeEvent } from './generated/RuntimeEvent.js'
@@ -31,6 +32,9 @@ import type { SubagentCancelIdResult } from './generated/SubagentCancelIdResult.
 import type { SubagentCancelOutcome } from './generated/SubagentCancelOutcome.js'
 
 export type { SessionEffectiveConfigSnapshot }
+export type { ErrorDetails }
+export type { ErrorKind } from './generated/ErrorKind.js'
+export type { NativeErrorCode } from './generated/NativeErrorCode.js'
 export type { RuntimeConfig, RuntimeEvent, SessionOptions, SessionDescriptor, HistorySnapshot, Prompt, PromptReceipt, CallbackContext, JsonValue, SkillsSnapshot }
 export type { ConfigCandidate } from './generated/ConfigCandidate.js'
 export type { McpServer } from './generated/McpServer.js'
@@ -104,7 +108,7 @@ export interface SpawnOptions extends ClientOptions {
 }
 
 export class RuntimeError extends Error {
-  constructor(readonly code: string, message: string) { super(message); this.name = 'RuntimeError' }
+  constructor(readonly code: string, message: string, readonly details?: ErrorDetails) { super(message); this.name = 'RuntimeError' }
 }
 
 type Pending = { resolve: (result: JsonValue) => void; reject: (error: unknown) => void }
@@ -189,7 +193,7 @@ export class Agent {
             if (!pending) throw new RuntimeError('unknown_response', 'Runtime returned an unknown request ID')
             this.pending.delete(frame.id)
             if (frame.type === 'response') pending.resolve(frame.result)
-            else pending.reject(new RuntimeError(frame.error.code, frame.error.message))
+            else pending.reject(new RuntimeError(frame.error.code, frame.error.message, frame.error.details))
             break
           }
           case 'event':

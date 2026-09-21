@@ -616,6 +616,16 @@ is intentionally `!Send`; the public handles remain `Send + Sync`. Event
 delivery uses Tokio broadcast semantics, including an explicit lag error when a
 receiver falls behind the bounded buffer.
 
+Runtime RPC failures retain their existing `code` and `message`. The official
+TypeScript `RuntimeError.details` optionally carries generated `ErrorDetails`:
+a fixed native error kind, numeric ACP code, validated HTTP status, allowlisted
+native code, and a flag indicating an attached prompt-usage object. These facts
+are captured before native errors become text; they never copy remote messages,
+credentials, configuration, or usage values. Missing details (older Runtimes or
+client-local errors), null status, and absent usage metadata do not establish
+that no inference occurred or that billing was rolled back. Error `message`
+remains potentially sensitive and is not a safe diagnostic log field.
+
 ### Correctness and validation boundary
 
 For **explicit app final exit or account retirement**, call

@@ -65,6 +65,11 @@ pub enum Error {
     Start(String),
     #[error("Grok Build operation failed: {0}")]
     Operation(String),
+    #[error("Grok Build operation failed: {message}")]
+    NativeOperation {
+        message: String,
+        details: ErrorDetails,
+    },
     #[error("agent {admission_source:?} admission is closed at generation {generation}")]
     AdmissionRejected {
         generation: u64,
@@ -83,6 +88,61 @@ impl Error {
     pub(crate) fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig(message.into())
     }
+
+    /// Safe structural diagnostics. Unlike Display, these contain no remote text.
+    pub fn details(&self) -> ErrorDetails {
+        let kind = match self {
+            Self::InvalidConfig(_) => ErrorKind::InvalidConfig,
+            Self::Start(_) => ErrorKind::Start,
+            Self::Operation(_) => ErrorKind::Operation,
+            Self::NativeOperation { details, .. } => return details.clone(),
+            Self::AdmissionRejected { .. } => ErrorKind::AdmissionRejected,
+            Self::QuiesceTimedOut(_) => ErrorKind::QuiesceTimedOut,
+            Self::UnsupportedClientRequest(_) => ErrorKind::UnsupportedClientRequest,
+            Self::RuntimeStopped => ErrorKind::RuntimeStopped,
+        };
+        ErrorDetails {
+            kind,
+            acp_code: None,
+            http_status: None,
+            native_code: None,
+            has_prompt_usage: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    InvalidConfig,
+    Start,
+    Operation,
+    NativeOperation,
+    AdmissionRejected,
+    QuiesceTimedOut,
+    UnsupportedClientRequest,
+    RuntimeStopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeErrorCode {
+    ConfigCandidateRejected,
+    SessionDirCreateFailed,
+    AssetsSaveFailed,
+    MaxOutputTokensClampFailed,
+}
+
+/// Additive diagnostics captured before native errors are converted to text.
+/// An absent status is unknown, not evidence that no provider request occurred.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorDetails {
+    pub kind: ErrorKind,
+    pub acp_code: Option<i32>,
+    pub http_status: Option<u16>,
+    pub native_code: Option<NativeErrorCode>,
+    pub has_prompt_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, ts_rs::TS)]

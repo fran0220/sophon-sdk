@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
 use indexmap::IndexMap;
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use xai_acp_lib::{AcpGatewayReceiver, AcpGatewaySender};
 use xai_grok_sampler::AuthScheme;
@@ -1962,7 +1963,35 @@ fn acp_error(error: acp::Error) -> Error {
             admission_source: source,
         };
     }
-    Error::Operation(error.to_string())
+    let data = error.data.as_ref();
+    let native_code = match data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+    {
+        Some("config_candidate_rejected") => Some(crate::NativeErrorCode::ConfigCandidateRejected),
+        Some("session_dir_create_failed") => Some(crate::NativeErrorCode::SessionDirCreateFailed),
+        Some("assets_save_failed") => Some(crate::NativeErrorCode::AssetsSaveFailed),
+        Some("max_output_tokens_clamp_failed") => {
+            Some(crate::NativeErrorCode::MaxOutputTokensClampFailed)
+        }
+        _ => None,
+    };
+    Error::NativeOperation {
+        message: error.to_string(),
+        details: crate::ErrorDetails {
+            kind: crate::ErrorKind::NativeOperation,
+            acp_code: Some(i32::from(error.code)),
+            http_status: data
+                .and_then(|data| data.get("http_status"))
+                .and_then(Value::as_u64)
+                .filter(|status| (100..=599).contains(status))
+                .map(|status| status as u16),
+            native_code,
+            has_prompt_usage: data
+                .and_then(|data| data.get("promptUsage"))
+                .is_some_and(Value::is_object),
+        },
+    }
 }
 
 fn management_extension_error(
@@ -2978,6 +3007,68 @@ impl SessionConfig {
 mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
+
+    #[test]
+    fn native_error_details_keep_structure_without_remote_text() {
+        for (native, expected_code, status, local_code) in [
+            (
+                acp::Error::invalid_params().data(serde_json::json!({
+                    "code":"config_candidate_rejected", "message":"secret-candidate",
+                })),
+                -32602,
+                None,
+                Some(crate::NativeErrorCode::ConfigCandidateRejected),
+            ),
+            (
+                acp::Error::internal_error().data(serde_json::json!({
+                    "http_status": 422, "message":"secret-provider", "code":"secret-code",
+                    "secret-key":"secret-value", "promptUsage":{"secret-usage": 9},
+                })),
+                -32603,
+                Some(422),
+                None,
+            ),
+        ] {
+            let before = format!("Grok Build operation failed: {native}");
+            let error = acp_error(native);
+            assert_eq!(
+                error.to_string(),
+                before,
+                "Display/fingerprint stays compatible"
+            );
+            let details = error.details();
+            assert_eq!(details.kind, crate::ErrorKind::NativeOperation);
+            assert_eq!(details.acp_code, Some(expected_code));
+            assert_eq!(details.http_status, status);
+            assert_eq!(details.native_code, local_code);
+            assert_eq!(details.has_prompt_usage, status.is_some());
+            assert!(!serde_json::to_string(&details).unwrap().contains("secret"));
+        }
+        for status in [
+            serde_json::json!(99),
+            serde_json::json!(600),
+            serde_json::json!(-1),
+            serde_json::json!(400.5),
+            serde_json::json!("400"),
+            Value::Null,
+        ] {
+            let error = acp_error(acp::Error::internal_error().data(serde_json::json!({
+                "http_status":status,"promptUsage":"secret-not-an-object",
+            })));
+            assert_eq!(error.details().http_status, None);
+            assert!(!error.details().has_prompt_usage);
+        }
+        for data in [
+            Value::Null,
+            serde_json::json!([400]),
+            serde_json::json!("secret-string"),
+        ] {
+            let details = acp_error(acp::Error::internal_error().data(data)).details();
+            assert_eq!(details.http_status, None);
+            assert_eq!(details.native_code, None);
+            assert!(!details.has_prompt_usage);
+        }
+    }
 
     #[test]
     fn scheduler_closed_is_refused_but_cancelled_has_unknown_outcome() {

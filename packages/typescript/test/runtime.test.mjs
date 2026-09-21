@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { createServer } from 'node:http'
-import { Agent } from '../dist/index.js'
+import { Agent, RuntimeError } from '../dist/index.js'
 import { StdioTransport } from '../dist/stdio.js'
 
 const executable = process.env.SOPHON_RUNTIME ?? resolve('../../target/debug/sophon-runtime')
@@ -178,7 +178,18 @@ test('official candidate ingress publishes native receipts and keeps busy prompt
   session.subscribe(event => events.push(event))
   const prompt = (turnId, text, configCandidate, sendNow = false) => session.prompt({ turnId, blocks: [{ type: 'text', text }], configCandidate, sendNow })
   assert.equal((await session.effectiveConfig()).mountedRevision, null)
-  await assert.rejects(prompt('cold-invalid', 'Must not infer.', candidate('invalid', 'missing-route')))
+  await assert.rejects(prompt('cold-invalid', 'Must not infer.', candidate('invalid', 'missing-route')), error => {
+    assert.ok(error instanceof RuntimeError)
+    assert.equal(error.code, 'operation_failed')
+    assert.deepEqual(error.details, { kind: 'native_operation', acpCode: -32602, httpStatus: null, nativeCode: null, hasPromptUsage: false })
+    return true
+  })
+  await assert.rejects(prompt('cold-invalid-skills', 'Must not infer.', { ...candidate('invalid-skills', 'runtime-test'), skillDirectories: [join(cwd, 'missing-skills')] }), error => {
+    assert.ok(error instanceof RuntimeError)
+    assert.equal(error.code, 'operation_failed')
+    assert.deepEqual(error.details, { kind: 'native_operation', acpCode: -32602, httpStatus: null, nativeCode: 'config_candidate_rejected', hasPromptUsage: false })
+    return true
+  })
   await assert.rejects(prompt('cold-unsupported-effort', 'Must not infer.', { ...candidate('invalid-effort', 'runtime-test'), reasoningEffort: 'high' }), /reasoning effort is unsupported/)
   assert.equal(requests.length, 0)
   assert.equal((await session.effectiveConfig()).mountedRevision, null)
