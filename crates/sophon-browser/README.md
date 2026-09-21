@@ -156,8 +156,8 @@ screenshot/video for review. Verified on Linux x86-64 with Chromium 153; this is
 not macOS/Windows evidence or full Origin Stage/audio parity.
 
 The separate Runtime roundtrip uses the official TS client, a compiled native
-Runtime, real Chromium, and a local deterministic inference fixture. It asserts
-that the model receives the native browser definition and actual snapshot result,
+Runtime, real Chromium, and a local deterministic provider-protocol fixture. It asserts
+that the model-facing payload contains the native browser definition and actual snapshot result,
 without invoking a TS tool callback or MCP service. It also checks live frame
 delivery, native text input, artifact retrieval and checked Runtime exit:
 
@@ -171,3 +171,36 @@ SOPHON_RUNTIME="$PWD/target/debug/sophon-runtime" SOPHON_CHROMIUM=/usr/bin/chrom
 
 This is a transport/native-registration test, not a live-provider model quality
 test. It uses disposable Runtime/profile directories and no production credentials.
+
+The opt-in `tests/gateway.mjs` instead uses real gateway inference. It requires
+`OG_AI_GATEWAY`, `OG_API_KEY` and `SOPHON_RUNTIME`, discovers the authenticated
+account-effective published default route, and preserves its exact model,
+endpoint and reasoning setting. It never falls back to a catalog-only model.
+It asks the model to navigate a disposable local form, snapshot, type, submit
+exactly once, and screenshot. It checks native tool events, the actual HTTP form
+submission, workspace PNG publication and `Session.readArtifact` bytes, with no
+TS tool callbacks. This spends gateway inference credits; run only with explicit
+acceptance authorization. No personal browser profile is used or uploaded.
+
+```sh
+SOPHON_RUNTIME="$PWD/target/debug/sophon-runtime" \
+  node crates/sophon-browser/tests/gateway.mjs
+```
+
+Keep the evidence categories separate:
+
+| Capability | Implemented verification / limitation |
+| --- | --- |
+| Navigation, semantic refs, typing, clicking, screenshots | Real gateway acceptance script; service tests independently verify effects and stale refs |
+| Frames | Same-origin frame snapshots/scaled clicks tested; cross-origin/OOPIF automation unsupported |
+| Live display | Native CDP screencast, bounded lag and reliable control responses tested; not audio |
+| Console/network | Bounded console/exception and network metadata; no response-body capture or interception API |
+| Downloads | No download lifecycle, progress, cancellation or workspace publication API implemented |
+| Recording | Silent H.264 through FFmpeg; elapsed duration, static frames and interrupted capture tested |
+| Cancellation | Pending-call cancellation and exactly-once issued effects tested; cancellation is not rollback |
+| Identity | Persistent Runtime profile locking/reopen and origin clearing tested; never tied to Game deletion |
+| Platforms | Linux Chromium executed; macOS/Windows unverified |
+
+A gateway admission error is a failed acceptance run, even if the standalone
+browser suite passes. Host-driven Stage transport tests do not demonstrate
+model-driven behavior, and neither demonstrates complete Origin renderer parity.

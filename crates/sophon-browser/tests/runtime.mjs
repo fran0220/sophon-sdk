@@ -65,7 +65,7 @@ try {
     env: { ...process.env, GROK_HOME: join(root, 'home'), GROK_AUTH: '', GROK_TELEMETRY_ENABLED: 'false', GROK_TRACE_UPLOAD: 'false', GROK_FEEDBACK_ENABLED: 'false', GROK_TURN_SUMMARY: 'false' },
     config: {
       models: [{ id: 'fixture', provider: { protocol: 'openai_chat', baseUrl: url, apiKey: 'local-fixture-no-secret', model: 'fixture', headers: {}, queryParams: {} }, contextWindow: 32768, maxCompletionTokens: 1024 }],
-      defaultModel: 'fixture', webSearchModel: null, sessionSummaryModel: null, imageDescriptionModel: null, media: null,
+      defaultModel: 'fixture', webSearchModel: null, sessionSummaryModel: null, compactionModel: null, imageDescriptionModel: null, media: null, subagents: [],
       browser: { executable: process.env.SOPHON_CHROMIUM ?? '/usr/bin/chromium', dataDir: join(root, 'identity'), artifactDir: join(root, 'evidence'), headless: true, noSandbox: true },
     },
     onCallback: async ({ method }) => {
@@ -115,8 +115,8 @@ try {
   const video = await agent.browser({ action: 'artifact', artifact_id: recording.artifact_id })
   assert.equal(video.mime_type, 'video/mp4')
   assert.equal(Buffer.from(video.base64, 'base64').subarray(4, 8).toString(), 'ftyp')
-  const session = await agent.createSession({ workspace: { id: 'browser-proof', cwd: workspace }, model: 'fixture', metadata: {}, mcpServers: [], tools: [] })
-  await session.prompt({ turnId: 'native-browser-roundtrip', blocks: [{ type: 'text', text: 'Verify native browser fixture using the browser tool.' }], metadata: {} })
+  const session = await agent.createSession({ workspace: { id: 'browser-proof', cwd: workspace }, model: 'fixture', mcpServers: [], tools: [] })
+  await session.prompt({ turnId: 'native-browser-roundtrip', blocks: [{ type: 'text', text: 'Verify native browser fixture using the browser tool.' }] })
   assert.equal(nativeDefinition, true, 'provider-protocol fixture must receive native browser definition')
   assert.equal(nativeResult, true, `model-facing payload must contain actual Chromium snapshot: ${JSON.stringify(toolResults)}`)
   assert.ok(nativeScreenshot?.artifact, `native screenshot must publish workspace artifact: ${JSON.stringify(nativeScreenshot)}`)
