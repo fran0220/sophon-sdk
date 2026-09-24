@@ -521,14 +521,12 @@ mod windows_tests {
                         let mut pending_output = Vec::new();
                         loop {
                             match events.recv().await.expect("terminal event") {
-                                TerminalEvent::Exit {terminal_id,exit_code} => {
-                                    assert_eq!(terminal_id,id);
+                                TerminalEvent::Exit {terminal_id,exit_code} if terminal_id == id => {
                                     assert_eq!(exit_code,code,"ConPTY direct exit changed during cleanup");
                                     break;
                                 }
-                                TerminalEvent::Error {message,..} => panic!("{message}"),
-                                TerminalEvent::Output {terminal_id,data,..} => {
-                                    assert_eq!(terminal_id,id);
+                                TerminalEvent::Error {terminal_id,message} if terminal_id == id => panic!("{message}"),
+                                TerminalEvent::Output {terminal_id,data,..} if terminal_id == id => {
                                     let bytes = base64::engine::general_purpose::STANDARD.decode(data).expect("output base64");
                                     for _ in 0..cursor_queries(&mut pending_output,&bytes) {
                                         service.execute(TerminalRequest::Write {
@@ -537,6 +535,9 @@ mod windows_tests {
                                         }).await.expect("reply to ConPTY cursor query");
                                     }
                                 }
+                                // Exit is not an output-drain barrier. Previous
+                                // terminals may still emit on this service bus.
+                                _ => {}
                             }
                         }
                     }).await.expect("exit deadline");
