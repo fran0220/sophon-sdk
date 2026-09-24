@@ -469,12 +469,35 @@ fn start_terminal(
     })
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod windows_tests {
+    #[cfg(windows)]
     use super::*;
+
+    fn cursor_queries(pending: &mut Vec<u8>, chunk: &[u8]) -> usize {
+        pending.extend_from_slice(chunk);
+        let queries = pending
+            .windows(4)
+            .filter(|bytes| *bytes == b"\x1b[6n")
+            .count();
+        // Retain only a possible split query. Completed queries cannot match again.
+        pending.drain(..pending.len().saturating_sub(3));
+        queries
+    }
+
+    #[test]
+    fn cursor_queries_survive_chunk_boundaries_without_duplicate_replies() {
+        let mut pending = Vec::new();
+        assert_eq!(cursor_queries(&mut pending, b"startup\x1b["), 0);
+        assert_eq!(cursor_queries(&mut pending, b"6ntext\x1b[6n\x1b"), 2);
+        assert_eq!(cursor_queries(&mut pending, b"[6"), 0);
+        assert_eq!(cursor_queries(&mut pending, b"n"), 1);
+        assert_eq!(cursor_queries(&mut pending, b"normal output"), 0);
+    }
 
     /// Exercise actual interactive ConPTY processes concurrently: the direct
     /// child's code must survive kill-on-close Job teardown, not become zero.
+    #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conpty_preserves_direct_exit_before_job_teardown() {
         let program = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
@@ -495,6 +518,7 @@ mod windows_tests {
                     let command = format!("Write-Host ('EXITPID=' + $PID + ':{code}'); [Environment]::Exit({code})\r\n");
                     service.execute(TerminalRequest::Write { terminal_id:id.clone(), data:base64::engine::general_purpose::STANDARD.encode(command) }).await.expect("write");
                     tokio::time::timeout(Duration::from_secs(30), async {
+                        let mut pending_output = Vec::new();
                         loop {
                             match events.recv().await.expect("terminal event") {
                                 TerminalEvent::Exit {terminal_id,exit_code} => {
@@ -503,7 +527,16 @@ mod windows_tests {
                                     break;
                                 }
                                 TerminalEvent::Error {message,..} => panic!("{message}"),
-                                TerminalEvent::Output {..} => {}
+                                TerminalEvent::Output {terminal_id,data,..} => {
+                                    assert_eq!(terminal_id,id);
+                                    let bytes = base64::engine::general_purpose::STANDARD.decode(data).expect("output base64");
+                                    for _ in 0..cursor_queries(&mut pending_output,&bytes) {
+                                        service.execute(TerminalRequest::Write {
+                                            terminal_id:id.clone(),
+                                            data:base64::engine::general_purpose::STANDARD.encode(b"\x1b[1;1R"),
+                                        }).await.expect("reply to ConPTY cursor query");
+                                    }
+                                }
                             }
                         }
                     }).await.expect("exit deadline");
