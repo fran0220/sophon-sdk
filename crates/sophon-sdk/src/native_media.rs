@@ -50,6 +50,9 @@ use std::{
 };
 use ts_rs::TS;
 
+mod glb;
+mod model3d;
+
 #[derive(Clone, Serialize, Deserialize, TS, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMediaConfig {
@@ -62,6 +65,9 @@ pub struct NativeMediaConfig {
     #[serde(default)]
     #[ts(optional)]
     pub music: Option<MediaRoute>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub model3d: Option<MediaRoute>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -87,6 +93,8 @@ pub enum MediaEndpoint {
     AudioSfx,
     #[serde(rename = "audio-music")]
     AudioMusic,
+    #[serde(rename = "model-3d-text")]
+    Model3dText,
 }
 
 pub struct NativeMediaService {
@@ -201,6 +209,7 @@ impl NativeMediaService {
             ("generate_sound_effect", "Generate decoded MP3 sound effects using the explicit audio-sfx route. One submission, no automatic retry. Local cancellation cannot cancel or refund the remote operation; inspect .native-media receipts before any resubmission.", json!({"prompt":string,"output_path":string,"duration_seconds":{"type":"number","minimum":0.5,"maximum":30},"loop":{"type":"boolean"},"prompt_influence":{"type":"number","minimum":0,"maximum":1}}), vec!["prompt","output_path"]),
             ("generate_music", "Generate decoded MP3 music using the explicit audio-music route. One submission, no automatic retry. Local cancellation cannot cancel or refund the remote operation; inspect .native-media receipts before any resubmission.", json!({"prompt":string,"output_path":string,"duration_seconds":{"type":"number","minimum":3,"maximum":600},"force_instrumental":{"type":"boolean"}}), vec!["prompt","output_path"]),
             ("generate_video", "Submit exactly once or resume an OpenAI video task by task_id. Poll at most 120 seconds. Local cancellation does not cancel the remote task; inspect .native-media receipts before retrying an uncertain submission.", json!({"prompt":string,"task_id":string,"output_path":string,"seconds":{"enum":["4","8","12"]},"size":string,"poll_seconds":{"type":"integer","minimum":0,"maximum":120}}), vec!["output_path"]),
+            ("generate_model3d", "Create one Meshy preview-quality static GLB or resume by task_id, using the explicit model-3d-text route. Supply prompt OR task_id. No automatic create retries or refine. Cancellation stops local work, not remote billing; inspect .native-media receipts before resubmission. Poll at most 120 seconds; downloaded GLB is bounded to 32 MiB and validated before publication.", json!({"prompt":{"type":"string","minLength":1,"maxLength":600},"task_id":string,"output_path":string,"poll_seconds":{"type":"integer","minimum":0,"maximum":120}}), vec!["output_path"]),
         ].into_iter().map(|(name,description,properties,required)| ToolSpec {
             name:name.into(), description:description.into(),
             input_schema:json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
@@ -214,6 +223,7 @@ impl NativeMediaService {
             "generate_video" => (&self.config.video, MediaEndpoint::OpenaiVideo),
             "generate_sound_effect" => (&self.config.sfx, MediaEndpoint::AudioSfx),
             "generate_music" => (&self.config.music, MediaEndpoint::AudioMusic),
+            "generate_model3d" => (&self.config.model3d, MediaEndpoint::Model3dText),
             _ => return Err(fail("Unknown native media tool")),
         };
         let route = route
@@ -234,6 +244,9 @@ impl NativeMediaService {
             }
             MediaEndpoint::AudioTts => self.speech(route, &client, parse(args)?, workspace).await,
             MediaEndpoint::OpenaiVideo => self.video(route, &client, parse(args)?, workspace).await,
+            MediaEndpoint::Model3dText => {
+                self.model3d(route, &client, parse(args)?, workspace).await
+            }
             MediaEndpoint::AudioSfx => {
                 let args: SoundEffectArgs = parse(args)?;
                 nonempty(&args.prompt)?;
@@ -773,6 +786,7 @@ async fn decoder_available(executable: &Path) -> Result<(), Error> {
 async fn decode(executable: &Path, bytes: &[u8], kind: &str) -> Result<(), Error> {
     let valid = match kind {
         "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
         "mp3" => {
             bytes.starts_with(b"ID3")
                 || bytes

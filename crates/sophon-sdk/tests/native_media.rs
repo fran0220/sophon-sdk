@@ -24,6 +24,229 @@ fn json_reply(value: Value) -> Reply {
         bytes: value.to_string().into_bytes(),
     }
 }
+
+fn triangle_glb() -> Vec<u8> {
+    let mut json = serde_json::to_vec(&json!({"asset":{"version":"2.0"},"buffers":[{"byteLength":36}],"bufferViews":[{"buffer":0,"byteLength":36}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[2,3,0]}],"meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],"nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}],"scene":0})).unwrap();
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let mut bytes = b"glTF".to_vec();
+    bytes.extend(2_u32.to_le_bytes());
+    bytes.extend(((28 + json.len() + 36) as u32).to_le_bytes());
+    bytes.extend((json.len() as u32).to_le_bytes());
+    bytes.extend(b"JSON");
+    bytes.extend(json);
+    bytes.extend(36_u32.to_le_bytes());
+    bytes.extend(b"BIN\0");
+    bytes.extend(
+        [0_f32, 0., 0., 2., 0., 0., 0., 3., 0.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes),
+    );
+    bytes
+}
+
+#[tokio::test]
+async fn model3d_creates_once_polls_owned_content_and_decodes_before_publish() {
+    let bytes = triangle_glb();
+    let status = json!({"task_id":"owned_1","platform":"meshy","action":"text-to-3d","status":"SUCCESS","result_url":"https://never-fetch.invalid/secret.mp4","data":{"secret":"never-export"}});
+    let (base, server) = server(vec![
+        Reply {
+            status: 202,
+            bytes: br#"{"result":"owned_1"}"#.to_vec(),
+        },
+        json_reply(status.clone()),
+        Reply {
+            status: 409,
+            bytes: vec![],
+        },
+        json_reply(status),
+        Reply {
+            status: 200,
+            bytes: bytes.clone(),
+        },
+    ]);
+    let root = tempfile::tempdir().unwrap();
+    let result = service(base.trim_end_matches("/v1"))
+        .execute(
+            "generate_model3d",
+            json!({"prompt":"asymmetric triangle","output_path":"model.glb","poll_seconds":4}),
+            root.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["geometry"]["vertices"], 3);
+    assert_eq!(result["geometry"]["triangles"], 1);
+    assert_eq!(result["artifact"]["mimeType"], "model/gltf-binary");
+    assert_eq!(
+        result["artifact"]["revision"],
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(std::fs::read(root.path().join("model.glb")).unwrap(), bytes);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    let request = String::from_utf8_lossy(&requests[0]);
+    assert!(request.starts_with("POST /meshy/openapi/v2/text-to-3d "));
+    assert!(request.to_lowercase().contains("idempotency-key:"));
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({"mode":"preview","prompt":"asymmetric triangle","ai_model":"latest","should_remesh":false,"target_formats":["glb"]})
+    );
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        assert!(
+            String::from_utf8_lossy(request).starts_with(if index % 2 == 1 {
+                "GET /meshy/tasks/owned_1 "
+            } else {
+                "GET /meshy/tasks/owned_1/content "
+            })
+        );
+    }
+    let receipt_path = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt, result);
+    for forbidden in [
+        "asymmetric triangle",
+        "never-export",
+        "never-fetch",
+        "fixture-secret",
+    ] {
+        assert!(!result.to_string().contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn model3d_resume_never_creates_and_rejects_corrupt_content() {
+    for (http, bytes) in [
+        (200, b"glTFnot-valid".to_vec()),
+        (302, vec![]),
+        (404, vec![]),
+    ] {
+        let (base, server) = server(vec![
+            json_reply(
+                json!({"task_id":"saved","platform":"meshy","action":"text-to-3d","status":"SUCCESS"}),
+            ),
+            Reply {
+                status: http,
+                bytes,
+            },
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            service(base.trim_end_matches("/v1"))
+                .execute(
+                    "generate_model3d",
+                    json!({"task_id":"saved","output_path":"model.glb"}),
+                    root.path()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join("model.glb").exists());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.starts_with(b"GET ")));
+        let path = std::fs::read_dir(root.path().join(".native-media"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(receipt["task_id"], "saved");
+        assert_ne!(receipt["status"], "completed");
+    }
+}
+
+/// Offline validation of a retained provider artifact, with no gateway request.
+#[tokio::test]
+#[ignore = "requires SOPHON_RETAINED_GLB pointing to an independently retained provider GLB"]
+async fn model3d_retained_provider_content_decodes_without_a_new_create() {
+    let bytes = std::fs::read(std::env::var("SOPHON_RETAINED_GLB").unwrap()).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let (base, server) = server(vec![
+        json_reply(
+            json!({"task_id":"retained","platform":"meshy","action":"text-to-3d","status":"SUCCESS"}),
+        ),
+        Reply {
+            status: 200,
+            bytes: bytes.clone(),
+        },
+    ]);
+    let root = tempfile::tempdir().unwrap();
+    let result = service(base.trim_end_matches("/v1"))
+        .execute(
+            "generate_model3d",
+            json!({"task_id":"retained","output_path":"retained.glb"}),
+            root.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["artifact"]["revision"], digest);
+    assert_eq!(
+        std::fs::read(root.path().join("retained.glb")).unwrap(),
+        bytes
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.starts_with(b"GET ")));
+    println!(
+        "retained GLB sha256={digest} bytes={} geometry={}",
+        bytes.len(),
+        result["geometry"]
+    );
+}
+
+#[tokio::test]
+async fn model3d_cancelled_create_retains_unknown_receipt_without_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = service(&format!("http://{}", listener.local_addr().unwrap()));
+    let mut call = Box::pin(service.execute(
+        "generate_model3d",
+        json!({"prompt":"private prompt","output_path":"model.glb"}),
+        root.path(),
+    ));
+    let (mut socket, _) = tokio::select! {
+        accepted = listener.accept() => accepted.unwrap(),
+        result = &mut call => panic!("create ended before request: {result:?}"),
+    };
+    use tokio::io::AsyncReadExt;
+    let mut bytes = [0; 4096];
+    let count = tokio::select! {
+        read = socket.read(&mut bytes) => read.unwrap(),
+        result = &mut call => panic!("create ended before body: {result:?}"),
+    };
+    assert!(bytes[..count].starts_with(b"POST /meshy/openapi/v2/text-to-3d "));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), call)
+            .await
+            .is_err()
+    );
+    let path = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(receipt["status"], "outcome_unknown");
+    assert!(receipt.get("task_id").is_none());
+    assert!(!receipt.to_string().contains("private prompt"));
+    assert!(!root.path().join("model.glb").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
 fn server(replies: Vec<Reply>) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -96,6 +319,7 @@ fn service(base: &str) -> NativeMediaService {
             video: Some(route(MediaEndpoint::OpenaiVideo)),
             sfx: Some(route(MediaEndpoint::AudioSfx)),
             music: Some(route(MediaEndpoint::AudioMusic)),
+            model3d: Some(route(MediaEndpoint::Model3dText)),
         },
         "ffmpeg".into(),
     )

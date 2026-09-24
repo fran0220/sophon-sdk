@@ -17,6 +17,8 @@ agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+dunce = { workspace = true }
+gltf = { version = "=1.4.1", default-features = false, features = ["utils"] }
 http = { workspace = true }
 indexmap = { workspace = true }
 ptyctl = { path = "../codegen/ptyctl" }

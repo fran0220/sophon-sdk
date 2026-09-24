@@ -587,6 +587,30 @@ cancellation cannot cancel a paid remote operation; an `outcome_unknown`
 receipt must not be replayed automatically. No remote URL downloads or redirects
 are used by these tools.
 
+`RuntimeConfig.media.model3d` mounts `generate_model3d` with endpoint
+`model-3d-text` and the relay **root** base URL (not its `/v1` base).
+It submits one explicit Meshy preview request to `/meshy/openapi/v2/text-to-3d`,
+then reads only owner-authenticated `/meshy/tasks/{id}` and `/content`.
+Supply `prompt` (1–600 characters) **or** a retained `task_id`, a new `.glb`
+`output_path`, and optional `poll_seconds` (0–120). Zero polling performs one
+status/content check; subsequent polling is bounded. Content-not-ready HTTP 409
+may be polled; redirects, provider result URLs, and automatic create retries are
+never used. A pre-submission receipt survives cancellation; once known, the task
+ID is retained for resume. Local cancellation cannot cancel/refund remote work.
+The 32 MiB download must decode as a self-contained GLB 2 static triangle scene
+with finite geometry, valid buffers/indices, and decodable embedded PNG/JPEG
+textures. External resources, animations, skins, sparse accessors and morphs are
+outside this preview profile. Published bytes are unchanged, digest-addressed,
+and marked preview quality/review-required; no refined-model quality is claimed.
+
+Use `agent.sessionHandle(descriptor)` to wrap a session already attached to that
+Agent's Runtime, particularly across multiple installed SDK copies. This local
+factory does not create/load/resume a native session or validate the descriptor;
+native operations still enforce session ownership/existence. `createSession`,
+`loadSession`, and `resumeSession` return handles from the same factory. Direct
+`new Session(agent, descriptor)` is deprecated and requires matching module
+identity; do not mix a Session constructor from one SDK copy with another Agent.
+
 `RuntimeConfig.decision` optionally binds the native `evaluate_decisions` tool:
 `{ endpoint: "system-one", model, baseUrl, bearerToken }`. The host supplies the
 published model and existing relay's `/v1` base and bearer; no model-name lookup,
