@@ -144,10 +144,11 @@ fn public_facade_lifecycle_is_cancellable_and_flushes_before_stopping() {
             .await
             .expect("second session");
         bounded(closed.close()).await.expect("close session");
-        assert!(matches!(
-            bounded(closed.set_mode("default")).await,
-            Err(Error::Operation(_))
-        ));
+        let error = bounded(closed.set_mode("default"))
+            .await
+            .expect_err("closed session must reject mode changes");
+        assert!(matches!(error, Error::NativeOperation { .. }));
+        assert_eq!(error.details().acp_code, Some(-32602));
         bounded(session.set_mode("default"))
             .await
             .expect("other session remains usable");
