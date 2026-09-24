@@ -411,7 +411,7 @@ fn start_terminal(
         let mut killed = false;
         loop {
             // PtyChild::is_alive only returns false after a successful try_wait.
-            // Drop the group immediately upon reap; never signal a recycled PID.
+            // Do not signal the process group once the child is observed exited.
             if !child.is_alive() {
                 break;
             }
@@ -437,10 +437,14 @@ fn start_terminal(
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Capture the direct child's status while its Windows Job is still
+        // alive. Closing a kill-on-close Job before this wait can change the
+        // reported ConPTY status (observed 7 -> 0). Cleanup still runs before
+        // publishing either the exit receipt or a wait error.
+        let result = child.wait().map_err(|e| format!("PTY wait: {e}"));
         drop(group);
         drop(scope);
         worker_closing.store(true, Ordering::Release);
-        let result = child.wait().map_err(|e| format!("PTY wait: {e}"));
         match &result {
             Ok(code) => {
                 let _ = events.send(TerminalEvent::Exit {
@@ -463,6 +467,58 @@ fn start_terminal(
         closing,
         exit,
     })
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Exercise actual interactive ConPTY processes concurrently: the direct
+    /// child's code must survive kill-on-close Job teardown, not become zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conpty_preserves_direct_exit_before_job_teardown() {
+        let program = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut workers = tokio::task::JoinSet::new();
+        for code in [3_u32, 7, 19, 23] {
+            let program = program.clone();
+            workers.spawn(async move {
+                let service = NativeTerminalService::new();
+                for _ in 0..8 {
+                    let mut events = service.subscribe();
+                    let opened = service.execute(TerminalRequest::Open {
+                        program: program.to_string_lossy().into_owned(), args: vec![],
+                        cwd: std::env::temp_dir(), env: HashMap::new(), cols: 80, rows: 24,
+                    }).await.expect("open ConPTY");
+                    let id = opened["terminalId"].as_str().unwrap().to_owned();
+                    service.execute(TerminalRequest::Resize { terminal_id:id.clone(), cols:103, rows:37 }).await.expect("resize");
+                    let command = format!("Write-Host ('EXITPID=' + $PID + ':{code}'); [Environment]::Exit({code})\r\n");
+                    service.execute(TerminalRequest::Write { terminal_id:id.clone(), data:base64::engine::general_purpose::STANDARD.encode(command) }).await.expect("write");
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        loop {
+                            match events.recv().await.expect("terminal event") {
+                                TerminalEvent::Exit {terminal_id,exit_code} => {
+                                    assert_eq!(terminal_id,id);
+                                    assert_eq!(exit_code,code,"ConPTY direct exit changed during cleanup");
+                                    break;
+                                }
+                                TerminalEvent::Error {message,..} => panic!("{message}"),
+                                TerminalEvent::Output {..} => {}
+                            }
+                        }
+                    }).await.expect("exit deadline");
+                    // Both published event and retained close receipt must keep
+                    // the original code; host close only follows the assertion.
+                    let closed = service.execute(TerminalRequest::Close {terminal_id:id}).await.expect("close");
+                    assert_eq!(closed["exitCode"],code);
+                }
+                service.shutdown().await.expect("shutdown");
+            });
+        }
+        while let Some(result) = workers.join_next().await {
+            result.expect("ConPTY worker");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
