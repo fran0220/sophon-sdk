@@ -683,6 +683,63 @@ async fn video_submit_receipt_resume_and_content_are_openai_jobs_not_imagine() {
 }
 
 #[tokio::test]
+async fn video_omitted_size_stays_absent_and_explicit_size_is_preserved() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![
+        json_reply(json!({"id":"default_size","status":"queued"})),
+        json_reply(json!({"id":"explicit_size","status":"queued"})),
+    ]);
+    let service = service(&base);
+    for (path, size) in [("default.mp4", None), ("portrait.mp4", Some("480x640"))] {
+        let mut args = json!({"prompt":"moving rectangle","output_path":path});
+        if let Some(size) = size {
+            args["size"] = json!(size);
+        }
+        let result = service
+            .execute("generate_video", args, root.path())
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "queued");
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        body(&requests[0]),
+        json!({"model":"explicit-wire-model","prompt":"moving rectangle","seconds":"4"})
+    );
+    assert_eq!(
+        body(&requests[1]),
+        json!({"model":"explicit-wire-model","prompt":"moving rectangle","seconds":"4","size":"480x640"})
+    );
+}
+
+#[tokio::test]
+async fn video_prompt_with_placeholder_task_id_never_submits() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = service(&format!("http://{}/v1", listener.local_addr().unwrap()));
+    let error = service
+        .execute(
+            "generate_video",
+            json!({"prompt":"moving rectangle","task_id":"new","output_path":"video.mp4"}),
+            root.path(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one of prompt or task_id")
+    );
+    assert!(!root.path().join(".native-media").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn reject_unknown_endpoints_paths_changed_references_and_imagine_payload() {
     assert!(
         serde_json::from_value::<NativeMediaConfig>(

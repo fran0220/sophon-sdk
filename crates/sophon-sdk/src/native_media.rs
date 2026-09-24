@@ -35,6 +35,8 @@
 //! `task_id` instead of `prompt`; this service cannot automatically recover a job
 //! when cancellation happened before its ID was received. Request bodies,
 //! provider errors, credentials, and remote URLs are never included in receipts.
+//! Video `size` is forwarded only when supplied; omission retains provider
+//! defaults rather than imposing an SDK resolution. Duration still defaults to 4 seconds.
 
 use crate::{Error, protocol::ToolSpec};
 use base64::Engine;
@@ -502,8 +504,10 @@ impl NativeMediaService {
             let prompt = args.prompt.as_ref().unwrap(); nonempty(prompt)?;
             let seconds = args.seconds.as_deref().unwrap_or("4");
             if !["4","8","12"].contains(&seconds) { return Err(fail("Unsupported video duration")); }
+            let mut body = json!({"model":route.model,"prompt":prompt,"seconds":seconds});
+            if let Some(size) = &args.size { body["size"] = json!(size); }
             write_receipt(&receipt,&json!({"status":"outcome_unknown","model":route.model,"output_path":args.output_path}))?;
-            route.request(client,Method::POST,"videos")?.json(&json!({"model":route.model,"prompt":prompt,"seconds":seconds,"size":args.size.as_deref().unwrap_or("1280x720")})).send().await
+            route.request(client,Method::POST,"videos")?.json(&body).send().await
         }.map_err(|_| fail("Video request outcome unknown; inspect .native-media receipts; not retried"))?;
         let mut payload: Value = parse_response(response).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(args.poll_seconds.into());
