@@ -267,6 +267,9 @@ fn server(replies: Vec<Reply>) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
                     Err(e) => panic!("HTTP fixture accept: {e}"),
                 }
             };
+            // Accepted sockets inherit nonblocking mode on Windows; the
+            // fixture below uses blocking read_exact with a bounded timeout.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
