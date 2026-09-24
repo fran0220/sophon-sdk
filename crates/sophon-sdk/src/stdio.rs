@@ -128,7 +128,11 @@ impl crate::native_tools::NativeToolHandler for RuntimeTools {
                 }
                 Ok(result)
             }
-            "generate_image" | "generate_speech" | "generate_video" => {
+            "generate_image"
+            | "generate_speech"
+            | "generate_video"
+            | "generate_sound_effect"
+            | "generate_music" => {
                 self.media
                     .as_ref()
                     .ok_or_else(|| Error::Operation("media is not configured".into()))?
@@ -908,6 +912,8 @@ pub async fn run() -> Result<()> {
                                 "generate_image" => media.image.is_some(),
                                 "generate_speech" => media.speech.is_some(),
                                 "generate_video" => media.video.is_some(),
+                                "generate_sound_effect" => media.sfx.is_some(),
+                                "generate_music" => media.music.is_some(),
                                 _ => false,
                             }),
                     );

@@ -94,6 +94,8 @@ fn service(base: &str) -> NativeMediaService {
             image: Some(route(MediaEndpoint::ImageGeneration)),
             speech: Some(route(MediaEndpoint::AudioTts)),
             video: Some(route(MediaEndpoint::OpenaiVideo)),
+            sfx: Some(route(MediaEndpoint::AudioSfx)),
+            music: Some(route(MediaEndpoint::AudioMusic)),
         },
         "ffmpeg".into(),
     )
@@ -124,6 +126,136 @@ fn fixture(root: &Path, kind: &str) -> Vec<u8> {
 fn body(request: &[u8]) -> Value {
     let start = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     serde_json::from_slice(&request[start..]).unwrap()
+}
+
+#[tokio::test]
+async fn sound_effect_and_music_use_exact_routes_decode_and_receipt_without_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let audio = fixture(root.path(), "mp3");
+    let (base, server) = server(
+        (0..3)
+            .map(|_| Reply {
+                status: 200,
+                bytes: audio.clone(),
+            })
+            .collect(),
+    );
+    let service = service(&base);
+    for (tool, args) in [
+        (
+            "generate_sound_effect",
+            json!({"prompt":"secret-prompt","output_path":"sfx.mp3","duration_seconds":0.5,"loop":true,"prompt_influence":1}),
+        ),
+        (
+            "generate_music",
+            json!({"prompt":"secret-music","output_path":"music.mp3","duration_seconds":3.125,"force_instrumental":false}),
+        ),
+        (
+            "generate_music",
+            json!({"prompt":"secret-default","output_path":"default.mp3"}),
+        ),
+    ] {
+        let result = service
+            .execute(tool, args.clone(), root.path())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(root.path().join(args["output_path"].as_str().unwrap())).unwrap();
+        assert_eq!(bytes, audio);
+        assert_eq!(
+            result["artifact"]["revision"],
+            format!("{:x}", Sha256::digest(&audio))
+        );
+        let receipt =
+            std::fs::read_to_string(root.path().join(result["receipt"].as_str().unwrap())).unwrap();
+        assert!(!receipt.contains("secret"));
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "completed");
+        assert_eq!(receipt["request_id"], result["request_id"]);
+        assert_eq!(receipt["artifact"], result["artifact"]);
+        assert!(
+            service.execute(tool, args, root.path()).await.is_err(),
+            "existing file must refuse before another request"
+        );
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with(b"POST /v1/sound-generation "));
+    assert!(requests[1].starts_with(b"POST /v1/music "));
+    assert_eq!(
+        body(&requests[0]),
+        json!({"model":"explicit-wire-model","model_id":"explicit-wire-model","text":"secret-prompt","duration_seconds":0.5,"loop":true,"prompt_influence":1.0})
+    );
+    assert_eq!(
+        body(&requests[1]),
+        json!({"model":"explicit-wire-model","model_id":"explicit-wire-model","prompt":"secret-music","music_length_ms":3125,"force_instrumental":false})
+    );
+    assert_eq!(
+        body(&requests[2]),
+        json!({"model":"explicit-wire-model","model_id":"explicit-wire-model","prompt":"secret-default"})
+    );
+}
+
+#[tokio::test]
+async fn audio_validation_cancellation_and_bad_response_never_replay_or_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = service(&format!("http://{}/v1", listener.local_addr().unwrap()));
+    for (tool, field, value) in [
+        ("generate_sound_effect", "duration_seconds", json!(0.49)),
+        ("generate_sound_effect", "duration_seconds", json!(30.01)),
+        ("generate_sound_effect", "prompt_influence", json!(-0.01)),
+        ("generate_sound_effect", "prompt_influence", json!(1.01)),
+        ("generate_music", "duration_seconds", json!(2.999)),
+        ("generate_music", "duration_seconds", json!(600.001)),
+        ("generate_music", "force_instrumental", json!("true")),
+    ] {
+        let mut args = json!({"prompt":"fixture","output_path":"reject.mp3"});
+        args[field] = value;
+        assert!(service.execute(tool, args, root.path()).await.is_err());
+    }
+    assert!(!root.path().join(".native-media").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    let mut call = Box::pin(service.execute(
+        "generate_music",
+        json!({"prompt":"secret-cancel","output_path":"cancel.mp3"}),
+        root.path(),
+    ));
+    let (_socket, _) = tokio::select! { result=&mut call=>panic!("unexpected result {result:?}"), accepted=listener.accept()=>accepted.unwrap() };
+    drop(call);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    let receipts = std::fs::read_dir(root.path().join(".native-media"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let receipt = std::fs::read_to_string(receipts[0].path()).unwrap();
+    assert!(receipt.contains("outcome_unknown"));
+    assert!(!receipt.contains("secret"));
+    assert!(!root.path().join("cancel.mp3").exists());
+    let (base, server) = server(vec![Reply {
+        status: 200,
+        bytes: b"ID3not-decodable".to_vec(),
+    }]);
+    assert!(
+        self::service(&base)
+            .execute(
+                "generate_sound_effect",
+                json!({"prompt":"fixture","output_path":"bad.mp3"}),
+                root.path()
+            )
+            .await
+            .is_err()
+    );
+    assert!(!root.path().join("bad.mp3").exists());
+    assert_eq!(server.join().unwrap().len(), 1);
 }
 
 #[tokio::test]

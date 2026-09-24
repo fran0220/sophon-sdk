@@ -570,6 +570,23 @@ Packaged hosts must supply their verified executable outside ASAR, validate its
 hash/dependencies/codecs, and keep the bundle immutable. Runtime path validation
 does not replace those checks or claim that an arbitrary file is usable FFmpeg.
 
+`RuntimeConfig.media.sfx` and `.music` optionally mount native
+`generate_sound_effect` and `generate_music` tools. Routes declare `audio-sfx`
+and `audio-music`, the exact published model, and the existing relay `/v1` base
+and bearer. They submit once to `/sound-generation` or `/music`; missing routes
+leave the corresponding tools unavailable. SFX accepts `duration_seconds`
+0.5–30, optional `loop` and `prompt_influence` 0–1; music accepts
+`duration_seconds` 3–600 and optional `force_instrumental`. Omitted options remain
+omitted; music duration is rounded to integer milliseconds for the provider.
+Both require `prompt` and a new workspace-relative `.mp3` `output_path`.
+Raw MP3 responses are capped at 32 MiB and decoded by the configured FFmpeg
+before no-clobber publication. Results contain an artifact digest and a local
+request/receipt ID, not fabricated usage, cost, or exact-duration assurances.
+Receipts persist before submission without prompts or credentials. Local
+cancellation cannot cancel a paid remote operation; an `outcome_unknown`
+receipt must not be replayed automatically. No remote URL downloads or redirects
+are used by these tools.
+
 `RuntimeConfig.decision` optionally binds the native `evaluate_decisions` tool:
 `{ endpoint: "system-one", model, baseUrl, bearerToken }`. The host supplies the
 published model and existing relay's `/v1` base and bearer; no model-name lookup,

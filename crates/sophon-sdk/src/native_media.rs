@@ -13,6 +13,11 @@
 //! `/audio/speech`; `openai-video` uses `/videos`, `/videos/{id}`, and
 //! `/videos/{id}/content`. The Imagine `/videos/generations` protocol is not
 //! supported. Unknown endpoint declarations fail deserialization.
+//! Optional `sfx` (`audio-sfx`) and `music` (`audio-music`) routes use
+//! `/sound-generation` and `/music`, respectively, with the exact declared model
+//! in both `model` and `model_id`. Only raw, decoded MP3 responses are published.
+//! Their local receipts are written before submission; cancellation, transfer,
+//! or decoding failure retains `outcome_unknown`, never authorizing a retry.
 //!
 //! Tool arguments use snake_case; configuration uses camelCase. Image references
 //! carry `{path, revision}` with a lowercase SHA-256 digest. Returned artifacts
@@ -51,6 +56,12 @@ pub struct NativeMediaConfig {
     pub image: Option<MediaRoute>,
     pub speech: Option<MediaRoute>,
     pub video: Option<MediaRoute>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub sfx: Option<MediaRoute>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub music: Option<MediaRoute>,
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
@@ -72,6 +83,10 @@ pub enum MediaEndpoint {
     AudioTts,
     #[serde(rename = "openai-video")]
     OpenaiVideo,
+    #[serde(rename = "audio-sfx")]
+    AudioSfx,
+    #[serde(rename = "audio-music")]
+    AudioMusic,
 }
 
 pub struct NativeMediaService {
@@ -118,6 +133,26 @@ struct SpeechArgs {
     voice: String,
     output_path: String,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoundEffectArgs {
+    prompt: String,
+    output_path: String,
+    duration_seconds: Option<f64>,
+    r#loop: Option<bool>,
+    prompt_influence: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MusicArgs {
+    prompt: String,
+    output_path: String,
+    duration_seconds: Option<f64>,
+    force_instrumental: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoArgs {
@@ -163,6 +198,8 @@ impl NativeMediaService {
                 "references":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","revision"],"properties":{"path":string,"revision":string}}}
             }), vec!["prompt","output_path"]),
             ("generate_speech", "Generate and decode MP3 speech using the explicit audio-tts route.", json!({"prompt":string,"voice":string,"output_path":string}), vec!["prompt","voice","output_path"]),
+            ("generate_sound_effect", "Generate decoded MP3 sound effects using the explicit audio-sfx route. One submission, no automatic retry. Local cancellation cannot cancel or refund the remote operation; inspect .native-media receipts before any resubmission.", json!({"prompt":string,"output_path":string,"duration_seconds":{"type":"number","minimum":0.5,"maximum":30},"loop":{"type":"boolean"},"prompt_influence":{"type":"number","minimum":0,"maximum":1}}), vec!["prompt","output_path"]),
+            ("generate_music", "Generate decoded MP3 music using the explicit audio-music route. One submission, no automatic retry. Local cancellation cannot cancel or refund the remote operation; inspect .native-media receipts before any resubmission.", json!({"prompt":string,"output_path":string,"duration_seconds":{"type":"number","minimum":3,"maximum":600},"force_instrumental":{"type":"boolean"}}), vec!["prompt","output_path"]),
             ("generate_video", "Submit exactly once or resume an OpenAI video task by task_id. Poll at most 120 seconds. Local cancellation does not cancel the remote task; inspect .native-media receipts before retrying an uncertain submission.", json!({"prompt":string,"task_id":string,"output_path":string,"seconds":{"enum":["4","8","12"]},"size":string,"poll_seconds":{"type":"integer","minimum":0,"maximum":120}}), vec!["output_path"]),
         ].into_iter().map(|(name,description,properties,required)| ToolSpec {
             name:name.into(), description:description.into(),
@@ -175,6 +212,8 @@ impl NativeMediaService {
             "generate_image" => (&self.config.image, MediaEndpoint::ImageGeneration),
             "generate_speech" => (&self.config.speech, MediaEndpoint::AudioTts),
             "generate_video" => (&self.config.video, MediaEndpoint::OpenaiVideo),
+            "generate_sound_effect" => (&self.config.sfx, MediaEndpoint::AudioSfx),
+            "generate_music" => (&self.config.music, MediaEndpoint::AudioMusic),
             _ => return Err(fail("Unknown native media tool")),
         };
         let route = route
@@ -195,7 +234,98 @@ impl NativeMediaService {
             }
             MediaEndpoint::AudioTts => self.speech(route, &client, parse(args)?, workspace).await,
             MediaEndpoint::OpenaiVideo => self.video(route, &client, parse(args)?, workspace).await,
+            MediaEndpoint::AudioSfx => {
+                let args: SoundEffectArgs = parse(args)?;
+                nonempty(&args.prompt)?;
+                let mut body =
+                    json!({"model":route.model,"model_id":route.model,"text":args.prompt});
+                if let Some(duration) = args.duration_seconds {
+                    if !duration.is_finite() || !(0.5..=30.0).contains(&duration) {
+                        return Err(fail("Sound effect duration_seconds must be 0.5..30"));
+                    }
+                    body["duration_seconds"] = json!(duration);
+                }
+                if let Some(influence) = args.prompt_influence {
+                    if !influence.is_finite() || !(0.0..=1.0).contains(&influence) {
+                        return Err(fail("Sound effect prompt_influence must be 0..1"));
+                    }
+                    body["prompt_influence"] = json!(influence);
+                }
+                if let Some(looping) = args.r#loop {
+                    body["loop"] = json!(looping);
+                }
+                self.audio_generation(
+                    route,
+                    &client,
+                    "sound-generation",
+                    body,
+                    workspace,
+                    &args.output_path,
+                )
+                .await
+            }
+            MediaEndpoint::AudioMusic => {
+                let args: MusicArgs = parse(args)?;
+                nonempty(&args.prompt)?;
+                let mut body =
+                    json!({"model":route.model,"model_id":route.model,"prompt":args.prompt});
+                if let Some(duration) = args.duration_seconds {
+                    if !duration.is_finite() || !(3.0..=600.0).contains(&duration) {
+                        return Err(fail("Music duration_seconds must be 3..600"));
+                    }
+                    body["music_length_ms"] = json!((duration * 1000.0).round() as u64);
+                }
+                if let Some(instrumental) = args.force_instrumental {
+                    body["force_instrumental"] = json!(instrumental);
+                }
+                self.audio_generation(route, &client, "music", body, workspace, &args.output_path)
+                    .await
+            }
         }
+    }
+
+    async fn audio_generation(
+        &self,
+        route: &MediaRoute,
+        client: &Client,
+        endpoint: &str,
+        body: Value,
+        workspace: &Path,
+        relative_output: &str,
+    ) -> Result<Value, Error> {
+        let output = output_path(workspace, relative_output, "mp3")?;
+        let receipt_dir = workspace.join(".native-media");
+        std::fs::create_dir_all(&receipt_dir)
+            .map_err(|_| fail("Cannot create media receipt directory"))?;
+        let receipt_dir = receipt_dir
+            .canonicalize()
+            .map_err(|_| fail("Cannot resolve media receipts"))?;
+        let root = workspace
+            .canonicalize()
+            .map_err(|_| fail("Cannot resolve workspace"))?;
+        if !receipt_dir.starts_with(root) {
+            return Err(fail("Media receipts must remain inside workspace"));
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let receipt = receipt_dir.join(format!("{request_id}.json"));
+        let mut facts = json!({"request_id":request_id,"status":"outcome_unknown","endpoint":route.endpoint,"model":route.model,"output_path":relative_output});
+        let request = route.request(client, Method::POST, endpoint)?.json(&body);
+        write_receipt(&receipt, &facts)?;
+        let response = request.send().await.map_err(|_| {
+            fail("Audio submission outcome unknown; inspect .native-media receipts; not retried")
+        })?;
+        let bytes = response_bytes(response, 32 * 1024 * 1024).await?;
+        decode(&self.ffmpeg_executable, &bytes, "mp3").await?;
+        let mut result = publish(&output, relative_output, &bytes, "audio/mpeg")?;
+        facts["status"] = json!("completed");
+        facts["artifact"] = result["artifact"].clone();
+        write_receipt(&receipt, &facts)?;
+        result["request_id"] = json!(request_id);
+        result["receipt"] = json!(format!(
+            ".native-media/{}",
+            receipt.file_name().unwrap().to_string_lossy()
+        ));
+        Ok(result)
     }
 
     async fn image(
