@@ -57,6 +57,34 @@ test('old protocol executable is rejected before initialization', { timeout: 100
   `] }), error => error.code === 'protocol_version' && /expected 2/.test(error.message))
 })
 
+test('owning Agent constructs session handles across distinct SDK module copies', { timeout: 10000 }, async t => {
+  const other = await import('../dist/index.js?independent-sdk-copy')
+  assert.notEqual(other.Agent, Agent)
+  const { config, env } = await setup(t)
+  const agent = await other.Agent.spawn({ executable: process.execPath, config, env, args: ['--input-type=module', '-e', `
+    import { createInterface } from 'node:readline'
+    const send = frame => process.stdout.write(JSON.stringify(frame) + '\\n')
+    send({ type: 'ready', protocolVersion: 2 })
+    const expected = ['initialize', 'history', 'subagent_query', 'scheduler_list', 'final_exit']
+    const lines = createInterface({ input: process.stdin })
+    for await (const line of lines) {
+      const frame = JSON.parse(line), request = frame.request
+      if (request.method !== expected.shift()) process.exit(2)
+      if (!['initialize', 'final_exit'].includes(request.method) && request.sessionId !== 'existing-native-session') process.exit(3)
+      if (request.method === 'subagent_query' && request.id !== 'owned-child') process.exit(4)
+      send({ type: 'response', id: frame.id, result: { checked: request.method } })
+      if (request.method === 'final_exit') { lines.close(); process.stdin.destroy(); break }
+    }
+  `] })
+  t.after(() => agent.finalExit().catch(() => {}))
+  const session = agent.sessionHandle({ id: 'existing-native-session' })
+  assert.ok(session instanceof other.Session)
+  assert.deepEqual(await session.history(), { checked: 'history' })
+  assert.deepEqual(await session.subagents.query('owned-child'), { checked: 'subagent_query' })
+  assert.deepEqual(await session.scheduler.list(), { checked: 'scheduler_list' })
+  await agent.finalExit()
+})
+
 test('supplied old Runtime executable is rejected', { timeout: 10000, skip: !process.env.SOPHON_OLD_RUNTIME }, async t => {
   const { config, env } = await setup(t)
   await assert.rejects(Agent.spawn({ executable: process.env.SOPHON_OLD_RUNTIME, config, env }), error => error.code === 'protocol_version' && /expected 2/.test(error.message))

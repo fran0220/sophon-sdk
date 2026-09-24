@@ -248,14 +248,20 @@ export class Agent {
     })
   }
 
+  /** Wrap a descriptor for a session already attached to this Agent's Runtime.
+   * This does not create, load, resume or validate native state. Always use the
+   * owning Agent's factory, including when an app has multiple SDK copies.
+   */
+  sessionHandle(descriptor: SessionDescriptor): Session { return new Session(this, descriptor) }
+
   async createSession(options: SessionOptions): Promise<Session> {
-    return new Session(this, await this[sendRequest]({ method: 'create_session', options }) as unknown as SessionDescriptor)
+    return this.sessionHandle(await this[sendRequest]({ method: 'create_session', options }) as unknown as SessionDescriptor)
   }
   async loadSession(id: string, options: SessionOptions): Promise<Session> {
-    return new Session(this, await this[sendRequest]({ method: 'load_session', id, options }) as unknown as SessionDescriptor)
+    return this.sessionHandle(await this[sendRequest]({ method: 'load_session', id, options }) as unknown as SessionDescriptor)
   }
   async resumeSession(id: string, options: SessionOptions): Promise<Session> {
-    return new Session(this, await this[sendRequest]({ method: 'resume_session', id, options }) as unknown as SessionDescriptor)
+    return this.sessionHandle(await this[sendRequest]({ method: 'resume_session', id, options }) as unknown as SessionDescriptor)
   }
   listSessions(cwd: string | null = null, cursor: string | null = null): Promise<JsonValue> { return this[sendRequest]({ method: 'list_sessions', cwd, cursor }) }
   browser(args: JsonValue): Promise<JsonValue> { return this[sendRequest]({ method: 'browser', args }) }
@@ -284,6 +290,7 @@ export class Session {
   readonly id: string
   readonly subagents: Subagents
   readonly scheduler: Scheduler
+  /** @deprecated Use agent.sessionHandle(descriptor); direct construction requires the same SDK module copy as agent. */
   constructor(private readonly agent: Agent, readonly descriptor: SessionDescriptor) {
     this.id = descriptor.id
     this.subagents = new Subagents(agent, this.id)
