@@ -1,4 +1,4 @@
-//! Runtime-local, Electron-independent browser execution. No CLI, MCP or agent loop.
+//! Runtime-local browser execution over Chromium CDP. No CLI, MCP or agent loop.
 mod cdp;
 mod downloads;
 mod recording;
@@ -45,17 +45,30 @@ const AGENT_ACTIONS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
-    pub executable: PathBuf,
+    pub source: BrowserSource,
     /// Trusted Runtime-selected executable; never replaced by a PATH fallback.
     pub ffmpeg_executable: PathBuf,
-    /// Dedicated account/Runtime directory, shared across Games. Never delete on
-    /// Game removal and never point at a user's default Chrome profile.
-    pub data_dir: PathBuf,
     /// Durable Runtime-owned artifact store, independent of browser identity.
     pub artifact_dir: PathBuf,
-    pub headless: bool,
-    /// Explicit opt-in for isolated containers only. Never enabled implicitly.
-    pub no_sandbox: bool,
+}
+
+/// Where the Chromium engine comes from.
+#[derive(Debug, Clone)]
+pub enum BrowserSource {
+    /// Launch a dedicated Chromium with its own persistent profile.
+    Launch {
+        executable: PathBuf,
+        /// Dedicated account/Runtime directory, shared across Games. Never delete on
+        /// Game removal and never point at a user's default Chrome profile.
+        data_dir: PathBuf,
+        headless: bool,
+        /// Explicit opt-in for isolated containers only. Never enabled implicitly.
+        no_sandbox: bool,
+    },
+    /// Attach to a host-owned browser-level CDP WebSocket. The host owns the
+    /// engine, its profile and page lifetime, so profile and site clearing are
+    /// host operations and closing the service only disconnects.
+    Endpoint { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,13 +127,17 @@ struct Page {
     streaming: bool,
 }
 struct Running {
-    child: Child,
-    group: Option<Arc<ProcessGroup>>,
+    /// Absent when attached to a host-owned endpoint.
+    process: Option<Process>,
     cdp: Option<Arc<Cdp>>,
     pages: HashMap<String, Page>,
     recording: Option<Recording>,
     download_dir: PathBuf,
-    _profile_lock: File,
+}
+struct Process {
+    child: Child,
+    group: Option<Arc<ProcessGroup>>,
+    profile_lock: File,
 }
 
 /// Operations are serialized; dropping a call stops waiting, never retries it.
@@ -250,29 +267,41 @@ impl BrowserService {
         if guard.is_none() {
             *guard = Some(self.launch().await?);
         }
+        if matches!(action, "clear_profile" | "clear_site")
+            && matches!(self.config.source, BrowserSource::Endpoint { .. })
+        {
+            return Err(Error::Unsupported(format!(
+                "{action} belongs to the host that owns the browser profile"
+            )));
+        }
         if action == "clear_profile" {
+            let BrowserSource::Launch { data_dir, .. } = &self.config.source else {
+                unreachable!("endpoint clears returned above")
+            };
             self.connection.write().expect("connection lock").take();
             stop_running(guard.as_mut().expect("launched")).await?;
             // Keep the exclusive profile lock until every old context has exited
             // and the identity directory is gone. Artifacts are not identity.
-            tokio::fs::remove_dir_all(self.config.data_dir.join("profile")).await?;
+            tokio::fs::remove_dir_all(data_dir.join("profile")).await?;
             guard.take();
             return Ok(json!({"cleared":true,"closed_all_tabs":true,"artifacts_retained":true}));
         }
         if action == "clear_site" {
             let origin = site_origin(string(&args, "origin")?)?;
             let old = guard.as_mut().expect("launched");
-            let lock = old._profile_lock.try_clone()?;
+            let lock = old
+                .process
+                .as_ref()
+                .expect("launched sources own a process")
+                .profile_lock
+                .try_clone()?;
             self.connection.write().expect("connection lock").take();
             stop_running(old).await?;
             // Restart with the same lock so old windows/workers cannot race the
             // clear and repopulate storage. Other origins' saved data is kept.
             *guard = Some(self.launch_with_lock(lock).await?);
             let running = guard.as_mut().expect("restarted");
-            running.cdp = Some(
-                self.connect(&mut running.child, &running.download_dir)
-                    .await?,
-            );
+            running.cdp = Some(self.connect(running).await?);
             let cdp = running.cdp.as_ref().expect("connected");
             let target = cdp
                 .call(None, "Target.createTarget", json!({"url":"about:blank"}))
@@ -300,10 +329,7 @@ impl BrowserService {
         }
         let running = guard.as_mut().expect("launched");
         if running.cdp.is_none() {
-            running.cdp = Some(
-                self.connect(&mut running.child, &running.download_dir)
-                    .await?,
-            );
+            running.cdp = Some(self.connect(running).await?);
         }
         let connection = running.cdp.as_ref().expect("connected");
         match action {
@@ -770,20 +796,43 @@ impl BrowserService {
     }
 
     async fn launch(&self) -> Result<Running, Error> {
-        tokio::fs::create_dir_all(&self.config.data_dir).await?;
+        let data_dir = match &self.config.source {
+            BrowserSource::Endpoint { .. } => {
+                return Ok(Running {
+                    process: None,
+                    cdp: None,
+                    pages: HashMap::new(),
+                    recording: None,
+                    download_dir: self.download_dir(),
+                });
+            }
+            BrowserSource::Launch { data_dir, .. } => data_dir,
+        };
+        tokio::fs::create_dir_all(data_dir).await?;
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.config.data_dir.join("profile.lock"))?;
+            .open(data_dir.join("profile.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| Error::Invalid("browser profile already in use".into()))?;
         self.launch_with_lock(lock).await
     }
 
     async fn launch_with_lock(&self, lock: File) -> Result<Running, Error> {
-        let profile = self.config.data_dir.join("profile");
+        let BrowserSource::Launch {
+            executable,
+            data_dir,
+            headless,
+            no_sandbox,
+        } = &self.config.source
+        else {
+            return Err(Error::Unsupported(
+                "a host-owned endpoint is never launched".into(),
+            ));
+        };
+        let profile = data_dir.join("profile");
         tokio::fs::create_dir_all(&profile).await?;
         let port_file = profile.join("DevToolsActivePort");
         match tokio::fs::remove_file(&port_file).await {
@@ -791,7 +840,7 @@ impl BrowserService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let mut command = Command::new(&self.config.executable);
+        let mut command = Command::new(executable);
         command
             .arg(format!("--user-data-dir={}", profile.display()))
             .args([
@@ -802,10 +851,10 @@ impl BrowserService {
                 "--disable-background-networking",
                 "--window-size=1280,720",
             ]);
-        if self.config.headless {
+        if *headless {
             command.arg("--headless=new");
         }
-        if self.config.no_sandbox {
+        if *no_sandbox {
             command.arg("--no-sandbox");
         }
         command
@@ -816,53 +865,45 @@ impl BrowserService {
             .kill_on_drop(true);
         let (child, group) = self.process_scope.spawn(command)?;
         Ok(Running {
-            child,
-            group: Some(group),
+            process: Some(Process {
+                child,
+                group: Some(group),
+                profile_lock: lock,
+            }),
             cdp: None,
             pages: HashMap::new(),
             recording: None,
-            download_dir: self
-                .config
-                .artifact_dir
-                .join(format!(".downloads-{}", Uuid::new_v4())),
-            _profile_lock: lock,
+            download_dir: self.download_dir(),
         })
     }
 
-    async fn connect(&self, child: &mut Child, downloads: &PathBuf) -> Result<Arc<Cdp>, Error> {
-        let port_file = self.config.data_dir.join("profile/DevToolsActivePort");
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    return Err(Error::Transport(format!(
-                        "Chromium exited during launch: {status}"
-                    )));
-                }
-                if let Ok(contents) = tokio::fs::read_to_string(&port_file).await {
-                    let mut lines = contents.lines();
-                    if let (Some(port), Some(path)) = (lines.next(), lines.next())
-                        && port.parse::<u16>().is_ok()
-                        && path.starts_with("/devtools/browser/")
-                    {
-                        tokio::fs::create_dir_all(downloads).await?;
-                        let cdp = Arc::new(
-                            Cdp::connect(
-                                &format!("ws://127.0.0.1:{port}{path}"),
-                                self.frames.clone(),
-                                downloads.clone(),
-                            )
-                            .await?,
-                        );
-                        cdp.call(None, "Browser.setDownloadBehavior", json!({"behavior":"allowAndName","downloadPath":downloads,"eventsEnabled":true})).await?;
-                        *self.connection.write().expect("connection lock") = Some(cdp.clone());
-                        return Ok(cdp);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+    fn download_dir(&self) -> PathBuf {
+        self.config
+            .artifact_dir
+            .join(format!(".downloads-{}", Uuid::new_v4()))
+    }
+
+    async fn connect(&self, running: &mut Running) -> Result<Arc<Cdp>, Error> {
+        let url = match (&self.config.source, running.process.as_mut()) {
+            (BrowserSource::Endpoint { url }, _) => url.clone(),
+            (BrowserSource::Launch { data_dir, .. }, Some(process)) => {
+                launched_endpoint(data_dir, &mut process.child).await?
             }
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
+            (BrowserSource::Launch { .. }, None) => {
+                return Err(Error::Transport("launched browser has no process".into()));
+            }
+        };
+        let downloads = &running.download_dir;
+        tokio::fs::create_dir_all(downloads).await?;
+        let cdp = Arc::new(Cdp::connect(&url, self.frames.clone(), downloads.clone()).await?);
+        cdp.call(
+            None,
+            "Browser.setDownloadBehavior",
+            json!({"behavior":"allowAndName","downloadPath":downloads,"eventsEnabled":true}),
+        )
+        .await?;
+        *self.connection.write().expect("connection lock") = Some(cdp.clone());
+        Ok(cdp)
     }
 
     pub async fn close(&self) -> Result<(), Error> {
@@ -900,30 +941,59 @@ impl Drop for BrowserService {
     }
 }
 
+/// Waits for a launched Chromium to publish its browser-level CDP WebSocket.
+async fn launched_endpoint(data_dir: &std::path::Path, child: &mut Child) -> Result<String, Error> {
+    let port_file = data_dir.join("profile/DevToolsActivePort");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Err(Error::Transport(format!(
+                    "Chromium exited during launch: {status}"
+                )));
+            }
+            if let Ok(contents) = tokio::fs::read_to_string(&port_file).await {
+                let mut lines = contents.lines();
+                if let (Some(port), Some(path)) = (lines.next(), lines.next())
+                    && port.parse::<u16>().is_ok()
+                    && path.starts_with("/devtools/browser/")
+                {
+                    return Ok(format!("ws://127.0.0.1:{port}{path}"));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
+}
+
 async fn stop_running(running: &mut Running) -> Result<(), Error> {
     if let Some(recording) = running.recording.as_mut() {
         recording.cancel().await?;
     }
     running.recording.take();
-    if let Some(cdp) = running.cdp.as_mut() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            cdp.call(None, "Browser.close", json!({})),
-        )
-        .await;
-    }
-    match tokio::time::timeout(Duration::from_secs(3), running.child.wait()).await {
-        Ok(status) => {
-            status?;
+    // A host-owned endpoint is only disconnected; its engine and pages stay with the host.
+    if let Some(process) = running.process.as_mut() {
+        if let Some(cdp) = running.cdp.as_mut() {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                cdp.call(None, "Browser.close", json!({})),
+            )
+            .await;
         }
-        Err(_) => {
-            if let Some(group) = &running.group {
-                group.kill()?;
+        match tokio::time::timeout(Duration::from_secs(3), process.child.wait()).await {
+            Ok(status) => {
+                status?;
             }
-            running.child.wait().await?;
+            Err(_) => {
+                if let Some(group) = &process.group {
+                    group.kill()?;
+                }
+                process.child.wait().await?;
+            }
         }
+        process.group.take();
     }
-    running.group.take();
     if let Some(cdp) = running.cdp.as_mut() {
         cdp.stop().await;
     }

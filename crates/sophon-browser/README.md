@@ -1,16 +1,27 @@
 # Native Runtime browser
 
-`sophon-browser` owns Chromium through a multiplexed, loopback-only native CDP
+`sophon-browser` drives Chromium through a multiplexed, loopback-only native CDP
 WebSocket. It does not invoke a browser CLI, MCP server, Electron API, or another
-agent loop. The published upstream checkout has no browser backend implementation
+agent loop. The engine either is launched by this crate or is a host-owned
+browser endpoint (for example a desktop shell's own Chromium). The published upstream checkout has no browser backend implementation
 to reuse; this crate uses Chromium's Accessibility, DOM, Input, Page, Runtime and
 Network domains and the SDK's existing `xai-tty-utils::ProcessScope` cleanup.
 
 ## Ownership and identity
 
 Create **one `BrowserService` per account/Runtime**, shared across Games. Construct
-it using `BrowserConfig { executable, ffmpeg_executable, data_dir, artifact_dir, headless,
-no_sandbox }`. `new` does not launch Chromium; the first browser operation does.
+it using `BrowserConfig { source, ffmpeg_executable, artifact_dir }`, where `source`
+is `BrowserSource::Launch { executable, data_dir, headless, no_sandbox }` or
+`BrowserSource::Endpoint { url }`. `new` does not launch or connect; the first
+browser operation does.
+
+- With `Endpoint`, `url` is a browser-level CDP WebSocket on loopback whose
+  capability URL or transport the host protects. The host owns the engine,
+  profile and page lifetime: it must implement the `Target` create/attach/close/
+  list methods and `Browser.setDownloadBehavior`/`cancelDownload` with download
+  events, and forward page-session commands. `clear_site` and `clear_profile`
+  return `unsupported` because they belong to the host, and `close()` only
+  disconnects.
 
 - `ffmpeg_executable` selects both recording preflight and encoding. A failed
   selected executable never falls back to another installation. The SDK's typed

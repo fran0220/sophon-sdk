@@ -881,12 +881,24 @@ pub async fn run() -> Result<()> {
                 let browser = config.browser.as_ref().map(|config| {
                     Arc::new(sophon_browser::BrowserService::new(
                         sophon_browser::BrowserConfig {
-                            executable: config.executable.clone().into(),
+                            source: match &config.source {
+                                crate::protocol::BrowserSource::Launch {
+                                    executable,
+                                    data_dir,
+                                    headless,
+                                    no_sandbox,
+                                } => sophon_browser::BrowserSource::Launch {
+                                    executable: executable.into(),
+                                    data_dir: data_dir.into(),
+                                    headless: *headless,
+                                    no_sandbox: *no_sandbox,
+                                },
+                                crate::protocol::BrowserSource::Endpoint { url } => {
+                                    sophon_browser::BrowserSource::Endpoint { url: url.clone() }
+                                }
+                            },
                             ffmpeg_executable: ffmpeg_executable.clone(),
-                            data_dir: config.data_dir.clone().into(),
                             artifact_dir: config.artifact_dir.clone().into(),
-                            headless: config.headless,
-                            no_sandbox: config.no_sandbox,
                         },
                     ))
                 });

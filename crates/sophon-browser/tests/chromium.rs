@@ -4,19 +4,21 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{Value, json};
-use sophon_browser::{BrowserConfig, BrowserService, Error};
+use sophon_browser::{BrowserConfig, BrowserService, BrowserSource, Error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config(root: &std::path::Path) -> BrowserConfig {
     BrowserConfig {
-        executable: PathBuf::from(
-            std::env::var("SOPHON_CHROMIUM").unwrap_or_else(|_| "/usr/bin/chromium".into()),
-        ),
+        source: BrowserSource::Launch {
+            executable: PathBuf::from(
+                std::env::var("SOPHON_CHROMIUM").unwrap_or_else(|_| "/usr/bin/chromium".into()),
+            ),
+            data_dir: root.join("identity"),
+            headless: true,
+            no_sandbox: true,
+        },
         ffmpeg_executable: PathBuf::from("ffmpeg"),
-        data_dir: root.join("identity"),
         artifact_dir: root.join("evidence"),
-        headless: true,
-        no_sandbox: true,
     }
 }
 
@@ -76,7 +78,9 @@ async fn capabilities_do_not_launch_and_close_is_terminal() {
     }
     let root = tempfile::tempdir().unwrap();
     let mut cfg = config(root.path());
-    cfg.executable = "missing-chromium".into();
+    if let BrowserSource::Launch { executable, .. } = &mut cfg.source {
+        *executable = "missing-chromium".into();
+    }
     let browser = BrowserService::new(cfg);
     assert_eq!(
         call(&browser, "capabilities", json!({})).await["audio"],

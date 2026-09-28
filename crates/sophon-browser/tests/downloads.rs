@@ -1,6 +1,6 @@
 use base64::Engine;
 use serde_json::{Value, json};
-use sophon_browser::{BrowserConfig, BrowserService};
+use sophon_browser::{BrowserConfig, BrowserService, BrowserSource};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -73,13 +73,15 @@ async fn real_download_artifacts_cancel_size_and_cleanup() {
     });
     let root = tempfile::tempdir().unwrap();
     let config = BrowserConfig {
-        executable: std::env::var_os("SOPHON_CHROMIUM")
-            .unwrap_or_else(|| "/usr/bin/chromium".into())
-            .into(),
-        data_dir: root.path().join("identity"),
+        source: BrowserSource::Launch {
+            executable: std::env::var_os("SOPHON_CHROMIUM")
+                .unwrap_or_else(|| "/usr/bin/chromium".into())
+                .into(),
+            data_dir: root.path().join("identity"),
+            headless: true,
+            no_sandbox: true,
+        },
         artifact_dir: root.path().join("artifacts"),
-        headless: true,
-        no_sandbox: true,
         ffmpeg_executable: "ffmpeg".into(),
     };
     let browser = BrowserService::new(config.clone());

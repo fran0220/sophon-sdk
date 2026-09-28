@@ -77,13 +77,26 @@ pub struct RuntimeConfig {
 #[derive(Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserConfig {
-    pub executable: String,
-    /// Account/runtime-scoped persistent profile, never per product thread.
-    pub data_dir: String,
+    pub source: BrowserSource,
     pub artifact_dir: String,
-    pub headless: bool,
-    #[serde(default)]
-    pub no_sandbox: bool,
+}
+
+/// Where the Runtime's Chromium comes from.
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum BrowserSource {
+    /// Launch a dedicated Chromium.
+    Launch {
+        executable: String,
+        /// Account/runtime-scoped persistent profile, never per product thread.
+        data_dir: String,
+        headless: bool,
+        #[serde(default)]
+        no_sandbox: bool,
+    },
+    /// Attach to a host-owned browser-level CDP WebSocket on loopback. The host
+    /// owns the engine, profile, page lifetime and profile/site clearing.
+    Endpoint { url: String },
 }
 
 #[derive(Clone, Serialize, Deserialize, TS)]
