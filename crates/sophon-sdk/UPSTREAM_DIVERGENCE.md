@@ -471,6 +471,92 @@ crates/sophon-sdk/scripts/check-sdk-boundary.sh
 If upstream gains an equivalent seam, remove that patch group rather than
 maintaining a duplicate implementation.
 
+## 1.0.45 validation (2026-10-01, Linux x86_64)
+
+Merged the complete public snapshot `2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`
+with `--no-ff`; it is an ancestor of main. The shell version is 1.0.45 and
+`SOURCE_REV` is `559751fdcec02d413e4c57c8832ab275e4f44980`. The Rust facade stays
+0.6.0; the TypeScript package advances from 0.7.0-alpha.1 to 0.8.0-alpha.1.
+
+All seven patch groups remain necessary; none were merged or removed wholesale.
+The session-list benchmark repair is gone because upstream fixed its fixture.
+The tools compatibility re-export and shell MCP utility now match upstream;
+hermetic gates live in their `xai-grok-config` owners. Managed configuration and
+permission discovery follow the new cloud-config/permission-rules owners.
+Every retained approved path still has a nonempty diff against the pin.
+The audit also catalogues pre-existing post-1.0.35 main-branch native overlays
+that were previously missing from the approved arrays, rather than excluding
+native directories from verification.
+
+`SubagentDefinition` and `SubagentBrief` expose optional nullable
+`reasoningEffort`. Explicit native mapping accepts low/medium/high/xhigh/max
+only when the bound model supports the value; none/minimal and incompatible
+bindings return `invalid_config`. Omission preserves native defaults or the
+registered profile's effort. Tests cover a brief model rebind retaining an
+incompatible profile effort and verify rejection before inference. Transport v2,
+outer RuntimeConfig/ConfigCandidate fields, event variants, and portable format
+v1 remain unchanged. Rust low-level Initialize requests now box their config;
+their JSON/TypeScript shape is unchanged. See the SDK README migration notes.
+
+- `cargo check --locked -p sophon-sdk`: passes.
+- `cargo test --locked -p sophon-sdk`: 68 unit, 37 integration, and 5 doctests
+  pass, with one existing ignored test. The final run includes the restored
+  upstream truncation resource and the SDK TLS/path adaptations.
+- `cargo clippy --locked -p sophon-sdk -p xai-grok-shell -p xai-grok-tools
+  -p xai-prompt-queue --lib -- -D warnings`: passes. SDK decision/media clients
+  now use the upstream TLS builder while preserving no redirect/retry/proxy;
+  path canonicalization uses dunce, preserving containment failures. No lint
+  was suppressed. Existing ts-rs serde-attribute and build-script diagnostics
+  remain visible.
+- `cargo fmt --check`: passes for the complete workspace.
+- `cargo test --locked -p xai-grok-tools --lib -- --test-threads=4`:
+  3,463 pass, 2 ignored. This caught and repaired a merge omission of upstream's
+  per-tool `TruncationCfg` resource installation. The paused-clock scheduler
+  fixture now drives the cadence cursor instead of obsolete last-fired timing;
+  its no-overlapping-child assertions are unchanged.
+- `cargo test --locked -p xai-grok-shell --lib --features test-support --
+  subagent --test-threads=4`: 461 pass. Fixtures follow the new optional media
+  key, persisted agent identity, context-window selection and compaction APIs.
+  Additional runs of the same built native test binary with serial filters pass:
+  config_candidate 7, strict_auxiliary 5, prepare_media_configs 1, portability 7,
+  portable_capture 3, history_capture 2, effective_model_facts_tests 1, and
+  replace_system_prompt_tests 4 (filters can overlap).
+- `cargo test --locked -p xai-grok-config --lib -- --test-threads=1`:
+  469 pass. The initial parallel run had two signed-policy tests fail while
+  sharing a process-global key override; those tests match upstream and all
+  tests pass serially. No production signature logic or assertion was changed.
+- `cargo test --locked -p xai-grok-hooks -p xai-prompt-queue --lib --
+  --test-threads=4`: 280 hooks and 15 queue tests pass. New hermetic coverage
+  retains host GROK_HOME hooks and excludes vendor/project paths.
+- `cargo run --locked -p sophon-sdk --bin sophon-runtime -- --generate-types
+  src/generated` from packages/typescript succeeds. The final rerun from the
+  repository root targets `packages/typescript/src/generated`, rebuilds the
+  Linux debug runtime, and produces identical declarations. Both subagent DTOs
+  have `reasoningEffort?: ReasoningEffort | null`.
+- In packages/typescript, `npm ci --ignore-scripts`, `npm run build`,
+  `npm test`, and `npm pack` pass. The final runtime-backed suite has 15 passing
+  tests and 4 opt-in external-provider/old-executable tests skipped. It covers
+  profile and brief effort reaching inference, invalid effort/model rejection,
+  and the new turn-summary call using its own endpoint/model/credential. The
+  initial media test exposed an implicit summary fallback to the primary
+  provider; strict embedded routing now skips an unconfigured summary route.
+  The tarball is `sophon-sdk-0.8.0-alpha.1.tgz` (version 0.8.0-alpha.1), SHA-256
+  `258225b2d778e1af5bdd5999042cf3df7f42c3b6b771c5b17ebcc7240bf27fcc`.
+  Its packaged SubagentDefinition/SubagentBrief declarations were inspected.
+- All seven digests were regenerated with the documented script after native
+  edits/formatting and staging. `scripts/check-upstream-sync.sh` and
+  `scripts/check-sdk-boundary.sh` pass: untouched upstream paths, exact patch
+  digests, no TUI dependencies, and 6,524 public SDK rustdoc signatures without
+  ACP/TUI type links.
+
+Commands use Rust 1.94.0, repository `bin/protoc` (29.3), and
+`env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` with absolute `PROTOC`.
+Native Git fixtures also set process-local `commit.gpgsign=false` and
+`init.defaultBranch=main`. This is Linux/local-mock validation, not live-provider
+or Windows/macOS execution. The entire shell suite, native TUI, and workspace
+all-target Clippy were not run for this upgrade.
+
 ## SDK 0.6.0 / 1.0.35 validation (2026-09-19, Linux x86_64)
 
 Imported the complete public snapshot `a28ee2b2063426e8816e380ccea528b9de95e5da`
