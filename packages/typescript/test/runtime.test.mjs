@@ -48,6 +48,114 @@ test('protocol v2 mock handshake exposes only the typed Agent facade', { timeout
   await agent.finalExit()
 })
 
+test('protocol v2 interactive MCP callbacks are typed, concurrent, cancellable, and isolated from tools', { timeout: 10000 }, async t => {
+  const { config, env } = await setup(t)
+  const seen = [], aborted = new Promise(resolve => { seen.abort = resolve })
+  let toolCalls = 0
+  const agent = await Agent.spawn({ executable: process.execPath, config, env, args: ['--input-type=module', '-e', `
+    import { createInterface } from 'node:readline'
+    const send = frame => process.stdout.write(JSON.stringify(frame) + '\\n')
+    const callbacks = new Map(), lines = createInterface({ input: process.stdin })
+    send({ type: 'ready', protocolVersion: 2 })
+    for await (const line of lines) {
+      const frame = JSON.parse(line)
+      if (frame.type === 'callback_result') {
+        if (frame.id === 'late') process.exit(9)
+        callbacks.set(frame.id, frame.result)
+        if (callbacks.size === 6) {
+          const expected = { accept: { action: 'accept', content: { value: 7 } }, decline: { action: 'decline' }, cancel: { action: 'cancel' }, url: { action: 'accept' }, oauth: { opened: true }, tool: { tool: true } }
+          for (const [id, value] of Object.entries(expected)) if (JSON.stringify(callbacks.get(id)) !== JSON.stringify(value)) process.exit(10)
+        }
+        continue
+      }
+      const request = frame.request
+      if (request.method === 'initialize') {
+        send({ type: 'response', id: frame.id, result: null })
+        for (const [id, request, context] of [
+          ['accept', { kind: 'elicitation', request: { mode: 'form', serverName: 'one', message: 'accept', requestedSchema: { type: 'object' } } }, { sessionId: 's1', requestId: 'r1' }],
+          ['decline', { kind: 'elicitation', request: { mode: 'form', serverName: 'two', message: 'decline' } }, { sessionId: 's2', requestId: 'r2' }],
+          ['cancel', { kind: 'elicitation', request: { mode: 'form', serverName: 'one', message: 'cancel' } }, { sessionId: 's1', requestId: 'r3' }],
+          ['url', { kind: 'elicitation', request: { mode: 'url', serverName: 'one', message: 'open', url: 'https://trusted.example/elicit', elicitationId: 'e1' } }, { sessionId: 's1', requestId: 'r4' }],
+          ['oauth', { kind: 'oauth', request: { serverName: 'one', url: 'https://trusted.example/auth' } }, { sessionId: 's1', requestId: 'r5' }],
+          ['late', { kind: 'elicitation', request: { mode: 'form', serverName: 'one', message: 'late' } }, { sessionId: 's1', requestId: 'r6' }],
+        ]) send({ type: 'mcp_callback', id, request, context })
+        send({ type: 'callback', id: 'tool', name: 'echo', args: {}, context: { sessionId: 's1', ownerSessionId: 's1', promptId: null, toolCallId: 't1', cwd: '/tmp', scheduledInvocation: null, originatingPrompt: null } })
+        send({ type: 'callback_cancelled', id: 'late' })
+      } else if (request.method === 'final_exit') {
+        if (callbacks.size !== 6) process.exit(11)
+        send({ type: 'response', id: frame.id, result: null }); lines.close(); process.stdin.destroy(); break
+      }
+    }
+  `],
+  onElicitation: async (request, context) => {
+    seen.push([request, context])
+    if (request.message === 'late') {
+      context.signal.addEventListener('abort', seen.abort, { once: true })
+      await new Promise(resolve => setTimeout(resolve, 100))
+      return { action: 'accept', content: { too: 'late' } }
+    }
+    if (request.message === 'accept') return { action: 'accept', content: { value: 7 } }
+    if (request.message === 'decline') return { action: 'decline' }
+    if (request.message === 'cancel') return { action: 'cancel' }
+    return { action: 'accept' }
+  },
+  onMcpOAuth: async (request, context) => {
+    assert.equal(request.url, 'https://trusted.example/auth')
+    assert.equal(context.sessionId, 's1')
+    return { opened: true }
+  },
+  onToolCall: async request => { toolCalls++; assert.equal(request.name, 'echo'); return { tool: true } },
+  })
+  await aborted
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.equal(toolCalls, 1)
+  assert.ok(seen.some(([, context]) => context.sessionId === 's1' && context.requestId === 'r1'))
+  assert.ok(seen.some(([, context]) => context.sessionId === 's2' && context.requestId === 'r2'))
+  await agent.finalExit()
+})
+
+test('interactive MCP defaults and session options/authentication pass through stdio', { timeout: 10000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  const options = { workspace: { id: 'interactive', cwd }, model: 'runtime-test', interactive: true, tools: [], mcpServers: [{ transport: 'http', name: 'secure', url: 'https://mcp.example', headers: { 'x-host': 'kept' }, bearerTokenEnvVar: 'MCP_TOKEN', oauth: { clientId: null, clientSecretEnvVar: 'MCP_SECRET', scopes: ['read'], callbackPort: null } }] }
+  const agent = await Agent.spawn({ executable: process.execPath, config, env, args: ['--input-type=module', '-e', `
+    import { createInterface } from 'node:readline'
+    const send = frame => process.stdout.write(JSON.stringify(frame) + '\\n')
+    const lines = createInterface({ input: process.stdin }); let defaults = 0
+    send({ type: 'ready', protocolVersion: 2 })
+    for await (const line of lines) {
+      const frame = JSON.parse(line)
+      if (frame.type === 'callback_result') {
+        if (frame.id === 'default-e' && frame.result.action === 'cancel' || frame.id === 'default-o' && frame.result.opened === false) defaults++
+        continue
+      }
+      const request = frame.request
+      if (request.method === 'initialize') {
+        send({ type: 'response', id: frame.id, result: null })
+        send({ type: 'mcp_callback', id: 'default-e', request: { kind: 'elicitation', request: { mode: 'form', serverName: 'secure', message: 'x' } }, context: { sessionId: 's', requestId: 'e' } })
+        send({ type: 'mcp_callback', id: 'default-o', request: { kind: 'oauth', request: { serverName: 'secure', url: 'https://trusted.example' } }, context: { sessionId: 's', requestId: 'o' } })
+      } else if (['create_session', 'load_session', 'resume_session'].includes(request.method)) {
+        if (!request.options.interactive || request.options.mcpServers[0].headers['x-host'] !== 'kept' || request.options.mcpServers[0].oauth.scopes[0] !== 'read' || request.options.mcpServers[0].bearerTokenEnvVar !== 'MCP_TOKEN') process.exit(12)
+        send({ type: 'response', id: frame.id, result: { id: request.id ?? 's' } })
+      } else if (request.method === 'mcp_authenticate') {
+        if (request.sessionId !== 's' || request.serverName !== 'secure' || defaults !== 2) process.exit(13)
+        send({ type: 'response', id: frame.id, result: null })
+      } else if (request.method === 'prompt') {
+        const server = request.prompt.configCandidate.externalMcpServers[0]
+        if (server.headers['x-host'] !== 'kept' || server.oauth.clientSecretEnvVar !== 'MCP_SECRET') process.exit(14)
+        send({ type: 'response', id: frame.id, result: { promptId: request.prompt.turnId, stopReason: 'end_turn' } })
+      } else if (request.method === 'final_exit') {
+        send({ type: 'response', id: frame.id, result: null }); lines.close(); process.stdin.destroy(); break
+      }
+    }
+  `] })
+  const created = await agent.createSession(options)
+  await agent.loadSession('loaded', options)
+  await agent.resumeSession('resumed', options)
+  await created.prompt({ turnId: 'candidate', blocks: [{ type: 'text', text: 'pass through' }], configCandidate: { ...candidate('mcp-candidate', 'runtime-test'), externalMcpServers: options.mcpServers } })
+  await created.authenticateMcp('secure')
+  await agent.finalExit()
+})
+
 test('old protocol executable is rejected before initialization', { timeout: 10000 }, async t => {
   const { config, env } = await setup(t)
   await assert.rejects(Agent.spawn({ executable: process.execPath, config, env, args: ['-e', `
@@ -110,6 +218,8 @@ test('real stdio Runtime creates, snapshots, schedules, reloads and checks proce
   const options = { workspace: { id: 'asymmetric-workspace', cwd }, model: 'runtime-test', mcpServers: [], tools: [] }
   const session = await agent.createSession(options)
   assert.match(session.id, /.+/)
+  // Native auth failures are successful ACP envelopes, but must reject at the public API.
+  await assert.rejects(session.authenticateMcp('not-configured'), error => error.code === 'operation_failed' && /non-interactive/.test(error.message))
   const snapshot = await session.history()
   assert.equal(snapshot.sessionId, session.id)
   assert.ok(events.some(event => event.type === 'history_boundary' && event.boundaryId === snapshot.boundaryId))

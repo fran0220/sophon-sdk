@@ -30,6 +30,11 @@ import type { SessionEffectiveConfigSnapshot } from './generated/SessionEffectiv
 import type { SkillsSnapshot } from './generated/SkillsSnapshot.js'
 import type { SubagentCancelIdResult } from './generated/SubagentCancelIdResult.js'
 import type { SubagentCancelOutcome } from './generated/SubagentCancelOutcome.js'
+import type { ElicitationRequest } from './generated/ElicitationRequest.js'
+import type { ElicitResult } from './generated/ElicitResult.js'
+import type { OAuthAuthorizationRequest } from './generated/OAuthAuthorizationRequest.js'
+import type { OAuthAuthorizationResult } from './generated/OAuthAuthorizationResult.js'
+import type { McpCallbackContext } from './generated/McpCallbackContext.js'
 
 export type { SessionEffectiveConfigSnapshot }
 export type { ErrorDetails }
@@ -76,6 +81,9 @@ export type { ToolSpec } from './generated/ToolSpec.js'
 export type { ToolCall } from './generated/ToolCall.js'
 export type { Update } from './generated/Update.js'
 export type { Workspace } from './generated/Workspace.js'
+export type { ElicitationRequest, ElicitResult, OAuthAuthorizationRequest, OAuthAuthorizationResult, McpCallbackContext }
+export type { McpHostRequest } from './generated/McpHostRequest.js'
+export type { OAuthConfig } from './generated/OAuthConfig.js'
 
 /** Transport implements delivery only, never an agent loop or prompt queue. */
 export interface Transport {
@@ -94,6 +102,8 @@ export interface ToolCallRequest {
 
 export interface ClientOptions {
   onToolCall?: (request: ToolCallRequest) => Promise<JsonValue>
+  onElicitation?: (request: ElicitationRequest, context: McpCallbackContext & { signal: AbortSignal }) => Promise<ElicitResult>
+  onMcpOAuth?: (request: OAuthAuthorizationRequest, context: McpCallbackContext & { signal: AbortSignal }) => Promise<OAuthAuthorizationResult>
   /** Observer failures are isolated from native execution. */
   onObserverError?: (error: unknown) => void
 }
@@ -202,6 +212,7 @@ export class Agent {
             this.emit(frame.event, frame.sequence)
             break
           case 'callback': void this.callback(frame); break
+          case 'mcp_callback': void this.mcpCallback(frame); break
           case 'browser_frame':
             for (const listener of this.browserListeners) {
               try { listener(frame.frame) } catch (error) { this.options.onObserverError?.(error) }
@@ -212,7 +223,12 @@ export class Agent {
               try { listener(frame.type === 'terminal' ? frame.event : { type: 'gap', dropped: frame.dropped }) } catch (error) { this.options.onObserverError?.(error) }
             }
             break
-          case 'callback_cancelled': this.callbacks.get(frame.id)?.abort(new RuntimeError('cancelled', 'Native tool call was cancelled')); break
+          case 'callback_cancelled': {
+            const controller = this.callbacks.get(frame.id)
+            this.callbacks.delete(frame.id)
+            controller?.abort(new RuntimeError('cancelled', 'Native callback was cancelled'))
+            break
+          }
           default: throw new RuntimeError('invalid_frame', 'Unrecognized Runtime frame')
         }
       }
@@ -232,6 +248,27 @@ export class Agent {
     } catch (error) {
       if (!controller.signal.aborted) {
         try { await this.transport.send({ type: 'callback_result', id: frame.id, result: null, error: { code: error instanceof RuntimeError ? error.code : 'callback_failed', message: error instanceof Error ? error.message : 'Product callback failed' } }) }
+        catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))) }
+      }
+    } finally { this.callbacks.delete(frame.id) }
+  }
+
+  private async mcpCallback(frame: Extract<ServerFrame, { type: 'mcp_callback' }>): Promise<void> {
+    const controller = new AbortController()
+    this.callbacks.set(frame.id, controller)
+    try {
+      const context = { ...frame.context, signal: controller.signal }
+      const result = frame.request.kind === 'elicitation'
+        ? this.options.onElicitation
+          ? await this.options.onElicitation(frame.request.request, context)
+          : { action: 'cancel' as const }
+        : this.options.onMcpOAuth
+          ? await this.options.onMcpOAuth(frame.request.request, context)
+          : { opened: false }
+      if (!controller.signal.aborted) await this.transport.send({ type: 'callback_result', id: frame.id, result, error: null })
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        try { await this.transport.send({ type: 'callback_result', id: frame.id, result: null, error: { code: 'callback_failed', message: error instanceof Error ? error.message : 'MCP callback failed' } }) }
         catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))) }
       }
     } finally { this.callbacks.delete(frame.id) }
@@ -310,6 +347,8 @@ export class Session {
   async effectiveConfig(): Promise<SessionEffectiveConfigSnapshot> { return await this.agent[sendRequest]({ method: 'effective_config', sessionId: this.id }) as unknown as SessionEffectiveConfigSnapshot }
   readArtifact(path: string): Promise<JsonValue> { return this.agent[sendRequest]({ method: 'read_artifact', sessionId: this.id, path }) }
   async setModel(model: string, reasoningEffort: string | null = null): Promise<void> { await this.agent[sendRequest]({ method: 'set_model', sessionId: this.id, model, reasoningEffort }) }
+  /** Complete the native OAuth exchange for an MCP server already attached to this session. */
+  async authenticateMcp(serverName: string): Promise<void> { await this.agent[sendRequest]({ method: 'mcp_authenticate', sessionId: this.id, serverName }) }
 }
 
 /** Native child coordinator, never an independent host Session loop. */

@@ -64,8 +64,9 @@ capture and import. The upstream tree is pinned by
 redistribution, not an official xAI SDK.
 
 The synchronized source includes the complete 1.0.45 public snapshot. The
-TypeScript SDK is 0.8.0-alpha.1 and supports explicit per-subagent reasoning
-effort in runtime profiles and configuration-candidate briefs. SDK 0.6.0
+TypeScript SDK is 0.9.0-alpha.1 and supports explicit per-subagent reasoning
+effort in runtime profiles and configuration-candidate briefs, plus additive
+[host-mediated MCP OAuth and elicitation](packages/typescript/PROTOCOL.md). SDK 0.6.0
 adapts the independent Memory V2 configuration and exposes native capture,
 Dream, rollout and retention controls. The update includes MCP handshake and
 structured-result fixes, parent/peer subagent messaging, prompt offloading,

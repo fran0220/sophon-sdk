@@ -5,6 +5,10 @@ import type { Workspace } from "./Workspace.js";
 
 export type SessionOptions = { workspace: Workspace, 
 /**
+ * Allow host-mediated MCP interactions for this attachment. Defaults to false.
+ */
+interactive?: boolean, 
+/**
  * Keep scheduler execution and mutations blocked until native candidate publication.
  * Set on every create/load/resume requiring a product-owned configuration.
  */

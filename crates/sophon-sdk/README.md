@@ -9,11 +9,24 @@ official xAI SDK.
 Current source identity:
 
 - SDK facade version: **0.6.0** (Memory V2 configuration upgrade)
-- TypeScript package version: **0.8.0-alpha.1**
+- TypeScript package version: **0.9.0-alpha.1**
 - public product source baseline: 1.0.45
 - public Grok Build commit: `2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`
 - public crate metadata: 1.0.45
 - embedded monorepo revision: `559751fdcec02d413e4c57c8832ab275e4f44980`
+
+## TypeScript 0.9 interactive MCP
+
+Protocol v2 remains additive. `SessionOptions.interactive` defaults to false;
+set it on each create/load/resume to allow MCP elicitation and OAuth consent.
+`onElicitation(request, context)` and `onMcpOAuth(request, context)` receive
+cancellation signals. HTTP server configuration adds optional `oauth` and
+`bearerTokenEnvVar` while retaining `headers`. Call `session.authenticateMcp(name)`
+after attaching to trigger native authentication. The host owns browser opening;
+the Runtime owns PKCE, the loopback callback, token exchange and storage.
+See the [protocol specification](../../packages/typescript/PROTOCOL.md).
+Vendor the generated client and rebuilt Runtime together. Rust HTTP transport
+literals must add `oauth: None` and `bearer_token_env_var: None` for old behavior.
 
 ## 1.0.45 / TypeScript 0.8 migration
 

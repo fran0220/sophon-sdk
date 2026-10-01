@@ -1,6 +1,6 @@
 {
   "name": "@sophon/sdk",
-  "version": "0.8.0-alpha.1",
+  "version": "0.9.0-alpha.1",
   "description": "Official typed client for the private Sophon Runtime transport",
   "type": "module",
   "license": "Apache-2.0",
@@ -19,7 +19,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "PROTOCOL.md"
   ],
   "scripts": {
     "generate": "cargo run --manifest-path ../../Cargo.toml -p sophon-sdk --bin sophon-runtime -- --generate-types src/generated",

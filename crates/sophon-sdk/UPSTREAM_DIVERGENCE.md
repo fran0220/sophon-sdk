@@ -829,3 +829,42 @@ The broader upstream full-suite/all-target lint limitations recorded above
 were not suppressed or represented as fixed. This release uses targeted
 native regression coverage; it does not claim exhaustive raw-route, live
 provider, Windows or macOS verification.
+
+## Interactive MCP / TypeScript 0.9 validation (Linux x86_64)
+
+The upstream pin remains 1.0.45. No patch group was removed or merged.
+The typed-management group adds host-owned OAuth and extension cancellation;
+the provider-routing digest also changes because shared actor fixtures carry
+the new attachment policy. Protocol v2 remains additive and opt-in.
+
+Executed with Rust 1.94.0, `PROTOC=$PWD/bin/protoc` (29.3), and
+`env -u GROK_AUTH RUST_MIN_STACK=33554432 CARGO_INCREMENTAL=0
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Git fixtures use the
+process-local unsigned-commit/main-default settings documented above.
+
+- `cargo check --locked -p sophon-sdk`: passed.
+- `cargo test --locked -p sophon-sdk`: 71 unit tests, 37 integration tests,
+  and 5 doctests passed; one existing integration test remains ignored.
+- `cargo test --locked -p xai-acp-lib`: 23 tests passed, including extension
+  withdrawal with legacy cancellation behavior disabled by default.
+- Focused `xai-grok-mcp` tests: host consent accept/deny/error and both OAuth
+  metadata tests passed without network or browser access.
+- Focused `xai-grok-shell --lib` tests: current-attachment policy (including
+  pending OAuth consent withdrawal) and subagent inheritance both passed.
+- `cargo clippy --locked -p sophon-sdk -p xai-grok-mcp -p xai-acp-lib
+  --all-targets -- -D warnings`: passed.
+- `cargo clippy --locked -p xai-grok-shell --lib -- -D warnings`: passed.
+- `cargo fmt --all --check`, `scripts/check-upstream-sync.sh`, and
+  `scripts/check-sdk-boundary.sh`: passed; the boundary audit checked 6,749
+  SDK-declared public signatures and found no ACP/TUI leaks or TUI dependencies.
+- Runtime type generation, `npm ci --ignore-scripts`, `npm run build`, and
+  `npm pack`: passed. `npm test` passed 17 tests with four opt-in tests skipped.
+  The final three focused stdio tests also passed, including the real Runtime
+  rejecting a non-interactive authentication attempt rather than reporting
+  success for a native `{status:"failed"}` envelope.
+- `cargo build --locked -p sophon-sdk --bin sophon-runtime`: passed.
+
+The package is `sophon-sdk-0.9.0-alpha.1.tgz`. Its declarations include the
+optional interactive flag, OAuth transport settings, elicitation results and
+host callback contexts. Live OAuth-provider exchange, user browser integration,
+and Windows/macOS execution were not exercised.
