@@ -3459,6 +3459,7 @@ mod tests {
         assert_eq!(profile.name, "general-purpose");
         assert_eq!(profile.prompt_body.as_deref(), Some("BASELINE_73"));
         assert_eq!(profile.session_tools_allowlist, Some(Vec::new()));
+        assert_eq!(profile.effort, None);
     }
 
     #[test]

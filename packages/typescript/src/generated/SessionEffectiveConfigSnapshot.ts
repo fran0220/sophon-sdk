@@ -6,26 +6,20 @@ import type { SessionModelFacts } from "./SessionModelFacts.js";
 import type { SessionRouteFacts } from "./SessionRouteFacts.js";
 import type { Version } from "./Version.js";
 
-export type SessionEffectiveConfigSnapshot = {
-  sessionId: SessionId;
-  /**
-   * Current actor-published candidate, absent until native mount succeeds.
-   */
-  mountedRevision: string | null;
-  /**
-   * Configuration invalidation token, not proof of candidate publication.
-   */
-  version: Version;
-  route: SessionRouteFacts;
-  model: SessionModelFacts;
-  backendSearchActive: boolean;
-  /**
-   * Configuration attached to the batch currently draining.
-   */
-  activeBatchSearch: SearchOverrideFacts;
-  /**
-   * Configuration after every already-admitted FIFO row drains.
-   */
-  nextEmptyFifoSearch: SearchOverrideFacts;
-  pendingConfigPromptIds: Array<QueueEntryId>;
-};
+export type SessionEffectiveConfigSnapshot = { sessionId: SessionId, 
+/**
+ * Current actor-published candidate, absent until native mount succeeds.
+ */
+mountedRevision: string | null, 
+/**
+ * Configuration invalidation token, not proof of candidate publication.
+ */
+version: Version, route: SessionRouteFacts, model: SessionModelFacts, backendSearchActive: boolean, 
+/**
+ * Configuration attached to the batch currently draining.
+ */
+activeBatchSearch: SearchOverrideFacts, 
+/**
+ * Configuration after every already-admitted FIFO row drains.
+ */
+nextEmptyFifoSearch: SearchOverrideFacts, pendingConfigPromptIds: Array<QueueEntryId>, };

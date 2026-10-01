@@ -52,7 +52,7 @@ impl SchedulerCadence {
                         || days
                             .iter()
                             .enumerate()
-                            .any(|(i, day)| days[..i].contains(day))
+                            .any(|(i, day)| days.iter().take(i).any(|prior| prior == day))
                 }) {
                     return Err(SchedulerError::InvalidInterval(
                         "weekdays must be nonempty unique ISO weekdays 1-7".into(),
@@ -132,12 +132,10 @@ impl SchedulerCadence {
                 for _ in 0..9 {
                     if weekdays.as_ref().is_none_or(|days| {
                         days.contains(&(date.weekday().number_from_monday() as u8))
-                    }) {
-                        if let Some(at) = Self::on_date(zone, date, time) {
-                            if at > after {
-                                return Some(at);
-                            }
-                        }
+                    }) && let Some(at) = Self::on_date(zone, date, time)
+                        && at > after
+                    {
+                        return Some(at);
                     }
                     date = date.succ_opt()?;
                 }

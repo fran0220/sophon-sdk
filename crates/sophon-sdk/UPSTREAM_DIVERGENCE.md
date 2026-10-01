@@ -82,6 +82,7 @@ upstream-owned. Approved files (digest: `provider-routing.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/recap.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/side_call.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_summary.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/idle_resume_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/inline_auto_compact_flow_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/memory_config_tests.rs`
@@ -134,6 +135,7 @@ Approved files (digest: `hermetic-discovery.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/config.rs`
 - `crates/codegen/xai-grok-shell/src/agent/folder_trust.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/sampler_prewarm.rs`
+- `crates/codegen/xai-grok-shell/src/claude_import_tests.rs`
 - `crates/codegen/xai-grok-shell/src/config/mod.rs`
 - `crates/codegen/xai-grok-shell/src/config/watcher.rs`
 - `crates/codegen/xai-grok-cloud-config/src/managed_config/store.rs`

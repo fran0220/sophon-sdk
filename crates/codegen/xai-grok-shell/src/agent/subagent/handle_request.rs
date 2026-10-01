@@ -881,7 +881,7 @@ pub(crate) async fn run_shell_child(
                 .get(&request.subagent_type)
                 .map(String::as_str)
         })
-        .or_else(|| match &definition.model {
+        .or(match &definition.model {
             ModelOverride::Override(id) => Some(id.as_str()),
             _ => None,
         });

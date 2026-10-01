@@ -3,14 +3,9 @@ import type { McpServer } from "./McpServer.js";
 import type { ToolSpec } from "./ToolSpec.js";
 import type { Workspace } from "./Workspace.js";
 
-export type SessionOptions = {
-  workspace: Workspace;
-  /**
-   * Keep scheduler execution and mutations blocked until native candidate publication.
-   * Set on every create/load/resume requiring a product-owned configuration.
-   */
-  requireConfigCandidate?: boolean;
-  model: string | null;
-  mcpServers: Array<McpServer>;
-  tools: Array<ToolSpec>;
-};
+export type SessionOptions = { workspace: Workspace, 
+/**
+ * Keep scheduler execution and mutations blocked until native candidate publication.
+ * Set on every create/load/resume requiring a product-owned configuration.
+ */
+requireConfigCandidate?: boolean, model: string | null, mcpServers: Array<McpServer>, tools: Array<ToolSpec>, };

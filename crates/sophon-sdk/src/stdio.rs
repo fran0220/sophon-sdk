@@ -1060,12 +1060,10 @@ pub async fn run() -> Result<()> {
             }
         }
     }
-    if !exit_requested {
-        if let Some(runtime) = &runtime {
-            runtime
-                .dispatch(p::Request::FinalExit { timeout_ms: 30_000 })
-                .await?;
-        }
+    if !exit_requested && let Some(runtime) = &runtime {
+        runtime
+            .dispatch(p::Request::FinalExit { timeout_ms: 30_000 })
+            .await?;
     }
     while let Some(result) = requests.join_next().await {
         result.map_err(operation)??;

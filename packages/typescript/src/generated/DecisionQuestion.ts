@@ -2,19 +2,4 @@
 import type { DecisionContent } from "./DecisionContent.js";
 import type { NoulCriteria } from "./NoulCriteria.js";
 
-export type DecisionQuestion =
-  | {
-      type: "noul";
-      instructions: DecisionContent;
-      criteria?: NoulCriteria | null;
-    }
-  | {
-      type: "choice";
-      instructions: DecisionContent;
-      criteria: { [key in string]: DecisionContent | null };
-    }
-  | {
-      type: "score";
-      instructions: DecisionContent;
-      criteria: Array<DecisionContent>;
-    };
+export type DecisionQuestion = { "type": "noul", instructions: DecisionContent, criteria?: NoulCriteria | null, } | { "type": "choice", instructions: DecisionContent, criteria: { [key in string]: DecisionContent | null }, } | { "type": "score", instructions: DecisionContent, criteria: Array<DecisionContent>, };

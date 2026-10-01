@@ -1727,11 +1727,10 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     fn resolve_teardown_drain_waiters(&mut self, parent_session_id: &str) {
         if self.close_drains.contains_key(parent_session_id)
             && !self.session_has_children(parent_session_id)
+            && let Some(waiters) = self.close_drains.get_mut(parent_session_id)
         {
-            if let Some(waiters) = self.close_drains.get_mut(parent_session_id) {
-                for waiter in waiters.drain(..) {
-                    let _ = waiter.send(Ok(()));
-                }
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Ok(()));
             }
         }
         // Cheap precondition (one lookup) before the three-collection scan on

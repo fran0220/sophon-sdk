@@ -377,14 +377,13 @@ impl ScheduledTask {
                 "task recurrence metadata disagrees with cadence".into(),
             ));
         }
-        if let Some(next) = self.next_run_at {
-            if let Some(before) = next.checked_sub_signed(chrono::Duration::nanoseconds(1)) {
-                if self.cadence.next_after(before) != Some(next) {
-                    return Err(SchedulerError::InvalidInterval(
-                        "nextRunAt is not an occurrence of the cadence".into(),
-                    ));
-                }
-            }
+        if let Some(next) = self.next_run_at
+            && let Some(before) = next.checked_sub_signed(chrono::Duration::nanoseconds(1))
+            && self.cadence.next_after(before) != Some(next)
+        {
+            return Err(SchedulerError::InvalidInterval(
+                "nextRunAt is not an occurrence of the cadence".into(),
+            ));
         }
         Ok(())
     }

@@ -2,7 +2,4 @@
 import type { DecisionContent } from "./DecisionContent.js";
 import type { DecisionQuestion } from "./DecisionQuestion.js";
 
-export type DecisionRequest = {
-  state: DecisionContent;
-  questions: { [key in string]: DecisionQuestion };
-};
+export type DecisionRequest = { state: DecisionContent, questions: { [key in string]: DecisionQuestion }, };

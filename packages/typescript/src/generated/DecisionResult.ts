@@ -2,12 +2,4 @@
 import type { DecisionAnswer } from "./DecisionAnswer.js";
 import type { DecisionUsage } from "./DecisionUsage.js";
 
-export type DecisionResult = {
-  requestId: string;
-  toolCallId: string;
-  elapsedMs: number;
-  requestedModel: string;
-  model: string;
-  answers: { [key in string]: DecisionAnswer };
-  usage: DecisionUsage;
-};
+export type DecisionResult = { requestId: string, toolCallId: string, elapsedMs: number, requestedModel: string, model: string, answers: { [key in string]: DecisionAnswer }, usage: DecisionUsage, };

@@ -4,5 +4,4 @@
  * Canonical gateway effort values, declared by the route catalog, never
  * inferred from a model name. Capability does not select a request default.
  */
-export type ReasoningEffort =
-  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

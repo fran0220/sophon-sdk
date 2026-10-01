@@ -67,10 +67,19 @@ impl SessionActor {
         self.refresh_token_if_expired().await;
         let session_config = self.reconstruct_full_config().await;
         // Resolve the helper's own endpoint and credentials; the session endpoint may not serve it.
-        let aux_config = if self.models_manager.model_in_catalog(&settings.model) {
-            self.resolve_aux_sampler_config(&settings.model).await
-        } else {
-            None
+        let aux_config = match self
+            .models_manager
+            .auxiliary_config(crate::agent::remote_config::AuxiliaryOperation::Summary)
+        {
+            Some(Ok(config)) => Some(config),
+            Some(Err(error)) => {
+                tracing::debug!(%error, "turn summary: explicit route unavailable");
+                return;
+            }
+            None if self.models_manager.model_in_catalog(&settings.model) => {
+                self.resolve_aux_sampler_config(&settings.model).await
+            }
+            None => None,
         };
         let mut config = match aux_config {
             Some(mut cfg) => {

@@ -2,13 +2,8 @@
 import type { ProviderRoute } from "./ProviderRoute.js";
 import type { ReasoningEffort } from "./ReasoningEffort.js";
 
-export type RuntimeModel = {
-  id: string;
-  provider: ProviderRoute;
-  /**
-   * Authoritative canonical effort capabilities. Omission grants none.
-   */
-  supportedReasoning: Array<ReasoningEffort>;
-  contextWindow: number | null;
-  maxCompletionTokens: number | null;
-};
+export type RuntimeModel = { id: string, provider: ProviderRoute, 
+/**
+ * Authoritative canonical effort capabilities. Omission grants none.
+ */
+supportedReasoning: Array<ReasoningEffort>, contextWindow: number | null, maxCompletionTokens: number | null, };

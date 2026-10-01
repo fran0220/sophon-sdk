@@ -554,6 +554,33 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
     }
 
+    #[test]
+    fn hermetic_sources_keep_grok_home_but_exclude_vendor_and_project_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let grok_home = dir.path().join("host-owned");
+        std::fs::create_dir_all(grok_home.join("hooks")).unwrap();
+        let options = DiscoveryOptions {
+            git_root: Some(dir.path()),
+            grok_home: Some(&grok_home),
+            home: Some(dir.path()),
+            trust: Trust::Trusted,
+            ..untrusted_without_git_root()
+        };
+        let ambient = discover_hook_source_paths(options);
+        assert!(!ambient.project.is_empty());
+        let hermetic = discover_hook_source_paths(DiscoveryOptions {
+            hermetic: true,
+            ..options
+        });
+        assert!(hermetic.project.is_empty());
+        assert!(!hermetic.global.is_empty());
+        assert!(hermetic.global.iter().all(|source| match source {
+            HookSourceConfig::Directory(path) | HookSourceConfig::SettingsFile(path) =>
+                path.starts_with(&grok_home),
+        }));
+        assert!(ambient.global.len() > hermetic.global.len());
+    }
+
     fn simple_hook(event: &str) -> String {
         simple_hook_with_id(event, "test")
     }

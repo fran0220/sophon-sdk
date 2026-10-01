@@ -40,8 +40,8 @@ test('native sound, music and model tools publish decoded artifacts without host
       calls.push({ path: request.url, body })
       response.writeHead(200, { 'content-type': 'audio/mpeg' }); response.end(audio); return
     }
-    const names = body.tools.map(tool => tool.function?.name)
-    assert.equal(names.includes('generate_sound_effect'), enabled)
+    const names = (body.tools ?? []).map(tool => tool.function?.name)
+    assert.equal(names.includes('generate_sound_effect'), enabled, 'unconfigured auxiliary calls must not fall back to the primary provider')
     assert.equal(names.includes('generate_music'), enabled)
     assert.equal(names.includes('generate_model3d'), enabled)
     const count = body.messages.filter(message => message.role === 'tool').length

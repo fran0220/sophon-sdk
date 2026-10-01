@@ -3,39 +3,28 @@
 /**
  * Resolved sampling, active harness, and retry behavior for a session.
  */
-export type SessionModelFacts = {
-  /**
-   * `None` means omitted from the provider request, not a guessed provider default.
-   */
-  maxCompletionTokens: number | null;
-  temperature: number | null;
-  topP: number | null;
-  streamToolCalls: boolean;
-  /**
-   * Actual installed harness name, rather than the catalog's requested label.
-   */
-  activeAgentType: string;
-  autoCompactThresholdPercent: number;
-  /**
-   * Sampler transport retry budget, including the native environment override.
-   */
-  maxRetries: number;
-  /**
-   * Total-attempt ceiling for sampler-owned 429 retries.
-   */
-  rateLimitRetryThreshold: number;
-  /**
-   * Active session's outer 429 wait loop; zero for main sessions or when disabled.
-   */
-  subagentRateLimitMaxAttempts: number;
-  subagentRateLimitMaxTotalWaitSecs: number;
-  /**
-   * Per-chunk idle timeout, not a whole-turn deadline.
-   */
-  inferenceIdleTimeoutSecs: number;
-  transientRetryEnabled: boolean;
-  transientRetriesPerStep: number;
-  transientRetriesPerPrompt: number;
-  transientRetryWindowSecs: number;
-  retryOnlyBeforeOutput: boolean;
-};
+export type SessionModelFacts = { 
+/**
+ * `None` means omitted from the provider request, not a guessed provider default.
+ */
+maxCompletionTokens: number | null, temperature: number | null, topP: number | null, streamToolCalls: boolean, 
+/**
+ * Actual installed harness name, rather than the catalog's requested label.
+ */
+activeAgentType: string, autoCompactThresholdPercent: number, 
+/**
+ * Sampler transport retry budget, including the native environment override.
+ */
+maxRetries: number, 
+/**
+ * Total-attempt ceiling for sampler-owned 429 retries.
+ */
+rateLimitRetryThreshold: number, 
+/**
+ * Active session's outer 429 wait loop; zero for main sessions or when disabled.
+ */
+subagentRateLimitMaxAttempts: number, subagentRateLimitMaxTotalWaitSecs: number, 
+/**
+ * Per-chunk idle timeout, not a whole-turn deadline.
+ */
+inferenceIdleTimeoutSecs: number, transientRetryEnabled: boolean, transientRetriesPerStep: number, transientRetriesPerPrompt: number, transientRetryWindowSecs: number, retryOnlyBeforeOutput: boolean, };

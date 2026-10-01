@@ -14,6 +14,7 @@ fn source_paths(
             grok_home: None,
             home: Some(dir),
             compat: compat.hooks(),
+            hermetic: compat.hermetic,
             claude_import: crate::claude_import::import_marker(),
             trust: xai_grok_hooks::trust::Trust::Trusted,
         },

@@ -348,6 +348,36 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   await agent.finalExit()
 })
 
+test('turn summaries use the explicit auxiliary route and credential', { timeout: 15000 }, async t => {
+  const { cwd, config, env } = await setup(t)
+  let receiveSummary
+  const summary = new Promise(resolve => { receiveSummary = resolve })
+  const server = createServer(async (request, response) => {
+    let raw = ''; for await (const chunk of request) raw += chunk
+    const body = JSON.parse(raw)
+    const isSummary = body.messages.some(message => String(message.content).includes('ultra-short dashboard line'))
+    if (isSummary) receiveSummary({ body, authorization: request.headers.authorization, url: request.url })
+    const chunk = (delta, finish_reason) => ({ id: 'summary-fixture', object: 'chat.completion.chunk', created: 1, model: body.model, choices: [{ index: 0, delta, finish_reason }] })
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    response.end(`data: ${JSON.stringify(chunk({ role: 'assistant', content: 'Distinct summary route verified.' }, null))}\n\ndata: ${JSON.stringify(chunk({}, 'stop'))}\n\ndata: [DONE]\n\n`)
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
+  const baseUrl = `http://127.0.0.1:${server.address().port}`
+  config.models[0].provider = { protocol: 'openai_chat', baseUrl: `${baseUrl}/primary`, apiKey: 'primary-secret', model: 'primary-wire', headers: {}, queryParams: {} }
+  config.models.push({ ...config.models[0], id: 'summary', provider: { ...config.models[0].provider, baseUrl: `${baseUrl}/summary`, apiKey: 'summary-secret', model: 'summary-wire' } })
+  config.sessionSummaryModel = 'summary'
+  const agent = await Agent.spawn({ executable, config, env: { ...env, GROK_TURN_SUMMARY: 'true' } })
+  t.after(() => agent.finalExit().catch(() => {}))
+  const session = await agent.createSession({ workspace: { id: 'summary-routing', cwd }, model: 'runtime-test', mcpServers: [], tools: [] })
+  await session.prompt({ turnId: 'summary-turn', blocks: [{ type: 'text', text: 'Answer briefly.' }] })
+  const observed = await summary
+  assert.equal(observed.body.model, 'summary-wire')
+  assert.equal(observed.authorization, 'Bearer summary-secret')
+  assert.equal(observed.url, '/summary/chat/completions')
+  await agent.finalExit()
+})
+
 test('ordinary and scheduled children retain callback owner, workspace, source and cancellation', { timeout: 60000 }, async t => {
   const { root, cwd, config, env } = await setup(t)
   const childCwd = join(root, 'child-workspace')

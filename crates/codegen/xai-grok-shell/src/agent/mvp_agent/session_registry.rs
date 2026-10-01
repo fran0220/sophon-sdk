@@ -2,13 +2,12 @@
 //! Distinct from `agent::session_registry_client`, which talks to the remote registry.
 use super::*;
 use xai_grok_tools::registry::types::FinalizedToolset;
+type CloseReceipt = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
 /// The map stays private so every caller goes through a named operation.
 #[derive(Clone, Default)]
 pub(super) struct SessionRegistry {
     sessions: Rc<RefCell<HashMap<acp::SessionId, SessionResources>>>,
-    pub(super) closing: Rc<
-        RefCell<HashMap<acp::SessionId, tokio::sync::watch::Receiver<Option<Result<(), String>>>>>,
-    >,
+    pub(super) closing: Rc<RefCell<HashMap<acp::SessionId, CloseReceipt>>>,
     pub(super) agent_directory: Rc<RefCell<super::agent_directory::AgentDirectory>>,
     next_install_id: Rc<std::cell::Cell<u64>>,
 }

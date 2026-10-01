@@ -197,7 +197,11 @@ fn deserialize_current<'de, D: serde::Deserializer<'de>>(
             .any(|(index, id)| {
                 id.is_empty()
                     || id.len() > MAX_TASK_ID_BYTES
-                    || current.quarantined_task_ids[..index].contains(id)
+                    || current
+                        .quarantined_task_ids
+                        .iter()
+                        .take(index)
+                        .any(|prior| prior == id)
             })
     {
         return Err(serde::de::Error::custom(

@@ -432,10 +432,11 @@ struct FinalizedTool {
     contract_version: Option<String>,
     /// Rebind the same concrete runtime instance into a replacement registry.
     /// Built-ins are reconstructed from their definition instead.
-    register_runtime_instance:
-        Option<Arc<dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync>>,
+    register_runtime_instance: Option<Arc<RegisterRuntimeInstance>>,
     external_mcp: bool,
 }
+
+type RegisterRuntimeInstance = dyn Fn(&xai_computer_hub_sdk::LocalRegistry) + Send + Sync;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredToolIdentity {

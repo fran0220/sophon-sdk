@@ -2,18 +2,12 @@
 import type { NativePromptOrigin } from "./NativePromptOrigin.js";
 import type { ScheduledInvocation } from "./ScheduledInvocation.js";
 
-export type CallbackContext = {
-  sessionId: string;
-  /**
-   * Session that registered this concrete tool handler; stable across inheritance.
-   */
-  ownerSessionId: string;
-  promptId: string | null;
-  toolCallId: string;
-  /**
-   * Actual invocation workspace on the runtime machine (including children).
-   */
-  cwd: string;
-  scheduledInvocation: ScheduledInvocation | null;
-  originatingPrompt: NativePromptOrigin | null;
-};
+export type CallbackContext = { sessionId: string, 
+/**
+ * Session that registered this concrete tool handler; stable across inheritance.
+ */
+ownerSessionId: string, promptId: string | null, toolCallId: string, 
+/**
+ * Actual invocation workspace on the runtime machine (including children).
+ */
+cwd: string, scheduledInvocation: ScheduledInvocation | null, originatingPrompt: NativePromptOrigin | null, };
