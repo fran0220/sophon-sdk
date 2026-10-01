@@ -126,6 +126,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+                mcp_interactive: tokio::sync::watch::channel(true).0,
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -662,6 +663,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+                mcp_interactive: tokio::sync::watch::channel(true).0,
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -988,6 +990,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+                mcp_interactive: tokio::sync::watch::channel(true).0,
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -2547,6 +2550,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+                mcp_interactive: tokio::sync::watch::channel(true).0,
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(

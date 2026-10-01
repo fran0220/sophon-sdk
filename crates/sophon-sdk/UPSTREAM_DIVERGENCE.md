@@ -277,6 +277,15 @@ front identity atomically with the finalization claim; unknown-session mode
 changes fail instead of hanging. The gateway optionally cancels orphaned
 permission callbacks; the default remains unchanged for native TUI/stdio users.
 
+Interactive MCP extends the same group: opt-in orphaned extension cancellation,
+per-session host-owned OAuth URL callbacks, OAuth metadata on ACP HTTP servers,
+and cancellation-safe loopback listener lifetime. SDK sessions never use native
+browser opening; child sessions inherit that policy. Retained MCP clients consult
+the current attachment's interactivity before asking the host for consent.
+Native PKCE, token exchange, credential persistence, and initial disk-only discovery
+remain authoritative. The SDK exposes the existing explicit authentication trigger,
+not a second OAuth implementation. Protocol v2 defaults stay non-interactive.
+
 Explicit final exit uses native cancellation, workflow drain and checked final
 persistence acknowledgements. Prompt results and durable terminals carry the
 native consumed index from the current turn-report slot; promotion resets it,
@@ -296,6 +305,8 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-agent/src/builder.rs`
 - `crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs`
 - `crates/codegen/xai-grok-pager/src/app/app_view.rs`
+- `crates/codegen/xai-grok-mcp/src/oauth.rs`
+- `crates/codegen/xai-grok-mcp/src/oauth_config.rs`
 - `crates/codegen/xai-grok-mcp/src/servers.rs`
 - `crates/codegen/xai-grok-mcp/src/servers_tests.rs`
 - `crates/codegen/xai-grok-mcp/src/shared_mcp_state.rs`
@@ -305,6 +316,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/subagent_spawn.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/subagent_spawn_context_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/handlers/session.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_lifecycle.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_registry.rs`
@@ -353,6 +365,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/mcp_failed_reminder_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/mcp_connecting_reminder_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_queue_actor_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs`

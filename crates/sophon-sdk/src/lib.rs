@@ -159,6 +159,7 @@ impl fmt::Display for SessionId {
 pub struct SessionConfig {
     pub(crate) cwd: PathBuf,
     pub(crate) model: Option<String>,
+    pub(crate) interactive: bool,
     pub(crate) require_config_candidate: bool,
     pub(crate) mcp_servers: Vec<McpServer>,
 }

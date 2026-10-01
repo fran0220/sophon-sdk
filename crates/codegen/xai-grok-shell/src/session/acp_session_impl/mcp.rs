@@ -162,6 +162,9 @@ impl SessionActor {
     ///
     /// Runs force_reauth (browser flow), then re-initializes the server and registers its tools.
     pub(super) async fn handle_mcp_auth_trigger(&self, server_name: &str) -> Result<(), String> {
+        if self.attach_non_interactive.get() {
+            return Err("MCP authentication is disabled for non-interactive sessions".to_string());
+        }
         self.wait_for_server_settled(server_name).await;
         let existing_client = {
             let state = self.mcp_state.lock().await;
@@ -244,13 +247,16 @@ impl SessionActor {
         let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let byo_config = oauth_config_map.get(server_name).cloned();
         let event_writer = self.events.writer();
-        let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+        let mut ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
             &event_writer,
             crate::session::mcp_servers::OauthInteractivity::Interactive,
             self.tool_context.process_scope.as_ref(),
         )
         .with_oauth_discovery(discovery);
+        if self.startup_hints.host_managed_mcp_oauth {
+            ctx = ctx.with_host_consent(self.host_mcp_oauth_consent());
+        }
         let new_client = crate::session::mcp_servers::start_mcp_server(
             server_config.clone(),
             Some(cwd),
@@ -304,6 +310,40 @@ impl SessionActor {
             "Rebuilt MCP HTTP client with OAuth manager"
         );
         Ok(arc)
+    }
+
+    pub(super) fn host_mcp_oauth_consent(&self) -> xai_grok_mcp::oauth::HostConsentCallback {
+        let gateway = self.notifications.gateway.clone();
+        let session_id = self.session_info.id.0.to_string();
+        let interactive = self.mcp_interactive.clone();
+        std::sync::Arc::new(move |server_name, url| {
+            static NEXT_REQUEST: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let gateway = gateway.clone();
+            let mut interactive = interactive.subscribe();
+            let payload = serde_json::json!({
+                "sessionId": session_id,
+                "requestId": NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string(),
+                "serverName": server_name,
+                "url": url,
+            });
+            Box::pin(async move {
+                let raw = serde_json::value::to_raw_value(&payload).map_err(|e| e.to_string())?;
+                let response = tokio::select! {
+                    biased;
+                    _ = interactive.wait_for(|allowed| !*allowed) => return Ok(false),
+                    response = gateway.send(agent_client_protocol::ExtRequest::new(
+                        "x.sophon/mcp/oauth",
+                        raw.into(),
+                    )) => response.map_err(|e| e.to_string())?,
+                };
+                serde_json::from_str::<serde_json::Value>(response.0.get())
+                    .map_err(|e| e.to_string())?
+                    .get("opened")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| "OAuth host response missing boolean 'opened'".to_string())
+            })
+        })
     }
     pub(super) async fn retry_auth_required_servers(&self) {
         let servers_to_retry: Vec<String> = {
@@ -439,12 +479,15 @@ impl SessionActor {
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let spawn_writer = self.events.writer();
-        let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+        let mut ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             self.session_info.id.0.as_ref(),
             &spawn_writer,
             OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
+        if self.startup_hints.host_managed_mcp_oauth {
+            ctx = ctx.with_host_consent(self.host_mcp_oauth_consent());
+        }
         let results = crate::session::mcp_servers::start_mcp_servers(
             configs,
             Some(cwd),
@@ -995,12 +1038,15 @@ impl SessionActor {
             crate::util::config::load_mcp_servers_with_oauth(cwd, &self.rebuild_spec.compat);
         let byo_config = oauth_config_map.get(server).cloned();
         let event_writer = self.events.writer();
-        let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+        let mut ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
             &event_writer,
             OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
+        if self.startup_hints.host_managed_mcp_oauth {
+            ctx = ctx.with_host_consent(self.host_mcp_oauth_consent());
+        }
         let new_client = crate::session::mcp_servers::start_mcp_server(
             server_config.clone(),
             Some(cwd),
@@ -1085,6 +1131,7 @@ impl SessionActor {
             || *self.delivery_tools.borrow() != hints.delivery_tools;
         self.mcp_strategy.set(strategy);
         self.attach_non_interactive.set(hints.non_interactive);
+        self.mcp_interactive.send_replace(!hints.non_interactive);
         *self.delivery_tools.borrow_mut() = hints.delivery_tools.clone();
         if changed {
             self.mcp_connecting_reminder_injected.set(false);
@@ -1360,12 +1407,15 @@ impl SessionActor {
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let spawn_writer = self.events.writer();
-        let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+        let mut ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
             &spawn_writer,
             OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
+        if self.startup_hints.host_managed_mcp_oauth {
+            ctx = ctx.with_host_consent(self.host_mcp_oauth_consent());
+        }
         let Ok(mcp_results) = generation
             .or_cancel(build_pending_clients(
                 &self.mcp_state,

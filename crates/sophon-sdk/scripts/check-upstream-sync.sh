@@ -104,6 +104,8 @@ typed_management=(
   crates/codegen/xai-grok-agent/src/builder.rs
   crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs
   crates/codegen/xai-grok-pager/src/app/app_view.rs
+  crates/codegen/xai-grok-mcp/src/oauth.rs
+  crates/codegen/xai-grok-mcp/src/oauth_config.rs
   crates/codegen/xai-grok-mcp/src/servers.rs
   crates/codegen/xai-grok-mcp/src/servers_tests.rs
   crates/codegen/xai-grok-mcp/src/shared_mcp_state.rs
@@ -113,6 +115,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/subagent_spawn.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs
+  crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/subagent_spawn_context_tests.rs
   crates/codegen/xai-grok-shell/src/agent/handlers/session.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_lifecycle.rs
   crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_registry.rs
@@ -161,6 +164,7 @@ typed_management=(
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/mcp_failed_reminder_tests.rs
+  crates/codegen/xai-grok-shell/src/session/acp_session_tests/mcp_connecting_reminder_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_queue_actor_tests.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs

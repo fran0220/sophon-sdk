@@ -124,6 +124,9 @@ pub struct SessionHandle {
     /// Whether this session was spawned non-interactive (`startupHints.nonInteractive`, e.g. headless `-p` / SDK).
     /// Stored per-session so subagents inherit it at spawn.
     pub non_interactive: bool,
+    /// Current attachment policy shared with retained MCP clients.
+    pub mcp_interactive: tokio::sync::watch::Sender<bool>,
+    pub host_managed_mcp_oauth: bool,
     /// Plan mode tracker, shared with the session actor via Arc.
     /// Exposed so the `x.ai/toggle_plan_mode` handler can toggle plan mode without going through the session command channel.
     pub plan_mode: std::sync::Arc<parking_lot::Mutex<crate::session::plan_mode::PlanModeTracker>>,

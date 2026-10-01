@@ -26,6 +26,7 @@ pub struct AcpGatewayReceiver<S: AcpSide, C> {
     spawn_fn: SpawnFn,
     on_meta: Option<OnMetaFn>,
     orphaned_permission_cancel: bool,
+    orphaned_extension_cancel: bool,
     inline_notifications: bool,
 }
 
@@ -40,6 +41,7 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
             }),
             on_meta: None,
             orphaned_permission_cancel: false,
+            orphaned_extension_cancel: false,
             inline_notifications: false,
         }
     }
@@ -48,6 +50,13 @@ impl<S: AcpSide, C> AcpGatewayReceiver<S, C> {
     /// Disabled by default; all other handlers are unaffected.
     pub fn with_orphaned_permission_cancel(mut self, enabled: bool) -> Self {
         self.orphaned_permission_cancel = enabled;
+        self
+    }
+
+    /// Cancel client-side extension callbacks when their response receiver is dropped.
+    /// Disabled by default to preserve the CLI's legacy detached-request behavior.
+    pub fn with_orphaned_extension_cancel(mut self, enabled: bool) -> Self {
+        self.orphaned_extension_cancel = enabled;
         self
     }
 
@@ -331,16 +340,29 @@ impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
                 AcpClientMessage::KillTerminalCommand(args) => {
                     handle!(args, self.tracing, conn, kill_terminal, spawn, on_meta);
                 }
-                AcpClientMessage::ExtMethod(args) => {
-                    handle!(
-                        no_meta,
-                        args,
-                        self.tracing,
-                        conn,
-                        ext_method,
-                        spawn,
-                        on_meta
-                    );
+                AcpClientMessage::ExtMethod(mut args) => {
+                    if self.orphaned_extension_cancel {
+                        let tracing = self.tracing;
+                        spawn(Box::pin(async move {
+                            let method = before_request(&args, tracing);
+                            let response = tokio::select! {
+                                biased;
+                                _ = args.response_tx.closed() => return,
+                                response = conn.ext_method(args.request) => response,
+                            };
+                            let _ = after_request(args.response_tx, response, method);
+                        }));
+                    } else {
+                        handle!(
+                            no_meta,
+                            args,
+                            self.tracing,
+                            conn,
+                            ext_method,
+                            spawn,
+                            on_meta
+                        );
+                    }
                 }
                 AcpClientMessage::ExtNotification(args) if self.inline_notifications => {
                     let method = before_request(&args, self.tracing);
@@ -602,6 +624,12 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl acp::Client for PermissionClient {
+        async fn ext_method(&self, _: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+            let _guard = DropSignal(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
         async fn request_permission(
             &self,
             _: acp::RequestPermissionRequest,
@@ -685,6 +713,45 @@ mod tests {
         check_orphaned_permission_cancel(None).await;
         check_orphaned_permission_cancel(Some(false)).await;
         check_orphaned_permission_cancel(Some(true)).await;
+    }
+
+    #[tokio::test]
+    async fn orphaned_extension_cancel_is_opt_in() {
+        for enabled in [false, true] {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let started = Rc::new(tokio::sync::Notify::new());
+                    let dropped = Rc::new(tokio::sync::Notify::new());
+                    let (sender, receiver) = acp_gateway::<acp::AgentSide, _>(PermissionClient {
+                        pending: true,
+                        started: started.clone(),
+                        dropped: dropped.clone(),
+                        notified: Rc::new(tokio::sync::Notify::new()),
+                    });
+                    tokio::task::spawn_local(
+                        receiver.with_orphaned_extension_cancel(enabled).run(),
+                    );
+                    let response = sender.forward_with_completion(acp::ExtRequest::new(
+                        "test",
+                        serde_json::value::to_raw_value(&serde_json::json!({}))
+                            .unwrap()
+                            .into(),
+                    ));
+                    started.notified().await;
+                    drop(response);
+                    assert_eq!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            dropped.notified()
+                        )
+                        .await
+                        .is_ok(),
+                        enabled
+                    );
+                })
+                .await;
+        }
     }
 
     #[tokio::test]

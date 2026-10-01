@@ -166,6 +166,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
                 attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+                mcp_interactive: tokio::sync::watch::channel(true).0,
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),

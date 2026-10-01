@@ -55,6 +55,14 @@ async fn apply_attach_policy_tracks_the_current_attachment() {
             }
             assert!(actor.delivery_tools.borrow().is_empty());
             assert!(!actor.attach_non_interactive.get());
+            assert!(*actor.mcp_interactive.borrow());
+            let callback = actor.host_mcp_oauth_consent();
+            let mut pending_consent = callback("server", "https://auth.invalid");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending_consent)
+                    .await
+                    .is_err()
+            );
 
             // Headless attachment re-applies Blocking and its delivery tools, and the OAuth-interactivity flag follows the attachment
             // A headless re-attach must not run interactive browser OAuth on the MCP re-init
@@ -71,6 +79,16 @@ async fn apply_attach_policy_tracks_the_current_attachment() {
                 vec!["srv__post".to_string()]
             );
             assert!(actor.attach_non_interactive.get());
+            assert!(!*actor.mcp_interactive.borrow());
+            assert!(
+                !pending_consent.await.unwrap(),
+                "reattach must withdraw pending host consent"
+            );
+            assert!(
+                !actor.host_mcp_oauth_consent()("server", "https://auth.invalid")
+                    .await
+                    .unwrap()
+            );
         })
         .await;
 }

@@ -50,12 +50,16 @@ pub enum Transport {
     },
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OAuthConfig {
+    #[ts(optional = nullable)]
     pub client_id: Option<String>,
+    #[ts(optional = nullable)]
     pub client_secret_env_var: Option<String>,
+    #[ts(optional = nullable)]
     pub scopes: Option<Vec<String>>,
+    #[ts(optional = nullable)]
     pub callback_port: Option<u16>,
 }
 

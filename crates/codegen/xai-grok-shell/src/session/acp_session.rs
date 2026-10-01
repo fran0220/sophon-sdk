@@ -839,6 +839,7 @@ pub(crate) struct SessionActor {
     /// `nonInteractive` for the CURRENT attachment (same lifecycle as `delivery_tools`).
     /// `startup_hints.non_interactive` keeps governing spawn-time structure (system prompt variant, user-message prefix, git-status mode).
     pub(crate) attach_non_interactive: std::rc::Rc<std::cell::Cell<bool>>,
+    pub(crate) mcp_interactive: tokio::sync::watch::Sender<bool>,
     /// Verbatim mirror-fork override: when `Some`, every turn sends this exact parent tool schema instead of the locally-built toolset.
     /// That keeps the child's request prefix byte-identical to the parent for radix cache reuse.
     /// `None` for all non-fork (and summarized-fork) sessions.

@@ -10373,6 +10373,7 @@ dependencies = [
  "xai-grok-config",
  "xai-grok-config-types",
  "xai-grok-extra-ca",
+ "xai-grok-mcp",
  "xai-grok-sampler",
  "xai-grok-shell",
  "xai-grok-test-support",

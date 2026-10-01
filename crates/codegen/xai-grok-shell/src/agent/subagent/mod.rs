@@ -266,6 +266,7 @@ pub(crate) struct SubagentSpawnContext {
     /// Whether the parent session is non-interactive (headless `-p` / SDK).
     /// Copied onto the child's `StartupHints` so its prompt omits interactive guidance.
     pub parent_non_interactive: bool,
+    pub parent_host_managed_mcp_oauth: bool,
     /// Parent session command channel.
     /// Carries lifecycle notifications the parent persists (`SubagentSpawned` / `SubagentFinished`).
     /// When goal mode is on, it also carries transient `SubagentProgress` ticks the parent consumes for token accounting without persisting.

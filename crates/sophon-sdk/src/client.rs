@@ -34,7 +34,7 @@ pub enum PermissionDecision {
 
 /// Host callbacks for capabilities that require an embedding-side response.
 ///
-/// Product tools use NativeToolHandler; this interface handles permissions only.
+/// Product tools use NativeToolHandler. MCP callbacks fail closed by default.
 #[async_trait::async_trait]
 pub trait ClientHandler: Send + Sync + 'static {
     /// The future is dropped when its requesting turn abandons the permission
@@ -42,5 +42,21 @@ pub trait ClientHandler: Send + Sync + 'static {
     /// host tasks are not cancelled by dropping the callback future.
     async fn request_permission(&self, _request: PermissionRequest) -> PermissionDecision {
         PermissionDecision::Cancel
+    }
+
+    async fn elicit(
+        &self,
+        _request: crate::protocol::ElicitationRequest,
+        _context: crate::protocol::McpCallbackContext,
+    ) -> crate::protocol::ElicitResult {
+        crate::protocol::ElicitResult::Cancel
+    }
+
+    async fn authorize_mcp(
+        &self,
+        _request: crate::protocol::OAuthAuthorizationRequest,
+        _context: crate::protocol::McpCallbackContext,
+    ) -> crate::protocol::OAuthAuthorizationResult {
+        crate::protocol::OAuthAuthorizationResult { opened: false }
     }
 }

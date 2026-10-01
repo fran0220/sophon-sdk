@@ -271,6 +271,8 @@ fn wedged_child_handle() -> (
         code_nav_enabled: false,
         ask_user_question_enabled: true,
         non_interactive: false,
+        mcp_interactive: tokio::sync::watch::channel(true).0,
+        host_managed_mcp_oauth: false,
         plan_mode: std::sync::Arc::new(
             parking_lot::Mutex::new(
                 crate::session::plan_mode::PlanModeTracker::new(PathBuf::from("/tmp")),

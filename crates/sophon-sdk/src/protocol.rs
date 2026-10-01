@@ -116,6 +116,10 @@ pub struct Workspace {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionOptions {
     pub workspace: Workspace,
+    /// Allow host-mediated MCP interactions for this attachment. Defaults to false.
+    #[serde(default)]
+    #[ts(optional)]
+    pub interactive: Option<bool>,
     /// Keep scheduler execution and mutations blocked until native candidate publication.
     /// Set on every create/load/resume requiring a product-owned configuration.
     #[serde(default)]
@@ -331,6 +335,65 @@ pub enum RuntimeEvent {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ElicitationRequest {
+    Form {
+        server_name: String,
+        message: String,
+        #[ts(optional = nullable)]
+        requested_schema: Option<Value>,
+    },
+    Url {
+        server_name: String,
+        message: String,
+        url: String,
+        elicitation_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ElicitResult {
+    Accept {
+        #[ts(optional = nullable)]
+        content: Option<Value>,
+    },
+    Decline,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthAuthorizationRequest {
+    pub server_name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthAuthorizationResult {
+    pub opened: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCallbackContext {
+    pub session_id: String,
+    pub request_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpHostRequest {
+    Elicitation { request: ElicitationRequest },
+    Oauth { request: OAuthAuthorizationRequest },
+}
+
 #[derive(Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CallbackContext {
@@ -420,6 +483,11 @@ pub enum ServerFrame {
     CallbackCancelled {
         id: String,
     },
+    McpCallback {
+        id: String,
+        request: McpHostRequest,
+        context: McpCallbackContext,
+    },
     /// Lossy bounded display channel, independent of ordered Session events.
     BrowserFrame {
         frame: Value,
@@ -439,6 +507,10 @@ pub enum ServerFrame {
     rename_all_fields = "camelCase"
 )]
 pub enum Request {
+    McpAuthenticate {
+        session_id: String,
+        server_name: String,
+    },
     Initialize {
         config: Box<RuntimeConfig>,
     },
@@ -556,6 +628,8 @@ pub fn export_types(path: &std::path::Path) -> Result<(), ts_rs::ExportError> {
         .with_import_extension(Some("js"));
     ClientFrame::export_all(&config)?;
     ServerFrame::export_all(&config)?;
+    ElicitResult::export_all(&config)?;
+    OAuthAuthorizationResult::export_all(&config)?;
     SessionDescriptor::export_all(&config)?;
     HistorySnapshot::export_all(&config)?;
     crate::decisions::DecisionRequest::export_all(&config)?;

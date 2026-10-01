@@ -4684,6 +4684,7 @@ fn probe_ctx<'a>(
         scope: None,
         discovery: McpOauthDiscovery::Network,
         send_grok_agent_id_header: false,
+        host_consent: None,
     }
 }
 

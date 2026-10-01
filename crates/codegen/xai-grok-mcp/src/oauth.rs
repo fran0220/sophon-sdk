@@ -19,6 +19,16 @@ const CREDENTIAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 const BROWSER_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+pub type HostConsentCallback = Arc<
+    dyn Fn(
+            &str,
+            &str,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[cfg(unix)]
 const AUTH_LOCK_WAIT: std::time::Duration =
     BROWSER_AUTH_TIMEOUT.saturating_add(std::time::Duration::from_secs(60));
@@ -64,6 +74,7 @@ pub(crate) async fn authenticate_mcp_server_dedup(
     auth_manager: &Arc<Mutex<AuthorizationManager>>,
     byo_config: Option<&McpOAuthConfig>,
     force: bool,
+    host_consent: Option<&HostConsentCallback>,
 ) -> Result<(), String> {
     let mut in_flight = IN_FLIGHT_AUTH.lock().await;
 
@@ -115,13 +126,35 @@ pub(crate) async fn authenticate_mcp_server_dedup(
 
     #[cfg(unix)]
     let result = if force {
-        run_browser_auth_flow(server_name, server_url, auth_manager, byo_config, None).await
+        run_browser_auth_flow(
+            server_name,
+            server_url,
+            auth_manager,
+            byo_config,
+            None,
+            host_consent,
+        )
+        .await
     } else {
-        authenticate_with_fs_lock(server_name, server_url, auth_manager, byo_config).await
+        authenticate_with_fs_lock(
+            server_name,
+            server_url,
+            auth_manager,
+            byo_config,
+            host_consent,
+        )
+        .await
     };
     #[cfg(not(unix))]
-    let result =
-        run_browser_auth_flow(server_name, server_url, auth_manager, byo_config, None).await;
+    let result = run_browser_auth_flow(
+        server_name,
+        server_url,
+        auth_manager,
+        byo_config,
+        None,
+        host_consent,
+    )
+    .await;
 
     let _ = tx.send(Some(result.clone()));
     let mut in_flight = IN_FLIGHT_AUTH.lock().await;
@@ -141,6 +174,7 @@ async fn authenticate_with_fs_lock(
     server_url: &str,
     auth_manager: &Arc<Mutex<AuthorizationManager>>,
     byo_config: Option<&McpOAuthConfig>,
+    host_consent: Option<&HostConsentCallback>,
 ) -> Result<(), String> {
     let lock_path = auth_lock_path(server_name);
 
@@ -159,8 +193,15 @@ async fn authenticate_with_fs_lock(
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(%e, "Failed to create auth lock file; proceeding without cross-process dedup");
-            return run_browser_auth_flow(server_name, server_url, auth_manager, byo_config, None)
-                .await;
+            return run_browser_auth_flow(
+                server_name,
+                server_url,
+                auth_manager,
+                byo_config,
+                None,
+                host_consent,
+            )
+            .await;
         }
     };
 
@@ -216,6 +257,7 @@ async fn authenticate_with_fs_lock(
         auth_manager,
         byo_config,
         Some(readiness),
+        host_consent,
     )
     .await
 }
@@ -242,6 +284,7 @@ async fn run_browser_auth_flow(
     auth_manager: &Arc<Mutex<AuthorizationManager>>,
     byo_config: Option<&McpOAuthConfig>,
     readiness: Option<OauthReadiness>,
+    host_consent: Option<&HostConsentCallback>,
 ) -> Result<(), String> {
     if try_token_refresh(server_name, auth_manager, readiness).await {
         return Ok(());
@@ -252,7 +295,7 @@ async fn run_browser_auth_flow(
         build_authorization_url(server_name, auth_manager, byo_config, &redirect_uri).await?;
     let token_before_browser = stored_access_token(server_name, server_url).await;
 
-    open_consent_browser(server_name, &auth_url);
+    open_consent(server_name, &auth_url, host_consent).await?;
     await_callback_or_disk_token(
         server_name,
         server_url,
@@ -418,16 +461,28 @@ async fn build_authorization_url(
         .map_err(|e| format!("Failed to get authorization URL: {e}"))
 }
 
-fn open_consent_browser(server_name: &str, auth_url: &str) {
+async fn open_consent(
+    server_name: &str,
+    auth_url: &str,
+    host: Option<&HostConsentCallback>,
+) -> Result<(), String> {
+    if let Some(host) = host {
+        return match host(server_name, auth_url).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("OAuth consent was declined by the host".to_string()),
+            Err(error) => Err(format!("Host OAuth consent request failed: {error}")),
+        };
+    }
     tracing::info!(server = server_name, "Opening browser for OAuth consent");
     if record_consent_url_for_test(auth_url) {
-        return;
+        return Ok(());
     }
     if let Err(e) = webbrowser::open(auth_url) {
         // eprintln! corrupts the TUI alternate screen (in-process, fd 2).
         // TODO: show the auth URL via ACP notification instead
         tracing::warn!(%e, url = %auth_url, "Failed to open browser for MCP OAuth; user must visit URL manually");
     }
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -487,10 +542,16 @@ async fn await_callback_or_disk_token(
         token_before_browser,
     );
     let (callback_server, callback_rx) = start_oauth_callback_server(listener);
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _callback_server = AbortOnDrop(callback_server);
 
     tokio::select! {
         result = callback_rx => {
-            callback_server.abort();
             let callback = result
                 .map_err(|_| "Callback channel dropped".to_string())?
                 .map_err(|e| format!("OAuth callback failed: {e}"))?;
@@ -508,14 +569,12 @@ async fn await_callback_or_disk_token(
             tracing::info!(server = server_name, "MCP OAuth authentication successful");
         }
         _ = poll_store => {
-            callback_server.abort();
             tracing::info!(
                 server = server_name,
                 "Fresh tokens detected on disk from another auth flow; skipping callback wait"
             );
         }
         _ = tokio::time::sleep(BROWSER_AUTH_TIMEOUT) => {
-            callback_server.abort();
             tracing::warn!(
                 server = server_name,
                 timeout_secs = BROWSER_AUTH_TIMEOUT.as_secs(),
@@ -643,6 +702,29 @@ mod tests {
     };
 
     const TEST_ISSUER: &str = "https://auth.example.com";
+
+    #[tokio::test]
+    async fn host_consent_is_exclusive_and_fail_closed() {
+        for response in [Ok(true), Ok(false), Err("host unavailable".to_string())] {
+            let expected = response == Ok(true);
+            let host: HostConsentCallback = Arc::new(move |server, url| {
+                assert_eq!(server, "secure");
+                assert_eq!(url, "https://auth.invalid/authorize?state=123");
+                let response = response.clone();
+                Box::pin(async move { response })
+            });
+            assert_eq!(
+                open_consent(
+                    "secure",
+                    "https://auth.invalid/authorize?state=123",
+                    Some(&host)
+                )
+                .await
+                .is_ok(),
+                expected
+            );
+        }
+    }
 
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -818,7 +900,7 @@ mod tests {
                 .unwrap(),
         ));
 
-        let err = run_browser_auth_flow("fake", &server_url, &mgr, None, None)
+        let err = run_browser_auth_flow("fake", &server_url, &mgr, None, None, None)
             .await
             .expect_err("no registration endpoint: flow must fail before the browser");
         assert_eq!(
@@ -832,7 +914,7 @@ mod tests {
         );
 
         poison_prm.store(true, Ordering::SeqCst);
-        let err = run_browser_auth_flow("fake", &server_url, &mgr, None, None)
+        let err = run_browser_auth_flow("fake", &server_url, &mgr, None, None, None)
             .await
             .expect_err("registration still fails");
         assert!(

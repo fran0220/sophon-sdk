@@ -661,6 +661,9 @@ pub struct StartupHints {
     pub require_config_candidate: bool,
     #[serde(default)]
     pub non_interactive: bool,
+    /// Route MCP OAuth consent URLs to the attached host instead of opening a browser.
+    #[serde(default)]
+    pub host_managed_mcp_oauth: bool,
     /// Leading conversation items to preserve verbatim across compaction (the immutable head).
     /// A fresh subagent's head is its spawn-injected items; a `resume_from` subagent's is just the System head so the resumed body stays compactable.
     #[serde(default)]

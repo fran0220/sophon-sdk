@@ -414,7 +414,7 @@ impl SessionActor {
         mcp.disabled_tools = crate::util::config::get_all_mcp_disabled_tools(cwd);
         let oauth = self.spawn_oauth_config_map(cwd);
         let events = self.events.writer();
-        let spawn_context = crate::session::mcp_servers::McpSpawnCtx::for_session(
+        let mut spawn_context = crate::session::mcp_servers::McpSpawnCtx::for_session(
             self.session_info.id.0.as_ref(),
             &events,
             crate::session::mcp_servers::OauthInteractivity::from_non_interactive(
@@ -422,6 +422,9 @@ impl SessionActor {
             ),
             self.tool_context.process_scope.as_ref(),
         );
+        if self.startup_hints.host_managed_mcp_oauth {
+            spawn_context = spawn_context.with_host_consent(self.host_mcp_oauth_consent());
+        }
         let clients = crate::session::mcp_servers::start_mcp_servers(
             configs,
             Some(cwd),

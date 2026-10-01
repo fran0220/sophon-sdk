@@ -58,6 +58,16 @@ impl Drop for CallbackGuard {
 
 impl Callbacks {
     async fn call(&self, name: String, args: Value, context: p::CallbackContext) -> Result<Value> {
+        self.exchange(|id| p::ServerFrame::Callback {
+            id,
+            name,
+            args,
+            context,
+        })
+        .await
+    }
+
+    async fn exchange(&self, frame: impl FnOnce(String) -> p::ServerFrame + Send) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -67,21 +77,46 @@ impl Callbacks {
             pending: self.pending.clone(),
         };
         self.output
-            .send(
-                p::ServerFrame::Callback {
-                    id,
-                    name,
-                    args,
-                    context,
-                }
-                .into(),
-            )
+            .send(frame(id).into())
             .map_err(|_| Error::RuntimeStopped)?;
         rx.await.map_err(|_| Error::RuntimeStopped)?
     }
 }
 
-impl ClientHandler for Callbacks {}
+#[async_trait::async_trait]
+impl ClientHandler for Callbacks {
+    async fn elicit(
+        &self,
+        request: p::ElicitationRequest,
+        context: p::McpCallbackContext,
+    ) -> p::ElicitResult {
+        self.exchange(|id| p::ServerFrame::McpCallback {
+            id,
+            request: p::McpHostRequest::Elicitation { request },
+            context,
+        })
+        .await
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(p::ElicitResult::Cancel)
+    }
+
+    async fn authorize_mcp(
+        &self,
+        request: p::OAuthAuthorizationRequest,
+        context: p::McpCallbackContext,
+    ) -> p::OAuthAuthorizationResult {
+        self.exchange(|id| p::ServerFrame::McpCallback {
+            id,
+            request: p::McpHostRequest::Oauth { request },
+            context,
+        })
+        .await
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(p::OAuthAuthorizationResult { opened: false })
+    }
+}
 
 struct Runtime {
     agent: Agent,
@@ -217,6 +252,26 @@ impl Runtime {
         use p::Request::*;
         match request {
             Initialize { .. } => Err(Error::Operation("runtime is already initialized".into())),
+            McpAuthenticate {
+                session_id,
+                server_name,
+            } => {
+                let result = self
+                    .session(&session_id)
+                    .await?
+                    .mcp()
+                    .trigger_auth(&server_name)
+                    .await
+                    .map_err(operation)?;
+                if result.status != crate::mcp::AuthOutcome::Authenticated {
+                    return Err(Error::Operation(
+                        result
+                            .error
+                            .unwrap_or_else(|| "MCP authentication did not complete".into()),
+                    ));
+                }
+                Ok(Value::Null)
+            }
             CreateSession { options }
             | LoadSession { id: _, options }
             | ResumeSession { id: _, options } => {
@@ -514,6 +569,7 @@ impl Runtime {
             .chain(options.tools)
             .collect::<Vec<_>>();
         let mut config = SessionConfig::new(&options.workspace.cwd)
+            .interactive(options.interactive.unwrap_or(false))
             .require_config_candidate(options.require_config_candidate.unwrap_or(false));
         if let Some(model) = options.model {
             config = config.model(model);
@@ -1097,6 +1153,74 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_callback_frames_validate_results_and_cancel_on_drop() {
+        let (output, mut outgoing) = mpsc::unbounded_channel();
+        let callbacks = Callbacks {
+            output,
+            pending: Default::default(),
+        };
+        for (reply, expected) in [
+            (
+                json!({"action":"accept","content":{"choice":31}}),
+                json!({"action":"accept","content":{"choice":31}}),
+            ),
+            (json!({"action":"decline"}), json!({"action":"decline"})),
+            (json!({"action":"cancel"}), json!({"action":"cancel"})),
+            (json!({"action":"unknown"}), json!({"action":"cancel"})),
+        ] {
+            let request = p::ElicitationRequest::Form {
+                server_name: "secure".into(),
+                message: "choose".into(),
+                requested_schema: Some(json!({"type":"object"})),
+            };
+            let context = p::McpCallbackContext {
+                session_id: "s1".into(),
+                request_id: "r1".into(),
+            };
+            let result = callbacks.elicit(request, context);
+            let respond = async {
+                let frame = serde_json::to_value(outgoing.recv().await.unwrap().frame).unwrap();
+                assert_eq!(frame["type"], "mcp_callback");
+                assert_eq!(frame["request"]["kind"], "elicitation");
+                assert_eq!(frame["context"]["sessionId"], "s1");
+                callbacks
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .remove(frame["id"].as_str().unwrap())
+                    .unwrap()
+                    .send(Ok(reply))
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(result, respond);
+            assert_eq!(serde_json::to_value(result).unwrap(), expected);
+            assert!(callbacks.pending.lock().unwrap().is_empty());
+        }
+        let mut oauth = Box::pin(callbacks.authorize_mcp(
+            p::OAuthAuthorizationRequest {
+                server_name: "secure".into(),
+                url: "https://auth.invalid".into(),
+            },
+            p::McpCallbackContext {
+                session_id: "s2".into(),
+                request_id: "oauth-2".into(),
+            },
+        ));
+        let frame = tokio::select! {
+            _ = &mut oauth => panic!("must await host"),
+            frame = outgoing.recv() => serde_json::to_value(frame.unwrap().frame).unwrap(),
+        };
+        assert_eq!(frame["request"]["kind"], "oauth");
+        assert_eq!(frame["request"]["request"]["url"], "https://auth.invalid");
+        drop(oauth);
+        assert_eq!(
+            serde_json::to_value(outgoing.recv().await.unwrap().frame).unwrap(),
+            json!({"type":"callback_cancelled","id":frame["id"]})
+        );
+        assert!(callbacks.pending.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn rpc_details_distinguish_sdk_variants_without_messages() {

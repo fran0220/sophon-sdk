@@ -3177,6 +3177,7 @@ pub struct McpClient {
     http_config: Option<HttpConfig>,
     /// BYO OAuth config for the full browser flow fallback (when refresh fails).
     byo_oauth_config: Option<McpOAuthConfig>,
+    pub(crate) host_consent: Option<crate::oauth::HostConsentCallback>,
     /// Rate limit on this server's reconnect warnings; passed to each HTTP transport so rebuilds keep the limit.
     warn_budget: crate::mcp_http_client::WarnBudget,
     /// The transport to rebuild on a dead connection; see [`McpClient::reset_transport`].
@@ -3280,6 +3281,7 @@ impl McpClient {
         observed_token: Option<crate::credentials::ObservedAccessToken>,
         http_config: Option<HttpConfig>,
         byo_oauth_config: Option<McpOAuthConfig>,
+        host_consent: Option<crate::oauth::HostConsentCallback>,
     ) -> Self {
         let reconnect = restorable_transport(&transport);
         let (startup_timeout_sec, tool_timeout_sec, tool_timeouts) =
@@ -3298,6 +3300,7 @@ impl McpClient {
             observed_token,
             http_config,
             byo_oauth_config,
+            host_consent,
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
@@ -3315,6 +3318,7 @@ impl McpClient {
         byo_oauth_config: Option<McpOAuthConfig>,
         overrides: Option<&McpClientTimeoutOverrides>,
         meta_config: Option<&McpServerMetaConfig>,
+        host_consent: Option<crate::oauth::HostConsentCallback>,
     ) -> Self {
         Self::new_with_transport(
             server_name,
@@ -3328,6 +3332,7 @@ impl McpClient {
             Some(observed_token),
             Some(config),
             byo_oauth_config,
+            host_consent,
         )
     }
 
@@ -3470,6 +3475,7 @@ impl McpClient {
                 auth_mgr,
                 self.byo_oauth_config.as_ref(),
                 force,
+                self.host_consent.as_ref(),
             )
             .await
             {
@@ -3580,6 +3586,7 @@ impl McpClient {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -3602,6 +3609,7 @@ impl McpClient {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -3619,6 +3627,7 @@ impl McpClient {
             None,
             None,
             Some(config),
+            None,
             None,
         )
     }
@@ -4809,6 +4818,7 @@ pub struct McpSpawnCtx<'a> {
     pub(crate) scope: Option<&'a ProcessScope>,
     pub(crate) discovery: McpOauthDiscovery,
     send_grok_agent_id_header: bool,
+    host_consent: Option<crate::oauth::HostConsentCallback>,
 }
 
 impl<'a> McpSpawnCtx<'a> {
@@ -4825,6 +4835,7 @@ impl<'a> McpSpawnCtx<'a> {
             scope,
             discovery: McpOauthDiscovery::Disk,
             send_grok_agent_id_header: false,
+            host_consent: None,
         }
     }
 
@@ -4841,12 +4852,19 @@ impl<'a> McpSpawnCtx<'a> {
             scope: None,
             discovery: McpOauthDiscovery::Disk,
             send_grok_agent_id_header: false,
+            host_consent: None,
         }
     }
 
     #[must_use]
     pub fn with_oauth_discovery(mut self, discovery: McpOauthDiscovery) -> Self {
         self.discovery = discovery;
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_consent(mut self, callback: crate::oauth::HostConsentCallback) -> Self {
+        self.host_consent = Some(callback);
         self
     }
 }
@@ -4858,6 +4876,9 @@ pub async fn start_mcp_server(
     byo_config: Option<&McpOAuthConfig>,
     ctx: &McpSpawnCtx<'_>,
 ) -> Result<McpClient, McpError> {
+    let host_oauth =
+        crate::oauth_config::from_acp_server(&mcp_server).map_err(McpError::ClientError)?;
+    let byo_config = host_oauth.as_ref().or(byo_config);
     // No whole-start timer here: `InstrumentationTimer` holds a Chrome-mode span guard that must not cross an await (it is `!Send` and tracing's span stack is per-thread), and this fn awaits on every transport. Durations are carried by the per-transport telemetry events instead.
     match mcp_server {
         acp::McpServer::Stdio(acp::McpServerStdio {
@@ -5022,6 +5043,7 @@ pub async fn start_mcp_server(
                         byo_config.cloned(),
                         overrides,
                         meta_config,
+                        ctx.host_consent.clone(),
                     ))
                 }
                 HttpAuthDecision::NoOauthSupport => Ok(McpClient::new_http(
@@ -5133,6 +5155,7 @@ impl McpClient {
             name.to_string(),
             PendingTransport::Http(HttpConfig::default()),
             Some(&overrides),
+            None,
             None,
             None,
             None,

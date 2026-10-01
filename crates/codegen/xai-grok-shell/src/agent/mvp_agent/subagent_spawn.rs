@@ -325,8 +325,9 @@ impl MvpAgent {
                 .map(|e| e.info.agent_type.clone());
         let parent_non_interactive = parent_handle
             .as_ref()
-            .map(|h| h.non_interactive)
+            .map(|h| !*h.mcp_interactive.borrow())
             .unwrap_or(false);
+        let parent_host_managed_mcp_oauth = parent_handle.as_ref().is_some_and(|h| h.host_managed_mcp_oauth);
         let (gcs_upload_method, gcs_bucket_url) = match self.trace_upload_config_snapshot() {
             Some(method) => {
                 let bucket = match &method {
@@ -441,6 +442,7 @@ impl MvpAgent {
             background_workflows_enabled: self.cfg.borrow().resolve_workflows().value,
             ask_user_question_enabled: false,
             parent_non_interactive,
+            parent_host_managed_mcp_oauth,
             parent_cmd_tx: parent_cmd_tx.clone(),
             spawner_address_target: None,
             parent_session_info: parent_handle.as_ref().map(|h| crate::session::info::Info {

@@ -39,6 +39,7 @@ xai-grok-config = { workspace = true }
 xai-grok-agent = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-extra-ca = { workspace = true }
+xai-grok-mcp = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-shell = { workspace = true }
 xai-grok-tools = { workspace = true }

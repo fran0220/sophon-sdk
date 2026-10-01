@@ -1414,6 +1414,8 @@ pub(crate) async fn spawn_session_actor(
     save_prompt_context(&session_info, &prompt_context);
     let is_subagent_spawn = startup_hints.is_subagent;
     let session_non_interactive = startup_hints.non_interactive;
+    let host_managed_mcp_oauth = startup_hints.host_managed_mcp_oauth;
+    let mcp_interactive = tokio::sync::watch::channel(!session_non_interactive).0;
     install_system_prompt(
         &mut conversation,
         &mut startup_hints.inherited_prefix_len,
@@ -1872,6 +1874,7 @@ pub(crate) async fn spawn_session_actor(
         attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(
             startup_hints.non_interactive,
         )),
+        mcp_interactive: mcp_interactive.clone(),
         startup_hints,
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
@@ -2490,6 +2493,8 @@ pub(crate) async fn spawn_session_actor(
         code_nav_enabled,
         ask_user_question_enabled,
         non_interactive: session_non_interactive,
+        mcp_interactive,
+        host_managed_mcp_oauth,
         plan_mode: plan_mode.clone(),
         force_compact,
         permission_handle: permissions_for_handle,

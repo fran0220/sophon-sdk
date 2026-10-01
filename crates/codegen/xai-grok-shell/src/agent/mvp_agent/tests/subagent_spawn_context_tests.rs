@@ -244,8 +244,11 @@ async fn subagent_spawn_context_copies_parent_non_interactive() {
     let sid_headless = acp::SessionId::new("parent-headless");
     let mut handle_headless = make_test_handle("test-model", false, None);
     handle_headless.non_interactive = true;
+    handle_headless.mcp_interactive.send_replace(false);
+    handle_headless.host_managed_mcp_oauth = true;
     agent.insert_resident(&sid_headless, handle_headless);
     let ctx_headless = agent.build_subagent_spawn_context(sid_headless.0.as_ref());
+    assert!(ctx_headless.parent_host_managed_mcp_oauth);
     assert!(
         ctx_headless.parent_non_interactive,
         "subagent must copy the parent's non_interactive flag (headless -p parent)"

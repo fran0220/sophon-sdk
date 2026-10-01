@@ -285,6 +285,7 @@ async fn create_test_actor(
         mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
         delivery_tools: std::cell::RefCell::new(Vec::new()),
         attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
+        mcp_interactive: tokio::sync::watch::channel(true).0,
         chat_state_handle,
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

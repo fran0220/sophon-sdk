@@ -809,10 +809,12 @@ async fn start_worker(
         permission_policy: config.permission_policy,
         handler: config.client_handler,
         retired,
+        elicitations: Mutex::default(),
     };
     tokio::task::spawn_local(
         AcpGatewayReceiver::<acp::AgentSide, _>::new(gateway_rx, client)
             .with_orphaned_permission_cancel(true)
+            .with_orphaned_extension_cancel(true)
             .with_inline_notifications(true)
             .run(),
     );
@@ -829,7 +831,6 @@ async fn start_worker(
                 )
                 .meta(
                     serde_json::json!({
-                        "startupHints": { "nonInteractive": true },
                         "clientType": "sophon-sdk",
                         "clientVersion": env!("CARGO_PKG_VERSION"),
                     })
@@ -1815,10 +1816,17 @@ fn session_parts(config: SessionConfig) -> Result<SessionParts, Error> {
     let SessionConfig {
         cwd,
         model,
+        interactive,
         require_config_candidate,
         mcp_servers,
     } = config;
     let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "startupHints".into(),
+        serde_json::json!({
+            "nonInteractive": !interactive, "hostManagedMcpOAuth": true
+        }),
+    );
     metadata.insert(
         "x.ai/requireConfigCandidate".into(),
         serde_json::Value::Bool(require_config_candidate),
@@ -1855,8 +1863,38 @@ fn native_mcp_server(server: crate::McpServer) -> Result<acp::McpServer, Error> 
             args,
             env,
         } => serde_json::json!({"name":name,"command":command,"args":args,"env":pairs(env)}),
-        McpServer::Http { name, url, headers } => {
-            serde_json::json!({"type":"http","name":name,"url":url,"headers":pairs(headers)})
+        McpServer::Http {
+            name,
+            url,
+            mut headers,
+            oauth,
+            bearer_token_env_var,
+        } => {
+            if let Some(env) = bearer_token_env_var {
+                if headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(Error::invalid_config(
+                        "MCP bearerTokenEnvVar conflicts with Authorization header",
+                    ));
+                }
+                let token = std::env::var(&env)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::invalid_config(format!(
+                            "MCP bearer token environment variable '{env}' is missing or empty"
+                        ))
+                    })?;
+                headers.insert("Authorization".into(), format!("Bearer {token}"));
+            }
+            let mut value =
+                serde_json::json!({"type":"http","name":name,"url":url,"headers":pairs(headers)});
+            if let Some(oauth) = oauth {
+                value["_meta"] = serde_json::json!({"x.sophon/oauth":oauth});
+            }
+            value
         }
         McpServer::Sse { name, url, headers } => {
             serde_json::json!({"type":"sse","name":name,"url":url,"headers":pairs(headers)})
@@ -2053,6 +2091,25 @@ struct EmbeddedClient {
     permission_policy: PermissionPolicy,
     handler: Option<Arc<dyn ClientHandler>>,
     retired: watch::Receiver<bool>,
+    elicitations: Mutex<std::collections::HashMap<String, PendingElicitation>>,
+}
+
+struct PendingElicitation {
+    session: String,
+    server: String,
+    elicitation: String,
+    _cancel: oneshot::Sender<()>,
+}
+
+struct ElicitationGuard<'a> {
+    pending: &'a Mutex<std::collections::HashMap<String, PendingElicitation>>,
+    id: String,
+}
+
+impl Drop for ElicitationGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2131,8 +2188,96 @@ impl acp::Client for EmbeddedClient {
         Ok(acp::RequestPermissionResponse::new(outcome))
     }
 
-    async fn ext_method(&self, _request: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        Err(acp::Error::method_not_found())
+    async fn ext_method(&self, request: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        use crate::protocol as p;
+        let method = request.method.as_ref();
+        if method != xai_grok_mcp::wire::MCP_ELICIT && method != "x.sophon/mcp/oauth" {
+            return Err(acp::Error::method_not_found());
+        }
+        let payload: Value =
+            serde_json::from_str(request.params.get()).map_err(|_| acp::Error::invalid_params())?;
+        let field = |key: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(acp::Error::invalid_params)
+        };
+        let context = p::McpCallbackContext {
+            session_id: field("sessionId")?,
+            request_id: field(if method == xai_grok_mcp::wire::MCP_ELICIT {
+                "toolCallId"
+            } else {
+                "requestId"
+            })?,
+        };
+        let mut retired = self.retired.clone();
+        let result = if method == xai_grok_mcp::wire::MCP_ELICIT {
+            let request: p::ElicitationRequest = serde_json::from_value(payload.clone())
+                .map_err(|_| acp::Error::invalid_params())?;
+            let (cancel, mut cancelled) = oneshot::channel();
+            let is_url = matches!(&request, p::ElicitationRequest::Url { .. });
+            let id = uuid::Uuid::new_v4().to_string();
+            let _guard = ElicitationGuard {
+                pending: &self.elicitations,
+                id: id.clone(),
+            };
+            if let p::ElicitationRequest::Url {
+                server_name,
+                elicitation_id,
+                ..
+            } = &request
+            {
+                self.elicitations.lock().unwrap().insert(
+                    id,
+                    PendingElicitation {
+                        session: context.session_id.clone(),
+                        server: server_name.clone(),
+                        elicitation: elicitation_id.clone(),
+                        _cancel: cancel,
+                    },
+                );
+            }
+            let response = tokio::select! {
+                biased;
+                _ = retired.wait_for(|value| *value) => p::ElicitResult::Cancel,
+                _ = &mut cancelled, if is_url => p::ElicitResult::Cancel,
+                response = async {
+                    match &self.handler {
+                        Some(handler) => handler.elicit(request, context).await,
+                        None => p::ElicitResult::Cancel,
+                    }
+                } => response,
+            };
+            match response {
+                p::ElicitResult::Accept { content } => {
+                    serde_json::json!({"outcome":"accept","content":content})
+                }
+                p::ElicitResult::Decline => serde_json::json!({"outcome":"decline"}),
+                p::ElicitResult::Cancel => serde_json::json!({"outcome":"cancel"}),
+            }
+        } else {
+            let request = p::OAuthAuthorizationRequest {
+                server_name: field("serverName")?,
+                url: field("url")?,
+            };
+            let response = tokio::select! {
+                biased;
+                _ = retired.wait_for(|value| *value) => p::OAuthAuthorizationResult { opened: false },
+                response = async {
+                    match &self.handler {
+                        Some(handler) => handler.authorize_mcp(request, context).await,
+                        None => p::OAuthAuthorizationResult { opened: false },
+                    }
+                } => response,
+            };
+            serde_json::json!({"opened": response.opened})
+        };
+        Ok(acp::ExtResponse::new(
+            serde_json::value::to_raw_value(&result)
+                .map_err(|_| acp::Error::internal_error())?
+                .into(),
+        ))
     }
 
     async fn session_notification(
@@ -2173,7 +2318,18 @@ impl acp::Client for EmbeddedClient {
             return Ok(());
         }
         let method = notification.method.to_string();
-        let payload = serde_json::from_str(notification.params.get()).unwrap_or_default();
+        let payload: Value = serde_json::from_str(notification.params.get()).unwrap_or_default();
+        if method == xai_grok_mcp::wire::MCP_ELICIT_COMPLETE {
+            self.elicitations.lock().unwrap().retain(|_, pending| {
+                !(payload.get("sessionId").and_then(Value::as_str)
+                    == Some(pending.session.as_str())
+                    && payload.get("serverName").and_then(Value::as_str)
+                        == Some(pending.server.as_str())
+                    && payload.get("elicitationId").and_then(Value::as_str)
+                        == Some(pending.elicitation.as_str()))
+            });
+            return Ok(());
+        }
         if method == "sophon-sdk/history-boundary" {
             if let (Some(id), Some(boundary_id)) = (
                 string_field(&payload, &["sessionId"]),
@@ -2656,6 +2812,7 @@ impl SessionConfig {
         Self {
             cwd: cwd.into(),
             model: None,
+            interactive: false,
             require_config_candidate: false,
             mcp_servers: Vec::new(),
         }
@@ -2663,6 +2820,12 @@ impl SessionConfig {
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Opt into host-mediated MCP OAuth and elicitation for this attachment.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -3036,6 +3199,152 @@ mod tests {
     use super::*;
     use crate::{MediaConfig, MediaProviderConfig, ModelConfig, ProviderConfig};
 
+    struct McpTestHandler;
+
+    #[async_trait::async_trait]
+    impl ClientHandler for McpTestHandler {
+        async fn elicit(
+            &self,
+            request: crate::protocol::ElicitationRequest,
+            context: crate::protocol::McpCallbackContext,
+        ) -> crate::protocol::ElicitResult {
+            assert_eq!(context.session_id, "session-a");
+            match request {
+                crate::protocol::ElicitationRequest::Form {
+                    requested_schema, ..
+                } => {
+                    assert_eq!(requested_schema.unwrap()["type"], "object");
+                    crate::protocol::ElicitResult::Accept {
+                        content: Some(serde_json::json!({"number":17})),
+                    }
+                }
+                crate::protocol::ElicitationRequest::Url { .. } => std::future::pending().await,
+            }
+        }
+
+        async fn authorize_mcp(
+            &self,
+            request: crate::protocol::OAuthAuthorizationRequest,
+            context: crate::protocol::McpCallbackContext,
+        ) -> crate::protocol::OAuthAuthorizationResult {
+            assert_eq!(context.request_id, "oauth-1");
+            assert_eq!(request.url, "https://auth.invalid");
+            crate::protocol::OAuthAuthorizationResult { opened: true }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_reverse_requests_map_results_and_scope_completion() {
+        use acp::Client as _;
+        let (events, _) = broadcast::channel(8);
+        let (management, _) = broadcast::channel(8);
+        let (_lifetime, retired) = watch::channel(false);
+        let mut client = EmbeddedClient {
+            events: events.clone(),
+            management: ManagementEmitter {
+                events: management,
+                ordered_events: events,
+                sequence: Arc::new(AtomicU64::new(0)),
+            },
+            permission_policy: PermissionPolicy::DenyAll,
+            handler: Some(Arc::new(McpTestHandler)),
+            retired,
+            elicitations: Mutex::default(),
+        };
+        let call = |method, payload: Value| {
+            acp::ExtRequest::new(
+                method,
+                serde_json::value::to_raw_value(&payload).unwrap().into(),
+            )
+        };
+        let form = serde_json::json!({"sessionId":"session-a","toolCallId":"elicit-1","serverName":"secure","message":"choose","mode":"form","requestedSchema":{"type":"object"}});
+        let result = client
+            .ext_method(call(xai_grok_mcp::wire::MCP_ELICIT, form.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(result.0.get()).unwrap(),
+            serde_json::json!({"outcome":"accept","content":{"number":17}})
+        );
+        let oauth = serde_json::json!({"sessionId":"session-a","requestId":"oauth-1","serverName":"secure","url":"https://auth.invalid"});
+        let result = client
+            .ext_method(call("x.sophon/mcp/oauth", oauth.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(result.0.get()).unwrap(),
+            serde_json::json!({"opened":true})
+        );
+        {
+            let mut pending = Box::pin(client.ext_method(call(xai_grok_mcp::wire::MCP_ELICIT, serde_json::json!({"sessionId":"session-a","toolCallId":"elicit-2","serverName":"secure","message":"open","mode":"url","url":"https://auth.invalid","elicitationId":"same-id"}))));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                    .await
+                    .is_err()
+            );
+            for session in ["other-session", "session-a"] {
+                client.ext_notification(acp::ExtNotification::new(xai_grok_mcp::wire::MCP_ELICIT_COMPLETE, serde_json::value::to_raw_value(&serde_json::json!({"sessionId":session,"serverName":"secure","elicitationId":"same-id"})).unwrap().into())).await.unwrap();
+                if session == "other-session" {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(result.0.get()).unwrap(),
+                serde_json::json!({"outcome":"cancel"})
+            );
+            assert!(client.elicitations.lock().unwrap().is_empty());
+        }
+        client.handler = None;
+        let result = client
+            .ext_method(call(xai_grok_mcp::wire::MCP_ELICIT, form))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(result.0.get()).unwrap()["outcome"],
+            "cancel"
+        );
+        let result = client
+            .ext_method(call("x.sophon/mcp/oauth", oauth))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(result.0.get()).unwrap()["opened"],
+            false
+        );
+    }
+
+    #[test]
+    fn mcp_attach_policy_and_http_oauth_are_preserved() {
+        for interactive in [false, true] {
+            let (_, _, meta) =
+                session_parts(SessionConfig::new("/workspace").interactive(interactive)).unwrap();
+            assert_eq!(
+                meta["startupHints"],
+                serde_json::json!({"nonInteractive":!interactive,"hostManagedMcpOAuth":true})
+            );
+        }
+        assert!(!SessionConfig::new("/workspace").interactive);
+        let config = serde_json::json!({"transport":"http","name":"secure","url":"https://mcp.invalid","headers":{"X-Host":"retained"},"oauth":{"clientId":"origin","scopes":["read"],"callbackPort":1234}});
+        let native = native_mcp_server(serde_json::from_value(config.clone()).unwrap()).unwrap();
+        let native = serde_json::to_value(native).unwrap();
+        assert_eq!(native["_meta"]["x.sophon/oauth"]["clientId"], "origin");
+        assert_eq!(
+            native["headers"],
+            serde_json::json!([{"name":"X-Host","value":"retained"}])
+        );
+        let mut missing = config;
+        missing["bearerTokenEnvVar"] = Value::String("SOPHON_TEST_MISSING_BEARER_91".into());
+        assert!(native_mcp_server(serde_json::from_value(missing).unwrap()).is_err());
+    }
+
     #[test]
     fn native_error_details_keep_structure_without_remote_text() {
         for (native, expected_code, status, local_code) in [
@@ -3259,6 +3568,7 @@ mod tests {
             permission_policy: PermissionPolicy::DenyAll,
             handler: None,
             retired: watch::channel(false).1,
+            elicitations: Mutex::default(),
         };
         for method in ["x.ai/session_notification", "x.ai/session/update"] {
             let payload = serde_json::json!({
@@ -3366,6 +3676,7 @@ mod tests {
             permission_policy: PermissionPolicy::DenyAll,
             handler: None,
             retired: watch::channel(false).1,
+            elicitations: Mutex::default(),
         };
         let user = serde_json::json!({"sessionId":"s", "_meta":{"eventId":"native-1","isReplay":true}, "update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hidden native text"},"_meta":{"promptIndex":7,"hideFromScrollback":true,"modelId":"model"}}});
         client

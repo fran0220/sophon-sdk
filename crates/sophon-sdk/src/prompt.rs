@@ -20,6 +20,12 @@ pub enum McpServer {
         url: String,
         #[serde(default)]
         headers: BTreeMap<String, String>,
+        #[serde(default)]
+        #[ts(optional = nullable)]
+        oauth: Option<crate::mcp::OAuthConfig>,
+        #[serde(default, rename = "bearerTokenEnvVar")]
+        #[ts(optional = nullable)]
+        bearer_token_env_var: Option<String>,
     },
     Sse {
         name: String,
