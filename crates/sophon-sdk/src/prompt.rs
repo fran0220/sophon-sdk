@@ -48,6 +48,9 @@ pub struct SubagentBrief {
     pub description: String,
     pub instructions: String,
     pub model: Option<String>,
+    /// Omission preserves the registered profile's effort and native defaults.
+    #[ts(optional = nullable)]
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Default)]

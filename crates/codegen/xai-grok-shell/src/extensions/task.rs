@@ -456,6 +456,7 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                 description: req.description,
                 subagent_type: req.subagent_type,
                 parent_prompt_id: None,
+                tool_call_id: None,
                 resume_from: req.resume_from,
                 cwd: req.cwd,
                 runtime_overrides: SubagentRuntimeOverrides {

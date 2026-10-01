@@ -23,6 +23,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::StatefulWidgetRef;
+use xai_grok_tools::types::SessionMode;
 use xai_ratatui_textarea::{ElementId, ElementKind, TextArea, TextAreaState, TextElement};
 
 use crate::app::actions::PermissionLabel;
@@ -180,7 +181,7 @@ pub struct PromptStyle {
     /// Only consulted when `chrome` is true.
     /// Defaults to `true` (the full-TUI boxed prompt); minimal mode sets it `false` for a cleaner, border-less input that still keeps the chrome padding.
     pub show_borders: bool,
-    /// Session title inlined in the top border (right-aligned, 2-cell inset), styled like the bottom info line's model name.
+    /// Session title inlined in the top border, aligned and styled like the bottom info line.
     /// None (default) keeps the plain border. Set only by the agent view.
     pub title: Option<String>,
     /// Paint image-chip overlay into `overlay_area` (default true).
@@ -298,24 +299,31 @@ pub struct PromptFlag<'a> {
     pub bold: bool,
 }
 
-/// Info-line mode flags shared by the chat prompt and the dashboard peek badge: plan label, then permission.
-/// Plan and permission are independent axes, so neither hides the other.
+/// Info-line mode flags shared by the chat prompt and the dashboard peek badge: mode label, then permission.
+/// Mode and permission are independent axes, so neither hides the other.
 pub fn mode_flags<'a>(
-    plan_label: Option<&'a str>,
+    mode_label: Option<&'a str>,
     permission: PermissionLabel,
     theme: &Theme,
 ) -> Vec<PromptFlag<'a>> {
     let mut flags = Vec::new();
-    if let Some(text) = plan_label {
+    if let Some(text) = mode_label {
+        // Ask must stay distinct from the plan-family accent.
+        let color = if text == SessionMode::Ask.as_id() {
+            theme.accent_success
+        } else {
+            theme.accent_plan
+        };
+
         flags.push(PromptFlag {
             text,
-            color: Some(theme.accent_plan),
+            color: Some(color),
             bold: false,
         });
     }
     if permission != PermissionLabel::Ask {
         flags.push(PromptFlag {
-            text: permission.as_canonical(),
+            text: permission.display_name(),
             // Blue `accent_system` reads as "system/automation", distinct from plan
             color: (permission == PermissionLabel::Auto).then_some(theme.accent_system),
             bold: false,
@@ -1009,6 +1017,11 @@ impl PromptWidget {
         self.image_undo_stash.push(image);
     }
 
+    #[cfg(test)]
+    pub(crate) fn image_undo_stash_len(&self) -> usize {
+        self.image_undo_stash.len()
+    }
+
     /// Get the current cursor position (byte offset into text).
     pub fn cursor(&self) -> usize {
         self.textarea.cursor()
@@ -1033,6 +1046,8 @@ impl PromptWidget {
 
     /// Move the current prompt state into a snapshot for later restoration.
     pub fn stash(&mut self) -> StashedPrompt {
+        // Bind orphan placeholders first so the chip snapshot and the drained images agree.
+        self.rebind_image_placeholders();
         let chip_elements = self
             .textarea
             .elements()
@@ -1080,13 +1095,32 @@ impl PromptWidget {
         self.set_images(images);
         self.image_counter = self.image_counter.max(image_counter);
         self.image_undo_stash = image_undo_stash;
+        self.rechip_orphan_image_placeholders();
         self.set_cursor(cursor);
         self.update_file_search_context();
     }
 
-    /// Set the text content. Orphan `PastedImage` records without matching chips can't be reached by
-    /// the user. Callers that restore an in-flight prompt after `set_text` must also restore its chip
-    /// elements and images.
+    /// [`Self::set_text`] for text that is not this draft's: a recalled history line or a rewound
+    /// prompt. Its `[Image #N]` placeholders name images from another send, so the records this
+    /// composer still holds are released first instead of re-binding to a matching number.
+    pub fn set_text_discarding_images(&mut self, text: &str) {
+        crate::prompt_images::drain_and_cleanup(
+            crate::prompt_images::SessionPathPolicy::Preserve,
+            &mut self.images,
+        );
+        crate::prompt_images::drain_and_cleanup(
+            crate::prompt_images::SessionPathPolicy::Preserve,
+            &mut self.image_undo_stash,
+        );
+        crate::prompt_images::reset_counter(&mut self.image_counter);
+        self.set_text(text);
+    }
+
+    /// Set the text content. A non-empty `text` that still names `[Image #N]` placeholders keeps the
+    /// `PastedImage` records, unbound until the next sync, `set_images`, or `stash` re-chips them.
+    /// No re-chip happens here: callers that restore an in-flight prompt follow with
+    /// `restore_chip_elements` and `set_images`, and a re-chip first would bind a stale undo-stash
+    /// record ahead of the restored one.
     pub fn set_text(&mut self, text: &str) {
         self.post_insert_image_preview = None;
         self.hovered_image_element_id = None;
@@ -2382,6 +2416,8 @@ impl PromptWidget {
         use std::collections::HashMap;
         use std::collections::hash_map::Entry;
 
+        self.rechip_orphan_image_placeholders();
+
         let live_image_elements: Vec<(ElementId, std::ops::Range<usize>)> = self
             .textarea
             .elements()
@@ -2420,8 +2456,10 @@ impl PromptWidget {
 
         // Fallback for elements restored by an undo/redo cycle. Keying by `display_number` is safe here
         // because the monotonic counter never recycles numbers within a prompt lifetime.
+        // A same-number duplicate is no redo target but still owns files, so it stays in the stash.
         let mut stash_by_number: HashMap<usize, PastedImage> =
             HashMap::with_capacity(self.image_undo_stash.len());
+        let mut stash_duplicates: Vec<PastedImage> = Vec::new();
         for img in self.image_undo_stash.drain(..) {
             let display_number = img.display_number;
             let element_id = img.element_id;
@@ -2435,8 +2473,9 @@ impl PromptWidget {
                         display_number,
                         element_id = ?element_id,
                         "sync_images_with_textarea: duplicate display_number \
-                         in undo stash — dropping later entry",
+                         in undo stash — kept aside, not a redo target",
                     );
+                    stash_duplicates.push(img);
                 }
             }
         }
@@ -2475,6 +2514,7 @@ impl PromptWidget {
         let mut new_stash: Vec<PastedImage> = stored_by_id
             .into_values()
             .chain(stash_by_number.into_values())
+            .chain(stash_duplicates)
             .collect();
         let stash_cap = Self::IMAGE_CAP * 2;
         if new_stash.len() > stash_cap {
@@ -2574,9 +2614,9 @@ impl PromptWidget {
         self.images.iter().find(|img| img.element_id == id)
     }
 
-    /// Drain all prompt-side images for submission. Reconciles against live `TextArea` elements first
-    /// so deleted chips are never included. Returns the drained images; the prompt-side storage is left
-    /// empty.
+    /// Drain all prompt-side images for submission. Re-binds orphan `[Image #N]` text to the records
+    /// that name it, then reconciles against live `TextArea` elements so deleted chips are never
+    /// included. Returns the drained images; the prompt-side storage is left empty.
     pub fn drain_images(&mut self) -> Vec<PastedImage> {
         self.post_insert_image_preview = None;
         self.reconciled_images();
@@ -2619,8 +2659,10 @@ impl PromptWidget {
         );
     }
 
-    /// Reconcile against live `TextArea` elements, dropping deleted chips before a drain.
+    /// Re-bind orphan placeholders, then reconcile against live `TextArea` elements before a drain,
+    /// dropping the records whose chip text is gone as well.
     pub(crate) fn reconciled_images(&mut self) -> &[PastedImage] {
+        self.rebind_image_placeholders();
         let live_ids: std::collections::HashSet<_> = self
             .textarea
             .elements()
@@ -2628,11 +2670,20 @@ impl PromptWidget {
             .filter(|e| e.kind == KIND_IMAGE)
             .map(|e| e.id)
             .collect();
+        let len_before = self.images.len();
         crate::prompt_images::reconcile(
             crate::prompt_images::SessionPathPolicy::Preserve,
             &mut self.images,
             &live_ids,
         );
+        let removed = len_before - self.images.len();
+        if removed > 0 {
+            tracing::warn!(
+                target: PROMPT_IMAGES_TRACING_TARGET,
+                removed,
+                "prompt_widget: image records without chip text discarded at drain",
+            );
+        }
         &self.images
     }
 
@@ -2712,14 +2763,28 @@ impl PromptWidget {
         // Align with the monotonic contract in `sync_images_with_textarea`: the counter only ever advances upward within a prompt lifetime
         self.image_counter = self.image_counter.max(images_high_water(&images));
         self.images = images;
+        // A record whose stored chip range went stale still binds to the placeholder text that names it.
+        self.rechip_orphan_image_placeholders();
     }
 
     /// Re-register all chip elements (paste blocks, @-file refs, image chips) after a `set_text` restore.
-    /// Uses the byte ranges stored at capture time; no buffer re-scanning.
+    /// Uses the byte ranges stored at capture time; no buffer re-scanning. A range an element of the
+    /// same kind already covers is skipped, so a re-chipped image never gets a second element.
     pub fn restore_chip_elements(&mut self, elems: &[crate::app::agent::ChipElement]) {
+        let covered: Vec<(ElementKind, std::ops::Range<usize>)> = self
+            .textarea
+            .elements()
+            .iter()
+            .map(|e| (e.kind, e.range.clone()))
+            .collect();
         self.textarea.restore_elements(
             elems
                 .iter()
+                .filter(|e| {
+                    !covered.iter().any(|(kind, range)| {
+                        *kind == e.kind && range.start < e.range.end && e.range.start < range.end
+                    })
+                })
                 .map(|e| (e.range.clone(), e.kind, e.display.clone())),
         );
     }
@@ -3000,14 +3065,15 @@ impl PromptWidget {
                 }
             }
 
-            // Caption inlined in the divider, right-aligned ending 2 cells before ╮.
-            // The pad spaces blank the adjacent `─`; corners plus 2-cell insets stay plain border.
+            // Caption inlined in the divider, ending on the same column as the info line below.
+            // The pad spaces blank the adjacent `─`.
             let caption = style
                 .title
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| !t.is_empty());
-            let max_w = area.width.saturating_sub(6);
+            let caption_right = content_area.x + content_area.width;
+            let max_w = caption_right.saturating_sub(area.x + 3);
             if let Some(caption) = caption
                 && max_w >= 6
             {
@@ -3015,7 +3081,7 @@ impl PromptWidget {
                 let trunc = crate::render::line_utils::truncate_str(&label, max_w as usize);
                 let label_w = unicode_width::UnicodeWidthStr::width(trunc.as_str()) as u16;
                 buf.set_string(
-                    area.x + area.width.saturating_sub(3 + label_w),
+                    caption_right.saturating_sub(label_w),
                     div_y,
                     &trunc,
                     Self::chrome_caption_style(bg, &theme, style.focused),
@@ -3168,6 +3234,8 @@ impl PromptWidget {
 
         // Interim STT: muted italic overlay (not in the textarea)
         // Finalized text remains the real, editable draft
+        // While it shows, the caret is drawn after the ghost words, where the final will leave it
+        let mut interim_caret: Option<(u16, u16)> = None;
         let voice_interim_shown = if let Some(v) = voice
             && let Some(interim) = v.interim.filter(|t| !t.trim().is_empty())
             && ta_area.width > 0
@@ -3186,6 +3254,19 @@ impl PromptWidget {
                     wrap_voice_interim(interim, ta_area.width as usize, ta_area.height as usize);
                 for (i, line) in lines.iter().enumerate() {
                     buf.set_string(ta_area.x, ta_area.y + i as u16, line, interim_style);
+                }
+                if let Some(last) = lines.last() {
+                    let end_x =
+                        ta_area.x + unicode_width::UnicodeWidthStr::width(last.as_str()) as u16;
+                    let last_y = ta_area.y + (lines.len() - 1) as u16;
+                    // Mirror the textarea: a full row wraps the caret to the next row, or pins it to the last cell on the last row
+                    interim_caret = Some(if end_x < ta_area.x + ta_area.width {
+                        (end_x, last_y)
+                    } else if last_y + 1 < ta_area.y + ta_area.height {
+                        (ta_area.x, last_y + 1)
+                    } else {
+                        (end_x - 1, last_y)
+                    });
                 }
             } else {
                 // Ghost preview of the interim inserted at the caret, or replacing the active selection.
@@ -3207,7 +3288,7 @@ impl PromptWidget {
                         (std::borrow::Cow::Borrowed(text), cursor, cursor)
                     }
                 };
-                let display = crate::voice::space_voice_fragment(&base, at, interim);
+                let (display, _) = crate::voice::space_voice_fragment(&base, at, interim);
 
                 if let Some((start_x, row_y)) =
                     self.textarea
@@ -3231,6 +3312,11 @@ impl PromptWidget {
                         let ghost_w =
                             unicode_width::UnicodeWidthStr::width(truncated.as_str()) as u16;
                         buf.set_string(start_x, row_y, &truncated, interim_style);
+                        // trim_end: the caret sits before the spacing added for the text that follows
+                        let words_w =
+                            unicode_width::UnicodeWidthStr::width(truncated.trim_end()) as u16;
+                        interim_caret =
+                            Some(((start_x + words_w).min(row_right.saturating_sub(1)), row_y));
                         let mut x = start_x.saturating_add(ghost_w);
                         for cell in saved {
                             if x >= row_right {
@@ -3330,14 +3416,15 @@ impl PromptWidget {
             crate::render::color::recede_area(buf, dim_area, bg, 0.66);
         }
 
-        // Finalized draft stays editable during voice; hide the caret only when the box is empty and interim is standing in for it
-        let hide_caret_for_empty_interim = self.textarea.text().is_empty()
-            && voice.is_some_and(|v| v.interim.is_some_and(|t| !t.trim().is_empty()));
-        let cursor_pos = if style.focused && !hide_caret_for_empty_interim {
-            self.textarea
-                .cursor_pos_with_state(ta_area, self.textarea_state)
-        } else {
+        // Finalized draft stays editable during voice; while interim words show, the caret follows their end
+        let cursor_pos = if !style.focused {
             None
+        } else {
+            // `interim_caret` is only set while the interim shows
+            interim_caret.or_else(|| {
+                self.textarea
+                    .cursor_pos_with_state(ta_area, self.textarea_state)
+            })
         };
 
         // Ghost suffixes (shell completion / predicted prompt)
@@ -3472,11 +3559,20 @@ impl PromptWidget {
             };
             let warning_style = Style::default().fg(fg).bg(bg);
             left_spans.push(Span::styled(warning.to_owned(), warning_style));
-            left_spans.push(Span::styled(" · ", sep_style));
         }
-        left_spans.push(Span::styled(info.model_name, model_style));
+        let mut needs_sep = info.usage_warning.is_some();
+        if !info.model_name.is_empty() {
+            if needs_sep {
+                left_spans.push(Span::styled(" · ", sep_style));
+            }
+            left_spans.push(Span::styled(info.model_name, model_style));
+            needs_sep = true;
+        }
         for flag in info.flags {
-            left_spans.push(Span::styled(" · ", sep_style));
+            if needs_sep {
+                left_spans.push(Span::styled(" · ", sep_style));
+            }
+            needs_sep = true;
             let mut style = if let Some(color) = flag.color {
                 if flag.bold {
                     // Bold flags use full color for visibility.
@@ -3755,6 +3851,8 @@ fn paste_chip_display_bytes(byte_len: usize) -> Line<'static> {
 fn images_high_water(images: &[PastedImage]) -> usize {
     images.iter().map(|i| i.display_number).max().unwrap_or(0)
 }
+
+mod image_state;
 
 #[cfg(test)]
 mod tests;

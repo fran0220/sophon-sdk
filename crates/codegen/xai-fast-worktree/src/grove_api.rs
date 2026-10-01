@@ -83,11 +83,14 @@ pub struct DetachReply {
     pub phase: String,
     pub same_device: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SalvageReply {
     pub virtual_remaining: Vec<String>,
     pub gitdir_copied: bool,
+    /// Steps after the copy that failed; the copy stands.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +157,15 @@ impl NfsStatusView {
         self.sole_mount()?
             .get("nfs_transport")
             .and_then(|v| v.as_str())
+    }
+    /// Kernel dest (`MountStatus.mountpoint`). Backing `worktree` / `git_dir` / `store_id` are not dests.
+    #[must_use]
+    pub fn slug_root(&self) -> Option<std::path::PathBuf> {
+        self.sole_mount()?
+            .get("mountpoint")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
     }
 }
 #[derive(Debug, Clone)]
@@ -387,5 +399,33 @@ mod tests {
         assert!(fork.keeps_grove_create());
         assert!(!fork.is_linked_local_view());
         assert!(!view(serde_json::json!({"mounts":[{"kind":"store"}]})).keeps_grove_create());
+    }
+    #[test]
+    fn slug_root_is_kernel_mountpoint_not_backing() {
+        assert_eq!(
+            view(serde_json::json!({
+                "mounts":[{
+                    "mountpoint": "/mnt/grove/acme",
+                    "worktree": "/var/grove/store/abc/worktree",
+                    "git_dir": "/var/grove/store/abc/git",
+                    "store_id": "abc"
+                }]
+            }))
+            .slug_root()
+            .as_deref(),
+            Some(std::path::Path::new("/mnt/grove/acme"))
+        );
+        assert_eq!(
+            view(serde_json::json!({
+                "mounts":[{
+                    "worktree": "/var/grove/store/abc/worktree",
+                    "git_dir": "/var/grove/store/abc/git",
+                    "store_id": "abc"
+                }]
+            }))
+            .slug_root(),
+            None
+        );
+        assert_eq!(view(serde_json::json!({"mounts":[{}]})).slug_root(), None);
     }
 }

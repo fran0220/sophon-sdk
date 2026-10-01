@@ -4,6 +4,9 @@ use crate::session::storage::StorageAdapter;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_tools::implementations::grok_build::task::types::{
+    HandedOffForegroundSubagent, SubagentEvent, SubagentHandOffForegroundRequest,
+};
 #[derive(Debug)]
 struct DummyTerminal;
 #[async_trait::async_trait]
@@ -84,6 +87,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
             );
             let actor = Arc::new(SessionActor {
                 explicit_system_prompt: Default::default(),
+                vcs_root: None,
                 repo_status_prefetch:
                     crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 transient_retry_enabled: true,
@@ -146,20 +150,14 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
-                },
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -263,7 +261,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -290,7 +288,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -628,6 +625,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
                 explicit_system_prompt: Default::default(),
+                vcs_root: None,
                 repo_status_prefetch:
                     crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 transient_retry_enabled: true,
@@ -690,20 +688,14 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
-                },
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: Some(crate::config::MemoryMode::Legacy),
                     v2_config: Default::default(),
@@ -810,7 +802,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -837,7 +829,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -974,6 +965,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 .await;
             let actor = SessionActor {
                 explicit_system_prompt: Default::default(),
+                vcs_root: None,
                 repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
@@ -1029,22 +1021,13 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(
-                        std::sync::atomic::AtomicBool::new(false),
-                    ),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+                    enabled: false,
+                    tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                    delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
                 },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -1163,7 +1146,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
@@ -1194,7 +1177,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -2543,6 +2525,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 .await;
             let actor = SessionActor {
                 explicit_system_prompt: Default::default(),
+                vcs_root: None,
                 repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
@@ -2598,22 +2581,13 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(
-                        std::sync::atomic::AtomicBool::new(false),
-                    ),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+                    enabled: false,
+                    tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                    delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
                 },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -2732,7 +2706,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
@@ -2763,7 +2737,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,

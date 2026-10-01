@@ -308,8 +308,8 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
   config.models[0].provider = { protocol: 'openai_chat', baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'local-fixture', model: 'main-wire', headers: {}, queryParams: {} }
-  config.models.push({ ...config.models[0], id: 'distillation', provider: { ...config.models[0].provider, model: 'distill-wire' } })
-  config.subagents[0] = { name: 'refiner', description: 'Product-owned fixed refiner', instructions: 'BASELINE_REFINEMENT_73. Return the requested refinement.', model: 'distillation', tools: [] }
+  config.models.push({ ...config.models[0], id: 'distillation', supportedReasoning: ['medium', 'high'], provider: { ...config.models[0].provider, model: 'distill-wire' } })
+  config.subagents[0] = { name: 'refiner', description: 'Product-owned fixed refiner', instructions: 'BASELINE_REFINEMENT_73. Return the requested refinement.', model: 'distillation', reasoningEffort: 'high', tools: [] }
   const agent = await Agent.spawn({ executable, config, env, onToolCall: () => { throw new Error('No tools allowed') } })
   t.after(() => agent.finalExit().catch(() => {}))
   const session = await agent.createSession({ workspace: { id: 'refiner-before-parent', cwd }, model: 'runtime-test', mcpServers: [], tools: [{ name: 'product_echo', description: 'Must not inherit into refiner', inputSchema: { type: 'object', properties: {} } }] })
@@ -320,6 +320,7 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
   assert.ok(refinement, 'actual inference must receive the fixed baseline')
   assert.equal(refinement.model, 'distill-wire', JSON.stringify(requests.map(request => ({ model: request.model, tools: request.tools?.length ?? 0, baseline: JSON.stringify(request.messages).includes('BASELINE_REFINEMENT_73') }))))
   assert.match(JSON.stringify(refinement.messages), /EVIDENCE_29/)
+  assert.equal(refinement.reasoning_effort, 'high', 'profile effort must reach the actual provider')
   assert.equal(refinement.tools?.length ?? 0, 0)
   const count = requests.length
   for (const model of ['missing-route', 'distill-wire']) {
@@ -328,6 +329,22 @@ test('fixed no-tools refiner runs before any parent prompt against its explicit 
     assert.match(refused.error ?? refused.output, /registered catalog/)
     assert.equal(requests.length, count, 'unpublished IDs and wire aliases must not fall back to primary')
   }
+  const brief = { name: 'refiner', description: 'Brief refiner', instructions: 'BRIEF_REFINEMENT_41', model: 'distillation' }
+  const mount = (revision, fields) => session.prompt({
+    turnId: revision, blocks: [{ type: 'text', text: 'Acknowledge the configuration.' }],
+    configCandidate: { ...candidate(revision, 'runtime-test'), subagentBriefs: [{ ...brief, ...fields }] },
+  })
+  for (const reasoningEffort of ['none', 'minimal', 'low', 'max']) {
+    await assert.rejects(mount(`invalid-brief-${reasoningEffort}`, { reasoningEffort }), error => error.code === 'invalid_config')
+    assert.equal(requests.length, count, 'rejected brief must not infer or publish')
+  }
+  await mount('medium-brief', { reasoningEffort: 'medium' })
+  const medium = await session.subagents.start({ id: await session.subagents.newId(), prompt: 'MEDIUM_CHILD_41', description: 'brief effort', subagentType: 'refiner', cwd: null, model: 'distillation' })
+  assert.equal(medium.state, 'completed', medium.error ?? medium.output)
+  assert.equal(requests.find(request => JSON.stringify(request.messages).includes('MEDIUM_CHILD_41')).reasoning_effort, 'medium')
+  const beforeRebind = requests.length
+  await assert.rejects(mount('unsupported-rebind', { model: 'runtime-test' }), error => error.code === 'invalid_config')
+  assert.equal(requests.length, beforeRebind, 'preserved profile effort must be validated on model rebinding')
   await agent.finalExit()
 })
 

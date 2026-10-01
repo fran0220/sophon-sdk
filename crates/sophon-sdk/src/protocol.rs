@@ -83,7 +83,12 @@ pub struct BrowserConfig {
 
 /// Where the Runtime's Chromium comes from.
 #[derive(Clone, Serialize, Deserialize, TS)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum BrowserSource {
     /// Launch a dedicated Chromium.
     Launch {

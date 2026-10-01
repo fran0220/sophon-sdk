@@ -32,13 +32,26 @@ fn candidate_error(message: impl Into<String>) -> acp::Error {
     }))
 }
 
+fn candidate_effort_error(message: impl Into<String>) -> acp::Error {
+    acp::Error::invalid_params().data(serde_json::json!({
+        "code": "config_candidate_effort_invalid", "message": message.into(),
+    }))
+}
+
 impl SessionActor {
-    pub(super) async fn seal_inherited_config(&self, mounted: MountedConfig) -> Result<crate::session::commands::SubagentParentSnapshot, acp::Error> {
+    pub(super) async fn seal_inherited_config(
+        &self,
+        mounted: MountedConfig,
+    ) -> Result<crate::session::commands::SubagentParentSnapshot, acp::Error> {
         if !self.startup_hints.is_subagent {
-            return Err(candidate_error("only a native child can inherit a mounted configuration"));
+            return Err(candidate_error(
+                "only a native child can inherit a mounted configuration",
+            ));
         }
         let generation = self.candidate_admission.generation();
-        let cancelled = self.candidate_admission.begin(generation)
+        let cancelled = self
+            .candidate_admission
+            .begin(generation)
             .ok_or_else(|| candidate_error("child admission closed"))?;
         let ready = tokio::select! {
             biased;
@@ -58,7 +71,9 @@ impl SessionActor {
                 skills.set_baseline_frozen(true);
             }
         }) {
-            return Err(candidate_error("child configuration already sealed or closed"));
+            return Err(candidate_error(
+                "child configuration already sealed or closed",
+            ));
         }
         drop(resources);
         drop(mcp);
@@ -78,7 +93,10 @@ impl SessionActor {
         crate::session::commands::SubagentParentSnapshot {
             mounted: self.candidate_admission.mounted(),
             toolset: bridge.toolset(),
-            tool_definitions: self.turn_base_tool_specs(&definitions),
+            tool_definitions: crate::session::commands::ForkedToolSnapshot {
+                specs: self.turn_base_tool_specs(&definitions),
+                task_model_selection: self.rebuild_spec.task_model_selection.get(),
+            },
             mcp_pool: if mcp.owned_clients.is_empty() && mcp.shared_clients.is_empty() {
                 None
             } else {
@@ -99,7 +117,9 @@ impl SessionActor {
         if self.candidate_admission.required() && !mounted {
             match command {
                 SessionCommand::Prompt { respond_to, .. } => {
-                    let _ = respond_to.send(Err(candidate_error("session requires a configuration candidate before execution")));
+                    let _ = respond_to.send(Err(candidate_error(
+                        "session requires a configuration candidate before execution",
+                    )));
                     return None;
                 }
                 // Dropping the reply rejects child admission at its existing
@@ -128,18 +148,22 @@ impl SessionActor {
                     return None;
                 }
                 SessionCommand::SetClientHooks { hooks } if mounted => {
-                    self.candidate_admission.defer_client_hooks_if_mounted(hooks);
+                    self.candidate_admission
+                        .defer_client_hooks_if_mounted(hooks);
                     return None;
                 }
                 SessionCommand::McpAuthTrigger { respond_to, .. } => {
-                    let _ = respond_to.send(Err("MCP authentication changes require a new configuration candidate".into()));
+                    let _ = respond_to.send(Err(
+                        "MCP authentication changes require a new configuration candidate".into(),
+                    ));
                     return None;
                 }
                 SessionCommand::RetryAuthRequiredServers { .. } => return None,
                 SessionCommand::HooksAction { respond_to, .. } => {
                     let _ = respond_to.send(xai_hooks_plugins_types::ActionOutcome {
                         status: xai_hooks_plugins_types::OutcomeStatus::ValidationError,
-                        message: "Mounted hooks can only change through a configuration candidate".into(),
+                        message: "Mounted hooks can only change through a configuration candidate"
+                            .into(),
                         requires_reload: false,
                         requires_restart: false,
                     });
@@ -171,7 +195,8 @@ impl SessionActor {
         // ticket: a request parked before cancel cannot re-enter the FIFO.
         if self.candidate_admission.generation() != generation {
             if let SessionCommand::Prompt { respond_to, .. } = prompt {
-                let _ = respond_to.send(Err(candidate_error("candidate superseded by cancellation")));
+                let _ =
+                    respond_to.send(Err(candidate_error("candidate superseded by cancellation")));
             }
             return None;
         }
@@ -232,7 +257,8 @@ impl SessionActor {
         let (plugin_revision, plugin_registry) = self
             .candidate_admission
             .plugins_for_preparation(self.plugin_registry.borrow().clone());
-        let client_hooks = self.candidate_admission
+        let client_hooks = self
+            .candidate_admission
             .client_hooks_for_preparation(self.client_hooks.borrow().clone());
         let (model, sampling, auth_type) = self
             .models_manager
@@ -243,9 +269,12 @@ impl SessionActor {
             ));
         }
         let mut config = self.models_manager.native_config_snapshot();
-        let auto_compact_threshold_percent = crate::util::config::resolve_auto_compact_threshold_percent(
-            &config, &candidate.model, Some(model.info()),
-        );
+        let auto_compact_threshold_percent =
+            crate::util::config::resolve_auto_compact_threshold_percent(
+                &config,
+                &candidate.model,
+                Some(model.info()),
+            );
         let mut seen = std::collections::HashSet::new();
         for brief in &candidate.subagent_briefs {
             if !seen.insert(&brief.name) {
@@ -262,9 +291,43 @@ impl SessionActor {
                         brief.name
                     ))
                 })?;
+            let effective_effort = crate::session::config_candidate::effective_brief_effort(
+                brief.reasoning_effort,
+                definition.effort,
+            )
+            .map_err(|()| {
+                candidate_effort_error("subagent effort must be low, medium, high, xhigh, or max")
+            })?;
+            let effort = effective_effort.map(|effort| match effort {
+                xai_grok_agent::config::Effort::Low => "low",
+                xai_grok_agent::config::Effort::Medium => "medium",
+                xai_grok_agent::config::Effort::High => "high",
+                xai_grok_agent::config::Effort::XHigh => "xhigh",
+                xai_grok_agent::config::Effort::Max => "max",
+            });
+            if brief.model.is_some() || effective_effort.is_some() {
+                let bound_model =
+                    brief
+                        .model
+                        .as_deref()
+                        .unwrap_or_else(|| match &definition.model {
+                            xai_grok_agent::config::ModelOverride::Override(model) => model,
+                            xai_grok_agent::config::ModelOverride::Inherit => &candidate.model,
+                        });
+                let prepared = self
+                    .models_manager
+                    .prepare_published_model(bound_model, effort);
+                if effective_effort.is_some() {
+                    prepared.map_err(|error| candidate_effort_error(error.to_string()))?;
+                } else {
+                    prepared?;
+                }
+            }
             if let Some(model) = &brief.model {
-                self.models_manager.prepare_published_model(model, None)?;
                 definition.model = xai_grok_agent::config::ModelOverride::Override(model.clone());
+            }
+            if brief.reasoning_effort.is_some() {
+                definition.effort = effective_effort;
             }
             definition.description = brief.description.clone();
             definition.prompt_body = Some(brief.instructions.clone());
@@ -298,14 +361,17 @@ impl SessionActor {
             false,
         );
         let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok();
+        let (hook_inputs, disabled_hooks) = crate::util::hooks::session_hook_inputs();
         let (native_hooks, hook_errors) = crate::util::hooks::discover_hooks(
-            git_root.as_deref(), &self.rebuild_spec.compat, project_trusted,
+            &hook_inputs,
+            git_root.as_deref(),
+            &self.rebuild_spec.compat,
+            xai_grok_hooks::trust::Trust::from_verdict(project_trusted),
         );
-        let (hook_registry, _) = self.prepare_plugin_hook_registry(
-            plugin_registry.as_deref(), Some(Arc::new(native_hooks)),
-        );
+        let (hook_registry, _) = self
+            .prepare_plugin_hook_registry(plugin_registry.as_deref(), Some(Arc::new(native_hooks)));
         let hook_load_errors = hook_errors.iter().map(ToString::to_string).collect();
-        let hook_disabled = Arc::new(xai_grok_hooks::trust::DisabledHooks::load());
+        let hook_disabled = Arc::new(disabled_hooks);
         let mut baseline = xai_grok_agent::prompt::skills::list_skills_with_plugins(
             Some(&self.session_info.cwd),
             &config.skills,
@@ -340,10 +406,7 @@ impl SessionActor {
         );
         let (mcp_generation, meta) = {
             let live = self.mcp_state.lock().await;
-            (
-                live.current_generation(),
-                live.meta_config_map.clone(),
-            )
+            (live.current_generation(), live.meta_config_map.clone())
         };
         let mut mcp = McpState::new_with_meta(configs.clone(), meta.clone());
         // A mounted baseline stays frozen; the next candidate reads fresh
@@ -479,10 +542,11 @@ impl SessionActor {
         {
             return Err(candidate_error("candidate superseded during preparation"));
         }
-        let (current_model, current_sampling, current_auth_type) = self.models_manager.prepare_published_model(
-            &prepared.mounted.candidate.model,
-            prepared.mounted.candidate.reasoning_effort.as_deref(),
-        )?;
+        let (current_model, current_sampling, current_auth_type) =
+            self.models_manager.prepare_published_model(
+                &prepared.mounted.candidate.model,
+                prepared.mounted.candidate.reasoning_effort.as_deref(),
+            )?;
         if serde_json::to_value(current_model).ok() != serde_json::to_value(&prepared.model).ok()
             || current_sampling.api_key != prepared.sampling.api_key
             || current_auth_type != prepared.auth_type
@@ -501,7 +565,9 @@ impl SessionActor {
             .ok_or_else(|| candidate_error("chat state unavailable"))?;
         let old_credentials = self.chat_state_handle.get_credentials().await;
         let sampling = prepared.sampling.clone();
-        let context_window = self.compaction.context_window_override
+        let context_window = self
+            .compaction
+            .context_window_override
             .or_else(|| std::num::NonZeroU64::new(sampling.context_window))
             .ok_or_else(|| candidate_error("candidate has invalid context window"))?;
         let chat_sampling = xai_grok_sampling_types::SamplingConfig {
@@ -522,6 +588,7 @@ impl SessionActor {
             reasoning_effort: sampling.reasoning_effort,
             reasoning_summary: sampling.reasoning_summary,
             stream_tool_calls: Some(sampling.stream_tool_calls),
+            max_request_bytes: sampling.max_request_bytes,
         };
         let credentials = xai_chat_state::Credentials {
             api_key: sampling.api_key.clone(),
@@ -627,14 +694,22 @@ impl SessionActor {
         self.compactions_remaining
             .set(sampling.compactions_remaining);
         self.compaction_at_tokens.set(sampling.compaction_at_tokens);
-        self.compaction.threshold_percent.set(auto_compact_threshold_percent);
+        self.compaction
+            .threshold_percent
+            .set(auto_compact_threshold_percent);
         self.invalidate_model_auth_memo();
         self.signals_handle().record_model_usage(&sampling.model);
-        let _ = self.notifications.persistence_tx.send(PersistenceMsg::CurrentModel {
-            model_id,
-            agent_name: Some(self.agent.borrow().definition().name.clone()),
-            reasoning_effort: Some(sampling.reasoning_effort),
-        });
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::CurrentModel {
+                model_id,
+                agent: crate::session::persistence::PersistedAgent::Named(
+                    self.agent.borrow().definition().name.clone(),
+                ),
+                reasoning_effort: Some(sampling.reasoning_effort),
+                context_window: Some(Some(context_window)),
+            });
         self.apply_skill_update_effects(skill_effects).await;
         let version = self.tool_context.config_clock.bump();
         self.broadcast_effective_config_changed(version);

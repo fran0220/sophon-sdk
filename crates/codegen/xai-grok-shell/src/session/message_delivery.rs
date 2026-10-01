@@ -46,25 +46,28 @@ pub(crate) struct HumanPromptContent {
 
 impl HumanPromptContent {
     fn into_command(self, prompt_id: String) -> SessionCommand {
-        super::config_candidate::wrap_prompt(SessionCommand::Prompt {
-            prompt_id,
-            prompt_blocks: self.prompt_blocks,
-            prompt_mode: self.prompt_mode,
-            artifact_upload_ctx: self.artifact_upload_ctx,
-            client_identifier: self.client_identifier,
-            screen_mode: self.screen_mode,
-            verbatim: self.verbatim,
-            traceparent: self.traceparent,
-            json_schema: self.json_schema,
-            send_now: false,
-            admission: None,
-            agent_admission: None,
-            tool_overrides_update: self.tool_overrides_update,
-            respond_to: self.respond_to,
-            prompt_admitted: None,
-            persist_ack: None,
-            parsed_prompt_tx: self.parsed_prompt_tx,
-        }, self.config_candidate)
+        super::config_candidate::wrap_prompt(
+            SessionCommand::Prompt {
+                prompt_id,
+                prompt_blocks: self.prompt_blocks,
+                prompt_mode: self.prompt_mode,
+                artifact_upload_ctx: self.artifact_upload_ctx,
+                client_identifier: self.client_identifier,
+                screen_mode: self.screen_mode,
+                verbatim: self.verbatim,
+                traceparent: self.traceparent,
+                json_schema: self.json_schema,
+                send_now: false,
+                admission: None,
+                agent_admission: None,
+                tool_overrides_update: self.tool_overrides_update,
+                respond_to: self.respond_to,
+                prompt_admitted: None,
+                persist_ack: None,
+                parsed_prompt_tx: self.parsed_prompt_tx,
+            },
+            self.config_candidate,
+        )
     }
 }
 

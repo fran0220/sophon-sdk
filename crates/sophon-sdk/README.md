@@ -9,10 +9,11 @@ official xAI SDK.
 Current source identity:
 
 - SDK facade version: **0.6.0** (Memory V2 configuration upgrade)
-- public product source baseline: 1.0.35
-- public Grok Build commit: `a28ee2b2063426e8816e380ccea528b9de95e5da`
-- public crate metadata: 1.0.35
-- embedded monorepo revision: `e8563f8f182296ebb53cadb3e1eab7615d76408e`
+- TypeScript package version: **0.8.0-alpha.1**
+- public product source baseline: 1.0.45
+- public Grok Build commit: `2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`
+- public crate metadata: 1.0.45
+- embedded monorepo revision: `559751fdcec02d413e4c57c8832ab275e4f44980`
 
 ## Use it
 

@@ -1672,6 +1672,7 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
         ).map_err(|error| Error::invalid_config(error.to_string()))?;
         definition.prompt_mode = xai_grok_agent::config::PromptMode::Full;
         definition.prompt_body = Some(profile.instructions.clone());
+        definition.effort = native_agent_effort(profile.reasoning_effort)?;
         definition.session_tools_allowlist = profile.tools.clone();
         if profile.tools.as_ref().is_some_and(Vec::is_empty) {
             definition.discover_skills = false;
@@ -1782,6 +1783,26 @@ fn grok_config(config: &AgentConfig) -> Result<(GrokConfig, IndexMap<String, Mod
         .collect();
     grok.registered_models = Some(models.clone());
     Ok((grok, models))
+}
+
+fn native_agent_effort(
+    effort: Option<crate::ReasoningEffort>,
+) -> Result<Option<xai_grok_agent::config::Effort>, Error> {
+    use crate::ReasoningEffort;
+    use xai_grok_agent::config::Effort;
+
+    effort
+        .map(|effort| match effort {
+            ReasoningEffort::None | ReasoningEffort::Minimal => Err(Error::invalid_config(
+                "subagent effort must be low, medium, high, xhigh, or max",
+            )),
+            ReasoningEffort::Low => Ok(Effort::Low),
+            ReasoningEffort::Medium => Ok(Effort::Medium),
+            ReasoningEffort::High => Ok(Effort::High),
+            ReasoningEffort::Xhigh => Ok(Effort::XHigh),
+            ReasoningEffort::Max => Ok(Effort::Max),
+        })
+        .transpose()
 }
 
 type SessionParts = (
@@ -1964,6 +1985,13 @@ fn acp_error(error: acp::Error) -> Error {
         };
     }
     let data = error.data.as_ref();
+    if data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        == Some("config_candidate_effort_invalid")
+    {
+        return Error::invalid_config("subagent effort is unsupported by its bound model");
+    }
     let native_code = match data
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
@@ -3421,6 +3449,7 @@ mod tests {
             description: "Fixed registered profile".into(),
             instructions: "BASELINE_73".into(),
             model: Some("default".into()),
+            reasoning_effort: None,
             tools: Some(Vec::new()),
         });
         let (grok, _) = grok_config(&config).expect("registered configuration");
@@ -3430,6 +3459,91 @@ mod tests {
         assert_eq!(profile.name, "general-purpose");
         assert_eq!(profile.prompt_body.as_deref(), Some("BASELINE_73"));
         assert_eq!(profile.session_tools_allowlist, Some(Vec::new()));
+    }
+
+    #[test]
+    fn subagent_effort_maps_to_the_native_field() {
+        use crate::ReasoningEffort;
+        use xai_grok_agent::config::Effort;
+
+        for (sdk, native) in [
+            (ReasoningEffort::Low, Effort::Low),
+            (ReasoningEffort::Medium, Effort::Medium),
+            (ReasoningEffort::High, Effort::High),
+            (ReasoningEffort::Xhigh, Effort::XHigh),
+            (ReasoningEffort::Max, Effort::Max),
+        ] {
+            assert_eq!(native_agent_effort(Some(sdk)).unwrap(), Some(native));
+        }
+        assert_eq!(native_agent_effort(None).unwrap(), None);
+        assert!(native_agent_effort(Some(ReasoningEffort::None)).is_err());
+        assert!(native_agent_effort(Some(ReasoningEffort::Minimal)).is_err());
+    }
+
+    #[test]
+    fn subagent_effort_requires_model_support() {
+        let mut config = config();
+        config.subagents.push(crate::config::SubagentDefinition {
+            name: "worker".into(),
+            description: "worker".into(),
+            instructions: "work".into(),
+            model: Some("default".into()),
+            reasoning_effort: Some(crate::ReasoningEffort::High),
+            tools: None,
+        });
+        assert!(config.validate().is_err());
+        config.models[0].supported_reasoning = vec![crate::ReasoningEffort::High];
+        config.validate().unwrap();
+        let (grok, _) = grok_config(&config).unwrap();
+        assert_eq!(
+            grok.registered_subagents[0].effort,
+            Some(xai_grok_agent::config::Effort::High)
+        );
+    }
+
+    #[test]
+    fn brief_effort_is_camel_case_and_optional() {
+        let brief: crate::SubagentBrief = serde_json::from_value(serde_json::json!({
+            "name": "worker", "description": "worker", "instructions": "work",
+            "model": "default", "reasoningEffort": "xhigh"
+        }))
+        .unwrap();
+        assert_eq!(brief.reasoning_effort, Some(crate::ReasoningEffort::Xhigh));
+        let value = serde_json::to_value(brief).unwrap();
+        assert_eq!(value["reasoningEffort"], "xhigh");
+        let omitted: crate::SubagentBrief = serde_json::from_value(serde_json::json!({
+            "name": "worker", "description": "worker", "instructions": "work", "model": null
+        }))
+        .unwrap();
+        assert_eq!(omitted.reasoning_effort, None);
+    }
+
+    #[test]
+    fn candidate_brief_effort_is_emitted_and_native_rejections_are_invalid_config() {
+        let candidate: crate::ConfigCandidate = serde_json::from_value(serde_json::json!({
+            "revision": "effort", "instructions": "work", "skillDirectories": [],
+            "externalMcpServers": [], "model": "default", "reasoningEffort": null,
+            "subagentBriefs": [{
+                "name": "worker", "description": "worker", "instructions": "work",
+                "model": "default", "reasoningEffort": "high"
+            }]
+        }))
+        .unwrap();
+        let metadata = prompt_metadata(crate::PromptOptions {
+            config_candidate: Some(candidate),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            metadata["x.sophon/configCandidate"]["subagentBriefs"][0]["reasoningEffort"],
+            "high"
+        );
+
+        let error = acp::Error::invalid_params().data(serde_json::json!({
+            "code": "config_candidate_effort_invalid",
+            "message": "native detail"
+        }));
+        assert!(matches!(acp_error(error), Error::InvalidConfig(_)));
     }
 
     #[test]

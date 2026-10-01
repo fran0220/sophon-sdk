@@ -146,7 +146,7 @@ async fn test_agent_from_config(
     use xai_grok_tools::computer::types::AsyncFileSystem;
     use xai_grok_tools::notification::ToolNotificationHandle;
     use xai_grok_tools::registry::types::SessionContext;
-    let builder = crate::tools::bridge::ToolBridge::get_builder();
+    let builder = crate::tools::bridge::ToolBridge::get_builder().with_mcp_file_input_preparation();
     let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
     let ctx = SessionContext {
         backend,
@@ -336,6 +336,7 @@ async fn create_test_actor_inner(
     let actor = SessionActor {
         explicit_system_prompt: Default::default(),
         candidate_admission: Default::default(),
+        vcs_root: None,
         repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(
         ),
         transient_retry_enabled: true,
@@ -382,20 +383,13 @@ async fn create_test_actor_inner(
         rewind_pending_prompt: std::sync::Mutex::new(None),
         startup_hints: StartupHints::default(),
         forked_tool_override: None,
-        compaction: crate::session::compaction_config::CompactionConfig {
-            threshold_percent: std::cell::Cell::new(threshold_percent),
-            force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            context_window_override: None,
-            count: std::sync::atomic::AtomicU64::new(0),
-            auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-            previous_model: std::cell::Cell::new(None),
-            compaction_mode: xai_chat_state::CompactionMode::Transcript,
-            verbatim_input: true,
-            tool_choice: crate::util::config::CompactionToolChoice::Auto,
-            prefire: crate::session::compaction_config::PrefireState::default(),
-            prefix_released: std::sync::atomic::AtomicBool::new(false),
-            cancel: Default::default(),
+        compaction: test_compaction_config(threshold_percent),
+        long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+            enabled: false,
+            tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+            delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
         },
+        long_reasoning_turn_state: Default::default(),
         memory: crate::session::memory_state::SessionMemory {
             configured_mode: None,
             v2_config: Default::default(),
@@ -496,7 +490,7 @@ async fn create_test_actor_inner(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        initial_client_mcp_servers: vec![],
+        initial_client_mcp_servers: Default::default(),
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announcements: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
@@ -523,7 +517,6 @@ async fn create_test_actor_inner(
         turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
-        vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
         hook_load_errors: std::cell::RefCell::new(Vec::new()),
         plugin_registry: std::cell::RefCell::new(None),
         plugin_registry_handle: None,
@@ -745,7 +738,7 @@ pub(crate) async fn prepare_call(
     let mut deferred = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        actor.prepare_tool_call(call, &mut deferred),
+        actor.prepare_tool_call(call, &mut deferred, None),
     )
     .await
     .expect("prepare_tool_call must not hang")
@@ -1287,4 +1280,24 @@ pub(crate) fn with_run_loop(mut actor: SessionActor) -> (Arc<SessionActor>, Star
         actor
     });
     (actor, startup_tasks)
+}
+/// Default compaction config for test actors; only the trigger threshold varies per test.
+pub(crate) fn test_compaction_config(
+    threshold_percent: u8,
+) -> crate::session::compaction_config::CompactionConfig {
+    crate::session::compaction_config::CompactionConfig {
+        threshold_percent: std::cell::Cell::new(threshold_percent),
+        force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        context_window_override: None,
+        context_window_selection: Default::default(),
+        count: std::sync::atomic::AtomicU64::new(0),
+        auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+        previous_model: std::cell::Cell::new(None),
+        compaction_mode: xai_chat_state::CompactionMode::Transcript,
+        verbatim_input: true,
+        tool_choice: crate::util::config::CompactionToolChoice::Auto,
+        prefire: crate::session::compaction_config::PrefireState::default(),
+        prefix_released: std::sync::atomic::AtomicBool::new(false),
+        cancel: Default::default(),
+    }
 }

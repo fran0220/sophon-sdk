@@ -52,6 +52,103 @@ pub struct SubagentBrief {
     pub description: String,
     pub instructions: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<CandidateEffort>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CandidateEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl CandidateEffort {
+    pub(crate) fn native(self) -> Option<xai_grok_agent::config::Effort> {
+        use xai_grok_agent::config::Effort;
+        match self {
+            Self::None | Self::Minimal => None,
+            Self::Low => Some(Effort::Low),
+            Self::Medium => Some(Effort::Medium),
+            Self::High => Some(Effort::High),
+            Self::Xhigh => Some(Effort::XHigh),
+            Self::Max => Some(Effort::Max),
+        }
+    }
+}
+
+pub(crate) fn effective_brief_effort(
+    explicit: Option<CandidateEffort>,
+    configured: Option<xai_grok_agent::config::Effort>,
+) -> Result<Option<xai_grok_agent::config::Effort>, ()> {
+    match explicit {
+        Some(effort) => effort.native().map(Some).ok_or(()),
+        None => Ok(configured),
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::{CandidateEffort, SubagentBrief, effective_brief_effort};
+    use xai_grok_agent::config::Effort;
+
+    #[test]
+    fn brief_reasoning_effort_decodes_to_native_effort() {
+        for (wire, expected) in [
+            ("low", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+            ("xhigh", Effort::XHigh),
+            ("max", Effort::Max),
+        ] {
+            let brief: SubagentBrief = serde_json::from_value(serde_json::json!({
+                "name": "worker", "description": "worker", "instructions": "work",
+                "model": "model", "reasoningEffort": wire
+            }))
+            .unwrap();
+            assert_eq!(brief.reasoning_effort.unwrap().native(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn brief_reasoning_effort_defaults_to_none_and_retains_sdk_only_values_for_validation() {
+        let brief: SubagentBrief = serde_json::from_value(serde_json::json!({
+            "name": "worker", "description": "worker", "instructions": "work", "model": null
+        }))
+        .unwrap();
+        assert_eq!(brief.reasoning_effort, None);
+        for (unsupported, expected) in [
+            ("none", CandidateEffort::None),
+            ("minimal", CandidateEffort::Minimal),
+        ] {
+            let brief = serde_json::from_value::<SubagentBrief>(serde_json::json!({
+                "name": "worker", "description": "worker", "instructions": "work",
+                "model": "model", "reasoningEffort": unsupported
+            }))
+            .unwrap();
+            assert_eq!(brief.reasoning_effort, Some(expected));
+            assert_eq!(brief.reasoning_effort.unwrap().native(), None);
+        }
+    }
+
+    #[test]
+    fn omitted_effort_preserves_profile_effort_for_model_rebinding() {
+        assert_eq!(
+            effective_brief_effort(None, Some(Effort::High)),
+            Ok(Some(Effort::High))
+        );
+        assert_eq!(
+            effective_brief_effort(Some(CandidateEffort::Low), Some(Effort::High)),
+            Ok(Some(Effort::Low))
+        );
+        assert!(
+            effective_brief_effort(Some(CandidateEffort::Minimal), Some(Effort::High)).is_err()
+        );
+    }
 }
 
 /// Out-of-band cancellation only; the actor mailbox remains the sole input FIFO.
@@ -106,9 +203,18 @@ impl CandidateAdmission {
         self.state.lock().required
     }
 
-    pub(crate) fn inherit(&self, generation: u64, mounted: MountedConfig, commit: impl FnOnce()) -> bool {
+    pub(crate) fn inherit(
+        &self,
+        generation: u64,
+        mounted: MountedConfig,
+        commit: impl FnOnce(),
+    ) -> bool {
         let mut state = self.state.lock();
-        if state.closed || state.generation != generation || state.required || state.mounted.is_some() {
+        if state.closed
+            || state.generation != generation
+            || state.required
+            || state.mounted.is_some()
+        {
             return false;
         }
         commit();
@@ -118,7 +224,8 @@ impl CandidateAdmission {
 
     pub(crate) fn activate_scheduler(&self) {
         let state = self.state.lock();
-        if !state.closed && state.mounted.is_some()
+        if !state.closed
+            && state.mounted.is_some()
             && let Some(gate) = &state.scheduler_activation
         {
             gate.activate();
@@ -143,19 +250,31 @@ impl CandidateAdmission {
         self.state.lock().mounted.clone()
     }
 
-    pub(crate) fn defer_client_hooks_if_mounted(&self, hooks: crate::extensions::hooks::ClientHooks) -> bool {
+    pub(crate) fn defer_client_hooks_if_mounted(
+        &self,
+        hooks: crate::extensions::hooks::ClientHooks,
+    ) -> bool {
         let mut state = self.state.lock();
         if state.mounted.is_none() {
             return false;
         }
         state.pending_client_hooks = Some(hooks);
         state.plugin_revision += 1;
-        if let Some(token) = &state.preparing { token.cancel(); }
+        if let Some(token) = &state.preparing {
+            token.cancel();
+        }
         true
     }
 
-    pub(crate) fn client_hooks_for_preparation(&self, current: crate::extensions::hooks::ClientHooks) -> crate::extensions::hooks::ClientHooks {
-        self.state.lock().pending_client_hooks.clone().unwrap_or(current)
+    pub(crate) fn client_hooks_for_preparation(
+        &self,
+        current: crate::extensions::hooks::ClientHooks,
+    ) -> crate::extensions::hooks::ClientHooks {
+        self.state
+            .lock()
+            .pending_client_hooks
+            .clone()
+            .unwrap_or(current)
     }
 
     pub(crate) fn defer_plugins_if_mounted(
@@ -204,7 +323,11 @@ impl CandidateAdmission {
         commit: impl FnOnce() -> bool,
     ) -> bool {
         let mut state = self.state.lock();
-        if state.closed || cancelled.is_cancelled() || state.plugin_revision != plugin_revision || !commit() {
+        if state.closed
+            || cancelled.is_cancelled()
+            || state.plugin_revision != plugin_revision
+            || !commit()
+        {
             return false;
         }
         state.pending_plugins = None;
@@ -254,7 +377,11 @@ mod tests {
             let meta = serde_json::json!({"x.ai/requireConfigCandidate":required});
             assert_eq!(required_from_meta(meta.as_object()).unwrap(), required);
         }
-        for invalid in [serde_json::Value::Null, serde_json::json!("true"), serde_json::json!(1)] {
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
             let meta = serde_json::json!({"x.ai/requireConfigCandidate":invalid});
             assert!(required_from_meta(meta.as_object()).is_err());
         }

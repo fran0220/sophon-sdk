@@ -59,11 +59,13 @@ requires downstream `x.ai/*` JSON; the raw extension seam remains for new,
 experimental and uncommon operations. A seventh protects portable conversation
 capture and import. The upstream tree is pinned by
 [`UPSTREAM_GROK_BUILD_COMMIT`](UPSTREAM_GROK_BUILD_COMMIT) at
-`a28ee2b2063426e8816e380ccea528b9de95e5da` (crate metadata 1.0.35, `SOURCE_REV`
-`e8563f8f182296ebb53cadb3e1eab7615d76408e`). This is an independent
+`2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8` (crate metadata 1.0.45, `SOURCE_REV`
+`559751fdcec02d413e4c57c8832ab275e4f44980`). This is an independent
 redistribution, not an official xAI SDK.
 
-The synchronized source includes the complete 1.0.35 public snapshot. SDK 0.6.0
+The synchronized source includes the complete 1.0.45 public snapshot. The
+TypeScript SDK is 0.8.0-alpha.1 and supports explicit per-subagent reasoning
+effort in runtime profiles and configuration-candidate briefs. SDK 0.6.0
 adapts the independent Memory V2 configuration and exposes native capture,
 Dream, rollout and retention controls. The update includes MCP handshake and
 structured-result fixes, parent/peer subagent messaging, prompt offloading,

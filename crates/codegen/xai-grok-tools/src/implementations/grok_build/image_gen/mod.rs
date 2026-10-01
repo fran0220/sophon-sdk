@@ -17,8 +17,10 @@
 
 use base64::Engine as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use xai_tool_runtime::ToolError;
 
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
+use crate::implementations::grok_build::media_bearer::MediaBearer;
 use crate::types::SharedApiKeyProvider;
 
 use crate::types::output::{MediaGenOutput, ToolOutput};
@@ -56,7 +58,7 @@ pub struct ImageGenClient {
     model: String,
     edit_model: String,
     writer: super::storage::SessionFileWriter,
-    api_key_provider: Option<SharedApiKeyProvider>,
+    bearer: MediaBearer,
     /// Optional 401-attribution hook. Hosts wire this so a 401 from the
     /// Imagine API emits an `auth_401_attribution` event with
     /// `consumer == "ImageGen"` for unified auth-failure telemetry.
@@ -102,16 +104,6 @@ impl ImageGenClient {
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        // Always bake the static api_key as the default Authorization header.
-        // The dynamic provider overrides per-request; this is the fallback.
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Invalid API key for header: {e}"
-                ))
-            })?,
-        );
 
         extra_headers.into_iter().try_for_each(|(key, value)| {
             let header_name =
@@ -153,9 +145,12 @@ impl ImageGenClient {
             model,
             edit_model,
             writer: super::storage::SessionFileWriter::new(DEFAULT_IMAGE_DIR, "jpg"),
-            api_key_provider: use_dynamic_api_key_provider
-                .then_some(api_key_provider)
-                .flatten(),
+            bearer: MediaBearer::new(
+                use_dynamic_api_key_provider
+                    .then_some(api_key_provider)
+                    .flatten(),
+                api_key.clone(),
+            ),
             attribution_callback: None,
             tier_restricted: *tier_restricted,
             session_header: None,
@@ -192,8 +187,9 @@ impl ImageGenClient {
         self
     }
 
-    pub(crate) async fn current_bearer(&self) -> Option<String> {
-        crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
+    /// `Err` means the request must not be sent; see [`MediaBearer::resolve`].
+    pub(crate) async fn current_bearer(&self) -> Result<String, ToolError> {
+        self.bearer.resolve().await
     }
 
     pub(crate) fn record_401_attribution(&self, consumer: ToolConsumer, sent_bearer: Option<&str>) {
@@ -210,12 +206,13 @@ impl ImageGenClient {
         &self,
         url: &str,
         payload: &serde_json::Value,
-        sent_bearer: Option<&str>,
+        sent_bearer: &str,
     ) -> reqwest::RequestBuilder {
-        let mut req = self.http.post(url).json(payload);
-        if let Some(key) = sent_bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
+        let mut req = self
+            .http
+            .post(url)
+            .json(payload)
+            .header(AUTHORIZATION, format!("Bearer {sent_bearer}"));
         if let Some(ref session) = self.session_header {
             req = req.header(SESSION_ID_HEADER, session.clone());
         }
@@ -249,8 +246,8 @@ impl ImageGenClient {
         // Capture the bearer once so the request and the 401-attribution
         // emit see the same value (even if the provider rotates between
         // the send and the response handling).
-        let sent_bearer = self.current_bearer().await;
-        let req = self.post_json(&url, &payload, sent_bearer.as_deref());
+        let sent_bearer = self.current_bearer().await?;
+        let req = self.post_json(&url, &payload, &sent_bearer);
 
         let response = req.send().await.map_err(|e| {
             xai_tool_runtime::ToolError::invalid_arguments(format!(
@@ -260,7 +257,7 @@ impl ImageGenClient {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(ToolConsumer::ImageGen, sent_bearer.as_deref());
+            self.record_401_attribution(ToolConsumer::ImageGen, Some(&sent_bearer));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -311,7 +308,8 @@ pub enum ImageGenConfig {
     #[default]
     Disabled,
     Enabled {
-        api_key: String,
+        /// `None`: the per-request `ApiKeyProvider` is the only bearer source.
+        api_key: Option<String>,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
         /// Allow the host's live auth provider to replace `api_key` for each
@@ -529,7 +527,7 @@ mod tests {
     #[test]
     fn per_tool_gates_are_independent() {
         let cfg = ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,
@@ -552,7 +550,7 @@ mod tests {
         let mut preset = indexmap::IndexMap::new();
         preset.insert(SESSION_ID_HEADER.to_string(), "caller-set".to_string());
         let cfg = ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: preset,
             use_dynamic_api_key_provider: true,
@@ -568,7 +566,7 @@ mod tests {
         assert!(client.session_header.is_none());
 
         let cfg_plain = ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,
@@ -592,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn post_json_attaches_session_and_bearer_headers() {
         let cfg = ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,
@@ -606,11 +604,7 @@ mod tests {
             .unwrap()
             .with_session_id("sess-42");
         let req = client
-            .post_json(
-                "https://api.x.ai/v1/images",
-                &serde_json::json!({}),
-                Some("tok"),
-            )
+            .post_json("https://api.x.ai/v1/images", &serde_json::json!({}), "tok")
             .build()
             .unwrap();
         assert_eq!(
@@ -664,12 +658,12 @@ mod tests {
             tier_restricted: false,
         };
         let client = ImageGenClient::new(&cfg, Some(std::sync::Arc::new(ModelKey))).unwrap();
-        assert!(client.api_key_provider.is_none());
+        assert_eq!(client.current_bearer().await.unwrap(), "media-key");
         let response = client
             .post_json(
                 &format!("{}/images/generations", server.uri()),
                 &serde_json::json!({ "model": client.model }),
-                None,
+                "media-key",
             )
             .send()
             .await
@@ -680,7 +674,7 @@ mod tests {
     #[test]
     fn client_selects_model_from_override() {
         let mk = |model_override: Option<&str>| ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,
@@ -712,7 +706,7 @@ mod tests {
     #[test]
     fn client_selects_edit_model_from_override() {
         let mk = |edit_model_override: Option<&str>| ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,
@@ -765,7 +759,7 @@ mod tests {
         // result (no HTTP, no error card) so the model can relay it. Only the client is inserted —
         // the short-circuit returns before any other resource (e.g. SessionFolder) is required.
         let cfg = ImageGenConfig::Enabled {
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             use_dynamic_api_key_provider: true,

@@ -534,6 +534,9 @@ pub struct SubagentDefinition {
     pub description: String,
     pub instructions: String,
     pub model: Option<String>,
+    /// Explicit native effort; omission preserves the model's default.
+    #[ts(optional = nullable)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Null inherits native tools; an empty list permits no tools, skills,
     /// MCP, project instructions, or child spawning.
     pub tools: Option<Vec<String>>,
@@ -706,6 +709,30 @@ impl AgentConfig {
                 .is_some_and(|model| !ids.contains(model.as_str()))
             {
                 return Err(Error::invalid_config("subagent model is not configured"));
+            }
+            if let Some(effort) = definition.reasoning_effort {
+                if matches!(effort, ReasoningEffort::None | ReasoningEffort::Minimal) {
+                    return Err(Error::invalid_config(
+                        "subagent effort must be low, medium, high, xhigh, or max",
+                    ));
+                }
+                let model_id = definition
+                    .model
+                    .as_ref()
+                    .or(self.default_model.as_ref())
+                    .ok_or_else(|| {
+                        Error::invalid_config("subagent effort requires a bound model")
+                    })?;
+                let model = self
+                    .models
+                    .iter()
+                    .find(|model| &model.id == model_id)
+                    .expect("validated default or subagent model is configured");
+                if !model.supported_reasoning.contains(&effort) {
+                    return Err(Error::invalid_config(format!(
+                        "subagent effort is unsupported by model: {model_id}"
+                    )));
+                }
             }
         }
         for (capability, model) in [

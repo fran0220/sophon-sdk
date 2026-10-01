@@ -48,6 +48,7 @@ pub mod terminal;
 pub mod usage;
 pub mod workflow;
 pub mod worktree;
+pub(crate) mod worktree_seed;
 use crate::session::ExtMethodResult;
 use agent_client_protocol as acp;
 use serde::Serialize;

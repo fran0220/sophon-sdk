@@ -1,5 +1,6 @@
 //! Tests for ChatStateActor.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -1417,28 +1418,40 @@ async fn prepared_config_commit_runs_before_chat_publication_and_can_refuse() {
         if cancel {
             token.cancel();
         }
-        let result = h.handle.install_prepared_config_with_commit(
-            "new".into(), test_config_with_window(32_000), Default::default(), token,
-            {
-                let published = published.clone();
-                let called = called.clone();
-                move || {
-                    called.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if accept {
-                        published.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = h
+            .handle
+            .install_prepared_config_with_commit(
+                "new".into(),
+                test_config_with_window(32_000),
+                Default::default(),
+                token,
+                {
+                    let published = published.clone();
+                    let called = called.clone();
+                    move || {
+                        called.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if accept {
+                            published.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        accept
                     }
-                    accept
-                }
-            },
-        ).await;
+                },
+            )
+            .await;
         assert_eq!(result, Some(!cancel && accept));
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), !cancel);
-        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), !cancel && accept);
+        assert_eq!(
+            published.load(std::sync::atomic::Ordering::SeqCst),
+            !cancel && accept
+        );
         let after = h.handle.snapshot().await.unwrap();
         if !cancel && accept {
             assert_eq!(after.sampling_config.context_window.get(), 32_000);
         } else {
-            assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
         }
     }
 }
@@ -3165,7 +3178,8 @@ async fn turn_capture_survives_integrity_repair_prefix_shrink() {
 
     // Integrity repair shrinks the conversation below the un-rebased capture offset.
     // Without the fix the later slice is out of range, panics the actor, and the query returns None.
-    h.handle.repair_dangling_after_harness_halt("test-halt");
+    h.handle
+        .repair_dangling_after_harness_halt("test-halt", HashMap::new());
 
     // Second turn item lands after the rebase — it must still be captured.
     h.handle
@@ -3201,7 +3215,8 @@ async fn integrity_repair_does_not_flag_compaction() {
 
     // An in-place integrity repair goes through `snapshot_turn_slice` like
     // compaction does, but it is NOT compaction — the flag must stay unset.
-    h.handle.repair_dangling_after_harness_halt("test-halt");
+    h.handle
+        .repair_dangling_after_harness_halt("test-halt", HashMap::new());
 
     let capture = h
         .handle
@@ -3566,7 +3581,8 @@ async fn cancel_integrity_repair_drops_stranded_continue_reminder() {
     h.handle
         .push_user_message(ConversationItem::length_continue_reminder("continue"));
 
-    h.handle.repair_dangling_after_harness_halt("test-cancel");
+    h.handle
+        .repair_dangling_after_harness_halt("test-cancel", HashMap::new());
     let conv = h.handle.get_conversation().await;
     assert!(
         !matches!(

@@ -5,13 +5,18 @@ explicitly reviewed patch groups. Each group has its own file list and SHA-256
 digest under `upstream-patches/`; `scripts/check-upstream-sync.sh` rejects both
 changes outside these lists and drift within a listed group.
 
+The 1.0.45 reconciliation also audited every native change added after the
+1.0.35 merge, rather than treating the old lists as an allowlist. SDK-owned
+`crates/sophon-sdk`, `crates/sophon-browser`, and `packages/typescript` sources
+and their root integration files are excluded from untouched-upstream checking;
+native source remains covered by one or more groups below.
+
 ## Portable conversation transfer
 
 `portable-conversation.sha256` covers the native actor admission fence,
 persistence flush/capture barrier, validated conversation projection and atomic
-create-only import. Its exact paths are the `portable_conversation` list in
-`scripts/check-upstream-sync.sh`; shared admission/actor files also remain in
-the typed-management digest. No upstream pin or package version is rewritten.
+create-only import. Shared admission/actor files also remain in the
+typed-management digest. No upstream pin or package version is rewritten.
 
 Format v1 preserves current model context and unfiltered persisted events, not
 destroyed historical model contexts, filesystem rewind custody or resumable
@@ -19,6 +24,21 @@ orchestration. Structural machine configuration is excluded; transcript text
 is not sanitized. Import recovery compares current native data without actor
 attachment, rather than trusting an import receipt after later mutations.
 The SDK README specifies the public contract and limitations.
+
+Approved files (digest: `portable-conversation.sha256`):
+
+- `crates/codegen/xai-grok-shell/src/agent/activity.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/portability.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs`
+- `crates/codegen/xai-grok-shell/src/session/commands.rs`
+- `crates/codegen/xai-grok-shell/src/session/mod.rs`
+- `crates/codegen/xai-grok-shell/src/session/persistence.rs`
+- `crates/codegen/xai-grok-shell/src/session/persistence_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/portability.rs`
+- `crates/codegen/xai-grok-shell/src/session/storage/jsonl/mod.rs`
+- `crates/codegen/xai-grok-shell/src/session/storage/mod.rs`
+- `crates/codegen/xai-grok-tools/src/management/admission.rs`
 
 ## Provider routing
 
@@ -48,14 +68,20 @@ upstream-owned. Approved files (digest: `provider-routing.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/config.rs`
 - `crates/codegen/xai-grok-shell/src/agent/config_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs`
+- `crates/codegen/xai-grok-shell/src/agent/media_tool_config.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
+- `crates/codegen/xai-grok-shell/src/agent/remote_config.rs`
+- `crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs`
+- `crates/codegen/xai-grok-shell/src/agent/remote_config/manager/tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/memory_control.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_build.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/recap.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/side_call.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/idle_resume_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/inline_auto_compact_flow_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/memory_config_tests.rs`
@@ -64,6 +90,8 @@ upstream-owned. Approved files (digest: `provider-routing.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/web_search_e2e_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/agent_rebuild.rs`
 - `crates/codegen/xai-grok-shell/src/session/compaction_inline_auto_compact_flow_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/summary.rs`
+- `crates/codegen/xai-grok-sampling-types/src/types.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/image_gen/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/video_gen/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/web_search/client.rs`
@@ -93,6 +121,11 @@ Approved files (digest: `hermetic-discovery.sha256`):
 - `crates/codegen/xai-grok-agent/src/plugins/discovery.rs`
 - `crates/codegen/xai-grok-agent/src/prompt/agents_md.rs`
 - `crates/codegen/xai-grok-agent/src/prompt/skills.rs`
+- `crates/codegen/xai-grok-config/src/compat.rs`
+- `crates/codegen/xai-grok-config/src/compat_tests.rs`
+- `crates/codegen/xai-grok-config/src/mcp_servers/json_config.rs`
+- `crates/codegen/xai-grok-config/src/mcp_servers/json_config_tests.rs`
+- `crates/codegen/xai-grok-hooks/src/discovery.rs`
 - `crates/codegen/xai-grok-config/src/hermetic.rs`
 - `crates/codegen/xai-grok-config/src/lib.rs`
 - `crates/codegen/xai-grok-config/src/macos_managed.rs`
@@ -103,23 +136,27 @@ Approved files (digest: `hermetic-discovery.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/sampler_prewarm.rs`
 - `crates/codegen/xai-grok-shell/src/config/mod.rs`
 - `crates/codegen/xai-grok-shell/src/config/watcher.rs`
-- `crates/codegen/xai-grok-shell/src/managed_config/store.rs`
-- `crates/codegen/xai-grok-shell/src/managed_config/supervisor.rs`
+- `crates/codegen/xai-grok-cloud-config/src/managed_config/store.rs`
+- `crates/codegen/xai-grok-cloud-config/src/managed_config/supervisor.rs`
 - `crates/codegen/xai-grok-shell/src/session/workflow/registry.rs`
-- `crates/codegen/xai-grok-shell/src/util/config/mcp.rs`
 - `crates/codegen/xai-grok-shell/src/util/hooks.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/cursor_rules_on_read.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/lsp/config.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/skills/discovery.rs`
-- `crates/codegen/xai-grok-tools/src/types/compat.rs`
 - `crates/codegen/xai-grok-workspace/src/envrc.rs`
 - `crates/codegen/xai-grok-workspace/src/folder_trust.rs`
-- `crates/codegen/xai-grok-workspace/src/permission/claude_settings.rs`
-- `crates/codegen/xai-grok-workspace/src/project_config.rs`
+- `crates/codegen/xai-grok-permission-rules/src/claude_settings.rs`
+- `crates/codegen/xai-grok-permission-rules/src/project_config.rs`
 
 `agent/config.rs` is intentionally in both groups because it carries both the
 runtime media provider and the resolved hermetic compatibility bit. Both
 digests therefore detect changes to that shared boundary.
+
+In 1.0.45, managed cloud configuration and permission-rule discovery moved to
+their new upstream owner crates. The obsolete shell/workspace paths were
+removed. The former tools `types/compat.rs` is now an upstream re-export;
+its hermetic field and instruction-discovery restrictions are retained at
+the new `xai-grok-config/src/compat.rs` owner, not duplicated in tools.
 
 ## Windows portability
 
@@ -133,6 +170,7 @@ branch repair is now included in the Windows digest.
 Approved files (digest: `windows-portability.sha256`):
 
 - `crates/build/xai-proto-build/src/lib.rs`
+- `crates/codegen/ptyctl/src/pty.rs`
 - `crates/codegen/xai-grok-shell-terminal/Cargo.toml`
 - `crates/codegen/xai-grok-shell-terminal/src/streaming_local_terminal.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs`
@@ -154,10 +192,11 @@ persistence/rewind assertions remain intact. The session-list benchmark also
 removes duplicate `agent_id`/`attempt_id` initializer fields from the snapshot.
 At 1.0.35, upstream supplies the image-strip concurrency repair and removes
 the stale memory imports, so those files no longer require an overlay.
+At 1.0.45, upstream constructs the session-list fixture through deserialization,
+which also resolves the duplicate-field issue; that patch path is removed.
 
 Approved files (digest: `public-snapshot-repairs.sha256`):
 
-- `crates/codegen/xai-grok-shell/benches/session_list.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/read_file/mod.rs`
 
 ## Goal reliability
@@ -248,15 +287,26 @@ routes remain under `crates/sophon-sdk` and are excluded from upstream-path
 validation. Approved upstream files (digest: `typed-management.sha256`):
 
 - `crates/codegen/xai-acp-lib/src/gateway.rs`
+- `crates/codegen/xai-chat-state/src/actor/mod.rs`
+- `crates/codegen/xai-chat-state/src/actor/tests.rs`
+- `crates/codegen/xai-chat-state/src/commands.rs`
+- `crates/codegen/xai-chat-state/src/handle.rs`
 - `crates/codegen/xai-grok-agent/src/builder.rs`
 - `crates/codegen/xai-grok-pager/src/app/acp_handler/tests/queue_and_adoption.rs`
 - `crates/codegen/xai-grok-pager/src/app/app_view.rs`
+- `crates/codegen/xai-grok-mcp/src/servers.rs`
+- `crates/codegen/xai-grok-mcp/src/servers_tests.rs`
+- `crates/codegen/xai-grok-mcp/src/shared_mcp_state.rs`
 - `crates/codegen/xai-grok-shell/src/agent/activity.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/subagent_spawn.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/list_running_heal_tests.rs`
+- `crates/codegen/xai-grok-shell/src/agent/handlers/session.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_lifecycle.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_registry.rs`
+- `crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests/session_resume_close_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/attempt_runner.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/child_runtime_tests.rs`
@@ -266,14 +316,22 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/agent/subagent/prompt_turn_result_tests.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/spawn.rs`
 - `crates/codegen/xai-grok-shell/src/agent/subagent/tests/rest.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/tests/mod.rs`
+- `crates/codegen/xai-grok-shell/src/agent/subagent/tests/wake.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/mcp.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/mcp/persistence.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/mcp/readiness.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/mod.rs`
+- `crates/codegen/xai-grok-shell/src/extensions/notification.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/task.rs`
 - `crates/codegen/xai-grok-shell/src/extensions/workflow.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_conversion.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/config_candidate.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/hooks_plugins.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/mcp.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/mcp_snapshot.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/notification_drain.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/parent_message.rs`
@@ -282,6 +340,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/rewind.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_end.rs`
@@ -291,6 +350,7 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/fs_injection_regression_tests.rs`
+- `crates/codegen/xai-grok-shell/src/session/acp_session_tests/mcp_failed_reminder_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_gate_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/prompt_queue_actor_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/acp_session_tests/support.rs`
@@ -302,8 +362,11 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/session/agent_rebuild_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/commands.rs`
 - `crates/codegen/xai-grok-shell/src/session/compaction.rs`
+- `crates/codegen/xai-grok-shell/src/session/config_candidate.rs`
 - `crates/codegen/xai-grok-shell/src/session/handle.rs`
+- `crates/codegen/xai-grok-shell/src/session/mcp_dispatcher.rs`
 - `crates/codegen/xai-grok-shell/src/session/message_delivery.rs`
+- `crates/codegen/xai-grok-shell/src/session/message_delivery_tests.rs`
 - `crates/codegen/xai-grok-shell/src/session/prompt_queue.rs`
 - `crates/codegen/xai-grok-shell/src/test_support/lsp_runtime.rs`
 - `crates/codegen/xai-grok-shell/src/tools/notification_bridge.rs`
@@ -311,6 +374,12 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-shell/src/tools/tool_context.rs`
 - `crates/codegen/xai-grok-subagent-resolution/src/overrides.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/actor.rs`
+- `crates/codegen/xai-grok-tools/Cargo.toml`
+- `crates/codegen/xai-grok-tools/src/bridge.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/cadence.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/list.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/mod.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/occurrence_journal_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/scheduler/types.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/send_subagent_message_tests.rs`
@@ -321,27 +390,45 @@ validation. Approved upstream files (digest: `typed-management.sha256`):
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/agent_targets.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/graph.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/graph_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/query.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/spawn.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/wake.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_tests.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/types.rs`
 - `crates/codegen/xai-grok-tools/src/implementations/grok_build/task_output/mod.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/grok_build/todo/mod.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/opencode/skill/mod.rs`
+- `crates/codegen/xai-grok-tools/src/implementations/skills/skill.rs`
 - `crates/codegen/xai-grok-tools/src/lib.rs`
 - `crates/codegen/xai-grok-tools/src/management/admission.rs`
 - `crates/codegen/xai-grok-tools/src/management/mod.rs`
 - `crates/codegen/xai-grok-tools/src/notification/types.rs`
 - `crates/codegen/xai-grok-tools/src/registry/types.rs`
+- `crates/codegen/xai-grok-tools/src/types/resources.rs`
+- `crates/codegen/xai-grok-tools/src/types/skill_discovery_tracker/mod.rs`
 - `crates/codegen/xai-grok-tools/tests/test_subagent_soak.rs`
 - `crates/codegen/xai-grok-workspace/src/session/tool_config.rs`
 - `crates/codegen/xai-prompt-queue/Cargo.toml`
 - `crates/codegen/xai-prompt-queue/src/lib.rs`
 - `crates/codegen/xai-prompt-queue/src/types.rs`
+- `crates/common/xai-tool-runtime/src/notification.rs`
+- `crates/common/xai-tool-runtime/tests/notification_serde.rs`
 
 `builder.rs`, `agent_ops.rs`, session spawn/rebuild paths and `tool_config.rs`
 intentionally overlap earlier groups. Each digest covers the complete pinned
 diff for its exact file set, so either boundary detects drift.
+
+The post-1.0.35 audit adds the previously uncatalogued native configuration
+candidate/chat actor, mounted MCP/plugin/skill publication, checked lifecycle,
+scheduler cadence/occurrence, child inheritance and typed notification paths to
+this group. The PTY child-reaping repair is catalogued under Windows
+portability, while explicit auxiliary-route resolution is catalogued under
+provider routing. Paths now identical to 1.0.45 were removed instead of being
+carried forward.
 
 ## Updating upstream
 

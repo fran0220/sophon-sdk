@@ -464,7 +464,19 @@ pub async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
         ));
     }
     let path = std::path::Path::new(&skill.path);
-    match tokio::fs::read_to_string(path).await {
+    match crate::util::file_reader::read_file(
+        path,
+        crate::util::file_reader::FileReadOptions::default(),
+    )
+    .await
+    .and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
+    }) {
         Ok(content) => {
             let body = extract_skill_body(&content);
             Ok(match path.parent() {
@@ -577,6 +589,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: true,
             paths: None,
+            origin: None,
             enabled: true,
             body: Some("---\n\nParagraph after a markdown HR.".to_string()),
         };
@@ -611,6 +624,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: true,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -646,6 +660,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -676,6 +691,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -709,6 +725,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -748,6 +765,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
