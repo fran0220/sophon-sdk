@@ -54,6 +54,8 @@ async fn reasoning_option_advances_config_clock_without_rewriting_explicit_head_
                     skip_prompt_rewrite: true,
                     auto_compact_threshold_percent: 85,
                     system_prompt_label: String::new(),
+                    context_window_selection: crate::session::SwitchContextWindow::Preserve,
+                    supported_context_windows: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -110,6 +112,8 @@ async fn attach_restore_retains_original_rules_and_explicit_override_wins() {
                         skip_prompt_rewrite: true,
                         auto_compact_threshold_percent: 75,
                         system_prompt_label: String::new(),
+                        context_window_selection: crate::session::SwitchContextWindow::Preserve,
+                        supported_context_windows: Vec::new(),
                     })
                     .await
                     .unwrap();

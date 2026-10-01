@@ -233,13 +233,14 @@ impl NativeMediaService {
             .ok_or_else(|| fail("Media route is not configured"))?;
         route.validate(endpoint)?;
         decoder_available(&self.ffmpeg_executable).await?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|_| fail("Cannot create media HTTP client"))?;
+        let client = xai_grok_extra_ca::build_reqwest_client(|builder| {
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .timeout(Duration::from_secs(120))
+        })
+        .map_err(|_| fail("Cannot create media HTTP client"))?;
         match endpoint {
             MediaEndpoint::ImageGeneration => {
                 self.image(route, &client, parse(args)?, workspace).await
@@ -312,12 +313,9 @@ impl NativeMediaService {
         let receipt_dir = workspace.join(".native-media");
         std::fs::create_dir_all(&receipt_dir)
             .map_err(|_| fail("Cannot create media receipt directory"))?;
-        let receipt_dir = receipt_dir
-            .canonicalize()
-            .map_err(|_| fail("Cannot resolve media receipts"))?;
-        let root = workspace
-            .canonicalize()
-            .map_err(|_| fail("Cannot resolve workspace"))?;
+        let receipt_dir =
+            dunce::canonicalize(receipt_dir).map_err(|_| fail("Cannot resolve media receipts"))?;
+        let root = dunce::canonicalize(workspace).map_err(|_| fail("Cannot resolve workspace"))?;
         if !receipt_dir.starts_with(root) {
             return Err(fail("Media receipts must remain inside workspace"));
         }
@@ -486,12 +484,9 @@ impl NativeMediaService {
         let receipt_dir = workspace.join(".native-media");
         std::fs::create_dir_all(&receipt_dir)
             .map_err(|_| fail("Cannot create media receipt directory"))?;
-        let receipt_dir = receipt_dir
-            .canonicalize()
-            .map_err(|_| fail("Cannot resolve media receipts"))?;
-        let root = workspace
-            .canonicalize()
-            .map_err(|_| fail("Cannot resolve workspace"))?;
+        let receipt_dir =
+            dunce::canonicalize(receipt_dir).map_err(|_| fail("Cannot resolve media receipts"))?;
+        let root = dunce::canonicalize(workspace).map_err(|_| fail("Cannot resolve workspace"))?;
         if !receipt_dir.starts_with(root) {
             return Err(fail("Media receipts must remain inside workspace"));
         }
@@ -715,12 +710,8 @@ fn relative(value: &str) -> Result<&Path, Error> {
     Ok(path)
 }
 fn input_path(root: &Path, value: &str) -> Result<PathBuf, Error> {
-    let root = root
-        .canonicalize()
-        .map_err(|_| fail("Cannot resolve workspace"))?;
-    let path = root
-        .join(relative(value)?)
-        .canonicalize()
+    let root = dunce::canonicalize(root).map_err(|_| fail("Cannot resolve workspace"))?;
+    let path = dunce::canonicalize(root.join(relative(value)?))
         .map_err(|_| fail("Cannot resolve reference"))?;
     if !path.starts_with(root) {
         return Err(fail("Reference escapes workspace"));
@@ -735,14 +726,9 @@ fn output_path(root: &Path, value: &str, extension: &str) -> Result<PathBuf, Err
     if path.extension().and_then(|v| v.to_str()) != Some(extension) {
         return Err(fail("Artifact output extension does not match media type"));
     }
-    let root = root
-        .canonicalize()
-        .map_err(|_| fail("Cannot resolve workspace"))?;
+    let root = dunce::canonicalize(root).map_err(|_| fail("Cannot resolve workspace"))?;
     let destination = root.join(path);
-    let parent = destination
-        .parent()
-        .unwrap()
-        .canonicalize()
+    let parent = dunce::canonicalize(destination.parent().unwrap())
         .map_err(|_| fail("Output parent must already exist"))?;
     if !parent.starts_with(root) || destination.symlink_metadata().is_ok() {
         return Err(fail("Output escapes workspace or already exists"));

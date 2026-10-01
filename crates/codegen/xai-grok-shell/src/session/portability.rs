@@ -745,6 +745,7 @@ fn publish(_: &Path, _: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::persistence::PersistedAgent;
 
     fn fixture() -> (tempfile::TempDir, Info) {
         let dir = tempfile::tempdir().unwrap();
@@ -756,7 +757,7 @@ mod tests {
             Summary::new(&info, agent_client_protocol::ModelId::new("model")).unwrap();
         summary.num_chat_messages = 1;
         summary.sandbox_profile = Some("source-machine-profile".into());
-        summary.agent_name = Some("source-machine-harness".into());
+        summary.set_agent(PersistedAgent::Named("source-machine-harness".into()));
         std::fs::write(
             dir.path().join(st::SUMMARY_FILE),
             serde_json::to_vec(&summary).unwrap(),

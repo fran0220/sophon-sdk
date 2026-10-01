@@ -4186,7 +4186,7 @@ async fn prepare_media_configs_keep_independent_provider_credentials() {
     else {
         panic!("expected image generation config");
     };
-    assert_eq!(api_key, "media-key");
+    assert_eq!(api_key.as_deref(), Some("media-key"));
     assert_eq!(base_url, "https://media.example/v1");
     assert_eq!(
         extra_headers.get("x-media-tenant").map(String::as_str),
@@ -4204,7 +4204,7 @@ async fn prepare_media_configs_keep_independent_provider_credentials() {
     else {
         panic!("expected video generation config");
     };
-    assert_eq!(api_key, "media-key");
+    assert_eq!(api_key.as_deref(), Some("media-key"));
     assert_eq!(base_url, "https://media.example/v1");
     assert_eq!(
         extra_headers.get("x-media-tenant").map(String::as_str),
@@ -5353,6 +5353,7 @@ fn native_nested_child_keeps_spawner_mount_after_root_remount() {
             run_in_background: true, surface_completion: false, await_to_completion: false,
             fork_context: false, owner: SubagentOwner::Task, cancel_token: Default::default(),
             spawn_root: Default::default(),
+            tool_call_id: None,
         }
     }
     run_local_for_bridge_test(|| Box::pin(async {

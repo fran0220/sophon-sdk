@@ -440,7 +440,7 @@ pub enum ServerFrame {
 )]
 pub enum Request {
     Initialize {
-        config: RuntimeConfig,
+        config: Box<RuntimeConfig>,
     },
     CreateSession {
         options: SessionOptions,

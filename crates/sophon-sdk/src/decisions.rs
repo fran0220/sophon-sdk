@@ -154,13 +154,14 @@ impl DecisionService {
             return Err(Error::invalid_config("invalid explicit decision route"));
         }
         url.set_path(&format!("{}/systemone", url.path().trim_end_matches('/')));
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|_| Error::invalid_config("cannot construct decision client"))?;
+        let client = xai_grok_extra_ca::build_reqwest_client(|builder| {
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .timeout(Duration::from_secs(60))
+        })
+        .map_err(|_| Error::invalid_config("cannot construct decision client"))?;
         Ok(Self {
             config,
             url,

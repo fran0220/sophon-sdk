@@ -645,7 +645,7 @@ mod tests {
             .mount(&server)
             .await;
         let cfg = ImageGenConfig::Enabled {
-            api_key: "media-key".into(),
+            api_key: Some("media-key".into()),
             base_url: server.uri(),
             extra_headers: indexmap::indexmap! {
                 "x-media-tenant".into() => "tenant".into(),

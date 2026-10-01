@@ -337,8 +337,6 @@ async fn create_test_actor_inner(
         explicit_system_prompt: Default::default(),
         candidate_admission: Default::default(),
         vcs_root: None,
-        repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(
-        ),
         transient_retry_enabled: true,
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),

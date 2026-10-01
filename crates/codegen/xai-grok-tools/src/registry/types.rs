@@ -1458,6 +1458,7 @@ impl ToolRegistryBuilder {
             );
             (Some(scheduler_cmd_rx), Some(cancel_token))
         };
+        resources.insert(crate::types::resources::TruncationCfg(truncation_config));
         let shared_resources = resources.into_shared();
         let mut scheduler_task = None;
         if let (Some(cmd_rx), Some(cancel_token)) = (scheduler_cmd_rx, &scheduler_cancel_token) {

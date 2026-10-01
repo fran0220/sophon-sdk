@@ -728,8 +728,9 @@ async fn history_capture_flushes_events_without_exporting_orchestration() {
         .tx
         .send(PersistenceMsg::CurrentModel {
             model_id: acp::ModelId::new("changed-summary-only"),
-            agent_name: None,
+            agent: PersistedAgent::Named("grok-build".into()),
             reasoning_effort: None,
+            context_window: None,
         })
         .unwrap();
     assert_eq!(
@@ -788,8 +789,9 @@ async fn portable_capture_flushes_recent_events_and_state_at_one_revision() {
         .tx
         .send(PersistenceMsg::CurrentModel {
             model_id: acp::ModelId::new("new-model"),
-            agent_name: None,
+            agent: PersistedAgent::Named("grok-build".into()),
             reasoning_effort: None,
+            context_window: None,
         })
         .unwrap();
     let captured = portable_capture(&actor.handle).await.unwrap();

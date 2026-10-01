@@ -10372,6 +10372,7 @@ dependencies = [
  "xai-grok-agent",
  "xai-grok-config",
  "xai-grok-config-types",
+ "xai-grok-extra-ca",
  "xai-grok-sampler",
  "xai-grok-shell",
  "xai-grok-test-support",

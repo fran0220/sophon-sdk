@@ -7,6 +7,8 @@ use super::super::{
     selectable_catalog_key_for_persisted,
 };
 use super::*;
+use chrono::{Duration as ChronoDuration, Utc};
+use std::collections::BTreeSet;
 
 #[test]
 fn strict_auxiliary_roles_are_independent_and_cli_is_unchanged() {

@@ -652,6 +652,9 @@ mod effective_model_facts_tests {
                                 skip_prompt_rewrite: true,
                                 auto_compact_threshold_percent: 81,
                                 system_prompt_label: String::new(),
+                                context_window_selection:
+                                    crate::session::SwitchContextWindow::Preserve,
+                                supported_context_windows: Vec::new(),
                             })
                             .await
                             .unwrap();

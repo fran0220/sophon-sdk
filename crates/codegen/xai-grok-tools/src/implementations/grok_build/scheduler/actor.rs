@@ -3299,7 +3299,11 @@ mod tests {
             else {
                 panic!("expected a scheduler task");
             };
-            task.last_fired_at = Some(Utc::now() - chrono::Duration::seconds(2));
+            // Tokio's paused clock does not move Utc. Make the next native
+            // occurrence due; last_fired_at is history, not the cadence cursor.
+            task.next_run_at = task
+                .cadence
+                .next_after(Utc::now() - chrono::Duration::seconds(2));
         }
         tokio::time::advance(Duration::from_secs(2)).await;
 
@@ -3307,13 +3311,15 @@ mod tests {
             &mut subagent_rx,
             &first_id,
             SubagentSnapshotStatus::Running {
-                turn_count: 1,
-                tool_call_count: 1,
-                tokens_used: 0,
-                context_window_tokens: 0,
-                context_usage_pct: 0,
-                tools_used: vec![],
-                error_count: 0,
+                progress: Some(SubagentProgress {
+                    turn_count: 1,
+                    tool_call_count: 1,
+                    tokens_used: 0,
+                    context_window_tokens: 0,
+                    context_usage_pct: 0,
+                    tools_used: vec![],
+                    error_count: 0,
+                }),
             },
         )
         .await;

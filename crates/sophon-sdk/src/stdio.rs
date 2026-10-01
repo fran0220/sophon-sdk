@@ -171,10 +171,10 @@ async fn publish_browser_artifact(cwd: &str, id: &str, artifact: Value) -> Resul
     let cwd = std::path::PathBuf::from(cwd);
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        let root = cwd.canonicalize().map_err(operation)?;
+        let root = dunce::canonicalize(cwd).map_err(operation)?;
         let directory = root.join(".native-browser");
         std::fs::create_dir_all(&directory).map_err(operation)?;
-        let directory = directory.canonicalize().map_err(operation)?;
+        let directory = dunce::canonicalize(directory).map_err(operation)?;
         if !directory.starts_with(&root) {
             return Err(Error::Operation(
                 "browser artifact directory escapes workspace".into(),
@@ -330,7 +330,10 @@ impl Runtime {
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(|| Error::Operation("session is not attached".into()))?;
-                let root = tokio::fs::canonicalize(cwd).await.map_err(operation)?;
+                let root = tokio::task::spawn_blocking(move || dunce::canonicalize(cwd))
+                    .await
+                    .map_err(operation)?
+                    .map_err(operation)?;
                 let relative = std::path::Path::new(&path);
                 if relative.is_absolute()
                     || relative
@@ -341,8 +344,10 @@ impl Runtime {
                         "artifact path must be workspace-relative",
                     ));
                 }
-                let file = tokio::fs::canonicalize(root.join(relative))
+                let file = root.join(relative);
+                let file = tokio::task::spawn_blocking(move || dunce::canonicalize(file))
                     .await
+                    .map_err(operation)?
                     .map_err(operation)?;
                 if !file.starts_with(root) {
                     return Err(Error::invalid_config("artifact escapes workspace"));
@@ -858,6 +863,7 @@ pub async fn run() -> Result<()> {
                 id,
                 request: p::Request::Initialize { config },
             } if runtime.is_none() => {
+                let config = *config;
                 let decision = match config
                     .decision
                     .clone()

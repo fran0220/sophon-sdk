@@ -30,6 +30,8 @@ FIFO admission, including their briefs, as before.
 Outer `RuntimeConfig`, `ConfigCandidate`, transport protocol v2, and public event
 variants are unchanged. Rust callers constructing `SubagentDefinition` or
 `SubagentBrief` literals must add `reasoning_effort: None` to retain prior behavior.
+Rust callers constructing the low-level `protocol::Request::Initialize` directly
+must box its `config`; JSON and generated TypeScript are unchanged.
 Regenerate/vendor the TypeScript package and replace the Runtime executable
 together; an older Runtime rejects the new field under `deny_unknown_fields`.
 
@@ -45,6 +47,10 @@ Origin should consume the SDK boundary rather than the moved native types.
 The new dashboard turn-summary call uses the explicit `sessionSummaryModel`
 route and its credentials. Without that route it is skipped in embedded mode,
 never sent to the primary provider as an implicit fallback.
+Decision/media HTTP clients now use the upstream shared TLS-root policy while
+retaining no redirects, no automatic retries, no proxy, and their existing
+timeouts. Artifact path checks use the upstream-recommended Windows-safe
+canonicalization, retaining symlink containment and fail-closed I/O errors.
 
 ## Use it
 
